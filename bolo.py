@@ -163,9 +163,12 @@ class BoloApp(rumps.App):
         self.stream = None  # opened only during recording
         self._ropt_held = False
         self._tap_loop = None
+        self._tap_ref  = None
 
         # Start global hotkey listener via CGEventTap (no pynput)
         self._start_event_tap()
+        # Watchdog: re-enable tap if macOS disables it
+        rumps.Timer(self._watchdog_tap, 2).start()
 
     # ── Audio ─────────────────────────────────────────────────────────────────
 
@@ -186,6 +189,13 @@ class BoloApp(rumps.App):
 
     # Right Option = NX_DEVICERALTKEYMASK (bit 6 of device-dep flags)
     _NX_DEVICERALTKEYMASK = 0x00000040
+
+    def _watchdog_tap(self, _):
+        if self._tap_ref is not None:
+            from Quartz import CGEventTapIsEnabled
+            if not CGEventTapIsEnabled(self._tap_ref):
+                self._log("[tap] was disabled by macOS — re-enabling")
+                CGEventTapEnable(self._tap_ref, True)
 
     def _start_event_tap(self):
         """Create a CGEventTap for flagsChanged events on a background thread."""
@@ -225,6 +235,7 @@ class BoloApp(rumps.App):
         self._tap_loop = CFRunLoopGetCurrent()
         CFRunLoopAddSource(self._tap_loop, source, kCFRunLoopDefaultMode)
         CGEventTapEnable(tap, True)
+        self._tap_ref = tap  # keep reference for watchdog
         self._log("[tap] CGEventTap active, listening for Right Option")
         CFRunLoopRun()
 
