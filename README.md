@@ -1,4 +1,4 @@
-# Bolo: Open source Wispr Flow alternative for macOS
+# Bolo, an open source Wispr Flow alternative for macOS
 
 Free, self-hosted voice dictation powered by Telnyx AI. Hold Right Option anywhere to dictate. Release to paste.
 

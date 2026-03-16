@@ -22,7 +22,7 @@ H = NSScreen.mainScreen().frame().size.height
 
 pw, ph = 160, 40
 x = (W - pw) / 2
-y = 110
+y = 180
 
 win = NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
     NSMakeRect(x, y, pw, ph), NSWindowStyleMaskBorderless, 2, False)
@@ -37,7 +37,7 @@ win.contentView().setWantsLayer_(True)
 win.contentView().layer().setCornerRadius_(20)
 win.contentView().layer().setMasksToBounds_(True)
 
-label = NSTextField.alloc().initWithFrame_(NSMakeRect(0, 0, pw, ph))
+label = NSTextField.alloc().initWithFrame_(NSMakeRect(0, (ph - 18) / 2 - 1, pw, 20))
 label.setAlignment_(NSTextAlignmentCenter)
 label.setFont_(NSFont.systemFontOfSize_(14.0))
 label.setTextColor_(NSColor.whiteColor())
