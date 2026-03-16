@@ -12,11 +12,13 @@ import threading
 import time
 import wave
 
+import collections
 import numpy as np
 import requests
 import rumps
 import sounddevice as sd
 import pyperclip
+from stt import SilenceDetector, TelnyxStreamingSTT
 
 from AppKit import (
     NSPanel, NSView, NSColor, NSBezierPath, NSFont,
@@ -180,22 +182,35 @@ class BoloApp(rumps.App):
             rumps.MenuItem("Hold Right Option to dictate", callback=None),
             None,
             rumps.MenuItem("Last transcript", callback=self._copy_last),
+            rumps.MenuItem("History", callback=None),
             None,
             rumps.MenuItem("Quit Bolo", callback=self.quit_app),
         ]
         self.menu["Bolo — Voice Dictation"].set_callback(None)
         self.menu["Hold Right Option to dictate"].set_callback(None)
+        self.menu["History"].set_callback(None)
         self.last_result     = None
-        self.last_raw        = None   # raw STT before corrections
+        self.last_raw        = None
         self.last_paste_time = 0.0
         self.correction_mode = False
+        self.session_history = collections.deque(maxlen=10)
         self.overlay = RecordingOverlay()
+
+        # Streaming STT state
+        self._stt            = None
+        self._silence        = SilenceDetector()
+        self._silence_event  = threading.Event()
+        self._partial_text   = ""
+        self._chunk_time     = time.time()
 
         self.stream = None  # opened only during recording
         self._ropt_held = False
         self._tap_loop  = None
         self._tap_ref   = None
         self._key_event = None  # "press" or "release" set by callback
+        self._tap_heartbeat = 0
+        self._tap_last_heartbeat = 0
+        self._tap_thread_obj = None
 
         # Start global hotkey listener via CGEventTap (no pynput)
         self._start_event_tap()
@@ -206,8 +221,23 @@ class BoloApp(rumps.App):
     # ── Audio ─────────────────────────────────────────────────────────────────
 
     def _audio_callback(self, indata, frames, time_info, status):
-        if self.recording:
-            self.audio_frames.append(indata.copy())
+        if not self.recording:
+            return
+        self.audio_frames.append(indata.copy())
+        pcm = indata.tobytes()
+        # Stream to WebSocket
+        if self._stt:
+            try:
+                self._stt.send_audio(pcm)
+            except Exception:
+                pass
+        # Silence detection
+        now = time.time()
+        elapsed = now - self._chunk_time
+        self._chunk_time = now
+        result = self._silence.process(pcm, elapsed)
+        if result == "end_of_utterance":
+            self._silence_event.set()
 
     def _to_wav_bytes(self, audio):
         buf = io.BytesIO()
@@ -224,6 +254,14 @@ class BoloApp(rumps.App):
     _NX_DEVICERALTKEYMASK = 0x00000040
 
     def _process_key_events(self, _):
+        # Silence auto-stop
+        if self._silence_event.is_set():
+            self._silence_event.clear()
+            if self.recording:
+                self._log("[silence] end of utterance detected — stopping")
+                self._stop_recording()
+            return
+
         event = self._key_event
         if event is None:
             return
@@ -248,6 +286,19 @@ class BoloApp(rumps.App):
             if not CGEventTapIsEnabled(self._tap_ref):
                 self._log("[tap] was disabled by macOS — re-enabling")
                 CGEventTapEnable(self._tap_ref, True)
+                return
+
+        now = time.time()
+        if self._tap_heartbeat > 0:
+            if now - self._tap_heartbeat > 10:
+                self._log("[tap] heartbeat stale — restarting tap thread")
+                self._restart_event_tap()
+        else:
+            if self._tap_last_heartbeat == 0:
+                self._tap_last_heartbeat = now
+            elif now - self._tap_last_heartbeat > 5:
+                self._log("[tap] no heartbeat after 5s — restarting")
+                self._restart_event_tap()
 
     def _start_event_tap(self):
         """Create a CGEventTap for flagsChanged events on a background thread."""
@@ -256,13 +307,31 @@ class BoloApp(rumps.App):
                 "[accessibility] NOT TRUSTED. Open System Settings > "
                 "Privacy & Security > Accessibility and add this app."
             )
-            # Prompt the macOS dialog
             HIServices.AXIsProcessTrustedWithOptions(
                 {HIServices.kAXTrustedCheckOptionPrompt: True}
             )
 
+        self._tap_heartbeat = 0
+        self._tap_last_heartbeat = time.time()
         t = threading.Thread(target=self._tap_thread, daemon=True)
         t.start()
+        self._tap_thread_obj = t
+
+    def _restart_event_tap(self):
+        """Kill and restart the event tap thread."""
+        if self._tap_loop is not None:
+            try:
+                CFRunLoopStop(self._tap_loop)
+            except Exception:
+                pass
+        self._tap_ref = None
+        self._tap_loop = None
+        self._tap_heartbeat = 0
+        self._tap_last_heartbeat = time.time()
+        self._ropt_held = False
+        t = threading.Thread(target=self._tap_thread, daemon=True)
+        t.start()
+        self._tap_thread_obj = t
 
     def _tap_thread(self):
         """Background thread running the CGEventTap run loop."""
@@ -287,12 +356,14 @@ class BoloApp(rumps.App):
         self._tap_loop = CFRunLoopGetCurrent()
         CFRunLoopAddSource(self._tap_loop, source, kCFRunLoopDefaultMode)
         CGEventTapEnable(tap, True)
-        self._tap_ref = tap  # keep reference for watchdog
+        self._tap_ref = tap
+        self._tap_heartbeat = time.time()
         self._log("[tap] CGEventTap active, listening for Right Option")
         CFRunLoopRun()
 
     def _flags_callback(self, proxy, event_type, event, refcon):
         """Called on every modifier flag change — must return instantly."""
+        self._tap_heartbeat = time.time()
         flags = CGEventGetFlags(event)
         ropt_down = bool(flags & self._NX_DEVICERALTKEYMASK)
 
@@ -335,6 +406,10 @@ class BoloApp(rumps.App):
             return
         self.icon = ICON_REC
         self.title = "⌥"
+        self._silence.reset()
+        self._silence_event.clear()
+        self._chunk_time = time.time()
+        self._stt = None
         self._play("Tink")
         self.overlay.show()
 
@@ -353,24 +428,32 @@ class BoloApp(rumps.App):
         self.overlay.hide()
 
         if not frames:
+            if self._stt:
+                self._stt.close()
+                self._stt = None
             return
 
         audio = np.concatenate(frames, axis=0)
         duration = len(audio) / SAMPLE_RATE
-        if duration < 1.0:
+        if duration < 0.5:
+            if self._stt:
+                self._stt.close()
+                self._stt = None
             return
 
-        self.last_pipeline = time.time()  # stamp early to block re-entry
+        self.last_pipeline = time.time()
+        stt_instance = self._stt
+        self._stt = None
         wav = self._to_wav_bytes(audio)
-        threading.Thread(target=self._pipeline, args=(wav,), daemon=True).start()
+        threading.Thread(
+            target=self._pipeline, args=(wav, stt_instance), daemon=True).start()
 
     # ── Pipeline ──────────────────────────────────────────────────────────────
 
     def _log(self, msg):
         print(msg, flush=True)
 
-    def _pipeline(self, wav_bytes):
-        # Watchdog: if pipeline takes >8s, play error sound
+    def _pipeline(self, wav_bytes, stt_instance=None):
         def _timeout_watchdog():
             self._play("Basso")
             self._show_error("Timed out — check network")
@@ -378,14 +461,23 @@ class BoloApp(rumps.App):
         watchdog = threading.Timer(8.0, _timeout_watchdog)
         watchdog.start()
         try:
-            self._pipeline_inner(wav_bytes)
+            self._pipeline_inner(wav_bytes, stt_instance)
         finally:
             watchdog.cancel()
 
-    def _pipeline_inner(self, wav_bytes):
+    def _pipeline_inner(self, wav_bytes, stt_instance=None):
         rms = int(np.sqrt(np.mean(np.frombuffer(wav_bytes[44:], dtype=np.int16).astype(np.float32)**2)))
         self._log(f"[pipeline] starting — audio RMS: {rms} ({'SILENT' if rms < 100 else 'OK'})")
-        # STT
+
+        # Close any streaming connection (not used for transcript)
+        if stt_instance is not None:
+            try:
+                stt_instance.close()
+            except Exception:
+                pass
+
+        # Batch REST STT — reliable, complete transcript
+        transcript = ""
         try:
             resp = requests.post(
                 STT_ENDPOINT,
@@ -398,7 +490,6 @@ class BoloApp(rumps.App):
                 },
                 timeout=8,
             )
-            # fall back to distil-whisper if nova-3 rate limits
             if resp.status_code == 429:
                 resp = requests.post(
                     STT_ENDPOINT,
@@ -407,18 +498,18 @@ class BoloApp(rumps.App):
                     data={"model": "distil-whisper/distil-large-v2"},
                     timeout=8,
                 )
+            if resp.status_code == 200:
+                transcript = resp.json().get("text", "").strip()
+            else:
+                self._log(f"[stt error] {resp.status_code}: {resp.text[:200]}")
+                self._show_error(f"STT error {resp.status_code}")
+                return
         except Exception as e:
             self._log(f"[stt exception] {e}")
             self._show_error(f"STT failed: {e}")
             return
 
-        if resp.status_code != 200:
-            self._log(f"[stt error] {resp.status_code}: {resp.text[:200]}")
-            self._show_error(f"STT error {resp.status_code}")
-            return
-
-        raw_transcript = resp.json().get("text", "").strip()
-        transcript = apply_corrections(raw_transcript)
+        transcript = apply_corrections(transcript)
         self._log(f"[stt] \"{transcript}\"")
         if not transcript:
             return
@@ -482,6 +573,15 @@ class BoloApp(rumps.App):
         self.last_result = result
         label = result if len(result) <= 50 else result[:47] + "..."
         self.menu["Last transcript"].title = f"↳ {label}"
+
+        # Session history
+        self.session_history.appendleft(result)
+        history_items = list(self.session_history)
+        history_text = "\n".join(
+            f"{i+1}. {t[:60]}{'...' if len(t)>60 else ''}"
+            for i, t in enumerate(history_items)
+        )
+        self.menu["History"].title = f"History ({len(history_items)})"
 
         # Inject
         self._inject(result)
