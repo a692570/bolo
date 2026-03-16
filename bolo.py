@@ -193,12 +193,14 @@ class BoloApp(rumps.App):
 
         self.stream = None  # opened only during recording
         self._ropt_held = False
-        self._tap_loop = None
-        self._tap_ref  = None
+        self._tap_loop  = None
+        self._tap_ref   = None
+        self._key_event = None  # "press" or "release" set by callback
 
         # Start global hotkey listener via CGEventTap (no pynput)
         self._start_event_tap()
-        # Watchdog: re-enable tap if macOS disables it
+        # Poll key events and watchdog on main thread
+        rumps.Timer(self._process_key_events, 0.02).start()
         rumps.Timer(self._watchdog_tap, 2).start()
 
     # ── Audio ─────────────────────────────────────────────────────────────────
@@ -220,6 +222,25 @@ class BoloApp(rumps.App):
 
     # Right Option = NX_DEVICERALTKEYMASK (bit 6 of device-dep flags)
     _NX_DEVICERALTKEYMASK = 0x00000040
+
+    def _process_key_events(self, _):
+        event = self._key_event
+        if event is None:
+            return
+        self._key_event = None
+
+        if event == "press":
+            if time.time() - self.last_paste_time < 3.0 and self.last_result:
+                self.correction_mode = True
+                self._log("[correction] correction mode activated")
+            else:
+                self.correction_mode = False
+            self._log("[key] Right Option pressed")
+            self._start_recording()
+        elif event == "release":
+            self._log("[key] Right Option released")
+            if self.recording:
+                self._stop_recording()
 
     def _watchdog_tap(self, _):
         if self._tap_ref is not None:
@@ -271,26 +292,16 @@ class BoloApp(rumps.App):
         CFRunLoopRun()
 
     def _flags_callback(self, proxy, event_type, event, refcon):
-        """Called on every modifier flag change."""
+        """Called on every modifier flag change — must return instantly."""
         flags = CGEventGetFlags(event)
-        # Check device-dependent flags for Right Option specifically
         ropt_down = bool(flags & self._NX_DEVICERALTKEYMASK)
 
         if ropt_down and not self._ropt_held:
             self._ropt_held = True
-            # Double-tap within 3s = correction mode
-            if time.time() - self.last_paste_time < 3.0 and self.last_result:
-                self.correction_mode = True
-                self._log("[correction] correction mode activated")
-            else:
-                self.correction_mode = False
-            self._log("[key] Right Option pressed")
-            self._start_recording()
+            self._key_event = "press"
         elif not ropt_down and self._ropt_held:
             self._ropt_held = False
-            self._log("[key] Right Option released")
-            if self.recording:
-                self._stop_recording()
+            self._key_event = "release"
 
         return event
 
