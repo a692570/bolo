@@ -370,6 +370,19 @@ class BoloApp(rumps.App):
         print(msg, flush=True)
 
     def _pipeline(self, wav_bytes):
+        # Watchdog: if pipeline takes >8s, play error sound
+        def _timeout_watchdog():
+            self._play("Basso")
+            self._show_error("Timed out — check network")
+            self._log("[pipeline] timed out")
+        watchdog = threading.Timer(8.0, _timeout_watchdog)
+        watchdog.start()
+        try:
+            self._pipeline_inner(wav_bytes)
+        finally:
+            watchdog.cancel()
+
+    def _pipeline_inner(self, wav_bytes):
         rms = int(np.sqrt(np.mean(np.frombuffer(wav_bytes[44:], dtype=np.int16).astype(np.float32)**2)))
         self._log(f"[pipeline] starting — audio RMS: {rms} ({'SILENT' if rms < 100 else 'OK'})")
         # STT
@@ -383,7 +396,7 @@ class BoloApp(rumps.App):
                     "language": "en",
                     "model_config": json.dumps({"smart_format": True, "punctuate": True}),
                 },
-                timeout=15,
+                timeout=8,
             )
             # fall back to distil-whisper if nova-3 rate limits
             if resp.status_code == 429:
@@ -392,7 +405,7 @@ class BoloApp(rumps.App):
                     headers={"Authorization": f"Bearer {TELNYX_API_KEY}"},
                     files={"file": ("audio.wav", wav_bytes, "audio/wav")},
                     data={"model": "distil-whisper/distil-large-v2"},
-                    timeout=15,
+                    timeout=8,
                 )
         except Exception as e:
             self._log(f"[stt exception] {e}")
@@ -429,7 +442,7 @@ class BoloApp(rumps.App):
                     "enable_thinking": False,
                     "stream": True,
                 },
-                timeout=15,
+                timeout=8,
                 stream=True,
             )
         except Exception as e:
