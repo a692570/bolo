@@ -1,0 +1,8 @@
+rumps
+sounddevice
+numpy
+requests
+pyperclip
+pyobjc-framework-Quartz
+pyobjc-framework-HIServices
+pyobjc-framework-AppKit
