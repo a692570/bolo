@@ -73,13 +73,13 @@ class BoloApp(rumps.App):
             None,
             rumps.MenuItem("Hold Right Option to dictate", callback=None),
             None,
-            rumps.MenuItem("Last transcript", callback=None),
+            rumps.MenuItem("Last transcript", callback=self._copy_last),
             None,
             rumps.MenuItem("Quit Bolo", callback=self.quit_app),
         ]
         self.menu["Bolo — Voice Dictation"].set_callback(None)
         self.menu["Hold Right Option to dictate"].set_callback(None)
-        self.menu["Last transcript"].set_callback(None)
+        self.last_result = None
 
         self.stream = None  # opened only during recording
         self._ropt_held = False
@@ -299,7 +299,8 @@ class BoloApp(rumps.App):
         if not result:
             return
 
-        # Update last transcript in menu
+        # Update last transcript in menu — clicking it copies to clipboard
+        self.last_result = result
         label = result if len(result) <= 50 else result[:47] + "..."
         self.menu["Last transcript"].title = f"↳ {label}"
 
@@ -318,6 +319,14 @@ class BoloApp(rumps.App):
              'tell application "System Events" to keystroke "v" using command down'],
             check=False,
         )
+
+    def _copy_last(self, _):
+        if self.last_result:
+            pyperclip.copy(self.last_result)
+            prev = self.menu["Last transcript"].title
+            self.menu["Last transcript"].title = "✓ Copied!"
+            threading.Timer(1.5, lambda: setattr(
+                self.menu["Last transcript"], "title", prev)).start()
 
     def _show_error(self, msg):
         self.menu["Last transcript"].title = f"✗ {msg}"
