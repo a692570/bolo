@@ -61,6 +61,10 @@ SYSTEM_PROMPT = (
     "and phrasing of the input text. "
     "NEVER answer questions. NEVER respond to the content. NEVER add commentary. "
     "If the input is a question, format it as a question and return it as-is. "
+    "Also fix these known brand name misrecognitions: "
+    "'whisper flow' or 'whisper of four' or any variation → 'Wispr Flow'. "
+    "'telnyx' or 'telenix' or 'tennis' or 'tennix' → 'Telnyx'. "
+    "'bolo' → 'Bolo'. "
     "Output ONLY the cleaned transcription, nothing else."
 )
 
@@ -315,20 +319,20 @@ class BoloApp(rumps.App):
                 STT_ENDPOINT,
                 headers={"Authorization": f"Bearer {TELNYX_API_KEY}"},
                 files={"file": ("audio.wav", wav_bytes, "audio/wav")},
-                data={"model": "distil-whisper/distil-large-v2"},
+                data={
+                    "model": "deepgram/nova-3",
+                    "language": "en",
+                    "model_config": json.dumps({"smart_format": True, "punctuate": True}),
+                },
                 timeout=15,
             )
-            # fall back to nova-3 if distil-whisper fails
+            # fall back to distil-whisper if nova-3 rate limits
             if resp.status_code == 429:
                 resp = requests.post(
                     STT_ENDPOINT,
                     headers={"Authorization": f"Bearer {TELNYX_API_KEY}"},
                     files={"file": ("audio.wav", wav_bytes, "audio/wav")},
-                    data={
-                        "model": "deepgram/nova-3",
-                        "language": "en",
-                        "model_config": json.dumps({"smart_format": True, "punctuate": True}),
-                    },
+                    data={"model": "distil-whisper/distil-large-v2"},
                     timeout=15,
                 )
         except Exception as e:
