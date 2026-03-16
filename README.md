@@ -1,8 +1,8 @@
-# Bolo
+# Bolo — Open source Wispr Flow alternative for macOS
 
-Hold Right Option anywhere to dictate. Release to paste transcribed text.
+Free, self-hosted voice dictation powered by Telnyx AI. Hold Right Option anywhere to dictate. Release to paste.
 
-Bolo is a fast voice dictation menubar app for macOS that sends speech to any text field without an always-on microphone. It is an open source alternative to Wispr Flow with ~1.0-1.3 second end-to-end latency.
+Bolo is a macOS menubar app that transcribes your speech and pastes it into any active text field — Slack, Notion, Gmail, VS Code, terminals, browsers. No always-on microphone. No subscription. ~1.0-1.3 second end-to-end latency.
 
 ```bash
 git clone https://github.com/a692570/bolo.git
