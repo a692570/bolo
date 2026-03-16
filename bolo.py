@@ -255,10 +255,21 @@ class BoloApp(rumps.App):
                 return
             self.recording = True
             self.audio_frames = []
-        self.stream = sd.InputStream(
-            samplerate=SAMPLE_RATE, channels=CHANNELS,
-            dtype="int16", callback=self._audio_callback)
-        self.stream.start()
+        for attempt in range(3):
+            try:
+                self.stream = sd.InputStream(
+                    samplerate=SAMPLE_RATE, channels=CHANNELS,
+                    dtype="int16", callback=self._audio_callback)
+                self.stream.start()
+                break
+            except Exception as e:
+                self._log(f"[mic] error opening stream (attempt {attempt+1}): {e}")
+                time.sleep(0.5)
+        else:
+            self._log("[mic] failed to open after 3 attempts — skipping")
+            with self.lock:
+                self.recording = False
+            return
         self.icon = ICON_REC
         self.title = "⌥"
         self._play("Tink")
