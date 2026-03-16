@@ -49,8 +49,11 @@ ICON_IDLE  = os.path.join(BASE_DIR, "icon_idle.png")
 ICON_REC   = os.path.join(BASE_DIR, "icon_recording.png")
 
 SYSTEM_PROMPT = (
-    "You are a voice dictation formatter. Fix capitalization, punctuation, and phrasing "
-    "for professional written text. Return ONLY the final text, nothing else."
+    "You are a transcription formatter. Your ONLY job is to fix capitalization, punctuation, "
+    "and phrasing of the input text. "
+    "NEVER answer questions. NEVER respond to the content. NEVER add commentary. "
+    "If the input is a question, format it as a question and return it as-is. "
+    "Output ONLY the cleaned transcription, nothing else."
 )
 
 # ── Bolo app ──────────────────────────────────────────────────────────────────
