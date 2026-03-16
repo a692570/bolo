@@ -52,9 +52,37 @@ LLM_ENDPOINT   = "https://api.telnyx.com/v2/ai/chat/completions"
 SAMPLE_RATE    = 16000
 CHANNELS       = 1
 
-BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
-ICON_IDLE  = os.path.join(BASE_DIR, "icon_idle.png")
-ICON_REC   = os.path.join(BASE_DIR, "icon_recording.png")
+BASE_DIR         = os.path.dirname(os.path.abspath(__file__))
+ICON_IDLE        = os.path.join(BASE_DIR, "icon_idle.png")
+ICON_REC         = os.path.join(BASE_DIR, "icon_recording.png")
+CORRECTIONS_FILE = os.path.expanduser("~/.bolo_corrections.json")
+
+
+def load_corrections():
+    if os.path.exists(CORRECTIONS_FILE):
+        try:
+            with open(CORRECTIONS_FILE) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+
+def save_correction(wrong, right):
+    corrections = load_corrections()
+    corrections[wrong.lower().strip()] = right.strip()
+    with open(CORRECTIONS_FILE, "w") as f:
+        json.dump(corrections, f, indent=2)
+
+
+def apply_corrections(text):
+    corrections = load_corrections()
+    lower = text.lower()
+    for wrong, right in corrections.items():
+        if wrong in lower:
+            import re
+            text = re.sub(re.escape(wrong), right, text, flags=re.IGNORECASE)
+    return text
 
 SYSTEM_PROMPT = (
     "You are a transcription formatter. Your ONLY job is to fix capitalization, punctuation, "
@@ -157,7 +185,10 @@ class BoloApp(rumps.App):
         ]
         self.menu["Bolo — Voice Dictation"].set_callback(None)
         self.menu["Hold Right Option to dictate"].set_callback(None)
-        self.last_result = None
+        self.last_result     = None
+        self.last_raw        = None   # raw STT before corrections
+        self.last_paste_time = 0.0
+        self.correction_mode = False
         self.overlay = RecordingOverlay()
 
         self.stream = None  # opened only during recording
@@ -247,6 +278,12 @@ class BoloApp(rumps.App):
 
         if ropt_down and not self._ropt_held:
             self._ropt_held = True
+            # Double-tap within 3s = correction mode
+            if time.time() - self.last_paste_time < 3.0 and self.last_result:
+                self.correction_mode = True
+                self._log("[correction] correction mode activated")
+            else:
+                self.correction_mode = False
             self._log("[key] Right Option pressed")
             self._start_recording()
         elif not ropt_down and self._ropt_held:
@@ -356,7 +393,8 @@ class BoloApp(rumps.App):
             self._show_error(f"STT error {resp.status_code}")
             return
 
-        transcript = resp.json().get("text", "").strip()
+        raw_transcript = resp.json().get("text", "").strip()
+        transcript = apply_corrections(raw_transcript)
         self._log(f"[stt] \"{transcript}\"")
         if not transcript:
             return
@@ -402,17 +440,43 @@ class BoloApp(rumps.App):
         if not result:
             return
 
+        self._log(f"[llm] \"{result}\"")
+
+        # Correction mode: undo previous paste, learn the mapping, inject new
+        if self.correction_mode and self.last_result:
+            self._log(f"[correction] replacing \"{self.last_result}\" → \"{result}\"")
+            # Select and delete previous paste
+            prev_len = len(self.last_result)
+            subprocess.run(["osascript", "-e",
+                f'tell application "System Events" to key code 51 using {{shift down}} repeated {prev_len} times'],
+                check=False)
+            # Learn: find differing words and save mapping
+            self._learn_correction(self.last_result, result)
+            self.correction_mode = False
+
         # Update last transcript in menu — clicking it copies to clipboard
         self.last_result = result
         label = result if len(result) <= 50 else result[:47] + "..."
         self.menu["Last transcript"].title = f"↳ {label}"
 
-        self._log(f"[llm] \"{result}\"")
         # Inject
         self._inject(result)
         self._play("Pop")
+        self.last_paste_time = time.time()
         self.last_pipeline = time.time()
         self._log(f"[done] injected and popped")
+
+    def _learn_correction(self, old_text, new_text):
+        """Compare old and new transcript, save changed phrases to dictionary."""
+        old_words = old_text.lower().split()
+        new_words = new_text.split()
+        # Find differing spans using simple alignment
+        if old_words == [w.lower() for w in new_words]:
+            return  # only capitalization changed, skip
+        # Save the full old→new pair if they differ meaningfully
+        if old_text.lower().strip() != new_text.lower().strip():
+            save_correction(old_text, new_text)
+            self._log(f"[learned] \"{old_text}\" → \"{new_text}\"")
 
     def _inject(self, text):
         pyperclip.copy(text)
