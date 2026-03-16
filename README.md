@@ -90,19 +90,19 @@ tail -f /tmp/bolo.log
 
 ## FAQ
 
-**How does this compare to Wispr Flow?**
+1. How does this compare to Wispr Flow?
 Bolo is a free open source alternative with similar push-to-talk mechanics. Both use global hotkeys and cloud STT. Bolo uses Telnyx APIs and is fully transparent in audio handling.
 
-**Is my audio stored or used for training?**
+2. Is my audio stored or used for training?
 Audio is sent to Telnyx APIs for transcription and immediately discarded. Bolo processes audio in memory only and does not retain any history.
 
-**Can I change the hotkey from Right Option?**
+3. Can I change the hotkey from Right Option?
 Currently hardcoded. Modify the `_NX_DEVICERALTKEYMASK` logic in the CGEventTap implementation in `bolo.py` to change this.
 
-**Does it work offline?**
+4. Does it work offline?
 No. Bolo requires internet to reach Telnyx APIs.
 
-**Why Python instead of Swift?**
+5. Why Python instead of Swift?
 Python provides rapid iteration for audio processing and API integration. pyobjc gives full access to CoreGraphics for global hotkeys without Objective-C.
 
 ## Troubleshooting
