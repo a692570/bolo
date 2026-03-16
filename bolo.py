@@ -18,6 +18,14 @@ import rumps
 import sounddevice as sd
 import pyperclip
 
+from AppKit import (
+    NSPanel, NSView, NSColor, NSBezierPath, NSFont,
+    NSMakeRect, NSScreen, NSWindowStyleMaskBorderless,
+    NSFloatingWindowLevel, NSApp,
+)
+from Foundation import NSObject, NSMakeRect as NSR, NSTimer
+import objc
+
 from Quartz import (
     CGEventTapCreate,
     CGEventTapEnable,
@@ -58,6 +66,72 @@ SYSTEM_PROMPT = (
 
 # ── Bolo app ──────────────────────────────────────────────────────────────────
 
+# ── Recording overlay ─────────────────────────────────────────────────────────
+
+class RecordingView(NSView):
+    def initWithFrame_(self, frame):
+        self = objc.super(RecordingView, self).initWithFrame_(frame)
+        if self is None:
+            return None
+        self._pulse = 1.0
+        self._direction = -1
+        return self
+
+    def drawRect_(self, rect):
+        # Dark pill background
+        bg = NSColor.colorWithCalibratedRed_green_blue_alpha_(0.1, 0.1, 0.1, 0.88)
+        bg.setFill()
+        pill = NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(rect, rect.size.height / 2, rect.size.height / 2)
+        pill.fill()
+
+        # Pulsing red dot
+        dot_color = NSColor.colorWithCalibratedRed_green_blue_alpha_(1.0, 0.25, 0.25, self._pulse)
+        dot_color.setFill()
+        dot_rect = NSMakeRect(14, rect.size.height / 2 - 5, 10, 10)
+        dot_path = NSBezierPath.bezierPathWithOvalInRect_(dot_rect)
+        dot_path.fill()
+
+        # "Recording..." label
+        from AppKit import NSAttributedString, NSForegroundColorAttributeName, NSFontAttributeName
+        attrs = {
+            NSForegroundColorAttributeName: NSColor.whiteColor(),
+            NSFontAttributeName: NSFont.systemFontOfSize_(13.0),
+        }
+        label = NSAttributedString.alloc().initWithString_attributes_("Go ahead...", attrs)
+        label.drawAtPoint_(NSMakeRect(34, rect.size.height / 2 - 8, 0, 0).origin)
+
+    def pulse(self):
+        self._pulse += self._direction * 0.06
+        if self._pulse <= 0.3:
+            self._direction = 1
+        elif self._pulse >= 1.0:
+            self._direction = -1
+        self.setNeedsDisplay_(True)
+
+
+class RecordingOverlay:
+    """Launches overlay.py as a subprocess — its own NSApplication, always visible."""
+
+    SCRIPT = os.path.join(BASE_DIR, "overlay.py")
+
+    def __init__(self):
+        self._proc = None
+
+    def show(self):
+        if self._proc and self._proc.poll() is None:
+            return
+        self._proc = subprocess.Popen(
+            ["/usr/bin/python3", self.SCRIPT],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        print("[overlay] shown", flush=True)
+
+    def hide(self):
+        if self._proc and self._proc.poll() is None:
+            self._proc.terminate()
+            self._proc = None
+        print("[overlay] hidden", flush=True)
+
+
 class BoloApp(rumps.App):
     def __init__(self):
         super().__init__("Bolo", icon=ICON_IDLE, title="⌥", template=True, quit_button=None)
@@ -80,6 +154,7 @@ class BoloApp(rumps.App):
         self.menu["Bolo — Voice Dictation"].set_callback(None)
         self.menu["Hold Right Option to dictate"].set_callback(None)
         self.last_result = None
+        self.overlay = RecordingOverlay()
 
         self.stream = None  # opened only during recording
         self._ropt_held = False
@@ -187,6 +262,7 @@ class BoloApp(rumps.App):
         self.icon = ICON_REC
         self.title = "⌥"
         self._play("Tink")
+        self.overlay.show()
 
     def _stop_recording(self):
         with self.lock:
@@ -200,6 +276,7 @@ class BoloApp(rumps.App):
             self.stream.close()
             self.stream = None
         self.icon = ICON_IDLE
+        self.overlay.hide()
 
         if not frames:
             return
@@ -339,6 +416,9 @@ class BoloApp(rumps.App):
             self.stream.close()
         if self._tap_loop is not None:
             CFRunLoopStop(self._tap_loop)
+        self.overlay.hide()
+        import pathlib
+        pathlib.Path("/tmp/bolo.lock").unlink(missing_ok=True)
         rumps.quit_application()
 
 
@@ -351,8 +431,7 @@ if __name__ == "__main__":
         print("Get a free key at https://telnyx.com and add to your shell:")
         print('  export TELNYX_API_KEY="your_key_here"')
         sys.exit(1)
-    # Hide from Dock before NSApp starts
-    info = NSBundle.mainBundle().infoDictionary()
-    if info is not None:
-        info["LSUIElement"] = "1"
+    from AppKit import NSApplication, NSApplicationActivationPolicyAccessory
+    NSApplication.sharedApplication().setActivationPolicy_(
+        NSApplicationActivationPolicyAccessory)
     BoloApp().run()
