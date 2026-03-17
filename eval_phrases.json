@@ -48,5 +48,15 @@
     "id": "remotion_sentence",
     "category": "product_terms",
     "expected": "Remotion should handle most of the video work."
+  },
+  {
+    "id": "ultra_pitch_short",
+    "category": "long_form",
+    "expected": "What I really need to do is make a better video to show 10x Ultra."
+  },
+  {
+    "id": "ultra_pitch_long",
+    "category": "long_form",
+    "expected": "The reason why Telnyx Ultra is so cool is because the voice sounds very real, and it has lower latency. And also, it makes the whole experience of talking on the phone a lot better."
   }
 ]

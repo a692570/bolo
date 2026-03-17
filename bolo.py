@@ -988,8 +988,11 @@ class BoloApp(rumps.App):
         if state is None:
             return
         now = time.time()
+        record_ms = int((now - self._record_started_at) * 1000) if self._record_started_at else None
+        final_words = len((final_text or "").split())
         metrics = {
-            "record_ms": int((now - self._record_started_at) * 1000) if self._record_started_at else None,
+            "record_ms": record_ms,
+            "audio_duration_s": round(record_ms / 1000.0, 2) if record_ms is not None else None,
             "release_to_final_ms": int((now - state.stop_requested_at) * 1000)
             if state.stop_requested_at else None,
             "stream_connect_ms": int((self._stream_connected_at - self._record_started_at) * 1000)
@@ -1007,6 +1010,9 @@ class BoloApp(rumps.App):
             "cleanup_ms": int((state.cleanup_finished_at - state.cleanup_started_at) * 1000)
             if state.cleanup_started_at and state.cleanup_finished_at else None,
             "final_chars": len(final_text or ""),
+            "final_words": final_words,
+            "chars_per_second": round(len(final_text or "") / max(0.1, record_ms / 1000.0), 2)
+            if record_ms is not None else None,
             "final_source": state.final_source or None,
             "stream_failed": state.stream_failed,
         }

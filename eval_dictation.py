@@ -98,6 +98,10 @@ def score_results(results_path: Path):
     print(f"phrases: {len(rows)}")
     print(f"exact_match: {exact}/{len(rows)}")
     print(f"normalized_match: {normalized}/{len(rows)}")
+    long_form_rows = [row for row in rows if row["category"] == "long_form"]
+    if long_form_rows:
+        long_form_ok = sum(int(row["normalized"]) for row in long_form_rows)
+        print(f"long_form_match: {long_form_ok}/{len(long_form_rows)}")
     print("")
     for row in rows:
         status = "OK" if row["normalized"] else "MISS"
