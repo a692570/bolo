@@ -221,13 +221,13 @@ class TelnyxStreamingSTT:
         except queue.Empty:
             return None
 
-    def close(self) -> None:
+    def close(self, timeout: float = 5.0) -> None:
         """Close the WebSocket connection and stop the background thread."""
         if self._loop and self._send_queue:
             # Signal the sender coroutine to stop
             self._loop.call_soon_threadsafe(self._send_queue.put_nowait, None)
         if self._thread:
-            self._thread.join(timeout=5.0)
+            self._thread.join(timeout=timeout)
         self._loop = None
         self._thread = None
         self._send_queue = None

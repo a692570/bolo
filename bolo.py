@@ -700,7 +700,7 @@ class BoloApp(rumps.App):
             state.done.wait(timeout=STREAM_DRAIN_SECONDS + 0.5)
         if self._stt is not None:
             try:
-                self._stt.close()
+                self._stt.close(timeout=0.35)
             except Exception as e:
                 self._log(f"[stream] close error: {e}")
             finally:
