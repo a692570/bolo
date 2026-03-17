@@ -120,17 +120,13 @@ Press Right Option again within 3 seconds of the previous transcription. Bolo re
 
 ## Troubleshooting
 
-**No text appears after releasing hotkey**
-Check `/tmp/bolo.log`. Verify `TELNYX_API_KEY` is set. Ensure Accessibility permission is granted and Bolo was restarted after granting it.
+- **No text appears after releasing hotkey**: Check `/tmp/bolo.log`. Verify `TELNYX_API_KEY` is set. Ensure Accessibility permission is granted and Bolo was restarted after granting it.
 
-**Audio not recording (silent / always transcribes as "you know,")**
-This is a Whisper hallucination for silence. Verify Microphone permission is granted in System Settings and that Bolo was launched from a Terminal session (not a LaunchAgent, since background processes cannot access the mic without a GUI session).
+- **Audio not recording (silent / always transcribes as "you know,")**: This is a Whisper hallucination for silence. Verify Microphone permission is granted in System Settings and that Bolo was launched from a Terminal session (not a LaunchAgent, since background processes cannot access the mic without a GUI session).
 
-**App appears as Python icon in Dock**
-This is fixed in the current version. If you see it, restart Bolo.
+- **App appears as Python icon in Dock**: This is fixed in the current version. If you see it, restart Bolo.
 
-**High latency**
-Check network connectivity. The STT call is the bottleneck at ~600ms. LLM cleanup adds ~400ms TTFT via streaming.
+- **High latency**: Check network connectivity. The STT call is the bottleneck at ~600ms. LLM cleanup adds ~400ms TTFT via streaming.
 
 ## License
 
