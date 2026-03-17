@@ -236,13 +236,15 @@ class TelnyxStreamingSTT:
 
     def _run_loop(self) -> None:
         """Entry point for the background thread: creates and runs the event loop."""
-        self._loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(self._loop)
+        loop = asyncio.new_event_loop()
+        self._loop = loop
+        asyncio.set_event_loop(loop)
         try:
-            self._loop.run_until_complete(self._ws_session())
+            loop.run_until_complete(self._ws_session())
         finally:
-            self._loop.close()
-            self._loop = None
+            loop.close()
+            if self._loop is loop:
+                self._loop = None
 
     async def _ws_session(self) -> None:
         """Manages the full WebSocket lifecycle: connect, send, receive."""

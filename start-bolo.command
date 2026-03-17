@@ -2,6 +2,7 @@
 source ~/.zshrc 2>/dev/null || true
 
 LOOP_PID_FILE=/tmp/bolo-loop.pid
+LOCK_DIR=/tmp/bolo-supervisor.lock
 
 # Kill existing loop and any running bolo/overlay processes
 if [ -f "$LOOP_PID_FILE" ]; then
@@ -14,6 +15,10 @@ sleep 1
 
 # Start fresh restart loop
 (
+  if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+    exit 0
+  fi
+  trap 'rm -rf "$LOCK_DIR"' EXIT
   while true; do
     echo "[bolo] starting at $(date)" >> /tmp/bolo.log
     /usr/bin/python3 /Users/abhisheksharma/bolo/bolo.py >> /tmp/bolo.log 2>&1
