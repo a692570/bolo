@@ -48,6 +48,12 @@ cd bolo
 
 The install script installs dependencies, prompts for your Telnyx API key if needed, and registers the existing `start-bolo.command` launcher as a Login Item so Bolo starts automatically on login.
 
+To restart Bolo manually later, run:
+
+```bash
+./restart.sh
+```
+
 ## Permissions
 
 Bolo requires two macOS permissions to function.
@@ -148,7 +154,7 @@ Re-dictate the corrected text. Bolo no longer uses the old learned correction me
 
 - **No text appears after releasing hotkey**: Check `/tmp/bolo.log`. Verify `TELNYX_API_KEY` is set. Ensure Accessibility permission is granted and Bolo was restarted after granting it.
 
-- **Audio not recording**: Verify Microphone permission is granted in System Settings. If Bolo was installed as a Login Item, try restarting it once from `start-bolo.command` so macOS re-prompts permissions cleanly.
+- **Audio not recording**: Verify Microphone permission is granted in System Settings. If Bolo was installed as a Login Item, try restarting it once with `./restart.sh` so macOS re-prompts permissions cleanly.
 
 - **App appears as Python icon in Dock**: This is fixed in the current version. If you see it, restart Bolo.
 
