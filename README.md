@@ -86,6 +86,14 @@ export TELNYX_API_KEY="your_key_here"
 
 Add to `~/.zshrc` or `~/.bash_profile` to persist. The install script does this automatically.
 
+You can also add personal vocabulary in `~/.bolo_vocabulary.json` as a JSON string array, for example:
+
+```json
+["Release note", "Remotion", "Telnyx", "Abhishek"]
+```
+
+Bolo merges that with its built-in vocabulary and passes it into cleanup constraints.
+
 ## Logs
 
 ```bash

@@ -2,7 +2,7 @@ rumps
 sounddevice
 numpy
 requests
-pyperclip
+websockets
 pyobjc-framework-Quartz
 pyobjc-framework-HIServices
 pyobjc-framework-AppKit

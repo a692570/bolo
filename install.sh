@@ -12,7 +12,7 @@ fi
 
 # Install dependencies
 echo "Installing Python dependencies..."
-pip3 install rumps sounddevice numpy requests pyperclip pyobjc-framework-Quartz pyobjc-framework-HIServices pyobjc-framework-AppKit
+pip3 install -r requirements.txt
 
 # Check for API key
 if [ -z "$TELNYX_API_KEY" ]; then
