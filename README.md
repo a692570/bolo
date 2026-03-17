@@ -2,7 +2,7 @@
 
 Free, self-hosted voice dictation powered by Telnyx AI. Hold Right Option anywhere to dictate. Release to paste.
 
-Bolo is a macOS menubar app that transcribes your speech and pastes it into any active text field — Slack, Notion, Gmail, VS Code, terminals, browsers. No always-on microphone. No subscription. ~1.0-1.3 second end-to-end latency.
+Bolo is a macOS menubar app that transcribes your speech and pastes it into any active text field, including Slack, Notion, Gmail, VS Code, terminals, and browsers. No always-on microphone. No subscription. ~1.0-1.3 second end-to-end latency.
 
 ```bash
 git clone https://github.com/a692570/bolo.git
@@ -95,21 +95,27 @@ tail -f /tmp/bolo.log
 ## FAQ
 
 1. How does this compare to Wispr Flow?
+
 Bolo is a free open source alternative with similar push-to-talk mechanics. Both use global hotkeys and cloud STT. Bolo uses Telnyx APIs and is fully transparent in audio handling.
 
 2. Is my audio stored or used for training?
+
 Audio is sent to Telnyx APIs for transcription and immediately discarded. Bolo processes audio in memory only and does not retain any history.
 
 3. Can I change the hotkey from Right Option?
+
 Currently hardcoded. Modify the `_NX_DEVICERALTKEYMASK` logic in the CGEventTap implementation in `bolo.py` to change this.
 
 4. Does it work offline?
+
 No. Bolo requires internet to reach Telnyx APIs.
 
 5. Why Python instead of Swift?
+
 Python provides rapid iteration for audio processing and API integration. pyobjc gives full access to CoreGraphics for global hotkeys without Objective-C.
 
 6. How do I correct a mistake?
+
 Press Right Option again within 3 seconds of the previous transcription. Bolo replaces the old text and learns your correction for future dictations.
 
 ## Troubleshooting
@@ -118,7 +124,7 @@ Press Right Option again within 3 seconds of the previous transcription. Bolo re
 Check `/tmp/bolo.log`. Verify `TELNYX_API_KEY` is set. Ensure Accessibility permission is granted and Bolo was restarted after granting it.
 
 **Audio not recording (silent / always transcribes as "you know,")**
-This is a Whisper hallucination for silence. Verify Microphone permission is granted in System Settings and that Bolo was launched from a Terminal session (not a LaunchAgent — background processes cannot access the mic without a GUI session).
+This is a Whisper hallucination for silence. Verify Microphone permission is granted in System Settings and that Bolo was launched from a Terminal session (not a LaunchAgent, since background processes cannot access the mic without a GUI session).
 
 **App appears as Python icon in Dock**
 This is fixed in the current version. If you see it, restart Bolo.
