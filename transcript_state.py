@@ -17,6 +17,8 @@ class TranscriptState:
     stream_finalized_at: float = None
     batch_started_at: float = None
     batch_finished_at: float = None
+    reconcile_started_at: float = None
+    reconcile_finished_at: float = None
     cleanup_started_at: float = None
     cleanup_finished_at: float = None
     correction_target: str = ""

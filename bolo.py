@@ -95,6 +95,14 @@ SYSTEM_PROMPT = (
     "Output only the cleaned transcript."
 )
 
+RECONCILE_PROMPT = (
+    "You reconcile two speech transcripts of the same utterance. "
+    "Choose the more accurate wording or combine them conservatively. "
+    "Do not add facts that are not present in either transcript. "
+    "Prefer the more complete ending, better grammar only when clearly supported, and preserve the speaker's meaning. "
+    "Output only the final transcript."
+)
+
 KNOWN_TERM_PATTERNS = (
     (re.compile(r"\bwhisper flow\b|\bwhisper of four\b", re.IGNORECASE), "Wispr Flow"),
     (re.compile(r"\btelnyx\b|\btelenix\b|\btennis\b|\btennix\b", re.IGNORECASE), "Telnyx"),
@@ -589,6 +597,13 @@ class BoloApp(rumps.App):
         if state:
             state.final_source = "stream" if use_stream else "batch"
 
+        if not use_stream and self._should_reconcile_long_form(stream_preview, transcript, duration_seconds):
+            reconciled = self._reconcile_transcripts(stream_preview, transcript, app_context, state)
+            if reconciled:
+                transcript = reconciled
+                if state:
+                    state.final_source = "batch+reconcile"
+
         transcript = self._canonicalize_known_terms(self._normalize_transcript_text(transcript))
         transcript = CORRECTION_STORE.apply(transcript)
         self.last_raw = transcript
@@ -804,6 +819,19 @@ class BoloApp(rumps.App):
             "vocabulary": vocabulary,
         }
 
+    def _should_reconcile_long_form(self, stream_preview, batch_transcript, duration_seconds):
+        if duration_seconds < 8.0:
+            return False
+        left = self._normalize_transcript_text(stream_preview or "")
+        right = self._normalize_transcript_text(batch_transcript or "")
+        if len(left.split()) < 12 or len(right.split()) < 12:
+            return False
+        if left.casefold() == right.casefold():
+            return False
+        shorter = min(len(left), len(right))
+        longer = max(len(left), len(right))
+        return shorter / max(1, longer) >= 0.65
+
     def _looks_codeish(self, transcript):
         lowered = transcript.lower()
         if re.search(r"[`{}()[\]<>_=\\/]", transcript):
@@ -908,6 +936,64 @@ class BoloApp(rumps.App):
             self._log(f"[llm] \"{result}\"")
         return result
 
+    def _reconcile_transcripts(self, stream_preview, batch_transcript, context, state=None):
+        app_name = context.get("app_name") or "unknown"
+        vocabulary = context.get("vocabulary") or []
+        vocab_line = ", ".join(vocabulary[:40]) if vocabulary else "none"
+        if state:
+            state.reconcile_started_at = time.time()
+        try:
+            llm_resp = requests.post(
+                LLM_ENDPOINT,
+                headers={
+                    "Authorization": f"Bearer {TELNYX_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": "Qwen/Qwen3-235B-A22B",
+                    "messages": [
+                        {"role": "system", "content": RECONCILE_PROMPT},
+                        {
+                            "role": "user",
+                            "content": (
+                                f"Frontmost app: {app_name}\n"
+                                f"Preferred vocabulary: {vocab_line}\n"
+                                f"Streaming transcript: {stream_preview}\n"
+                                f"Batch transcript: {batch_transcript}"
+                            ),
+                        },
+                    ],
+                    "max_tokens": 400,
+                    "temperature": 0,
+                    "enable_thinking": False,
+                    "stream": True,
+                },
+                timeout=8,
+                stream=True,
+            )
+        except Exception as e:
+            if state:
+                state.reconcile_finished_at = time.time()
+            self._log(f"[reconcile exception] {e}")
+            return ""
+
+        result = ""
+        for line in llm_resp.iter_lines():
+            if line and line.startswith(b"data: "):
+                chunk = line[6:]
+                if chunk == b"[DONE]":
+                    break
+                data = json.loads(chunk)
+                delta = data.get("choices", [{}])[0].get("delta", {}).get("content", "")
+                result += delta or ""
+
+        if state:
+            state.reconcile_finished_at = time.time()
+        result = result.strip()
+        if result:
+            self._log(f"[reconcile] \"{result}\"")
+        return result
+
     def _correction_active(self):
         return self.correction_mode or time.time() < self.correction_window_until
 
@@ -1007,6 +1093,8 @@ class BoloApp(rumps.App):
             if state.stream_finalized_at and self._record_started_at else None,
             "batch_ms": int((state.batch_finished_at - state.batch_started_at) * 1000)
             if state.batch_started_at and state.batch_finished_at else None,
+            "reconcile_ms": int((state.reconcile_finished_at - state.reconcile_started_at) * 1000)
+            if state.reconcile_started_at and state.reconcile_finished_at else None,
             "cleanup_ms": int((state.cleanup_finished_at - state.cleanup_started_at) * 1000)
             if state.cleanup_started_at and state.cleanup_finished_at else None,
             "final_chars": len(final_text or ""),
