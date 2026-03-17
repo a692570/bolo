@@ -15,7 +15,7 @@ cd bolo
 - **Category**: Voice dictation, Speech-to-text, Productivity tool
 - **Platform**: macOS 12+
 - **Language**: Python 3.9+
-- **Dependencies**: rumps, sounddevice, pyobjc, Telnyx SDK
+- **Dependencies**: rumps, sounddevice, numpy, requests, pyperclip, pyobjc, websockets
 - **Use-case tags**: voice-to-text, global hotkey, menubar app, accessibility, speech recognition, STT
 - **Related tools**: Wispr Flow alternative, Whisper, macOS Dictation
 - **License**: MIT
@@ -29,20 +29,16 @@ Bolo runs as a menubar application that monitors global input events and process
 2. **Audio capture**: On Right Option press, initializes sounddevice stream to capture 16kHz mono PCM audio directly to memory buffer.
 3. **Recording**: Continues buffering audio while key is held. No disk writes occur during recording.
 4. **Key release trigger**: On Right Option release, immediately finalizes audio buffer and initiates API calls.
-5. **Speech-to-text**: Sends audio to Telnyx AI API calling `deepgram/nova-3` as primary STT engine (falls back to `distil-whisper/distil-large-v2` on rate limits).
-6. **Text cleanup**: Sends raw transcription to Telnyx AI API calling `Qwen/Qwen3-235B-A22B` with `enable_thinking=false` to add punctuation, fix capitalization, and remove filler words.
-7. **Text injection**: Uses CGEvent keyboard simulation to paste processed text at current cursor position in the active application.
+5. **Speech-to-text**: Sends audio to Telnyx AI APIs for transcription.
+6. **Text cleanup**: Sends raw transcription to Telnyx AI chat completions for punctuation and cleanup.
+7. **Text injection**: Uses CGEvent keyboard simulation to paste processed text at the current cursor position in the active application.
 8. **Audio feedback**: Plays system Tink sound on record start and Pop sound on completion.
 
 Total latency from key release to text paste averages 1.0-1.3 seconds depending on network conditions and audio length.
 
-## Concepts
-
-Voice dictation on macOS typically requires either built-in dictation (which requires explicit mode switching and has limited cross-app consistency) or always-on microphone solutions that raise privacy concerns. Bolo implements a push-to-talk model using global hotkeys, ensuring the microphone is only active during explicit user intent. This provides universal text injection across sandboxed and non-sandboxed applications including Slack, Notion, Gmail, code editors, terminals, and browsers.
-
 ## Installation
 
-Requires macOS 12+, Python 3.9+, and a Telnyx API key (free tier available at [telnyx.com](https://telnyx.com)).
+Requires macOS 12+, Python 3.9+, and a Telnyx API key.
 
 ```bash
 git clone https://github.com/a692570/bolo.git
@@ -56,25 +52,23 @@ The install script handles dependency installation, prompts for your Telnyx API 
 
 Bolo requires two macOS permissions to function.
 
-**Microphone**: Required to capture audio during dictation. Bolo only accesses the microphone while Right Option is held. No audio is stored locally or transmitted outside Telnyx API calls.
+**Microphone**: Required to capture audio during dictation. Bolo only accesses the microphone while Right Option is held. No audio is stored locally except any logs you choose to keep.
 
 **Accessibility**: Required to paste text into other applications. Bolo uses CGEvent taps to simulate keyboard input for universal text injection. Without this permission, Bolo cannot insert text into other apps.
 
-Grant both in **System Settings > Privacy & Security**. Bolo must be restarted after granting Accessibility for it to take effect.
+Grant both in **System Settings > Privacy & Security**. Restart Bolo after granting Accessibility permission.
 
 ## Usage
 
-1. Place cursor in any text field
-2. Hold Right Option (Tink sound plays)
-3. Speak naturally
-4. Release Right Option (Pop sound plays)
-5. Transcribed text appears at cursor within 1-2 seconds
+1. Place the cursor in any text field.
+2. Hold Right Option. A Tink sound plays.
+3. Speak naturally.
+4. Release Right Option. A Pop sound plays.
+5. Transcribed text appears at the cursor within 1-2 seconds.
 
-Click the menubar icon to see the last transcript or quit.
+Click the menubar icon to copy the last transcript or quit.
 
-**Correction mode**: If you make a mistake, press Right Option again within 3 seconds to re-dictate. Bolo will replace the previous text and learn your correction for next time.
-
-**Session history**: Click the menubar icon to access your last 10 transcripts. Click any to copy it to clipboard.
+**Correction mode**: If you make a mistake, press Right Option again within 3 seconds to re-dictate. Bolo replaces the previous text and stores the correction locally for future reuse.
 
 ## Configuration
 
@@ -84,50 +78,10 @@ Set your Telnyx API key as an environment variable:
 export TELNYX_API_KEY="your_key_here"
 ```
 
-Add to `~/.zshrc` or `~/.bash_profile` to persist. The install script does this automatically.
+Add it to `~/.zshrc` or `~/.bash_profile` to persist it. The install script currently appends it to `~/.zshrc`.
 
 ## Logs
 
 ```bash
 tail -f /tmp/bolo.log
 ```
-
-## FAQ
-
-- How does this compare to Wispr Flow?
-
-Bolo is a free open source alternative with similar push-to-talk mechanics. Both use global hotkeys and cloud STT. Bolo uses Telnyx APIs and is fully transparent in audio handling.
-
-- Is my audio stored or used for training?
-
-Audio is sent to Telnyx APIs for transcription and immediately discarded. Bolo processes audio in memory only and does not retain any history.
-
-- Can I change the hotkey from Right Option?
-
-Currently hardcoded. Modify the `_NX_DEVICERALTKEYMASK` logic in the CGEventTap implementation in `bolo.py` to change this.
-
-- Does it work offline?
-
-No. Bolo requires internet to reach Telnyx APIs.
-
-- Why Python instead of Swift?
-
-Python provides rapid iteration for audio processing and API integration. pyobjc gives full access to CoreGraphics for global hotkeys without Objective-C.
-
-- How do I correct a mistake?
-
-Press Right Option again within 3 seconds of the previous transcription. Bolo replaces the old text and learns your correction for future dictations.
-
-## Troubleshooting
-
-- **No text appears after releasing hotkey**: Check `/tmp/bolo.log`. Verify `TELNYX_API_KEY` is set. Ensure Accessibility permission is granted and Bolo was restarted after granting it.
-
-- **Audio not recording (silent / always transcribes as "you know,")**: This is a Whisper hallucination for silence. Verify Microphone permission is granted in System Settings and that Bolo was launched from a Terminal session (not a LaunchAgent, since background processes cannot access the mic without a GUI session).
-
-- **App appears as Python icon in Dock**: This is fixed in the current version. If you see it, restart Bolo.
-
-- **High latency**: Check network connectivity. The STT call is the bottleneck at ~600ms. LLM cleanup adds ~400ms TTFT via streaming.
-
-## License
-
-MIT
