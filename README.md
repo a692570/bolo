@@ -2,7 +2,7 @@
 
 Free, self-hosted voice dictation powered by Telnyx AI. Hold Right Option anywhere to dictate. Release to paste.
 
-Bolo is a macOS menubar app that transcribes your speech and pastes it into any active text field, including Slack, Notion, Gmail, VS Code, terminals, and browsers. No always-on microphone. No subscription. ~1.0-1.3 second end-to-end latency.
+Bolo is a macOS menubar app that transcribes your speech and pastes it into any active text field, including Slack, Notion, Gmail, VS Code, terminals, and browsers. No always-on microphone. No subscription.
 
 ```bash
 git clone https://github.com/a692570/bolo.git
@@ -15,7 +15,7 @@ cd bolo
 - **Category**: Voice dictation, Speech-to-text, Productivity tool
 - **Platform**: macOS 12+
 - **Language**: Python 3.9+
-- **Dependencies**: rumps, sounddevice, pyobjc, Telnyx SDK
+- **Dependencies**: rumps, sounddevice, pyobjc, requests, websockets
 - **Use-case tags**: voice-to-text, global hotkey, menubar app, accessibility, speech recognition, STT
 - **Related tools**: Wispr Flow alternative, Whisper, macOS Dictation
 - **License**: MIT
@@ -30,11 +30,11 @@ Bolo runs as a menubar application that monitors global input events and process
 3. **Recording**: Continues buffering audio while key is held. No disk writes occur during recording.
 4. **Key release trigger**: On Right Option release, immediately finalizes audio buffer and initiates API calls.
 5. **Speech-to-text**: Sends audio to Telnyx AI API calling `deepgram/nova-3` as primary STT engine (falls back to `distil-whisper/distil-large-v2` on rate limits).
-6. **Text cleanup**: Sends raw transcription to Telnyx AI API calling `Qwen/Qwen3-235B-A22B` with `enable_thinking=false` to add punctuation, fix capitalization, and remove filler words.
+6. **Text cleanup**: Optionally sends raw transcription to Telnyx AI API calling `Qwen/Qwen3-235B-A22B` for minimal punctuation and capitalization cleanup in prose-oriented contexts.
 7. **Text injection**: Uses CGEvent keyboard simulation to paste processed text at current cursor position in the active application.
 8. **Audio feedback**: Plays system Tink sound on record start and Pop sound on completion.
 
-Total latency from key release to text paste averages 1.0-1.3 seconds depending on network conditions and audio length.
+Latency varies with utterance length and whether Bolo uses streaming preview or safer batch finalization. Short phrases can feel quick; longer dictation is currently slower.
 
 ## Concepts
 
@@ -50,7 +50,7 @@ cd bolo
 ./install.sh
 ```
 
-The install script handles dependency installation, prompts for your Telnyx API key, and registers Bolo as a Login Item so it starts automatically on login.
+The install script installs dependencies, prompts for your Telnyx API key if needed, and registers the existing `start-bolo.command` launcher as a Login Item so Bolo starts automatically on login.
 
 ## Permissions
 
@@ -68,11 +68,9 @@ Grant both in **System Settings > Privacy & Security**. Bolo must be restarted a
 2. Hold Right Option (Tink sound plays)
 3. Speak naturally
 4. Release Right Option (Pop sound plays)
-5. Transcribed text appears at cursor within 1-2 seconds
+5. Transcribed text appears at cursor after finalization
 
 Click the menubar icon to see the last transcript or quit.
-
-**Correction mode**: If you make a mistake, press Right Option again within 3 seconds to re-dictate. Bolo will replace the previous text and learn your correction for next time.
 
 **Session history**: Click the menubar icon to access your last 10 transcripts. Click any to copy it to clipboard.
 
@@ -86,10 +84,42 @@ export TELNYX_API_KEY="your_key_here"
 
 Add to `~/.zshrc` or `~/.bash_profile` to persist. The install script does this automatically.
 
+You can also add personal vocabulary in `~/.bolo_vocabulary.json` as a JSON string array, for example:
+
+```json
+["Release note", "Remotion", "Telnyx", "Abhishek"]
+```
+
+Bolo merges that with its built-in vocabulary and uses it to preserve known terms more reliably.
+
+## Current Limitations
+
+- Bolo is under active development and improving quickly.
+- Short dictation works well today. Longer dictation and latency are still improving.
+- Streaming preview can stall on long speech; Bolo falls back to a listening status and safer finalization.
+- Cleanup is intentionally conservative to preserve literal meaning.
+- Learned correction memory is currently disabled while a safer replacement is being designed.
+
 ## Logs
 
 ```bash
 tail -f /tmp/bolo.log
+```
+
+## Evaluation
+
+To run the small phrase-based evaluation harness:
+
+```bash
+cd bolo
+python3 eval_dictation.py prompts
+python3 eval_dictation.py init > eval_results.json
+```
+
+Fill `actual` in `eval_results.json` with what Bolo produced for each phrase, then score it:
+
+```bash
+python3 eval_dictation.py score eval_results.json
 ```
 
 ## FAQ
@@ -116,17 +146,17 @@ Python provides rapid iteration for audio processing and API integration. pyobjc
 
 - How do I correct a mistake?
 
-Press Right Option again within 3 seconds of the previous transcription. Bolo replaces the old text and learns your correction for future dictations.
+Re-dictate the corrected text. Bolo no longer uses the old learned correction memory because it was too error-prone.
 
 ## Troubleshooting
 
 - **No text appears after releasing hotkey**: Check `/tmp/bolo.log`. Verify `TELNYX_API_KEY` is set. Ensure Accessibility permission is granted and Bolo was restarted after granting it.
 
-- **Audio not recording (silent / always transcribes as "you know,")**: This is a Whisper hallucination for silence. Verify Microphone permission is granted in System Settings and that Bolo was launched from a Terminal session (not a LaunchAgent, since background processes cannot access the mic without a GUI session).
+- **Audio not recording**: Verify Microphone permission is granted in System Settings. If Bolo was installed as a Login Item, try restarting it once from `start-bolo.command` so macOS re-prompts permissions cleanly.
 
 - **App appears as Python icon in Dock**: This is fixed in the current version. If you see it, restart Bolo.
 
-- **High latency**: Check network connectivity. The STT call is the bottleneck at ~600ms. LLM cleanup adds ~400ms TTFT via streaming.
+- **High latency**: Check network connectivity. Longer utterances currently prefer safer batch finalization, which is slower but more reliable.
 
 ## License
 

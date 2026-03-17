@@ -11,7 +11,6 @@ import json
 import queue
 import struct
 import threading
-import time
 from typing import Optional, Tuple
 
 
@@ -23,11 +22,11 @@ class SilenceDetector:
 
     Ported from Swift silence detection logic:
       - speech_threshold = 0.02  (RMS on 0.0-1.0 scale)
-      - required_silence_duration = 2.0 seconds after speech has been detected
+      - required_silence_duration = disabled by default in Bolo's current UX
     """
 
     SPEECH_THRESHOLD = 0.02
-    REQUIRED_SILENCE_DURATION = 2.0
+    REQUIRED_SILENCE_DURATION = 9999.0
 
     def __init__(self):
         self._has_speech: bool = False
@@ -167,6 +166,7 @@ class TelnyxStreamingSTT:
         self._send_queue: "asyncio.Queue[Optional[bytes]]" = None
         self._transcript_queue: queue.Queue = queue.Queue()
         self._connected = threading.Event()
+        self._connect_error: Optional[Exception] = None
         self._first_chunk_sent = False
         self._api_key: str = ""
 
@@ -179,6 +179,7 @@ class TelnyxStreamingSTT:
         """
         self._api_key = api_key
         self._first_chunk_sent = False
+        self._connect_error = None
         self._connected.clear()
 
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
@@ -186,6 +187,10 @@ class TelnyxStreamingSTT:
 
         if not self._connected.wait(timeout=10.0):
             raise TimeoutError("TelnyxStreamingSTT: WebSocket connection timed out.")
+        if self._connect_error is not None:
+            raise RuntimeError(
+                f"TelnyxStreamingSTT: failed to connect: {self._connect_error}"
+            ) from self._connect_error
 
     def send_audio(self, pcm16_bytes: bytes) -> None:
         """
@@ -251,23 +256,28 @@ class TelnyxStreamingSTT:
         headers = {"Authorization": f"Bearer {self._api_key}"}
         self._send_queue = asyncio.Queue()
 
-        async with websockets.connect(_WS_ENDPOINT, additional_headers=headers) as ws:
-            self._ws = ws
+        try:
+            async with websockets.connect(_WS_ENDPOINT, additional_headers=headers) as ws:
+                self._ws = ws
+                self._connected.set()
+
+                sender = asyncio.ensure_future(self._sender(ws))
+                receiver = asyncio.ensure_future(self._receiver(ws))
+
+                done, pending = await asyncio.wait(
+                    [sender, receiver],
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for task in pending:
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+        except Exception as exc:
+            self._connect_error = exc
             self._connected.set()
-
-            sender   = asyncio.ensure_future(self._sender(ws))
-            receiver = asyncio.ensure_future(self._receiver(ws))
-
-            done, pending = await asyncio.wait(
-                [sender, receiver],
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            for task in pending:
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
+            raise
 
     async def _sender(self, ws) -> None:
         """Drains the send queue and forwards binary frames to the WebSocket."""
@@ -280,17 +290,20 @@ class TelnyxStreamingSTT:
 
     async def _receiver(self, ws) -> None:
         """Receives JSON text messages and enqueues parsed transcripts."""
-        async for message in ws:
-            if not isinstance(message, str):
-                continue
-            try:
-                data = json.loads(message)
-            except json.JSONDecodeError:
-                continue
+        try:
+            async for message in ws:
+                if not isinstance(message, str):
+                    continue
+                try:
+                    data = json.loads(message)
+                except json.JSONDecodeError:
+                    continue
 
-            transcript, is_final = self._parse_transcript(data)
-            if transcript:
-                self._transcript_queue.put((transcript, is_final))
+                transcript, is_final = self._parse_transcript(data)
+                if transcript:
+                    self._transcript_queue.put((transcript, is_final))
+        except Exception:
+            return
 
     @staticmethod
     def _parse_transcript(data: dict) -> Tuple[str, bool]:

@@ -3,7 +3,10 @@ __pycache__/
 .env
 build/
 dist/
+Bolo.app/
 *.egg-info/
 icon_options/
 /tmp/
 .DS_Store
+eval_results.json
+test-overlay.py

@@ -1,0 +1,52 @@
+[
+  {
+    "id": "restart_command",
+    "category": "commands",
+    "expected": "What was the code for restarting Bolo?"
+  },
+  {
+    "id": "release_note",
+    "category": "product_terms",
+    "expected": "Release note."
+  },
+  {
+    "id": "please_note",
+    "category": "confusable_terms",
+    "expected": "Please note."
+  },
+  {
+    "id": "remotion",
+    "category": "product_terms",
+    "expected": "Remotion."
+  },
+  {
+    "id": "grokwise",
+    "category": "product_terms",
+    "expected": "I really like Grokwise."
+  },
+  {
+    "id": "merge_main",
+    "category": "developer_terms",
+    "expected": "Please merge this in main."
+  },
+  {
+    "id": "cleanup_prose",
+    "category": "cleanup",
+    "expected": "If I'm making typos or mistakes, it cleans it up."
+  },
+  {
+    "id": "long_pause",
+    "category": "long_form",
+    "expected": "This is a long sentence, and I am pausing in the middle because we need to test it out."
+  },
+  {
+    "id": "release_notes_sentence",
+    "category": "product_terms",
+    "expected": "I need to write the release note for Bolo."
+  },
+  {
+    "id": "remotion_sentence",
+    "category": "product_terms",
+    "expected": "Remotion should handle most of the video work."
+  }
+]

@@ -12,7 +12,7 @@ fi
 
 # Install dependencies
 echo "Installing Python dependencies..."
-pip3 install rumps sounddevice numpy requests pyperclip pyobjc-framework-Quartz pyobjc-framework-HIServices pyobjc-framework-AppKit
+pip3 install -r requirements.txt
 
 # Check for API key
 if [ -z "$TELNYX_API_KEY" ]; then
@@ -30,16 +30,6 @@ fi
 # Install the launcher as a Login Item
 BOLO_DIR="$(cd "$(dirname "$0")" && pwd)"
 COMMAND_FILE="$BOLO_DIR/start-bolo.command"
-
-# Rewrite the command file with the correct path
-cat > "$COMMAND_FILE" << SCRIPT
-#!/bin/bash
-export TELNYX_API_KEY="$TELNYX_API_KEY"
-nohup /usr/bin/python3 "$BOLO_DIR/bolo.py" >> /tmp/bolo.log 2>&1 &
-echo "Bolo started (PID \$!)"
-sleep 1
-exit 0
-SCRIPT
 chmod +x "$COMMAND_FILE"
 
 # Add Login Item
