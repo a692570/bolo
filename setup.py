@@ -10,7 +10,7 @@ OPTIONS = {
     'plist': {
         'CFBundleIdentifier': 'com.abhishek.bolo',
         'CFBundleName': 'Bolo',
-        'CFBundleShortVersionString': '1.0.0',
+        'CFBundleShortVersionString': '1.2.0-alpha.1',
         'LSUIElement': True,
         'NSMicrophoneUsageDescription': 'Bolo needs mic access to transcribe your voice.',
         'NSAccessibilityUsageDescription': 'Bolo needs accessibility to inject text into apps.',

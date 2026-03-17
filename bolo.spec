@@ -11,9 +11,8 @@ a = Analysis(
         ('icon_recording.png', '.'),
     ],
     hiddenimports=[
-        'rumps', 'pynput', 'pynput.keyboard', 'pynput.mouse',
+        'rumps',
         'sounddevice', 'numpy', 'requests', 'websockets',
-        'pynput.backend', 'pynput.backend.darwin',
     ],
     hookspath=[],
     hooksconfig={},
@@ -64,6 +63,6 @@ app = BUNDLE(
         'NSMicrophoneUsageDescription': 'Bolo needs mic access to transcribe your voice.',
         'NSAccessibilityUsageDescription': 'Bolo needs accessibility access to inject text.',
         'LSUIElement': True,  # menubar only, no Dock icon
-        'CFBundleShortVersionString': '1.0.0',
+        'CFBundleShortVersionString': '1.2.0-alpha.1',
     },
 )
