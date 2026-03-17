@@ -472,6 +472,24 @@ class BoloApp(rumps.App):
         self._overlay_stall_notice_shown = True
         self.overlay.update("listening", "Still listening...")
 
+    def _shutdown_stream_async(self, stream):
+        if stream is None:
+            return
+
+        def _worker():
+            try:
+                self._log("[audio] stopping input stream")
+                stream.stop()
+            except Exception as e:
+                self._log(f"[audio] stream stop error: {e}")
+            try:
+                self._log("[audio] closing input stream")
+                stream.close()
+            except Exception as e:
+                self._log(f"[audio] stream close error: {e}")
+
+        threading.Thread(target=_worker, daemon=True).start()
+
     def _stop_recording(self):
         session_id = self._active_session_id
         with self.lock:
@@ -479,11 +497,10 @@ class BoloApp(rumps.App):
                 return
             self.recording = False
             frames = list(self.audio_frames)
-
-        if self.stream:
-            self.stream.stop()
-            self.stream.close()
+            stream = self.stream
             self.stream = None
+
+        self._shutdown_stream_async(stream)
         self.icon = ICON_IDLE
         if self._set_session_phase("processing", session_id):
             self.overlay.update("processing", "")
@@ -973,6 +990,8 @@ class BoloApp(rumps.App):
         now = time.time()
         metrics = {
             "record_ms": int((now - self._record_started_at) * 1000) if self._record_started_at else None,
+            "release_to_final_ms": int((now - state.stop_requested_at) * 1000)
+            if state.stop_requested_at else None,
             "stream_connect_ms": int((self._stream_connected_at - self._record_started_at) * 1000)
             if self._stream_connected_at and self._record_started_at else None,
             "first_partial_ms": int((state.first_partial_at - self._record_started_at) * 1000)
