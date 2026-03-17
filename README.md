@@ -29,7 +29,7 @@ Bolo runs as a menubar application that monitors global input events and process
 2. **Audio capture**: On Right Option press, initializes sounddevice stream to capture 16kHz mono PCM audio directly to memory buffer.
 3. **Recording**: Continues buffering audio while key is held. No disk writes occur during recording.
 4. **Key release trigger**: On Right Option release, immediately finalizes audio buffer and initiates API calls.
-5. **Speech-to-text**: Sends audio to Telnyx AI API calling `distil-whisper/distil-large-v2` as primary STT engine.
+5. **Speech-to-text**: Sends audio to Telnyx AI API calling `deepgram/nova-3` as primary STT engine (falls back to `distil-whisper/distil-large-v2` on rate limits).
 6. **Text cleanup**: Sends raw transcription to Telnyx AI API calling `Qwen/Qwen3-235B-A22B` with `enable_thinking=false` to add punctuation, fix capitalization, and remove filler words.
 7. **Text injection**: Uses CGEvent keyboard simulation to paste processed text at current cursor position in the active application.
 8. **Audio feedback**: Plays system Tink sound on record start and Pop sound on completion.
@@ -72,6 +72,10 @@ Grant both in **System Settings > Privacy & Security**. Bolo must be restarted a
 
 Click the menubar icon to see the last transcript or quit.
 
+**Correction mode**: If you make a mistake, press Right Option again within 3 seconds to re-dictate. Bolo will replace the previous text and learn your correction for next time.
+
+**Session history**: Click the menubar icon to access your last 10 transcripts. Click any to copy it to clipboard.
+
 ## Configuration
 
 Set your Telnyx API key as an environment variable:
@@ -104,6 +108,9 @@ No. Bolo requires internet to reach Telnyx APIs.
 
 5. Why Python instead of Swift?
 Python provides rapid iteration for audio processing and API integration. pyobjc gives full access to CoreGraphics for global hotkeys without Objective-C.
+
+6. How do I correct a mistake?
+Press Right Option again within 3 seconds of the previous transcription. Bolo replaces the old text and learns your correction for future dictations.
 
 ## Troubleshooting
 
