@@ -15,7 +15,7 @@ cd bolo
 - **Category**: Voice dictation, Speech-to-text, Productivity tool
 - **Platform**: macOS 12+
 - **Language**: Python 3.9+
-- **Dependencies**: rumps, sounddevice, pyobjc, requests, websockets
+- **Dependencies**: rumps, sounddevice, numpy, pyobjc, requests, websockets
 - **Use-case tags**: voice-to-text, global hotkey, menubar app, accessibility, speech recognition, STT
 - **Related tools**: Wispr Flow alternative, Whisper, macOS Dictation
 - **License**: MIT
@@ -36,13 +36,9 @@ Bolo runs as a menubar application that monitors global input events and process
 
 Latency varies with utterance length and whether Bolo uses streaming preview or safer batch finalization. Short phrases can feel quick; longer dictation is currently slower.
 
-## Concepts
-
-Voice dictation on macOS typically requires either built-in dictation (which requires explicit mode switching and has limited cross-app consistency) or always-on microphone solutions that raise privacy concerns. Bolo implements a push-to-talk model using global hotkeys, ensuring the microphone is only active during explicit user intent. This provides universal text injection across sandboxed and non-sandboxed applications including Slack, Notion, Gmail, code editors, terminals, and browsers.
-
 ## Installation
 
-Requires macOS 12+, Python 3.9+, and a Telnyx API key (free tier available at [telnyx.com](https://telnyx.com)).
+Requires macOS 12+, Python 3.9+, and a Telnyx API key.
 
 ```bash
 git clone https://github.com/a692570/bolo.git
@@ -56,11 +52,11 @@ The install script installs dependencies, prompts for your Telnyx API key if nee
 
 Bolo requires two macOS permissions to function.
 
-**Microphone**: Required to capture audio during dictation. Bolo only accesses the microphone while Right Option is held. No audio is stored locally or transmitted outside Telnyx API calls.
+**Microphone**: Required to capture audio during dictation. Bolo only accesses the microphone while Right Option is held. No audio is stored locally except any logs you choose to keep.
 
 **Accessibility**: Required to paste text into other applications. Bolo uses CGEvent taps to simulate keyboard input for universal text injection. Without this permission, Bolo cannot insert text into other apps.
 
-Grant both in **System Settings > Privacy & Security**. Bolo must be restarted after granting Accessibility for it to take effect.
+Grant both in **System Settings > Privacy & Security**. Restart Bolo after granting Accessibility permission.
 
 ## Usage
 
@@ -70,7 +66,7 @@ Grant both in **System Settings > Privacy & Security**. Bolo must be restarted a
 4. Release Right Option (Pop sound plays)
 5. Transcribed text appears at cursor after finalization
 
-Click the menubar icon to see the last transcript or quit.
+Click the menubar icon to copy the last transcript or quit.
 
 **Session history**: Click the menubar icon to access your last 10 transcripts. Click any to copy it to clipboard.
 
@@ -82,7 +78,7 @@ Set your Telnyx API key as an environment variable:
 export TELNYX_API_KEY="your_key_here"
 ```
 
-Add to `~/.zshrc` or `~/.bash_profile` to persist. The install script does this automatically.
+Add it to `~/.zshrc` or `~/.bash_profile` to persist it. The install script currently appends it to `~/.zshrc`.
 
 You can also add personal vocabulary in `~/.bolo_vocabulary.json` as a JSON string array, for example:
 
