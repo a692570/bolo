@@ -100,6 +100,22 @@ Bolo merges that with its built-in vocabulary and passes it into cleanup constra
 tail -f /tmp/bolo.log
 ```
 
+## Evaluation
+
+To run the small phrase-based evaluation harness:
+
+```bash
+cd bolo
+python3 eval_dictation.py prompts
+python3 eval_dictation.py init > eval_results.json
+```
+
+Fill `actual` in `eval_results.json` with what Bolo produced for each phrase, then score it:
+
+```bash
+python3 eval_dictation.py score eval_results.json
+```
+
 ## FAQ
 
 - How does this compare to Wispr Flow?

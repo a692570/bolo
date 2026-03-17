@@ -8,3 +8,5 @@ Bolo.app/
 icon_options/
 /tmp/
 .DS_Store
+eval_results.json
+test-overlay.py
