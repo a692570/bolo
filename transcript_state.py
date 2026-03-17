@@ -10,9 +10,15 @@ class TranscriptState:
     unstable_text: str = ""
     visible_text: str = ""
     final_text: str = ""
+    final_source: str = ""
     first_partial_at: float = None
     first_final_at: float = None
     first_visible_at: float = None
+    stream_finalized_at: float = None
+    batch_started_at: float = None
+    batch_finished_at: float = None
+    cleanup_started_at: float = None
+    cleanup_finished_at: float = None
     correction_target: str = ""
     stream_failed: bool = False
     stream_error: str = ""

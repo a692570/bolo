@@ -564,11 +564,13 @@ class BoloApp(rumps.App):
             self._log_metrics(state, final_text=stream_command["display"])
             return
         use_stream = self._should_accept_stream_result(state, stream_preview, duration_seconds)
-        transcript = stream_preview if use_stream else self._batch_transcribe(wav_bytes)
+        transcript = stream_preview if use_stream else self._batch_transcribe(wav_bytes, state)
         if not transcript and not use_stream:
             transcript = stream_preview
         if not transcript:
             return
+        if state:
+            state.final_source = "stream" if use_stream else "batch"
 
         transcript = self._canonicalize_known_terms(self._normalize_transcript_text(transcript))
         transcript = CORRECTION_STORE.apply(transcript)
@@ -589,10 +591,12 @@ class BoloApp(rumps.App):
             return
 
         result = transcript
-        if self._should_run_cleanup(transcript, app_context):
-            cleaned = self._cleanup_transcript(transcript, app_context)
+        if self._should_run_cleanup(transcript, app_context, duration_seconds):
+            cleaned = self._cleanup_transcript(transcript, app_context, state)
             if cleaned:
                 result = cleaned
+                if state:
+                    state.final_source = f"{state.final_source}+cleanup" if state.final_source else "cleanup"
 
         result = result.strip()
         if not result:
@@ -688,6 +692,7 @@ class BoloApp(rumps.App):
         if state is None:
             return ""
         with self._transcript_lock:
+            state.stream_finalized_at = time.time()
             final_text = state.display_text().strip()
             if final_text:
                 state.final_text = final_text
@@ -722,8 +727,10 @@ class BoloApp(rumps.App):
         )
         return accepted
 
-    def _batch_transcribe(self, wav_bytes):
+    def _batch_transcribe(self, wav_bytes, state=None):
         self._log("[stt] using batch fallback")
+        if state:
+            state.batch_started_at = time.time()
         try:
             resp = requests.post(
                 STT_ENDPOINT,
@@ -745,11 +752,17 @@ class BoloApp(rumps.App):
                     timeout=8,
                 )
             if resp.status_code == 200:
+                if state:
+                    state.batch_finished_at = time.time()
                 return resp.json().get("text", "").strip()
+            if state:
+                state.batch_finished_at = time.time()
             self._log(f"[stt error] {resp.status_code}: {resp.text[:200]}")
             self._show_error(f"STT error {resp.status_code}")
             return ""
         except Exception as e:
+            if state:
+                state.batch_finished_at = time.time()
             self._log(f"[stt exception] {e}")
             self._show_error(f"STT failed: {e}")
             return ""
@@ -795,12 +808,14 @@ class BoloApp(rumps.App):
         )
         return any(token in lowered for token in code_tokens)
 
-    def _should_run_cleanup(self, transcript, context):
+    def _should_run_cleanup(self, transcript, context, duration_seconds):
         if LLM_CLEANUP_MODE == "off":
             return False
         if LLM_CLEANUP_MODE == "on":
             return True
-        if len(transcript.split()) < 12:
+        if len(transcript.split()) < 18:
+            return False
+        if duration_seconds < 6.0:
             return False
         if context.get("is_code_app"):
             return False
@@ -818,10 +833,12 @@ class BoloApp(rumps.App):
             return False
         return True
 
-    def _cleanup_transcript(self, transcript, context):
+    def _cleanup_transcript(self, transcript, context, state=None):
         app_name = context.get("app_name") or "unknown"
         vocabulary = context.get("vocabulary") or []
         vocab_line = ", ".join(vocabulary[:40]) if vocabulary else "none"
+        if state:
+            state.cleanup_started_at = time.time()
         try:
             llm_resp = requests.post(
                 LLM_ENDPOINT,
@@ -852,6 +869,8 @@ class BoloApp(rumps.App):
                 stream=True,
             )
         except Exception as e:
+            if state:
+                state.cleanup_finished_at = time.time()
             self._log(f"[llm exception] {e}")
             return ""
 
@@ -865,6 +884,8 @@ class BoloApp(rumps.App):
                 delta = data.get("choices", [{}])[0].get("delta", {}).get("content", "")
                 result += delta or ""
 
+        if state:
+            state.cleanup_finished_at = time.time()
         result = result.strip()
         if result:
             self._log(f"[llm] \"{result}\"")
@@ -960,7 +981,14 @@ class BoloApp(rumps.App):
             if state.first_final_at and self._record_started_at else None,
             "first_visible_ms": int((state.first_visible_at - self._record_started_at) * 1000)
             if state.first_visible_at and self._record_started_at else None,
+            "stream_finalize_ms": int((state.stream_finalized_at - self._record_started_at) * 1000)
+            if state.stream_finalized_at and self._record_started_at else None,
+            "batch_ms": int((state.batch_finished_at - state.batch_started_at) * 1000)
+            if state.batch_started_at and state.batch_finished_at else None,
+            "cleanup_ms": int((state.cleanup_finished_at - state.cleanup_started_at) * 1000)
+            if state.cleanup_started_at and state.cleanup_finished_at else None,
             "final_chars": len(final_text or ""),
+            "final_source": state.final_source or None,
             "stream_failed": state.stream_failed,
         }
         self._log(f"[metrics] {json.dumps(metrics, sort_keys=True)}")
