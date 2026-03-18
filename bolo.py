@@ -589,13 +589,16 @@ class BoloApp(rumps.App):
             self._log_metrics(state, final_text=stream_command["display"])
             return
         use_stream = self._should_accept_stream_result(state, stream_preview, duration_seconds)
-        transcript = stream_preview if use_stream else self._batch_transcribe(wav_bytes, state)
+        source = "stream"
+        transcript = stream_preview
+        if not use_stream:
+            transcript, source = self._batch_transcribe(wav_bytes, state, duration_seconds)
         if not transcript and not use_stream:
             transcript = stream_preview
         if not transcript:
             return
         if state:
-            state.final_source = "stream" if use_stream else "batch"
+            state.final_source = source
 
         if not use_stream and self._should_reconcile_long_form(stream_preview, transcript, duration_seconds):
             reconciled = self._reconcile_transcripts(stream_preview, transcript, app_context, state)
@@ -759,10 +762,8 @@ class BoloApp(rumps.App):
         )
         return accepted
 
-    def _batch_transcribe(self, wav_bytes, state=None):
+    def _batch_transcribe_request(self, wav_bytes):
         self._log("[stt] using batch fallback")
-        if state:
-            state.batch_started_at = time.time()
         try:
             resp = requests.post(
                 STT_ENDPOINT,
@@ -775,6 +776,7 @@ class BoloApp(rumps.App):
                 },
                 timeout=8,
             )
+            rate_limited = resp.status_code == 429
             if resp.status_code == 429:
                 resp = requests.post(
                     STT_ENDPOINT,
@@ -784,20 +786,110 @@ class BoloApp(rumps.App):
                     timeout=8,
                 )
             if resp.status_code == 200:
-                if state:
-                    state.batch_finished_at = time.time()
-                return resp.json().get("text", "").strip()
-            if state:
-                state.batch_finished_at = time.time()
+                return resp.json().get("text", "").strip(), rate_limited
             self._log(f"[stt error] {resp.status_code}: {resp.text[:200]}")
-            self._show_error(f"STT error {resp.status_code}")
-            return ""
+            return "", rate_limited
+        except Exception as e:
+            self._log(f"[stt exception] {e}")
+            raise
+
+    def _batch_transcribe(self, wav_bytes, state=None, duration_seconds=0.0):
+        if state:
+            state.batch_started_at = time.time()
+        try:
+            transcript, rate_limited = self._batch_transcribe_request(wav_bytes)
         except Exception as e:
             if state:
                 state.batch_finished_at = time.time()
-            self._log(f"[stt exception] {e}")
             self._show_error(f"STT failed: {e}")
+            return "", "batch"
+        if state:
+            state.batch_finished_at = time.time()
+        if not transcript:
+            self._show_error("STT error")
+            return "", "batch"
+        if rate_limited:
+            self._log("[stt] primary model rate limited")
+            return transcript, "batch"
+        if self._should_retry_chunked_batch(transcript, duration_seconds):
+            chunked = self._batch_transcribe_chunked(wav_bytes, state)
+            if self._prefer_chunked_transcript(transcript, chunked):
+                self._log("[stt] accepted chunked batch retry")
+                return chunked, "batch+chunked"
+        return transcript, "batch"
+
+    def _should_retry_chunked_batch(self, transcript, duration_seconds):
+        transcript = (transcript or "").strip()
+        if duration_seconds < 12.0 or not transcript:
+            return False
+        if transcript.endswith((".", "!", "?", "\"")):
+            return False
+        trailing_tokens = {"a", "an", "and", "or", "but", "the", "to", "of", "on", "in", "for", "with", "at", "by"}
+        words = transcript.split()
+        if not words:
+            return False
+        return words[-1].lower().strip(",.!?\"'") in trailing_tokens or len(words) < int(duration_seconds * 1.7)
+
+    def _prefer_chunked_transcript(self, original, chunked):
+        original = (original or "").strip()
+        chunked = (chunked or "").strip()
+        if not chunked:
+            return False
+        if len(chunked) <= len(original):
+            return False
+        if original.endswith((".", "!", "?")) and len(original.split()) >= len(chunked.split()) - 2:
+            return False
+        return True
+
+    def _batch_transcribe_chunked(self, wav_bytes, state=None):
+        try:
+            pcm = np.frombuffer(wav_bytes[44:], dtype=np.int16).copy()
+        except Exception as e:
+            self._log(f"[stt] chunked decode failed: {e}")
             return ""
+        total_samples = len(pcm)
+        if total_samples <= 0:
+            return ""
+        chunk_samples = int(SAMPLE_RATE * 10.0)
+        overlap_samples = int(SAMPLE_RATE * 1.25)
+        segments = []
+        start = 0
+        while start < total_samples:
+            end = min(total_samples, start + chunk_samples)
+            segments.append(pcm[start:end])
+            if end >= total_samples:
+                break
+            start = max(0, end - overlap_samples)
+        if len(segments) <= 1:
+            return ""
+
+        self._log(f"[stt] chunked batch retry segments={len(segments)}")
+        if state:
+            state.chunked_started_at = time.time()
+            state.chunked_segments = len(segments)
+        transcripts = []
+        for segment in segments:
+            chunk_wav = self._to_wav_bytes(segment)
+            try:
+                text, rate_limited = self._batch_transcribe_request(chunk_wav)
+            except Exception as e:
+                self._log(f"[stt] chunked request failed: {e}")
+                text = ""
+                rate_limited = False
+            if rate_limited:
+                self._log("[stt] chunked retry aborted due to rate limit")
+                transcripts = []
+                break
+            if text:
+                transcripts.append(text.strip())
+        if state:
+            state.chunked_finished_at = time.time()
+        if not transcripts:
+            return ""
+        merged = ""
+        for text in transcripts:
+            merged = merge_transcript(merged, text)
+        return merged.strip()
 
     def _frontmost_app_name(self):
         try:
@@ -1093,6 +1185,9 @@ class BoloApp(rumps.App):
             if state.stream_finalized_at and self._record_started_at else None,
             "batch_ms": int((state.batch_finished_at - state.batch_started_at) * 1000)
             if state.batch_started_at and state.batch_finished_at else None,
+            "chunked_ms": int((state.chunked_finished_at - state.chunked_started_at) * 1000)
+            if state.chunked_started_at and state.chunked_finished_at else None,
+            "chunked_segments": state.chunked_segments or None,
             "reconcile_ms": int((state.reconcile_finished_at - state.reconcile_started_at) * 1000)
             if state.reconcile_started_at and state.reconcile_finished_at else None,
             "cleanup_ms": int((state.cleanup_finished_at - state.cleanup_started_at) * 1000)
