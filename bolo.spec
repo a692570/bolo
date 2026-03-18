@@ -63,6 +63,6 @@ app = BUNDLE(
         'NSMicrophoneUsageDescription': 'Bolo needs mic access to transcribe your voice.',
         'NSAccessibilityUsageDescription': 'Bolo needs accessibility access to inject text.',
         'LSUIElement': True,  # menubar only, no Dock icon
-        'CFBundleShortVersionString': '1.2.0-alpha.1',
+        'CFBundleShortVersionString': '1.2.0-alpha.2',
     },
 )
