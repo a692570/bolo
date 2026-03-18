@@ -20,6 +20,7 @@ class TranscriptState:
     chunked_started_at: float = None
     chunked_finished_at: float = None
     chunked_segments: int = 0
+    rate_limited: bool = False
     reconcile_started_at: float = None
     reconcile_finished_at: float = None
     cleanup_started_at: float = None

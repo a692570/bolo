@@ -63,6 +63,7 @@ CORRECTION_WINDOW_SECONDS = 3.0
 STREAM_DRAIN_SECONDS = 0.25
 LLM_CLEANUP_MODE = os.environ.get("BOLO_LLM_CLEANUP", "auto").strip().lower()
 DELETE_KEYCODE = 51
+RATE_LIMIT_BACKOFF_SECONDS = 45.0
 
 BASE_DIR         = os.path.dirname(os.path.abspath(__file__))
 ICON_IDLE        = os.path.join(BASE_DIR, "icon_idle.png")
@@ -140,6 +141,7 @@ class BoloApp(rumps.App):
         self.last_result     = None
         self.last_raw        = None
         self.last_paste_time = 0.0
+        self._rate_limit_backoff_until = 0.0
         self.correction_window_until = 0.0
         self.correction_mode = False
         self.session_history = collections.deque(maxlen=10)
@@ -785,6 +787,8 @@ class BoloApp(rumps.App):
                     data={"model": "distil-whisper/distil-large-v2"},
                     timeout=8,
                 )
+                if resp.status_code == 429:
+                    return "", True
             if resp.status_code == 200:
                 return resp.json().get("text", "").strip(), rate_limited
             self._log(f"[stt error] {resp.status_code}: {resp.text[:200]}")
@@ -806,10 +810,19 @@ class BoloApp(rumps.App):
         if state:
             state.batch_finished_at = time.time()
         if not transcript:
-            self._show_error("STT error")
+            if rate_limited:
+                if state:
+                    state.rate_limited = True
+                self._rate_limit_backoff_until = time.time() + RATE_LIMIT_BACKOFF_SECONDS
+                self._show_error("Rate limited, try again shortly")
+            else:
+                self._show_error("STT error")
             return "", "batch"
         if rate_limited:
             self._log("[stt] primary model rate limited")
+            if state:
+                state.rate_limited = True
+            self._rate_limit_backoff_until = time.time() + RATE_LIMIT_BACKOFF_SECONDS
             return transcript, "batch"
         if self._should_retry_chunked_batch(transcript, duration_seconds):
             chunked = self._batch_transcribe_chunked(wav_bytes, state)
@@ -946,6 +959,8 @@ class BoloApp(rumps.App):
         return any(token in lowered for token in code_tokens)
 
     def _should_run_cleanup(self, transcript, context, duration_seconds):
+        if time.time() < self._rate_limit_backoff_until:
+            return False
         if LLM_CLEANUP_MODE == "off":
             return False
         if LLM_CLEANUP_MODE == "on":
@@ -1005,6 +1020,18 @@ class BoloApp(rumps.App):
                 timeout=8,
                 stream=True,
             )
+            if llm_resp.status_code == 429:
+                self._log("[llm] cleanup rate limited")
+                self._rate_limit_backoff_until = time.time() + RATE_LIMIT_BACKOFF_SECONDS
+                if state:
+                    state.rate_limited = True
+                    state.cleanup_finished_at = time.time()
+                return ""
+            if llm_resp.status_code != 200:
+                self._log(f"[llm error] {llm_resp.status_code}: {llm_resp.text[:200]}")
+                if state:
+                    state.cleanup_finished_at = time.time()
+                return ""
         except Exception as e:
             if state:
                 state.cleanup_finished_at = time.time()
@@ -1017,7 +1044,11 @@ class BoloApp(rumps.App):
                 chunk = line[6:]
                 if chunk == b"[DONE]":
                     break
-                data = json.loads(chunk)
+                try:
+                    data = json.loads(chunk)
+                except json.JSONDecodeError:
+                    self._log("[llm] malformed stream chunk")
+                    continue
                 delta = data.get("choices", [{}])[0].get("delta", {}).get("content", "")
                 result += delta or ""
 
@@ -1029,6 +1060,8 @@ class BoloApp(rumps.App):
         return result
 
     def _reconcile_transcripts(self, stream_preview, batch_transcript, context, state=None):
+        if time.time() < self._rate_limit_backoff_until:
+            return ""
         app_name = context.get("app_name") or "unknown"
         vocabulary = context.get("vocabulary") or []
         vocab_line = ", ".join(vocabulary[:40]) if vocabulary else "none"
@@ -1063,6 +1096,18 @@ class BoloApp(rumps.App):
                 timeout=8,
                 stream=True,
             )
+            if llm_resp.status_code == 429:
+                self._log("[reconcile] rate limited")
+                self._rate_limit_backoff_until = time.time() + RATE_LIMIT_BACKOFF_SECONDS
+                if state:
+                    state.rate_limited = True
+                    state.reconcile_finished_at = time.time()
+                return ""
+            if llm_resp.status_code != 200:
+                self._log(f"[reconcile error] {llm_resp.status_code}: {llm_resp.text[:200]}")
+                if state:
+                    state.reconcile_finished_at = time.time()
+                return ""
         except Exception as e:
             if state:
                 state.reconcile_finished_at = time.time()
@@ -1075,7 +1120,11 @@ class BoloApp(rumps.App):
                 chunk = line[6:]
                 if chunk == b"[DONE]":
                     break
-                data = json.loads(chunk)
+                try:
+                    data = json.loads(chunk)
+                except json.JSONDecodeError:
+                    self._log("[reconcile] malformed stream chunk")
+                    continue
                 delta = data.get("choices", [{}])[0].get("delta", {}).get("content", "")
                 result += delta or ""
 
@@ -1197,6 +1246,7 @@ class BoloApp(rumps.App):
             "chars_per_second": round(len(final_text or "") / max(0.1, record_ms / 1000.0), 2)
             if record_ms is not None else None,
             "final_source": state.final_source or None,
+            "rate_limited": state.rate_limited,
             "stream_failed": state.stream_failed,
         }
         self._log(f"[metrics] {json.dumps(metrics, sort_keys=True)}")
