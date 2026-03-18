@@ -1,5 +1,12 @@
 #!/bin/bash
-source ~/.zshrc 2>/dev/null || true
+
+if [ -z "$TELNYX_API_KEY" ] && [ -f "$HOME/.codex/.env" ]; then
+  export TELNYX_API_KEY="$(/usr/bin/awk -F= '/^TELNYX_API_KEY=/{print substr($0, index($0,$2)); exit}' "$HOME/.codex/.env")"
+fi
+
+if [ -z "$TELNYX_API_KEY" ] && [ -f "$HOME/.zshrc" ]; then
+  export TELNYX_API_KEY="$(/usr/bin/sed -n 's/^export TELNYX_API_KEY=\"\\(.*\\)\"/\\1/p' "$HOME/.zshrc" | /usr/bin/head -n 1)"
+fi
 
 LOOP_PID_FILE=/tmp/bolo-loop.pid
 LOCK_DIR=/tmp/bolo-supervisor.lock
