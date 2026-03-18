@@ -4,6 +4,8 @@ Free, self-hosted voice dictation powered by Telnyx AI. Hold Right Option anywhe
 
 Bolo is a macOS menubar app that transcribes your speech and pastes it into any active text field, including Slack, Notion, Gmail, VS Code, terminals, and browsers. No always-on microphone. No subscription.
 
+The name comes from Hindi: "bolo" means "speak."
+
 ```bash
 git clone https://github.com/a692570/bolo.git
 cd bolo
@@ -30,9 +32,10 @@ Bolo runs as a menubar application that monitors global input events and process
 3. **Recording**: Continues buffering audio while key is held. No disk writes occur during recording.
 4. **Key release trigger**: On Right Option release, immediately finalizes audio buffer and initiates API calls.
 5. **Speech-to-text**: Sends audio to Telnyx AI API calling `deepgram/nova-3` as primary STT engine (falls back to `distil-whisper/distil-large-v2` on rate limits).
-6. **Text cleanup**: Optionally sends raw transcription to Telnyx AI API calling `Qwen/Qwen3-235B-A22B` for minimal punctuation and capitalization cleanup in prose-oriented contexts.
-7. **Text injection**: Uses CGEvent keyboard simulation to paste processed text at current cursor position in the active application.
-8. **Audio feedback**: Plays system Tink sound on record start and Pop sound on completion.
+6. **Long-form recovery**: For longer utterances, Bolo can reconcile streaming and batch transcripts and retry suspicious cut-off outputs with chunked batch STT.
+7. **Text cleanup**: Optionally sends raw transcription to Telnyx AI API calling `Qwen/Qwen3-235B-A22B` for minimal punctuation and capitalization cleanup in prose-oriented contexts.
+8. **Text injection**: Uses CGEvent keyboard simulation to paste processed text at current cursor position in the active application.
+9. **Audio feedback**: Plays system Tink sound on record start and Pop sound on completion.
 
 Latency varies with utterance length and whether Bolo uses streaming preview or safer batch finalization. Short phrases can feel quick; longer dictation is currently slower.
 
@@ -99,6 +102,7 @@ Bolo merges that with its built-in vocabulary and uses it to preserve known term
 - Bolo is under active development and improving quickly.
 - Short dictation works well today. Longer dictation and latency are still improving.
 - Streaming preview can stall on long speech; Bolo falls back to a listening status and safer finalization.
+- Long dictation now has extra recovery paths, but still needs more real-world validation than short phrases.
 - Cleanup is intentionally conservative to preserve literal meaning.
 - Learned correction memory is currently disabled while a safer replacement is being designed.
 
@@ -156,9 +160,11 @@ Re-dictate the corrected text. Bolo no longer uses the old learned correction me
 
 - **Audio not recording**: Verify Microphone permission is granted in System Settings. If Bolo was installed as a Login Item, try restarting it once with `./restart.sh` so macOS re-prompts permissions cleanly.
 
+- **Multiple Bolo icons appear**: Run `./restart.sh`. Current versions are designed to keep only one supervisor and one Bolo app process alive.
+
 - **App appears as Python icon in Dock**: This is fixed in the current version. If you see it, restart Bolo.
 
-- **High latency**: Check network connectivity. Longer utterances currently prefer safer batch finalization, which is slower but more reliable.
+- **High latency**: Check network connectivity. Longer utterances currently prefer safer batch finalization, and may also run reconciliation or chunked retry when the transcript looks cut off.
 
 ## License
 
