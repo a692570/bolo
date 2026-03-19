@@ -35,6 +35,7 @@ from Quartz import (
     CGEventCreateKeyboardEvent,
     CGEventKeyboardSetUnicodeString,
     CGEventPost,
+    CGEventSourceFlagsState,
     CGEventTapCreate,
     CGEventTapEnable,
     CGEventGetFlags,
@@ -47,6 +48,7 @@ from Quartz import (
     kCGSessionEventTap,
     kCGHeadInsertEventTap,
     kCGHIDEventTap,
+    kCGEventSourceStateCombinedSessionState,
     kCGEventTapOptionListenOnly,
     kCGEventFlagsChanged,
 )
@@ -174,6 +176,7 @@ class BoloApp(rumps.App):
         self._tap_heartbeat = 0
         self._tap_last_heartbeat = 0
         self._tap_thread_obj = None
+        self._last_press_at = 0.0
 
         # Start global hotkey listener via CGEventTap (no pynput)
         self._start_event_tap()
@@ -251,6 +254,13 @@ class BoloApp(rumps.App):
     # Right Option = NX_DEVICERALTKEYMASK (bit 6 of device-dep flags)
     _NX_DEVICERALTKEYMASK = 0x00000040
 
+    def _is_right_option_down(self):
+        try:
+            flags = CGEventSourceFlagsState(kCGEventSourceStateCombinedSessionState)
+        except Exception:
+            return self._ropt_held
+        return bool(flags & self._NX_DEVICERALTKEYMASK)
+
     def _process_key_events(self, _):
         # Silence auto-stop
         if self._silence_event.is_set():
@@ -260,6 +270,14 @@ class BoloApp(rumps.App):
                 self._stop_recording()
             return
 
+        # Recover from a missed modifier release. This is the main hotkey wedge.
+        if self._ropt_held and not self._is_right_option_down():
+            if time.time() - self._last_press_at > 0.08:
+                self._ropt_held = False
+                if self._key_event != "release":
+                    self._log("[key] synthesized Right Option release after missed tap event")
+                    self._key_event = "release"
+
         event = self._key_event
         if event is None:
             return
@@ -267,6 +285,7 @@ class BoloApp(rumps.App):
 
         if event == "press":
             self.correction_mode = False
+            self._last_press_at = time.time()
             self._log("[key] Right Option pressed")
             self._start_recording()
         elif event == "release":
@@ -360,6 +379,7 @@ class BoloApp(rumps.App):
 
         if ropt_down and not self._ropt_held:
             self._ropt_held = True
+            self._last_press_at = time.time()
             self._key_event = "press"
         elif not ropt_down and self._ropt_held:
             self._ropt_held = False
