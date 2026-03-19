@@ -56,14 +56,48 @@ import HIServices
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-TELNYX_API_KEY = os.environ.get("TELNYX_API_KEY", "")
+def _load_env_value(name: str) -> str:
+    value = os.environ.get(name, "").strip()
+    if value:
+        return value
+
+    env_file = os.path.expanduser("~/.codex/.env")
+    if os.path.exists(env_file):
+        try:
+            with open(env_file, "r", encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    key, raw = line.split("=", 1)
+                    if key.strip() == name:
+                        return raw.strip().strip("\"'")
+        except OSError:
+            pass
+
+    shell_file = os.path.expanduser("~/.zshrc")
+    if os.path.exists(shell_file):
+        try:
+            with open(shell_file, "r", encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line.startswith(f"export {name}="):
+                        continue
+                    return line.split("=", 1)[1].strip().strip("\"'")
+        except OSError:
+            pass
+
+    return ""
+
+
+TELNYX_API_KEY = _load_env_value("TELNYX_API_KEY")
 STT_ENDPOINT   = "https://api.telnyx.com/v2/ai/audio/transcriptions"
 LLM_ENDPOINT   = "https://api.telnyx.com/v2/ai/chat/completions"
 SAMPLE_RATE    = 16000
 CHANNELS       = 1
 CORRECTION_WINDOW_SECONDS = 3.0
 STREAM_DRAIN_SECONDS = 0.25
-LLM_CLEANUP_MODE = os.environ.get("BOLO_LLM_CLEANUP", "auto").strip().lower()
+LLM_CLEANUP_MODE = _load_env_value("BOLO_LLM_CLEANUP").strip().lower() or "auto"
 DELETE_KEYCODE = 51
 RATE_LIMIT_BACKOFF_SECONDS = 45.0
 
