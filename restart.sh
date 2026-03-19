@@ -9,4 +9,4 @@ pkill -f "overlay.py" 2>/dev/null || true
 rm -f /tmp/bolo-loop.pid
 rm -rf /tmp/bolo-supervisor.lock
 
-open "$DIR/start-bolo.command"
+/bin/bash "$DIR/start-bolo.command" >/dev/null 2>&1 &
