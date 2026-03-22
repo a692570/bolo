@@ -540,14 +540,16 @@ class BoloApp(rumps.App):
     def _watchdog_overlay_preview(self, _):
         if not self.recording:
             return
-        if self._overlay_stall_notice_shown:
-            return
         if not self._last_overlay_preview_at:
             return
-        if time.time() - self._last_overlay_preview_at < 1.5:
+        since_last_partial = time.time() - self._last_overlay_preview_at
+        if since_last_partial < 2.0:
             return
-        self._overlay_stall_notice_shown = True
-        self.overlay.update("listening", "Still listening...")
+        # No stream partial received in 2s: show a live word-count estimate
+        # so the user has feedback that the recording is progressing.
+        elapsed = time.time() - self._record_started_at
+        estimated_words = max(1, int(elapsed * 2.5))
+        self.overlay.update("listening", f"~{estimated_words} words so far...")
 
     def _watchdog_recording(self, _):
         if not self.recording:
