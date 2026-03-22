@@ -848,7 +848,7 @@ class BoloApp(rumps.App):
             vocab_terms = VOCAB_STORE.terms()
             model_config = {"smart_format": True, "punctuate": True}
             if vocab_terms:
-                model_config["keywords"] = vocab_terms[:50]
+                model_config["keyterms"] = vocab_terms[:50]
             resp = requests.post(
                 STT_ENDPOINT,
                 headers={"Authorization": f"Bearer {TELNYX_API_KEY}"},
