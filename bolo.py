@@ -242,6 +242,8 @@ class BoloApp(rumps.App):
         self._overlay_stall_notice_shown = False
 
         self.stream = None  # opened only during recording
+        self._current_context = ""
+        self._context_aware = True
         self._ropt_held = False
         self._tap_loop  = None
         self._tap_ref   = None
@@ -333,6 +335,42 @@ class BoloApp(rumps.App):
         text = re.sub(r'^\s*[,;]\s*', '', text)  # leading comma/semicolon
         text = re.sub(r'\s+([.,!?;:])', r'\1', text)  # space before punctuation
         return text.strip()
+
+    # ── Context awareness ─────────────────────────────────────────────────────
+
+    def _get_focused_text_context(self) -> str:
+        """Read the last 500 chars of the currently focused text field via accessibility API."""
+        try:
+            focused_system = HIServices.AXUIElementCreateSystemWide()
+            err, focused_el = HIServices.AXUIElementCopyAttributeValue(
+                focused_system, "AXFocusedUIElement", None
+            )
+            if err != 0 or focused_el is None:
+                return ""
+            err, value = HIServices.AXUIElementCopyAttributeValue(
+                focused_el, "AXValue", None
+            )
+            if err != 0 or not value:
+                return ""
+            text = str(value)
+            return text[-500:].strip() if len(text) > 500 else text.strip()
+        except Exception:
+            return ""
+
+    def _apply_context_capitalization(self, text: str, context: str) -> str:
+        """Lower the first character of text if the context indicates we are mid-sentence."""
+        if not text or not context:
+            return text
+        context_stripped = context.rstrip()
+        if not context_stripped:
+            return text
+        last_char = context_stripped[-1]
+        # Mid-sentence indicators: comma, colon, semicolon, or no ending punctuation at all
+        sentence_enders = {".", "!", "?"}
+        if last_char not in sentence_enders:
+            # We are mid-sentence: do not capitalize the first word
+            return text[0].lower() + text[1:]
+        return text
 
     # ── Audio ─────────────────────────────────────────────────────────────────
 
@@ -586,6 +624,12 @@ class BoloApp(rumps.App):
         self.icon = ICON_REC
         self.title = "⌥"
         self._silence.reset()
+        if self._context_aware:
+            self._current_context = self._get_focused_text_context()
+            if self._current_context:
+                self._log(f"[context] captured {len(self._current_context)} chars from focused field")
+        else:
+            self._current_context = ""
         threshold = AUTO_SILENCE_SECONDS if self._auto_silence_enabled else 9999.0
         self._silence.set_silence_threshold(threshold)
         self._silence_event.clear()
@@ -814,6 +858,12 @@ class BoloApp(rumps.App):
         if not result:
             return
         result = self._canonicalize_known_terms(self._normalize_transcript_text(result))
+
+        # Context-aware capitalization: lower first word if we are mid-sentence
+        if self._context_aware and self._current_context and not (state and state.correction_target):
+            result = self._apply_context_capitalization(result, self._current_context)
+            if self._current_context:
+                self._log(f"[context] capitalization applied, context ends with: '{self._current_context[-1]}'")
 
         self._render_text(result)
 
@@ -1168,8 +1218,18 @@ class BoloApp(rumps.App):
         app_name = context.get("app_name") or "unknown"
         vocabulary = context.get("vocabulary") or []
         vocab_line = ", ".join(vocabulary[:40]) if vocabulary else "none"
+        existing_text = self._current_context
         if state:
             state.cleanup_started_at = time.time()
+        context_instruction = ""
+        if existing_text:
+            snippet = existing_text[-300:]
+            context_instruction = (
+                f"The user is dictating into a text field that already contains this text "
+                f"(last 300 chars shown): '{snippet}'. "
+                "Continue naturally from that context. Do not repeat information already present. "
+                "If the dictation starts mid-sentence (no capital), preserve that casing.\n"
+            )
         try:
             llm_resp = requests.post(
                 LLM_ENDPOINT,
@@ -1186,6 +1246,7 @@ class BoloApp(rumps.App):
                             "content": (
                                 f"Frontmost app: {app_name}\n"
                                 f"Preferred vocabulary: {vocab_line}\n"
+                                f"{context_instruction}"
                                 "Apply only minimal punctuation/capitalization cleanup.\n"
                                 f"Transcript: {transcript}"
                             ),
