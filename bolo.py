@@ -101,6 +101,9 @@ LLM_CLEANUP_MODE = _load_env_value("BOLO_LLM_CLEANUP").strip().lower() or "auto"
 DELETE_KEYCODE = 51
 RATE_LIMIT_BACKOFF_SECONDS = 45.0
 MAX_RECORDING_SECONDS = 90.0  # force-stop if stuck recording longer than this
+AUTO_SILENCE_SECONDS = 1.5    # stop after this many seconds of silence (Wispr Flow parity)
+AUTO_SILENCE_MIN_SPEAKING = 2.0  # only trigger auto-stop after user has been speaking this long
+BOLO_PREFS_FILE = os.path.expanduser("~/.bolo_prefs.json")
 
 BASE_DIR         = os.path.dirname(os.path.abspath(__file__))
 ICON_IDLE        = os.path.join(BASE_DIR, "icon_idle.png")
@@ -193,6 +196,8 @@ class BoloApp(rumps.App):
             rumps.MenuItem("Last transcript", callback=self._copy_last),
             rumps.MenuItem("History", callback=None),
             None,
+            rumps.MenuItem("Auto-stop on silence", callback=self._toggle_auto_silence),
+            None,
             rumps.MenuItem("Quit Bolo", callback=self.quit_app),
         ]
         self.menu["Bolo — Voice Dictation"].set_callback(None)
@@ -210,6 +215,11 @@ class BoloApp(rumps.App):
         self._session_seq = 0
         self._active_session_id = 0
         self._session_phase = "idle"
+
+        # Auto-silence feature (Wispr Flow parity)
+        prefs = self._load_prefs()
+        self._auto_silence_enabled = prefs.get("auto_silence_enabled", True)
+        self._update_auto_silence_menu()
 
         # Streaming STT state
         self._stt            = None
@@ -244,6 +254,34 @@ class BoloApp(rumps.App):
         rumps.Timer(self._watchdog_overlay_preview, 0.5).start()
         rumps.Timer(self._watchdog_recording, 5).start()
         self._ensure_warm_stream()
+
+    # ── Prefs ─────────────────────────────────────────────────────────────────
+
+    def _load_prefs(self):
+        try:
+            with open(BOLO_PREFS_FILE, "r", encoding="utf-8") as fh:
+                return json.load(fh)
+        except (OSError, json.JSONDecodeError):
+            return {}
+
+    def _save_prefs(self, prefs):
+        try:
+            with open(BOLO_PREFS_FILE, "w", encoding="utf-8") as fh:
+                json.dump(prefs, fh, indent=2)
+        except OSError as e:
+            self._log(f"[prefs] failed to save: {e}")
+
+    def _update_auto_silence_menu(self):
+        label = "Auto-stop on silence " + ("✓" if self._auto_silence_enabled else "")
+        self.menu["Auto-stop on silence"].title = label.strip()
+
+    def _toggle_auto_silence(self, _):
+        self._auto_silence_enabled = not self._auto_silence_enabled
+        self._update_auto_silence_menu()
+        prefs = self._load_prefs()
+        prefs["auto_silence_enabled"] = self._auto_silence_enabled
+        self._save_prefs(prefs)
+        self._log(f"[silence] auto-stop {'enabled' if self._auto_silence_enabled else 'disabled'}")
 
     def _begin_session(self):
         self._session_seq += 1
@@ -338,8 +376,21 @@ class BoloApp(rumps.App):
         if self._silence_event.is_set():
             self._silence_event.clear()
             if self.recording:
-                self._log("[silence] end of utterance detected — stopping")
-                self._stop_recording()
+                elapsed_recording = time.time() - self._record_started_at
+                if elapsed_recording >= AUTO_SILENCE_MIN_SPEAKING:
+                    self._log(
+                        f"[silence] end of utterance after {elapsed_recording:.1f}s -- stopping"
+                    )
+                    self._stop_recording()
+                else:
+                    # Too early: reset so it can fire again once the user has spoken long enough
+                    self._log(
+                        f"[silence] ignored early trigger ({elapsed_recording:.1f}s < "
+                        f"{AUTO_SILENCE_MIN_SPEAKING}s min)"
+                    )
+                    self._silence.reset()
+                    threshold = AUTO_SILENCE_SECONDS if self._auto_silence_enabled else 9999.0
+                    self._silence.set_silence_threshold(threshold)
             return
 
         # Recover from a missed modifier release. This is the main hotkey wedge.
@@ -530,6 +581,8 @@ class BoloApp(rumps.App):
         self.icon = ICON_REC
         self.title = "⌥"
         self._silence.reset()
+        threshold = AUTO_SILENCE_SECONDS if self._auto_silence_enabled else 9999.0
+        self._silence.set_silence_threshold(threshold)
         self._silence_event.clear()
         self._chunk_time = time.time()
         self._transcript_state = TranscriptState()

@@ -71,6 +71,10 @@ class SilenceDetector:
         self._has_speech = False
         self._trailing_silence = 0.0
 
+    def set_silence_threshold(self, seconds: float) -> None:
+        """Override the required silence duration for this detector instance."""
+        self.REQUIRED_SILENCE_DURATION = seconds
+
     # ── Internals ─────────────────────────────────────────────────────────────
 
     @staticmethod
