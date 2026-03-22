@@ -245,8 +245,15 @@ class TelnyxStreamingSTT:
         asyncio.set_event_loop(loop)
         try:
             loop.run_until_complete(self._ws_session())
+        except Exception:
+            # Swallow all exceptions so a daemon thread crash does not kill the process.
+            # Connection errors are already stored in self._connect_error by _ws_session.
+            pass
         finally:
-            loop.close()
+            try:
+                loop.close()
+            except Exception:
+                pass
             if self._loop is loop:
                 self._loop = None
 
@@ -274,11 +281,16 @@ class TelnyxStreamingSTT:
                     [sender, receiver],
                     return_when=asyncio.FIRST_COMPLETED,
                 )
+                for task in done:
+                    try:
+                        task.result()
+                    except Exception:
+                        pass
                 for task in pending:
                     task.cancel()
                     try:
                         await task
-                    except asyncio.CancelledError:
+                    except (asyncio.CancelledError, Exception):
                         pass
         except Exception as exc:
             self._connect_error = exc
