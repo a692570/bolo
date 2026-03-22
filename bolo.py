@@ -98,7 +98,7 @@ LLM_ENDPOINT   = "https://api.telnyx.com/v2/ai/chat/completions"
 SAMPLE_RATE    = 16000
 CHANNELS       = 1
 CORRECTION_WINDOW_SECONDS = 3.0
-STREAM_DRAIN_SECONDS = 0.25
+STREAM_DRAIN_SECONDS = 0.1
 LLM_CLEANUP_MODE = _load_env_value("BOLO_LLM_CLEANUP").strip().lower() or "auto"
 DELETE_KEYCODE = 51
 RATE_LIMIT_BACKOFF_SECONDS = 45.0
@@ -969,13 +969,18 @@ class BoloApp(rumps.App):
         if word_count == 0:
             return False
 
-        if duration_seconds > 3.5:
+        if duration_seconds > 8.0:
             self._log(
                 f"[stream] rejected for long utterance duration_s={duration_seconds:.2f}"
             )
             return False
 
-        min_words = max(1, int(duration_seconds * 1.3 + 0.999))
+        # For medium clips (3.5-8s), require more words to trust the stream result
+        # is not a partial. Short clips keep the looser 1.3x threshold.
+        if duration_seconds > 3.5:
+            min_words = int(duration_seconds * 1.5)
+        else:
+            min_words = max(1, int(duration_seconds * 1.3 + 0.999))
         if state and state.first_final_at is not None:
             accepted = word_count >= min_words
             self._log(
