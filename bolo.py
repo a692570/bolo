@@ -124,8 +124,13 @@ SYSTEM_PROMPT = (
     "You are a transcription formatter. "
     "Your only job is to apply minimal capitalization and punctuation fixes to a raw speech transcript. "
     "Do not rewrite meaning. Do not summarize. Do not add or remove claims. "
-    "Preserve wording, filler, and structure unless a tiny punctuation or capitalization change is clearly needed. "
     "If the input is already good, return it unchanged. "
+    "Remove filler words and verbal tics that add no meaning: "
+    "'um', 'uh', 'hmm', 'like' when used as filler (not as a meaningful word), "
+    "'you know', 'I mean', 'sort of', 'kind of', 'basically', 'literally' when used as filler, "
+    "'and all', 'and everything', 'right?' at end of sentences when rhetorical. "
+    "Be conservative: only remove when the word is clearly filler with no semantic value. "
+    "Do not remove 'like' when it means 'similar to' or has real meaning. "
     "Also fix these known brand name and term misrecognitions when context makes them obvious: "
     "'whisper flow', 'wisper flow', 'Voisei', or 'Voisey' -> 'Wispr Flow'; "
     "'telnyx' or close variants -> 'Telnyx'; "
@@ -153,6 +158,19 @@ KNOWN_TERM_PATTERNS = (
     (re.compile(r"\bnova[ -]three\b|\bnova 3\b", re.IGNORECASE), "nova-3"),
     (re.compile(r"\bquen\b|\bqueue when\b|\bkyuen\b|\bkwan\b", re.IGNORECASE), "Qwen"),
 )
+
+# Filler patterns applied as a pre-LLM cleanup pass.
+# Ordered from most to least greedy. Each entry: (compiled regex, replacement).
+FILLER_PATTERNS = [
+    # Standalone hesitation sounds at the start, middle, or end of a phrase
+    (re.compile(r'\b(um+|uh+|hmm+|mhm)\b[,.]?\s*', re.IGNORECASE), ''),
+    # "you know" as filler
+    (re.compile(r'\byou know[,.]?\s*', re.IGNORECASE), ''),
+    # "and all" only at end of phrase (not "and all of ...")
+    (re.compile(r'\band all\b(?!\s+of)\b[,.]?\s*$', re.IGNORECASE), ''),
+    # trailing rhetorical "right?" or ", right?"
+    (re.compile(r',?\s*\bright\??\s*$', re.IGNORECASE), ''),
+]
 
 # ── Bolo app ──────────────────────────────────────────────────────────────────
 
@@ -259,6 +277,19 @@ class BoloApp(rumps.App):
         for pattern, replacement in KNOWN_TERM_PATTERNS:
             text = pattern.sub(replacement, text)
         return text
+
+    def _remove_fillers(self, text):
+        """Strip isolated filler words/sounds that add no semantic value."""
+        text = (text or "").strip()
+        if not text:
+            return ""
+        for pattern, replacement in FILLER_PATTERNS:
+            text = pattern.sub(replacement, text)
+        # Clean up whitespace and punctuation artifacts left by removals
+        text = re.sub(r'  +', ' ', text)         # collapse double spaces
+        text = re.sub(r'^\s*[,;]\s*', '', text)  # leading comma/semicolon
+        text = re.sub(r'\s+([.,!?;:])', r'\1', text)  # space before punctuation
+        return text.strip()
 
     # ── Audio ─────────────────────────────────────────────────────────────────
 
@@ -695,6 +726,7 @@ class BoloApp(rumps.App):
                     state.final_source = "batch+reconcile"
 
         transcript = self._canonicalize_known_terms(self._normalize_transcript_text(transcript))
+        transcript = self._remove_fillers(transcript)
         transcript = CORRECTION_STORE.apply(transcript)
         self.last_raw = transcript
         if stream_preview and stream_preview != transcript:
