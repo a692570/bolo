@@ -25,7 +25,7 @@ class SilenceDetector:
       - required_silence_duration = disabled by default in Bolo's current UX
     """
 
-    SPEECH_THRESHOLD = 0.02
+    SPEECH_THRESHOLD = 0.006
     REQUIRED_SILENCE_DURATION = 9999.0
 
     def __init__(self):
@@ -307,9 +307,15 @@ class TelnyxStreamingSTT:
             await ws.send(payload)
 
     async def _receiver(self, ws) -> None:
-        """Receives JSON text messages and enqueues parsed transcripts."""
+        """Receives JSON messages (text or binary) and enqueues parsed transcripts."""
         try:
             async for message in ws:
+                # Deepgram may send binary frames containing UTF-8 JSON
+                if isinstance(message, bytes):
+                    try:
+                        message = message.decode("utf-8")
+                    except Exception:
+                        continue
                 if not isinstance(message, str):
                     continue
                 try:

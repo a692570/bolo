@@ -4,6 +4,7 @@ Bolo — Telnyx voice dictation menubar app.
 Hold Right Option anywhere to dictate. Release to transcribe and inject.
 """
 
+import concurrent.futures
 import io
 import json
 import os
@@ -37,6 +38,7 @@ from Quartz import (
     CGEventCreateKeyboardEvent,
     CGEventKeyboardSetUnicodeString,
     CGEventPost,
+    CGEventSetFlags,
     CGEventSourceFlagsState,
     CGEventTapCreate,
     CGEventTapEnable,
@@ -98,12 +100,15 @@ LLM_ENDPOINT   = "https://api.telnyx.com/v2/ai/chat/completions"
 SAMPLE_RATE    = 16000
 CHANNELS       = 1
 CORRECTION_WINDOW_SECONDS = 3.0
-STREAM_DRAIN_SECONDS = 0.1
+STREAM_DRAIN_SECONDS = 0.15
+_SILENCE_PADDING = bytes(int(16000 * 0.35 * 2))  # 350ms of silence at 16kHz mono 16-bit
 LLM_CLEANUP_MODE = _load_env_value("BOLO_LLM_CLEANUP").strip().lower() or "auto"
 DELETE_KEYCODE = 51
 RATE_LIMIT_BACKOFF_SECONDS = 45.0
 MAX_RECORDING_SECONDS = 90.0  # force-stop if stuck recording longer than this
-AUTO_SILENCE_SECONDS = 1.5    # stop after this many seconds of silence (Wispr Flow parity)
+AUTO_SILENCE_SECONDS = 5.0    # stop after this many seconds of silence
+AUTO_SILENCE_MAX_SECONDS = 5.0  # flat threshold — no extension logic
+AUTO_SILENCE_EXTEND_STEP = 2.0  # unused, kept for reference
 AUTO_SILENCE_MIN_SPEAKING = 2.0  # only trigger auto-stop after user has been speaking this long
 BOLO_PREFS_FILE = os.path.expanduser("~/.bolo_prefs.json")
 
@@ -233,6 +238,7 @@ class BoloApp(rumps.App):
         self._warm_stt = None
         self._warm_stt_lock = threading.Lock()
         self._warm_stt_connecting = False
+        self._warm_stt_connected_at: float = 0.0
         self._silence        = SilenceDetector()
         self._silence_event  = threading.Event()
         self._chunk_time     = time.time()
@@ -414,6 +420,16 @@ class BoloApp(rumps.App):
             return self._ropt_held
         return bool(flags & self._NX_DEVICERALTKEYMASK)
 
+    def _stream_ends_at_sentence_boundary(self) -> bool:
+        """Check if the latest stream transcript ends with sentence-terminal punctuation."""
+        state = self._transcript_state
+        if not state:
+            return True  # no transcript state, allow stop
+        text = state.display_text().strip()
+        if not text:
+            return True  # nothing transcribed, allow stop
+        return text[-1] in ".?!"
+
     def _process_key_events(self, _):
         # Silence auto-stop
         if self._silence_event.is_set():
@@ -544,6 +560,10 @@ class BoloApp(rumps.App):
         ropt_down = bool(flags & self._NX_DEVICERALTKEYMASK)
 
         if ropt_down and not self._ropt_held:
+            if self.recording:
+                # Spurious key-down while already recording — ignore to prevent state reset
+                self._log("[key] spurious Right Option down while recording — ignored")
+                return event
             self._ropt_held = True
             self._last_press_at = time.time()
             self._key_event = "press"
@@ -584,12 +604,21 @@ class BoloApp(rumps.App):
                     pass
                 return
             self._warm_stt = stt
+            self._warm_stt_connected_at = time.time()
             self._warm_stt_connecting = False
         self._log("[stream] warm connection ready")
 
     def _claim_warm_stream(self):
         with self._warm_stt_lock:
             stt = self._warm_stt
+            age = time.time() - self._warm_stt_connected_at
+            if stt is not None and age > 45.0:
+                self._log(f"[stream] warm stream stale ({age:.1f}s), discarding")
+                try:
+                    stt.close()
+                except Exception:
+                    pass
+                stt = None
             self._warm_stt = None
             self._warm_stt_connecting = False
             return stt
@@ -635,22 +664,19 @@ class BoloApp(rumps.App):
         self._silence_event.clear()
         self._chunk_time = time.time()
         self._transcript_state = TranscriptState()
+
+        # IMMEDIATELY give user feedback — don't wait for stream/context
+        self._play("Tink")
+        self.overlay.show()
+        self.overlay.update("listening", "")
+        self._set_session_phase("recording", session_id)
+
         self._stt = self._claim_warm_stream()
         if self._stt is not None:
             self._stream_connected_at = time.time()
             threading.Thread(target=self._drain_stream_transcripts, daemon=True).start()
         else:
-            self._stt = TelnyxStreamingSTT()
-            try:
-                self._stt.connect(TELNYX_API_KEY)
-                self._stream_connected_at = time.time()
-                threading.Thread(target=self._drain_stream_transcripts, daemon=True).start()
-            except Exception as e:
-                self._log(f"[stream] connect failed, falling back later: {e}")
-                self._transcript_state.stream_failed = True
-                self._transcript_state.stream_error = str(e)
-                self._transcript_state.done.set()
-                self._stt = None
+            threading.Thread(target=self._connect_stream_async, daemon=True).start()
         for attempt in range(3):
             try:
                 self.stream = sd.InputStream(
@@ -670,10 +696,35 @@ class BoloApp(rumps.App):
                 self.recording = False
             self._ensure_warm_stream()
             return
-        self._play("Tink")
-        self.overlay.show()
-        self.overlay.update("listening", "")
-        self._set_session_phase("recording", session_id)
+
+    def _connect_stream_async(self) -> None:
+        """Connect a fresh STT WebSocket in background; catch up with buffered audio."""
+        stt = TelnyxStreamingSTT()
+        try:
+            stt.connect(TELNYX_API_KEY)
+        except Exception as e:
+            self._log(f"[stream] async connect failed: {e}")
+            return
+        if not self.recording:
+            # Recording ended before we connected — discard
+            try:
+                stt.close()
+            except Exception:
+                pass
+            return
+        # Catch up: send audio frames already captured before stream was ready
+        with self.lock:
+            buffered = list(self.audio_frames)
+        if buffered:
+            try:
+                pcm = np.concatenate(buffered, axis=0).tobytes()
+                stt.send_audio(pcm)  # First call prepends WAV header automatically
+            except Exception:
+                pass
+        self._stt = stt
+        self._stream_connected_at = time.time()
+        self._log(f"[stream] async connected at +{int((time.time() - self._record_started_at)*1000)}ms")
+        threading.Thread(target=self._drain_stream_transcripts, daemon=True).start()
 
     def _watchdog_overlay_preview(self, _):
         if not self.recording:
@@ -724,11 +775,23 @@ class BoloApp(rumps.App):
             if not self.recording:
                 return
             self.recording = False
+            state_ref = self._transcript_state
+            if state_ref and state_ref.stop_requested_at is None:
+                state_ref.stop_requested_at = time.time()
             frames = list(self.audio_frames)
             stream = self.stream
             self.stream = None
 
         self._shutdown_stream_async(stream)
+
+        # Send silence padding so Deepgram's VAD can finalize the utterance
+        stt_for_padding = self._stt
+        if stt_for_padding is not None:
+            try:
+                stt_for_padding.send_audio(_SILENCE_PADDING)
+            except Exception:
+                pass
+
         self.icon = ICON_IDLE
         if self._set_session_phase("processing", session_id):
             self.overlay.update("processing", "")
@@ -753,8 +816,6 @@ class BoloApp(rumps.App):
 
         self.last_pipeline = time.time()
         state = self._transcript_state
-        if state:
-            state.stop_requested_at = time.time()
         wav = self._to_wav_bytes(audio)
         threading.Thread(
             target=self._pipeline, args=(wav, state, session_id), daemon=True).start()
@@ -797,35 +858,66 @@ class BoloApp(rumps.App):
         self._log(f"[pipeline] starting — audio RMS: {rms} ({'SILENT' if rms < 100 else 'OK'})")
         app_context = self._cleanup_context()
 
-        stream_preview = self._finalize_streaming_transcript(state)
         duration_seconds = max(0.0, (len(wav_bytes) - 44) / float(SAMPLE_RATE * CHANNELS * 2))
+
+        # Start batch in background immediately so it runs in parallel with stream drain
+        _executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        batch_future = _executor.submit(self._batch_transcribe, wav_bytes, state, duration_seconds)
+
+        # Drain stream (shorter 0.15s window)
+        stream_preview = self._finalize_streaming_transcript(state)
+
         stream_command = parse_command(stream_preview, correction_active=self._correction_active())
         if stream_command and duration_seconds <= 2.0:
             self._log(f"[command] using stream command fast path: {stream_command['kind']}")
+            batch_future.cancel()
+            _executor.shutdown(wait=False)
             if self._set_session_phase("final", session_id):
                 self.overlay.update("final", stream_command["display"])
             self._apply_command(stream_command, state)
             self._hide_overlay_after_delay(session_id=session_id)
             self._log_metrics(state, final_text=stream_command["display"])
             return
+
         use_stream = self._should_accept_stream_result(state, stream_preview, duration_seconds)
-        source = "stream"
-        transcript = stream_preview
-        if not use_stream:
-            transcript, source = self._batch_transcribe(wav_bytes, state, duration_seconds)
+
+        if use_stream:
+            # Stream won: cancel batch (best effort), use stream result
+            batch_future.cancel()
+            _executor.shutdown(wait=False)
+            transcript = stream_preview
+            source = "stream"
+        else:
+            # Batch was already running from t=0, just collect the result
+            _executor.shutdown(wait=False)
+            try:
+                batch_result = batch_future.result(timeout=9.0)
+                transcript = batch_result[0] if batch_result else ""
+                source = batch_result[1] if batch_result else "batch"
+            except Exception as e:
+                self._log(f"[pipeline] batch future failed: {e}")
+                transcript = stream_preview or ""
+                source = "stream_fallback"
+
+        if state:
+            state.final_source = source
+
+        self._log(
+            f"[pipeline] winner={source} stream_had_final={state.first_final_at is not None if state else False}"
+        )
+
         if not transcript and not use_stream:
             transcript = stream_preview
         if not transcript:
             return
-        if state:
-            state.final_source = source
 
-        if not use_stream and self._should_reconcile_long_form(stream_preview, transcript, duration_seconds):
-            reconciled = self._reconcile_transcripts(stream_preview, transcript, app_context, state)
-            if reconciled:
-                transcript = reconciled
-                if state:
-                    state.final_source = "batch+reconcile"
+        # Reconcile removed from critical path — batch nova-3 is accurate enough
+        # if not use_stream and self._should_reconcile_long_form(stream_preview, transcript, duration_seconds):
+        #     reconciled = self._reconcile_transcripts(stream_preview, transcript, app_context, state)
+        #     if reconciled:
+        #         transcript = reconciled
+        #         if state:
+        #             state.final_source = "batch+reconcile"
 
         transcript = self._canonicalize_known_terms(self._normalize_transcript_text(transcript))
         transcript = self._remove_fillers(transcript)
@@ -969,24 +1061,18 @@ class BoloApp(rumps.App):
         if word_count == 0:
             return False
 
-        if duration_seconds > 8.0:
+        if duration_seconds > 25.0:
             self._log(
                 f"[stream] rejected for long utterance duration_s={duration_seconds:.2f}"
             )
             return False
 
-        # For medium clips (3.5-8s), require more words to trust the stream result
-        # is not a partial. Short clips keep the looser 1.3x threshold.
-        if duration_seconds > 3.5:
-            min_words = int(duration_seconds * 1.5)
-        else:
-            min_words = max(1, int(duration_seconds * 1.3 + 0.999))
+        # If Deepgram sent a final, trust it — don't gate on word count
         if state and state.first_final_at is not None:
-            accepted = word_count >= min_words
             self._log(
-                f"[stream] final candidate words={word_count} min={min_words} duration_s={duration_seconds:.2f} accepted={accepted}"
+                f"[stream] final candidate words={word_count} duration_s={duration_seconds:.2f} accepted=True"
             )
-            return accepted
+            return True
 
         accepted = duration_seconds <= 0.9 and word_count >= 1
         self._log(
@@ -1029,6 +1115,26 @@ class BoloApp(rumps.App):
             return "", rate_limited
         except Exception as e:
             self._log(f"[stt exception] {e}")
+            # Retry once on transient network/SSL errors
+            try:
+                import time as _time
+                _time.sleep(0.3)
+                resp = requests.post(
+                    STT_ENDPOINT,
+                    headers={"Authorization": f"Bearer {TELNYX_API_KEY}"},
+                    files={"file": ("audio.wav", wav_bytes, "audio/wav")},
+                    data={
+                        "model": "deepgram/nova-3",
+                        "language": "en",
+                        "model_config": json.dumps({"smart_format": True, "punctuate": True}),
+                    },
+                    timeout=8,
+                )
+                if resp.status_code == 200:
+                    self._log("[stt] retry succeeded")
+                    return resp.json().get("text", "").strip(), False
+            except Exception as e2:
+                self._log(f"[stt retry failed] {e2}")
             raise
 
     def _batch_transcribe(self, wav_bytes, state=None, duration_seconds=0.0):
@@ -1446,6 +1552,8 @@ class BoloApp(rumps.App):
         up = CGEventCreateKeyboardEvent(None, 0, False)
         CGEventKeyboardSetUnicodeString(down, len(text), text)
         CGEventKeyboardSetUnicodeString(up, len(text), text)
+        CGEventSetFlags(down, 0)
+        CGEventSetFlags(up, 0)
         CGEventPost(kCGHIDEventTap, down)
         CGEventPost(kCGHIDEventTap, up)
 
@@ -1453,6 +1561,8 @@ class BoloApp(rumps.App):
         for _ in range(max(0, count)):
             down = CGEventCreateKeyboardEvent(None, DELETE_KEYCODE, True)
             up = CGEventCreateKeyboardEvent(None, DELETE_KEYCODE, False)
+            CGEventSetFlags(down, 0)
+            CGEventSetFlags(up, 0)
             CGEventPost(kCGHIDEventTap, down)
             CGEventPost(kCGHIDEventTap, up)
 
