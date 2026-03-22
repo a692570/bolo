@@ -3,13 +3,21 @@
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
 LOCK_DIR=/tmp/bolo-supervisor.lock
+PID_FILE=/tmp/bolo-supervisor.pid
 
-# Kill existing supervisor and bolo processes
+# Kill existing supervisor loop by saved PID
+if [ -f "$PID_FILE" ]; then
+    OLD_PID=$(cat "$PID_FILE")
+    kill "$OLD_PID" 2>/dev/null || true
+    rm -f "$PID_FILE"
+fi
+
+# Kill any remaining bolo processes
 pkill -f "bolo.py" 2>/dev/null || true
 pkill -f "overlay.py" 2>/dev/null || true
 
-# Remove stale supervisor lock so start-bolo.command can acquire it
-rmdir "$LOCK_DIR" 2>/dev/null || true
+# Remove stale lock
+rmdir "$LOCK_DIR" 2>/dev/null || rm -rf "$LOCK_DIR" 2>/dev/null || true
 
 sleep 1
 
@@ -23,4 +31,6 @@ sleep 1
     done
 ) &
 
-echo "[bolo] restarted (supervisor PID $!)"
+SUP_PID=$!
+echo "$SUP_PID" > "$PID_FILE"
+echo "[bolo] restarted (supervisor PID $SUP_PID)"

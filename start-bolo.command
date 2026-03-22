@@ -5,6 +5,7 @@
 
 BOLO_DIR=/Users/abhisheksharma/bolo
 LOCK_DIR=/tmp/bolo-supervisor.lock
+PID_FILE=/tmp/bolo-supervisor.pid
 
 # Prevent duplicate supervisors
 if mkdir "$LOCK_DIR" 2>/dev/null; then
@@ -27,6 +28,8 @@ sleep 1
     done
 ) &
 
-echo "[bolo] supervisor started (PID $!)"
+SUP_PID=$!
+echo "$SUP_PID" > "$PID_FILE"
+echo "[bolo] supervisor started (PID $SUP_PID)"
 sleep 1
 exit 0
