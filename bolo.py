@@ -142,11 +142,13 @@ RECONCILE_PROMPT = (
 )
 
 KNOWN_TERM_PATTERNS = (
-    (re.compile(r"\bwhisper flow\b|\bwhisper of four\b", re.IGNORECASE), "Wispr Flow"),
+    (re.compile(r"\bwhisper flow\b|\bwhisper of four\b|\bwisper flow\b|\bvoisei\b|\bvoisey\b", re.IGNORECASE), "Wispr Flow"),
     (re.compile(r"\btelnyx\b|\btelenix\b|\btennis\b|\btennix\b", re.IGNORECASE), "Telnyx"),
     (re.compile(r"\bbolo\b|\bbollo\b", re.IGNORECASE), "Bolo"),
     (re.compile(r"\bremotion\b|\bemotion\b|\bemotions\b|\bmotion\b", re.IGNORECASE), "Remotion"),
     (re.compile(r"\bgrokwise\b|\bcrocawise\b|\bgrok wise\b|\bcroca wise\b", re.IGNORECASE), "Grokwise"),
+    (re.compile(r"\bnova[ -]three\b|\bnova 3\b", re.IGNORECASE), "nova-3"),
+    (re.compile(r"\bquen\b|\bqueue when\b|\bkyuen\b|\bkwan\b", re.IGNORECASE), "Qwen"),
 )
 
 # ── Bolo app ──────────────────────────────────────────────────────────────────
