@@ -12,7 +12,8 @@ if [ -f "$PID_FILE" ]; then
     rm -f "$PID_FILE"
 fi
 
-# Kill any remaining bolo processes
+# Kill any remaining bolo processes AND their parent supervisor loops
+pgrep -f "bolo.py" | xargs -I{} ps -o ppid= -p {} 2>/dev/null | sort -u | xargs kill 2>/dev/null || true
 pkill -f "bolo.py" 2>/dev/null || true
 pkill -f "overlay.py" 2>/dev/null || true
 
