@@ -27,8 +27,9 @@ sleep 1
     mkdir "$LOCK_DIR" 2>/dev/null || true
     while true; do
         python3 "$DIR/bolo.py" >> /tmp/bolo.log 2>&1
-        echo "[bolo] crashed -- restarting in 3s" >> /tmp/bolo.log
-        sleep 3
+        echo "[bolo] crashed -- restarting in 5s" >> /tmp/bolo.log
+        pkill -f "bolo.py" 2>/dev/null || true
+        sleep 5
     done
 ) &
 
