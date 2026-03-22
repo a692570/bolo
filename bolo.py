@@ -126,10 +126,13 @@ SYSTEM_PROMPT = (
     "Do not rewrite meaning. Do not summarize. Do not add or remove claims. "
     "Preserve wording, filler, and structure unless a tiny punctuation or capitalization change is clearly needed. "
     "If the input is already good, return it unchanged. "
-    "Also fix these known brand name misrecognitions when obvious: "
-    "'whisper flow' or close variants -> 'Wispr Flow'; "
+    "Also fix these known brand name and term misrecognitions when context makes them obvious: "
+    "'whisper flow', 'wisper flow', 'Voisei', or 'Voisey' -> 'Wispr Flow'; "
     "'telnyx' or close variants -> 'Telnyx'; "
-    "'bolo' -> 'Bolo'. "
+    "'bolo' -> 'Bolo'; "
+    "'remotion', 'emotion', 'emotions' (when referring to a framework) -> 'Remotion'; "
+    "'nova three' or 'nova 3' (when referring to a model) -> 'nova-3'; "
+    "'Quen', 'Queue When', or 'Kyuen' (when referring to the AI model) -> 'Qwen'. "
     "Output only the cleaned transcript."
 )
 
