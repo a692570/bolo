@@ -100,6 +100,7 @@ STREAM_DRAIN_SECONDS = 0.25
 LLM_CLEANUP_MODE = _load_env_value("BOLO_LLM_CLEANUP").strip().lower() or "auto"
 DELETE_KEYCODE = 51
 RATE_LIMIT_BACKOFF_SECONDS = 45.0
+MAX_RECORDING_SECONDS = 90.0  # force-stop if stuck recording longer than this
 
 BASE_DIR         = os.path.dirname(os.path.abspath(__file__))
 ICON_IDLE        = os.path.join(BASE_DIR, "icon_idle.png")
@@ -218,6 +219,7 @@ class BoloApp(rumps.App):
         rumps.Timer(self._process_key_events, 0.02).start()
         rumps.Timer(self._watchdog_tap, 2).start()
         rumps.Timer(self._watchdog_overlay_preview, 0.5).start()
+        rumps.Timer(self._watchdog_recording, 5).start()
         self._ensure_warm_stream()
 
     def _begin_session(self):
@@ -466,6 +468,17 @@ class BoloApp(rumps.App):
         if self._overlay_hide_timer is not None:
             self._overlay_hide_timer.cancel()
             self._overlay_hide_timer = None
+
+        # Rate limit check -- give user feedback instead of silently ignoring
+        backoff_remaining = self._rate_limit_backoff_until - time.time()
+        if backoff_remaining > 0:
+            self._play("Basso")
+            wait_sec = int(backoff_remaining) + 1
+            self.overlay.show()
+            self.overlay.update("error", f"Rate limited - wait {wait_sec}s")
+            self._hide_overlay_after_delay(1.5)
+            return
+
         with self.lock:
             if self.recording:
                 return
@@ -535,6 +548,17 @@ class BoloApp(rumps.App):
             return
         self._overlay_stall_notice_shown = True
         self.overlay.update("listening", "Still listening...")
+
+    def _watchdog_recording(self, _):
+        if not self.recording:
+            return
+        elapsed = time.time() - self._record_started_at
+        if elapsed < MAX_RECORDING_SECONDS:
+            return
+        # Only force-stop if the key is genuinely not held — avoids cutting off long voice notes
+        if not self._is_right_option_down():
+            self._log(f"[watchdog] recording stuck for {elapsed:.0f}s, key not held — force-stopping")
+            self._stop_recording()
 
     def _shutdown_stream_async(self, stream):
         if stream is None:
@@ -821,6 +845,10 @@ class BoloApp(rumps.App):
     def _batch_transcribe_request(self, wav_bytes):
         self._log("[stt] using batch fallback")
         try:
+            vocab_terms = VOCAB_STORE.terms()
+            model_config = {"smart_format": True, "punctuate": True}
+            if vocab_terms:
+                model_config["keywords"] = vocab_terms[:50]
             resp = requests.post(
                 STT_ENDPOINT,
                 headers={"Authorization": f"Bearer {TELNYX_API_KEY}"},
@@ -828,7 +856,7 @@ class BoloApp(rumps.App):
                 data={
                     "model": "deepgram/nova-3",
                     "language": "en",
-                    "model_config": json.dumps({"smart_format": True, "punctuate": True}),
+                    "model_config": json.dumps(model_config),
                 },
                 timeout=8,
             )
