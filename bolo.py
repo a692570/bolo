@@ -8,9 +8,11 @@ import io
 import json
 import os
 import re
+import signal
 import subprocess
 import threading
 import time
+import traceback
 import wave
 
 import collections
@@ -160,6 +162,9 @@ KNOWN_TERM_PATTERNS = (
     (re.compile(r"\bgrokwise\b|\bcrocawise\b|\bgrok wise\b|\bcroca wise\b", re.IGNORECASE), "Grokwise"),
     (re.compile(r"\bnova[ -]three\b|\bnova 3\b", re.IGNORECASE), "nova-3"),
     (re.compile(r"\bquen\b|\bqueue when\b|\bkyuen\b|\bkwan\b", re.IGNORECASE), "Qwen"),
+    (re.compile(r"\bsonne\b|\bsonet\b|\bsonnet\b", re.IGNORECASE), "Sonnet"),
+    (re.compile(r"\bkimi\s*k\s*2\.?5\b|\bkimi\s*k2\.?5\b", re.IGNORECASE), "Kimi K2.5"),
+    (re.compile(r"\bclaude\s+sony\b|\bclaude\s+sonne\b|\bclaude\s+sonet\b", re.IGNORECASE), "Claude Sonnet"),
 )
 
 # Filler patterns applied as a pre-LLM cleanup pass.
@@ -1482,6 +1487,15 @@ if __name__ == "__main__":
         print("Get a free key at https://telnyx.com and add to your shell:")
         print('  export TELNYX_API_KEY="your_key_here"')
         sys.exit(1)
+    def _crash_handler(signum, frame):
+        print(f"[crash] received signal {signum}", flush=True)
+        traceback.print_stack(frame)
+    for _sig in (signal.SIGABRT, signal.SIGBUS, signal.SIGSEGV):
+        try:
+            signal.signal(_sig, _crash_handler)
+        except (OSError, ValueError):
+            pass
+
     from AppKit import NSApplication, NSApplicationActivationPolicyAccessory
     NSApplication.sharedApplication().setActivationPolicy_(
         NSApplicationActivationPolicyAccessory)
