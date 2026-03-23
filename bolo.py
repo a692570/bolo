@@ -5,6 +5,7 @@ Hold Right Option anywhere to dictate. Release to transcribe and inject.
 """
 
 import concurrent.futures
+import datetime
 import io
 import json
 import os
@@ -100,7 +101,7 @@ LLM_ENDPOINT   = "https://api.telnyx.com/v2/ai/chat/completions"
 SAMPLE_RATE    = 16000
 CHANNELS       = 1
 CORRECTION_WINDOW_SECONDS = 3.0
-STREAM_DRAIN_SECONDS = 0.15
+STREAM_DRAIN_SECONDS = 0.35
 _SILENCE_PADDING = bytes(int(16000 * 0.35 * 2))  # 350ms of silence at 16kHz mono 16-bit
 LLM_CLEANUP_MODE = _load_env_value("BOLO_LLM_CLEANUP").strip().lower() or "auto"
 DELETE_KEYCODE = 51
@@ -118,6 +119,7 @@ ICON_REC         = os.path.join(BASE_DIR, "icon_recording.png")
 CORRECTIONS_FILE = os.path.expanduser("~/.bolo_corrections.json")
 BUILT_IN_VOCAB_FILE = os.path.join(BASE_DIR, "vocabulary.json")
 USER_VOCAB_FILE = os.path.expanduser("~/.bolo_vocabulary.json")
+BOLO_METRICS_FILE = os.path.expanduser("~/.bolo/metrics.jsonl")
 CORRECTION_STORE = CorrectionStore(CORRECTIONS_FILE)
 VOCAB_STORE = VocabularyStore(BUILT_IN_VOCAB_FILE, USER_VOCAB_FILE)
 CODE_APPS = {
@@ -563,6 +565,7 @@ class BoloApp(rumps.App):
             if self.recording:
                 # Spurious key-down while already recording — ignore to prevent state reset
                 self._log("[key] spurious Right Option down while recording — ignored")
+                self._ropt_held = True  # still track so release is recognized
                 return event
             self._ropt_held = True
             self._last_press_at = time.time()
@@ -1605,6 +1608,54 @@ class BoloApp(rumps.App):
             "stream_failed": state.stream_failed,
         }
         self._log(f"[metrics] {json.dumps(metrics, sort_keys=True)}")
+
+        # Derive the fields required for persistent metrics and write off the hot path.
+        source = state.final_source or ""
+        if "stream" in source:
+            stt_provider = "deepgram_stream"
+        elif "batch+chunked" in source:
+            stt_provider = "deepgram_batch_chunked"
+        elif "batch" in source:
+            stt_provider = "deepgram_batch"
+        else:
+            stt_provider = source or "unknown"
+
+        # End-to-end latency: key press to text injected.
+        # record_ms covers press->release; release_to_final_ms covers release->inject.
+        e2e_ms = None
+        if record_ms is not None and metrics.get("release_to_final_ms") is not None:
+            e2e_ms = record_ms + metrics["release_to_final_ms"]
+        elif record_ms is not None:
+            e2e_ms = record_ms
+
+        audio_duration_ms = int(record_ms) if record_ms is not None else None
+
+        persistent = {
+            "ts": datetime.datetime.utcnow().isoformat() + "Z",
+            "latency_ms": e2e_ms,
+            "audio_duration_ms": audio_duration_ms,
+            "stt_provider": stt_provider,
+            "stt_success": bool(final_text),
+            "inject_success": bool(final_text),
+            "word_count": final_words,
+            "error": "rate_limited" if state.rate_limited else (
+                "stream_failed" if state.stream_failed else None
+            ),
+        }
+        threading.Thread(
+            target=self._persist_metrics, args=(persistent,), daemon=True
+        ).start()
+
+    def _persist_metrics(self, record: dict):
+        """Append one JSONL record to ~/.bolo/metrics.jsonl (called from background thread)."""
+        try:
+            metrics_dir = os.path.dirname(BOLO_METRICS_FILE)
+            os.makedirs(metrics_dir, exist_ok=True)
+            line = json.dumps(record, separators=(",", ":")) + "\n"
+            with open(BOLO_METRICS_FILE, "a", encoding="utf-8") as fh:
+                fh.write(line)
+        except Exception as e:
+            self._log(f"[metrics] failed to persist record: {e}")
 
     def _remember_result(self, text):
         self.last_result = text
