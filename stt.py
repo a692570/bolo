@@ -11,7 +11,8 @@ import json
 import queue
 import struct
 import threading
-from typing import Optional, Tuple
+import urllib.parse
+from typing import List, Optional, Tuple
 
 
 # ── SilenceDetector ───────────────────────────────────────────────────────────
@@ -173,15 +174,22 @@ class TelnyxStreamingSTT:
         self._connect_error: Optional[Exception] = None
         self._first_chunk_sent = False
         self._api_key: str = ""
+        self._keywords: List[str] = []
 
     # ── Public API ────────────────────────────────────────────────────────────
 
-    def connect(self, api_key: str) -> None:
+    def connect(self, api_key: str, keywords: Optional[List[str]] = None) -> None:
         """
         Open a WebSocket connection in a background thread.
         Blocks until the connection is established (or raises on failure).
+
+        Args:
+            api_key:  Telnyx API key.
+            keywords: Optional list of vocabulary terms to boost recognition of.
+                      Passed to Deepgram as repeated `keywords=term` query params.
         """
         self._api_key = api_key
+        self._keywords = list(keywords) if keywords else []
         self._first_chunk_sent = False
         self._connect_error = None
         self._connected.clear()
@@ -269,8 +277,20 @@ class TelnyxStreamingSTT:
         headers = {"Authorization": f"Bearer {self._api_key}"}
         self._send_queue = asyncio.Queue()
 
+        # Build endpoint URL, appending keyword hints for Deepgram if provided.
+        # Each term becomes a separate `keywords=<term>` query param (no boost suffix
+        # means Deepgram uses its default boost of 1).  Cap at 30 terms to keep the
+        # URL well within server limits.
+        endpoint = _WS_ENDPOINT
+        if self._keywords:
+            kw_params = "&".join(
+                "keywords=" + urllib.parse.quote(term, safe="")
+                for term in self._keywords[:30]
+            )
+            endpoint = f"{_WS_ENDPOINT}&{kw_params}"
+
         try:
-            async with websockets.connect(_WS_ENDPOINT, additional_headers=headers) as ws:
+            async with websockets.connect(endpoint, additional_headers=headers) as ws:
                 self._ws = ws
                 self._connected.set()
 

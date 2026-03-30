@@ -8,6 +8,7 @@ import concurrent.futures
 import datetime
 import io
 import json
+import logging
 import os
 import re
 import signal
@@ -30,6 +31,8 @@ from transcript_state import TranscriptState, longest_common_prefix, merge_trans
 from vocabulary import VocabularyStore
 
 from AppKit import (
+    NSEvent,
+    NSEventMaskFlagsChanged,
     NSPasteboard,
     NSPasteboardTypeString,
     NSWorkspace,
@@ -41,31 +44,35 @@ from Quartz import (
     CGEventPost,
     CGEventSetFlags,
     CGEventSourceFlagsState,
-    CGEventTapCreate,
-    CGEventTapEnable,
-    CGEventGetFlags,
-    CFMachPortCreateRunLoopSource,
-    CFRunLoopAddSource,
-    CFRunLoopGetCurrent,
-    CFRunLoopRun,
-    CFRunLoopStop,
-    kCFRunLoopDefaultMode,
-    kCGSessionEventTap,
-    kCGHeadInsertEventTap,
     kCGHIDEventTap,
     kCGEventSourceStateCombinedSessionState,
-    kCGEventTapOptionListenOnly,
-    kCGEventFlagsChanged,
 )
 import HIServices
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+
+_LOG_FILE = "/tmp/bolo.log"
+_log_handler = logging.FileHandler(_LOG_FILE, encoding="utf-8")
+_log_handler.setFormatter(logging.Formatter("%(asctime)s %(message)s", datefmt="%Y-%m-%dT%H:%M:%S"))
+_console_handler = logging.StreamHandler()
+_console_handler.setFormatter(logging.Formatter("%(message)s"))
+_logger = logging.getLogger("bolo")
+_logger.setLevel(logging.DEBUG)
+_logger.addHandler(_log_handler)
+_logger.addHandler(_console_handler)
+_logger.propagate = False
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
 def _load_env_value(name: str) -> str:
-    value = os.environ.get(name, "").strip()
-    if value:
-        return value
+    """Load a config value.
 
+    Priority (highest first):
+      1. ~/.codex/.env — authoritative on-disk source; always wins so that
+         stale shell env vars (from a previous session) cannot shadow the key.
+      2. os.environ — useful for CI/test overrides when .codex/.env is absent.
+      3. ~/.zshrc — last-resort fallback.
+    """
     env_file = os.path.expanduser("~/.codex/.env")
     if os.path.exists(env_file):
         try:
@@ -76,9 +83,15 @@ def _load_env_value(name: str) -> str:
                         continue
                     key, raw = line.split("=", 1)
                     if key.strip() == name:
-                        return raw.strip().strip("\"'")
+                        val = raw.strip().strip("\"'")
+                        if val:
+                            return val
         except OSError:
             pass
+
+    value = os.environ.get(name, "").strip()
+    if value:
+        return value
 
     shell_file = os.path.expanduser("~/.zshrc")
     if os.path.exists(shell_file):
@@ -95,9 +108,38 @@ def _load_env_value(name: str) -> str:
     return ""
 
 
-TELNYX_API_KEY = _load_env_value("TELNYX_API_KEY")
-STT_ENDPOINT   = "https://api.telnyx.com/v2/ai/audio/transcriptions"
-LLM_ENDPOINT   = "https://api.telnyx.com/v2/ai/chat/completions"
+TELNYX_API_KEY  = _load_env_value("TELNYX_API_KEY")
+_LITELLM_BASE   = _load_env_value("LITELLM_BASE") or ""
+_LITELLM_KEY    = _load_env_value("LITELLM_KEY") or ""
+
+STT_ENDPOINT    = "https://api.telnyx.com/v2/ai/audio/transcriptions"
+_TELNYX_LLM_ENDPOINT = "https://api.telnyx.com/v2/ai/chat/completions"
+
+
+def _llm_endpoint() -> str:
+    """Return the LLM chat-completions URL. Prefer LiteLLM proxy when available."""
+    if _LITELLM_BASE:
+        base = _LITELLM_BASE.rstrip("/")
+        if not base.endswith("/v1"):
+            base = base + "/v1"
+        return f"{base}/chat/completions"
+    return _TELNYX_LLM_ENDPOINT
+
+
+def _llm_headers() -> dict:
+    """Return Authorization headers for the active LLM backend."""
+    if _LITELLM_BASE and _LITELLM_KEY:
+        return {"Authorization": f"Bearer {_LITELLM_KEY}", "Content-Type": "application/json"}
+    return {"Authorization": f"Bearer {TELNYX_API_KEY}", "Content-Type": "application/json"}
+
+
+def _llm_model() -> str:
+    """Return model ID appropriate for the active backend."""
+    if _LITELLM_BASE:
+        return "MiniMax-M2.5-drop"
+    return "Qwen/Qwen3-235B-A22B"
+
+
 SAMPLE_RATE    = 16000
 CHANNELS       = 1
 CORRECTION_WINDOW_SECONDS = 3.0
@@ -132,6 +174,38 @@ CODE_APPS = {
     "Warp",
 }
 
+# STT prompt limit: Whisper uses a 224-token window; 4 chars/token is a safe approximation.
+_STT_PROMPT_MAX_CHARS = 224 * 4
+
+
+def build_stt_prompt(vocab_terms: list, context_text: str = "") -> str:
+    """
+    Build a short STT hint string for the Telnyx/Whisper `prompt` parameter.
+
+    Proper nouns and domain terms are listed first (highest leverage), followed
+    by a tail of the active text-field context so the model continues in the
+    right register.  The result is capped at _STT_PROMPT_MAX_CHARS to stay
+    within Whisper's 224-token prompt window.
+
+    Returns an empty string when there is nothing useful to inject.
+    """
+    parts = []
+
+    if vocab_terms:
+        # Comma-separated list of recognised terms
+        parts.append(", ".join(vocab_terms))
+
+    if context_text:
+        # Append the last 120 chars of the active field — enough for register
+        # continuity without blowing the token budget.
+        tail = context_text.strip()[-120:]
+        if tail:
+            parts.append(tail)
+
+    prompt = ". ".join(parts) if parts else ""
+    return prompt[:_STT_PROMPT_MAX_CHARS]
+
+
 SYSTEM_PROMPT = (
     "You are a transcription formatter. "
     "Your only job is to apply minimal capitalization and punctuation fixes to a raw speech transcript. "
@@ -152,6 +226,39 @@ SYSTEM_PROMPT = (
     "'Quen', 'Queue When', or 'Kyuen' (when referring to the AI model) -> 'Qwen'. "
     "Output only the cleaned transcript."
 )
+
+_CLEANUP_PROMPT_SLACK = (
+    "You are a transcription formatter for a casual chat message. "
+    "Fix obvious errors, remove filler words (um, uh, you know, like), and apply light punctuation. "
+    "Keep contractions (don't, I'm, it's). Do NOT add formal punctuation or restructure sentences. "
+    "Keep the tone casual and conversational. Output only the cleaned text."
+)
+
+_CLEANUP_PROMPT_MAIL = (
+    "You are a transcription formatter for an email message. "
+    "Fix grammar, apply proper sentence punctuation, remove filler words (um, uh, you know, kind of, sort of). "
+    "Use full sentences with correct capitalization. Maintain a professional but natural tone. "
+    "Do not add or remove content. Output only the cleaned text."
+)
+
+_CLEANUP_PROMPT_NOTES = (
+    "You are a transcription formatter for a notes or document app. "
+    "Fix grammar and punctuation. Remove filler words. "
+    "If the text appears to be a list or contains bullet-point structure, preserve that structure. "
+    "Apply light formatting improvements without changing meaning. Output only the cleaned text."
+)
+
+
+def _build_cleanup_prompt(app_name: str) -> str:
+    """Return the system prompt variant appropriate for the given app."""
+    name = (app_name or "").lower()
+    if any(k in name for k in ("slack", "messages", "discord", "whatsapp", "telegram")):
+        return _CLEANUP_PROMPT_SLACK
+    if any(k in name for k in ("mail", "gmail", "outlook", "spark")):
+        return _CLEANUP_PROMPT_MAIL
+    if any(k in name for k in ("notes", "notion", "obsidian", "bear", "craft", "docs", "word")):
+        return _CLEANUP_PROMPT_NOTES
+    return SYSTEM_PROMPT
 
 RECONCILE_PROMPT = (
     "You reconcile two speech transcripts of the same utterance. "
@@ -241,6 +348,7 @@ class BoloApp(rumps.App):
         self._warm_stt_lock = threading.Lock()
         self._warm_stt_connecting = False
         self._warm_stt_connected_at: float = 0.0
+        self._stream_auth_failed = False  # set on first 401; blocks all warm retries
         self._silence        = SilenceDetector()
         self._silence_event  = threading.Event()
         self._chunk_time     = time.time()
@@ -253,16 +361,12 @@ class BoloApp(rumps.App):
         self._current_context = ""
         self._context_aware = True
         self._ropt_held = False
-        self._tap_loop  = None
-        self._tap_ref   = None
-        self._key_event = None  # "press" or "release" set by callback
-        self._tap_heartbeat = 0
-        self._tap_last_heartbeat = 0
-        self._tap_thread_obj = None
+        self._ns_monitor = None
+        self._key_event = None  # "press" or "release" set by handler
         self._last_press_at = 0.0
 
-        # Start global hotkey listener via CGEventTap (no pynput)
-        self._start_event_tap()
+        # Start global hotkey listener via NSEvent (never disabled by macOS)
+        self._start_nsevent_monitor()
         # Poll key events and watchdog on main thread
         rumps.Timer(self._process_key_events, 0.02).start()
         rumps.Timer(self._watchdog_tap, 2).start()
@@ -410,7 +514,7 @@ class BoloApp(rumps.App):
             wf.writeframes(audio.tobytes())
         return buf.getvalue()
 
-    # ── Hotkey (CGEventTap) ────────────────────────────────────────────────
+    # ── Hotkey (NSEvent global monitor) ───────────────────────────────────
 
     # Right Option = NX_DEVICERALTKEYMASK (bit 6 of device-dep flags)
     _NX_DEVICERALTKEYMASK = 0x00000040
@@ -478,24 +582,17 @@ class BoloApp(rumps.App):
                 self._stop_recording()
 
     def _watchdog_tap(self, _):
-        if self._tap_thread_obj is not None and not self._tap_thread_obj.is_alive():
-            self._log("[tap] thread died — restarting tap thread")
-            self._restart_event_tap()
-            return
+        # NSEvent monitors are never disabled by macOS — just log if monitor was lost.
+        if self._ns_monitor is None:
+            self._log("[tap] NSEvent monitor is None — re-registering")
+            self._start_nsevent_monitor()
 
-        if self._tap_ref is not None:
-            from Quartz import CGEventTapIsEnabled
-            if not CGEventTapIsEnabled(self._tap_ref):
-                self._log("[tap] was disabled by macOS — re-enabling")
-                CGEventTapEnable(self._tap_ref, True)
-            return
+    def _start_nsevent_monitor(self):
+        """Register an NSEvent global monitor for flagsChanged events.
 
-        if self._tap_last_heartbeat and time.time() - self._tap_last_heartbeat > 5:
-            self._log("[tap] no active tap after 5s — restarting")
-            self._restart_event_tap()
-
-    def _start_event_tap(self):
-        """Create a CGEventTap for flagsChanged events on a background thread."""
+        NSEvent monitors are never disabled by macOS (unlike CGEventTap),
+        so no watchdog re-enable loop is needed.
+        """
         if not HIServices.AXIsProcessTrusted():
             self._log(
                 "[accessibility] NOT TRUSTED. Open System Settings > "
@@ -505,60 +602,18 @@ class BoloApp(rumps.App):
                 {HIServices.kAXTrustedCheckOptionPrompt: True}
             )
 
-        self._tap_heartbeat = 0
-        self._tap_last_heartbeat = time.time()
-        t = threading.Thread(target=self._tap_thread, daemon=True)
-        t.start()
-        self._tap_thread_obj = t
-
-    def _restart_event_tap(self):
-        """Kill and restart the event tap thread."""
-        if self._tap_loop is not None:
-            try:
-                CFRunLoopStop(self._tap_loop)
-            except Exception:
-                pass
-        self._tap_ref = None
-        self._tap_loop = None
-        self._tap_heartbeat = 0
-        self._tap_last_heartbeat = time.time()
-        self._ropt_held = False
-        t = threading.Thread(target=self._tap_thread, daemon=True)
-        t.start()
-        self._tap_thread_obj = t
-
-    def _tap_thread(self):
-        """Background thread running the CGEventTap run loop."""
-        mask = 1 << kCGEventFlagsChanged
-
-        tap = CGEventTapCreate(
-            kCGSessionEventTap,
-            kCGHeadInsertEventTap,
-            kCGEventTapOptionListenOnly,
-            mask,
-            self._flags_callback,
-            None,
+        self._ns_monitor = NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(
+            NSEventMaskFlagsChanged,
+            self._nsevent_flags_handler,
         )
-        if tap is None:
-            self._log(
-                "[tap] CGEventTapCreate returned None. "
-                "Accessibility permission not granted for this process."
-            )
-            return
+        if self._ns_monitor is None:
+            self._log("[tap] NSEvent monitor creation failed — Accessibility not granted?")
+        else:
+            self._log("[tap] NSEvent global monitor active, listening for Right Option")
 
-        source = CFMachPortCreateRunLoopSource(None, tap, 0)
-        self._tap_loop = CFRunLoopGetCurrent()
-        CFRunLoopAddSource(self._tap_loop, source, kCFRunLoopDefaultMode)
-        CGEventTapEnable(tap, True)
-        self._tap_ref = tap
-        self._tap_heartbeat = time.time()
-        self._log("[tap] CGEventTap active, listening for Right Option")
-        CFRunLoopRun()
-
-    def _flags_callback(self, proxy, event_type, event, refcon):
-        """Called on every modifier flag change — must return instantly."""
-        self._tap_heartbeat = time.time()
-        flags = CGEventGetFlags(event)
+    def _nsevent_flags_handler(self, event):
+        """Called on every modifier flag change via NSEvent global monitor."""
+        flags = event.modifierFlags()
         ropt_down = bool(flags & self._NX_DEVICERALTKEYMASK)
 
         if ropt_down and not self._ropt_held:
@@ -566,7 +621,7 @@ class BoloApp(rumps.App):
                 # Spurious key-down while already recording — ignore to prevent state reset
                 self._log("[key] spurious Right Option down while recording — ignored")
                 self._ropt_held = True  # still track so release is recognized
-                return event
+                return
             self._ropt_held = True
             self._last_press_at = time.time()
             self._key_event = "press"
@@ -574,14 +629,14 @@ class BoloApp(rumps.App):
             self._ropt_held = False
             self._key_event = "release"
 
-        return event
-
     # ── Record ────────────────────────────────────────────────────────────────
 
     def _play(self, sound):
         subprocess.Popen(["afplay", f"/System/Library/Sounds/{sound}.aiff"])
 
     def _ensure_warm_stream(self):
+        if self._stream_auth_failed:
+            return  # API key is bad — don't hammer the endpoint
         with self._warm_stt_lock:
             if self.recording or self._stt or self._warm_stt or self._warm_stt_connecting:
                 return
@@ -591,9 +646,15 @@ class BoloApp(rumps.App):
     def _warm_stream_worker(self):
         stt = TelnyxStreamingSTT()
         try:
-            stt.connect(TELNYX_API_KEY)
+            stt.connect(TELNYX_API_KEY, keywords=VOCAB_STORE.terms())
         except Exception as e:
+            err_msg = str(e)
             self._log(f"[stream] warm connect failed: {e}")
+            if "401" in err_msg or "Unauthorized" in err_msg or "auth" in err_msg.lower():
+                self._stream_auth_failed = True
+                self._rate_limit_backoff_until = time.time() + 86400.0
+                self._log("[stream] 401 auth failure — disabling stream. Fix API key and restart.")
+                self._show_error("Invalid API key — check ~/.codex/.env")
             with self._warm_stt_lock:
                 self._warm_stt_connecting = False
             return
@@ -631,13 +692,16 @@ class BoloApp(rumps.App):
             self._overlay_hide_timer.cancel()
             self._overlay_hide_timer = None
 
-        # Rate limit check -- give user feedback instead of silently ignoring
+        # Backoff / auth-failure check — give user feedback instead of silently ignoring
         backoff_remaining = self._rate_limit_backoff_until - time.time()
         if backoff_remaining > 0:
             self._play("Basso")
-            wait_sec = int(backoff_remaining) + 1
             self.overlay.show()
-            self.overlay.update("error", f"Rate limited - wait {wait_sec}s")
+            if self._stream_auth_failed:
+                self.overlay.update("error", "Invalid API key — restart required")
+            else:
+                wait_sec = int(backoff_remaining) + 1
+                self.overlay.update("error", f"Rate limited - wait {wait_sec}s")
             self._hide_overlay_after_delay(1.5)
             return
 
@@ -704,9 +768,15 @@ class BoloApp(rumps.App):
         """Connect a fresh STT WebSocket in background; catch up with buffered audio."""
         stt = TelnyxStreamingSTT()
         try:
-            stt.connect(TELNYX_API_KEY)
+            stt.connect(TELNYX_API_KEY, keywords=VOCAB_STORE.terms())
         except Exception as e:
+            err_msg = str(e)
             self._log(f"[stream] async connect failed: {e}")
+            if "401" in err_msg or "Unauthorized" in err_msg or "auth" in err_msg.lower():
+                self._stream_auth_failed = True
+                self._rate_limit_backoff_until = time.time() + 86400.0
+                self._log("[stream] 401 auth failure — disabling stream. Fix API key and restart.")
+                self._show_error("Invalid API key — check ~/.codex/.env")
             return
         if not self.recording:
             # Recording ended before we connected — discard
@@ -724,7 +794,8 @@ class BoloApp(rumps.App):
                 stt.send_audio(pcm)  # First call prepends WAV header automatically
             except Exception:
                 pass
-        self._stt = stt
+        with self.lock:
+            self._stt = stt
         self._stream_connected_at = time.time()
         self._log(f"[stream] async connected at +{int((time.time() - self._record_started_at)*1000)}ms")
         threading.Thread(target=self._drain_stream_transcripts, daemon=True).start()
@@ -826,7 +897,7 @@ class BoloApp(rumps.App):
     # ── Pipeline ──────────────────────────────────────────────────────────────
 
     def _log(self, msg):
-        print(msg, flush=True)
+        _logger.info(msg)
 
     def _pipeline(self, wav_bytes, state, session_id):
         def _timeout_watchdog():
@@ -942,12 +1013,10 @@ class BoloApp(rumps.App):
             return
 
         result = transcript
-        if self._should_run_cleanup(transcript, app_context, duration_seconds):
-            cleaned = self._cleanup_transcript(transcript, app_context, state)
-            if cleaned:
-                result = cleaned
-                if state:
-                    state.final_source = f"{state.final_source}+cleanup" if state.final_source else "cleanup"
+        run_async_cleanup = (
+            not (state and state.correction_target)
+            and self._should_run_cleanup(transcript, app_context, duration_seconds)
+        )
 
         result = result.strip()
         if not result:
@@ -980,6 +1049,14 @@ class BoloApp(rumps.App):
         self._hide_overlay_after_delay(session_id=session_id)
         self._log_metrics(state, final_text=result)
         self._log(f"[done] injected and popped")
+
+        # Async LLM cleanup: log only, no in-place replacement (disabled — fires into wrong window)
+        if run_async_cleanup:
+            raw_for_cleanup = result
+            threading.Thread(
+                target=lambda: self._cleanup_transcript(raw_for_cleanup, app_context, state),
+                daemon=True,
+            ).start()
 
     def _learn_correction(self, old_text, new_text):
         """Compare old and new transcript, save changed phrases to dictionary."""
@@ -1090,24 +1167,36 @@ class BoloApp(rumps.App):
             model_config = {"smart_format": True, "punctuate": True}
             if vocab_terms:
                 model_config["keyterms"] = vocab_terms[:50]
+            stt_prompt = build_stt_prompt(vocab_terms, self._current_context)
+            primary_data = {
+                "model": "deepgram/nova-3",
+                "language": "en",
+                "model_config": json.dumps(model_config),
+            }
+            if stt_prompt:
+                primary_data["prompt"] = stt_prompt
+                self._log(f"[stt] prompt injected ({len(stt_prompt)} chars)")
             resp = requests.post(
                 STT_ENDPOINT,
                 headers={"Authorization": f"Bearer {TELNYX_API_KEY}"},
                 files={"file": ("audio.wav", wav_bytes, "audio/wav")},
-                data={
-                    "model": "deepgram/nova-3",
-                    "language": "en",
-                    "model_config": json.dumps(model_config),
-                },
+                data=primary_data,
                 timeout=8,
             )
+            if resp.status_code == 401:
+                self._log("[stt] 401 Unauthorized — check TELNYX_API_KEY in ~/.codex/.env")
+                raise RuntimeError("STT auth failed (401): invalid or missing API key")
             rate_limited = resp.status_code == 429
             if resp.status_code == 429:
+                # Rate-limited fallback: lighter model, still include prompt
+                fallback_data = {"model": "distil-whisper/distil-large-v2"}
+                if stt_prompt:
+                    fallback_data["prompt"] = stt_prompt
                 resp = requests.post(
                     STT_ENDPOINT,
                     headers={"Authorization": f"Bearer {TELNYX_API_KEY}"},
                     files={"file": ("audio.wav", wav_bytes, "audio/wav")},
-                    data={"model": "distil-whisper/distil-large-v2"},
+                    data=fallback_data,
                     timeout=8,
                 )
                 if resp.status_code == 429:
@@ -1122,15 +1211,20 @@ class BoloApp(rumps.App):
             try:
                 import time as _time
                 _time.sleep(0.3)
+                vocab_terms = VOCAB_STORE.terms()
+                retry_data = {
+                    "model": "deepgram/nova-3",
+                    "language": "en",
+                    "model_config": json.dumps({"smart_format": True, "punctuate": True}),
+                }
+                retry_prompt = build_stt_prompt(vocab_terms, self._current_context)
+                if retry_prompt:
+                    retry_data["prompt"] = retry_prompt
                 resp = requests.post(
                     STT_ENDPOINT,
                     headers={"Authorization": f"Bearer {TELNYX_API_KEY}"},
                     files={"file": ("audio.wav", wav_bytes, "audio/wav")},
-                    data={
-                        "model": "deepgram/nova-3",
-                        "language": "en",
-                        "model_config": json.dumps({"smart_format": True, "punctuate": True}),
-                    },
+                    data=retry_data,
                     timeout=8,
                 )
                 if resp.status_code == 200:
@@ -1145,6 +1239,18 @@ class BoloApp(rumps.App):
             state.batch_started_at = time.time()
         try:
             transcript, rate_limited = self._batch_transcribe_request(wav_bytes)
+        except RuntimeError as e:
+            if state:
+                state.batch_finished_at = time.time()
+            msg = str(e)
+            if "401" in msg or "auth failed" in msg.lower():
+                # Auth failure: freeze backoff so no further requests are made.
+                # User must fix the key and restart.
+                self._rate_limit_backoff_until = time.time() + 86400.0  # 24h
+                self._show_error("Invalid API key — check ~/.codex/.env")
+            else:
+                self._show_error(f"STT failed: {e}")
+            return "", "batch"
         except Exception as e:
             if state:
                 state.batch_finished_at = time.time()
@@ -1303,97 +1409,120 @@ class BoloApp(rumps.App):
 
     def _should_run_cleanup(self, transcript, context, duration_seconds):
         if time.time() < self._rate_limit_backoff_until:
+            self._log("[llm] skipped (rate limit backoff)")
             return False
         if LLM_CLEANUP_MODE == "off":
+            self._log("[llm] skipped (mode=off)")
             return False
         if LLM_CLEANUP_MODE == "on":
+            self._log("[llm] running (mode=on)")
             return True
-        if len(transcript.split()) < 18:
+        # auto mode — relaxed thresholds
+        word_count = len(transcript.split())
+        if word_count < 6:
+            self._log(f"[llm] skipped (too short: {word_count} words)")
             return False
-        if duration_seconds < 6.0:
+        if duration_seconds < 2.0:
+            self._log(f"[llm] skipped (duration too short: {duration_seconds:.1f}s)")
             return False
         if context.get("is_code_app"):
+            self._log("[llm] skipped (code app)")
             return False
         if self._looks_codeish(transcript):
+            self._log("[llm] skipped (looks like code)")
             return False
-        app_name = context.get("app_name") or ""
-        prose_apps = {"Slack", "Messages", "Mail", "Notes", "Notion", "Google Chrome", "Arc", "Safari"}
-        if app_name not in prose_apps:
-            return False
-        if any(transcript.lower().startswith(prefix) for prefix in ("actually ", "bullet ")):
-            return False
-        if any(token in transcript.lower() for token in ("release note", "remotion", "telnyx", "bolo", "wispr")):
-            return False
-        if transcript.endswith((".", "!", "?")) and re.search(r"[A-Z]", transcript):
-            return False
+        self._log("[llm] running (auto)")
         return True
 
-    def _cleanup_transcript(self, transcript, context, state=None):
-        app_name = context.get("app_name") or "unknown"
-        vocabulary = context.get("vocabulary") or []
-        vocab_line = ", ".join(vocabulary[:40]) if vocabulary else "none"
-        existing_text = self._current_context
-        if state:
-            state.cleanup_started_at = time.time()
-        context_instruction = ""
-        if existing_text:
-            snippet = existing_text[-300:]
-            context_instruction = (
-                f"The user is dictating into a text field that already contains this text "
-                f"(last 300 chars shown): '{snippet}'. "
-                "Continue naturally from that context. Do not repeat information already present. "
-                "If the dictation starts mid-sentence (no capital), preserve that casing.\n"
-            )
+    def _call_llm(self, system_prompt: str, user_content: str, state=None) -> str:
+        """
+        POST to the active LLM backend (LiteLLM proxy or Telnyx direct).
+        Falls back to Telnyx API if LiteLLM returns a non-200 on first attempt.
+        Returns the streamed completion text, or "" on failure.
+        """
+        endpoint = _llm_endpoint()
+        headers = _llm_headers()
+        model = _llm_model()
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content},
+            ],
+            "max_tokens": 1500,
+            "temperature": 0,
+            "stream": True,
+        }
+        # Telnyx-specific param — harmless to omit on LiteLLM
+        if not _LITELLM_BASE:
+            payload["enable_thinking"] = False
+
+        def _do_request(ep, hdrs):
+            return requests.post(ep, headers=hdrs, json=payload, timeout=8, stream=True)
+
         try:
-            llm_resp = requests.post(
-                LLM_ENDPOINT,
-                headers={
+            resp = _do_request(endpoint, headers)
+        except Exception as e:
+            # If LiteLLM is unreachable, fall back to Telnyx silently
+            if _LITELLM_BASE:
+                self._log(f"[llm] LiteLLM unreachable ({e}), falling back to Telnyx API")
+                fallback_headers = {
                     "Authorization": f"Bearer {TELNYX_API_KEY}",
                     "Content-Type": "application/json",
-                },
-                json={
-                    "model": "Qwen/Qwen3-235B-A22B",
-                    "messages": [
-                        {"role": "system", "content": SYSTEM_PROMPT},
-                        {
-                            "role": "user",
-                            "content": (
-                                f"Frontmost app: {app_name}\n"
-                                f"Preferred vocabulary: {vocab_line}\n"
-                                f"{context_instruction}"
-                                "Apply only minimal punctuation/capitalization cleanup.\n"
-                                f"Transcript: {transcript}"
-                            ),
-                        },
-                    ],
-                    "max_tokens": 300,
-                    "temperature": 0,
-                    "enable_thinking": False,
-                    "stream": True,
-                },
-                timeout=8,
-                stream=True,
-            )
-            if llm_resp.status_code == 429:
-                self._log("[llm] cleanup rate limited")
-                self._rate_limit_backoff_until = time.time() + RATE_LIMIT_BACKOFF_SECONDS
-                if state:
-                    state.rate_limited = True
-                    state.cleanup_finished_at = time.time()
-                return ""
-            if llm_resp.status_code != 200:
-                self._log(f"[llm error] {llm_resp.status_code}: {llm_resp.text[:200]}")
+                }
+                payload["model"] = "Qwen/Qwen3-235B-A22B"
+                payload["enable_thinking"] = False
+                try:
+                    resp = _do_request(_TELNYX_LLM_ENDPOINT, fallback_headers)
+                except Exception as e2:
+                    if state:
+                        state.cleanup_finished_at = time.time()
+                    self._log(f"[llm exception] fallback also failed: {e2}")
+                    return ""
+            else:
                 if state:
                     state.cleanup_finished_at = time.time()
+                self._log(f"[llm exception] {e}")
                 return ""
-        except Exception as e:
+
+        if resp.status_code == 429:
+            self._log("[llm] rate limited")
+            self._rate_limit_backoff_until = time.time() + RATE_LIMIT_BACKOFF_SECONDS
             if state:
+                state.rate_limited = True
                 state.cleanup_finished_at = time.time()
-            self._log(f"[llm exception] {e}")
             return ""
 
+        if resp.status_code != 200:
+            # If LiteLLM returned an error, retry on Telnyx
+            if _LITELLM_BASE:
+                self._log(f"[llm] LiteLLM error {resp.status_code}, falling back to Telnyx API")
+                fallback_headers = {
+                    "Authorization": f"Bearer {TELNYX_API_KEY}",
+                    "Content-Type": "application/json",
+                }
+                payload["model"] = "Qwen/Qwen3-235B-A22B"
+                payload["enable_thinking"] = False
+                try:
+                    resp = _do_request(_TELNYX_LLM_ENDPOINT, fallback_headers)
+                    if resp.status_code != 200:
+                        self._log(f"[llm error] fallback {resp.status_code}: {resp.text[:200]}")
+                        if state:
+                            state.cleanup_finished_at = time.time()
+                        return ""
+                except Exception as e:
+                    if state:
+                        state.cleanup_finished_at = time.time()
+                    self._log(f"[llm exception] fallback: {e}")
+                    return ""
+            else:
+                self._log(f"[llm error] {resp.status_code}: {resp.text[:200]}")
+                if state:
+                    state.cleanup_finished_at = time.time()
+                return ""
+
         result = ""
-        for line in llm_resp.iter_lines():
+        for line in resp.iter_lines():
             if line and line.startswith(b"data: "):
                 chunk = line[6:]
                 if chunk == b"[DONE]":
@@ -1403,15 +1532,87 @@ class BoloApp(rumps.App):
                 except json.JSONDecodeError:
                     self._log("[llm] malformed stream chunk")
                     continue
-                delta = data.get("choices", [{}])[0].get("delta", {}).get("content", "")
+                choice = data.get("choices", [{}])[0]
+                delta = choice.get("delta", {}).get("content", "") or ""
+                # Some models (GLM-5, Kimi) stream reasoning in a separate field — ignore it
+                if not delta:
+                    delta = ""
                 result += delta or ""
+
+        # Strip Kimi/Qwen chain-of-thought reasoning tags
+        result = re.sub(r"<think>.*?</think>", "", result, flags=re.DOTALL)
+        return result.strip()
+
+    def _cleanup_transcript(self, transcript, context, state=None):
+        app_name = context.get("app_name") or "unknown"
+        vocabulary = context.get("vocabulary") or []
+        vocab_line = ", ".join(vocabulary[:40]) if vocabulary else "none"
+        existing_text = self._current_context
+        if state:
+            state.cleanup_started_at = time.time()
+
+        system_prompt = _build_cleanup_prompt(app_name)
+
+        context_instruction = ""
+        if existing_text:
+            snippet = existing_text[-300:]
+            context_instruction = (
+                f"The user is dictating into a text field that already contains this text "
+                f"(last 300 chars shown): '{snippet}'. "
+                "Continue naturally from that context. Do not repeat information already present. "
+                "If the dictation starts mid-sentence (no capital), preserve that casing.\n"
+            )
+
+        user_content = (
+            f"Frontmost app: {app_name}\n"
+            f"Preferred vocabulary: {vocab_line}\n"
+            f"{context_instruction}"
+            "Apply only minimal punctuation/capitalization cleanup.\n"
+            f"Transcript: {transcript}"
+        )
+
+        result = self._call_llm(system_prompt, user_content, state=state)
 
         if state:
             state.cleanup_finished_at = time.time()
-        result = result.strip()
         if result:
             self._log(f"[llm] \"{result}\"")
         return result
+
+    def _cleanup_transcript_async(self, raw_text: str, context: dict, state, injected_app: str):
+        """
+        Background worker: run LLM cleanup on raw_text that was already injected,
+        then replace it in-place if the result differs meaningfully AND the focused
+        app is still the same as when the text was injected.
+        """
+        cleaned = self._cleanup_transcript(raw_text, context, state)
+        if not cleaned:
+            return
+        cleaned = cleaned.strip()
+        # Meaningful difference check: skip if only whitespace differs
+        if cleaned.lower() == raw_text.lower():
+            self._log("[llm] in-place skipped (no meaningful change)")
+            return
+        # App-change guard: don't stomp a different window
+        current_app = self._frontmost_app_name()
+        if current_app and injected_app and current_app != injected_app:
+            self._log(f"[llm] in-place skipped (app changed: '{injected_app}' -> '{current_app}')")
+            return
+        # Delete the raw text and type the cleaned version
+        self._log(f"[llm] replaced in-place: \"{raw_text}\" -> \"{cleaned}\"")
+        # Small guard: only replace if lengths are plausible (not a runaway LLM response)
+        if len(cleaned) > len(raw_text) * 3:
+            self._log("[llm] in-place skipped (cleaned text suspiciously long)")
+            return
+        chars_to_delete = len(raw_text)
+        self._delete_text(chars_to_delete)
+        self._type_text(cleaned)
+        # Update last_result so corrections reference the cleaned version
+        self.last_result = cleaned
+        if state:
+            state.final_text = cleaned
+            if state.final_source:
+                state.final_source += "+async_cleanup"
 
     def _reconcile_transcripts(self, stream_preview, batch_transcript, context, state=None):
         if time.time() < self._rate_limit_backoff_until:
@@ -1421,70 +1622,17 @@ class BoloApp(rumps.App):
         vocab_line = ", ".join(vocabulary[:40]) if vocabulary else "none"
         if state:
             state.reconcile_started_at = time.time()
-        try:
-            llm_resp = requests.post(
-                LLM_ENDPOINT,
-                headers={
-                    "Authorization": f"Bearer {TELNYX_API_KEY}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": "Qwen/Qwen3-235B-A22B",
-                    "messages": [
-                        {"role": "system", "content": RECONCILE_PROMPT},
-                        {
-                            "role": "user",
-                            "content": (
-                                f"Frontmost app: {app_name}\n"
-                                f"Preferred vocabulary: {vocab_line}\n"
-                                f"Streaming transcript: {stream_preview}\n"
-                                f"Batch transcript: {batch_transcript}"
-                            ),
-                        },
-                    ],
-                    "max_tokens": 400,
-                    "temperature": 0,
-                    "enable_thinking": False,
-                    "stream": True,
-                },
-                timeout=8,
-                stream=True,
-            )
-            if llm_resp.status_code == 429:
-                self._log("[reconcile] rate limited")
-                self._rate_limit_backoff_until = time.time() + RATE_LIMIT_BACKOFF_SECONDS
-                if state:
-                    state.rate_limited = True
-                    state.reconcile_finished_at = time.time()
-                return ""
-            if llm_resp.status_code != 200:
-                self._log(f"[reconcile error] {llm_resp.status_code}: {llm_resp.text[:200]}")
-                if state:
-                    state.reconcile_finished_at = time.time()
-                return ""
-        except Exception as e:
-            if state:
-                state.reconcile_finished_at = time.time()
-            self._log(f"[reconcile exception] {e}")
-            return ""
 
-        result = ""
-        for line in llm_resp.iter_lines():
-            if line and line.startswith(b"data: "):
-                chunk = line[6:]
-                if chunk == b"[DONE]":
-                    break
-                try:
-                    data = json.loads(chunk)
-                except json.JSONDecodeError:
-                    self._log("[reconcile] malformed stream chunk")
-                    continue
-                delta = data.get("choices", [{}])[0].get("delta", {}).get("content", "")
-                result += delta or ""
+        user_content = (
+            f"Frontmost app: {app_name}\n"
+            f"Preferred vocabulary: {vocab_line}\n"
+            f"Streaming transcript: {stream_preview}\n"
+            f"Batch transcript: {batch_transcript}"
+        )
+        result = self._call_llm(RECONCILE_PROMPT, user_content, state=state)
 
         if state:
             state.reconcile_finished_at = time.time()
-        result = result.strip()
         if result:
             self._log(f"[reconcile] \"{result}\"")
         return result
@@ -1697,25 +1845,52 @@ class BoloApp(rumps.App):
             self._warm_stt_connecting = False
         if warm_stt:
             warm_stt.close()
-        if self._tap_loop is not None:
-            CFRunLoopStop(self._tap_loop)
+        if self._ns_monitor is not None:
+            NSEvent.removeMonitor_(self._ns_monitor)
+            self._ns_monitor = None
         self.overlay.hide()
-        import pathlib
-        pathlib.Path("/tmp/bolo.lock").unlink(missing_ok=True)
+        # Instance lock is released by the atexit handler registered at startup.
         rumps.quit_application()
 
 
 # ── Entry ─────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    import pathlib
     import sys
+
+    # ── Single-instance guard ─────────────────────────────────────────────────
+    # Use a lock directory (atomic on all POSIX systems) so two launches of
+    # bolo.py (e.g. Bolo.app + start-bolo.command) cannot coexist.
+    _LOCK_DIR = pathlib.Path("/tmp/bolo-instance.lock")
+    try:
+        _LOCK_DIR.mkdir(parents=False, exist_ok=False)
+    except FileExistsError:
+        _logger.info("[startup] another instance already running (lock exists). Exiting.")
+        sys.exit(0)
+
+    def _release_instance_lock():
+        try:
+            _LOCK_DIR.rmdir()
+        except Exception:
+            pass
+
+    import atexit
+    atexit.register(_release_instance_lock)
+
+    # Also release on SIGTERM so the supervisor can clean up cleanly.
+    def _sigterm_handler(signum, frame):
+        _release_instance_lock()
+        sys.exit(0)
+    signal.signal(signal.SIGTERM, _sigterm_handler)
+
+    # ── API key check ─────────────────────────────────────────────────────────
     if not TELNYX_API_KEY:
-        print("ERROR: TELNYX_API_KEY not set.")
-        print("Get a free key at https://telnyx.com and add to your shell:")
-        print('  export TELNYX_API_KEY="your_key_here"')
+        _logger.error("ERROR: TELNYX_API_KEY not set. Add to ~/.codex/.env and restart.")
         sys.exit(1)
+
     def _crash_handler(signum, frame):
-        print(f"[crash] received signal {signum}", flush=True)
+        _logger.error(f"[crash] received signal {signum}")
         traceback.print_stack(frame)
     for _sig in (signal.SIGABRT, signal.SIGBUS, signal.SIGSEGV):
         try:
