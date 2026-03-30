@@ -27,7 +27,7 @@ cd bolo
 
 Bolo runs as a menubar application that monitors global input events and processes audio only while the hotkey is held.
 
-1. **Global hotkey monitoring**: Uses CGEventTap via pyobjc to listen for Right Option key events system-wide without interfering with other applications.
+1. **Global hotkey monitoring**: Uses NSEvent global monitor (AppKit) to listen for Right Option key events system-wide without interfering with other applications.
 2. **Audio capture**: On Right Option press, initializes sounddevice stream to capture 16kHz mono PCM audio directly to memory buffer.
 3. **Recording**: Continues buffering audio while key is held. No disk writes occur during recording.
 4. **Key release trigger**: On Right Option release, immediately finalizes audio buffer and initiates API calls.
@@ -140,7 +140,7 @@ Audio is sent to Telnyx APIs for transcription and immediately discarded. Bolo p
 
 - Can I change the hotkey from Right Option?
 
-Currently hardcoded. Modify the `_NX_DEVICERALTKEYMASK` logic in the CGEventTap implementation in `bolo.py` to change this.
+Currently hardcoded. Modify the `_NX_DEVICERALTKEYMASK` check in `_nsevent_flags_handler` in `bolo.py` to change this.
 
 - Does it work offline?
 
