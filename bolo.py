@@ -316,6 +316,7 @@ class BoloApp(rumps.App):
             rumps.MenuItem("History", callback=None),
             None,
             rumps.MenuItem("Auto-stop on silence", callback=self._toggle_auto_silence),
+            rumps.MenuItem("Clipboard paste mode", callback=self._toggle_clipboard_mode),
             None,
             rumps.MenuItem("Quit Bolo", callback=self.quit_app),
         ]
@@ -338,7 +339,9 @@ class BoloApp(rumps.App):
         # Auto-silence feature (Wispr Flow parity)
         prefs = self._load_prefs()
         self._auto_silence_enabled = prefs.get("auto_silence_enabled", True)
+        self._clipboard_mode_enabled = prefs.get("clipboard_mode_enabled", False)
         self._update_auto_silence_menu()
+        self._update_clipboard_mode_menu()
 
         # Streaming STT state
         self._stt            = None
@@ -401,6 +404,18 @@ class BoloApp(rumps.App):
         prefs["auto_silence_enabled"] = self._auto_silence_enabled
         self._save_prefs(prefs)
         self._log(f"[silence] auto-stop {'enabled' if self._auto_silence_enabled else 'disabled'}")
+
+    def _update_clipboard_mode_menu(self):
+        label = "Clipboard paste mode " + ("✓" if self._clipboard_mode_enabled else "")
+        self.menu["Clipboard paste mode"].title = label.strip()
+
+    def _toggle_clipboard_mode(self, _):
+        self._clipboard_mode_enabled = not self._clipboard_mode_enabled
+        self._update_clipboard_mode_menu()
+        prefs = self._load_prefs()
+        prefs["clipboard_mode_enabled"] = self._clipboard_mode_enabled
+        self._save_prefs(prefs)
+        self._log(f"[clipboard] paste mode {'enabled' if self._clipboard_mode_enabled else 'disabled'}")
 
     def _begin_session(self):
         self._session_seq += 1
@@ -867,8 +882,8 @@ class BoloApp(rumps.App):
                 pass
 
         self.icon = ICON_IDLE
-        if self._set_session_phase("processing", session_id):
-            self.overlay.update("processing", "")
+        if self._set_session_phase("transcribing", session_id):
+            self.overlay.update("transcribing", "")
 
         if not frames:
             if self._stt:
@@ -946,9 +961,11 @@ class BoloApp(rumps.App):
             self._log(f"[command] using stream command fast path: {stream_command['kind']}")
             batch_future.cancel()
             _executor.shutdown(wait=False)
-            if self._set_session_phase("final", session_id):
-                self.overlay.update("final", stream_command["display"])
+            if self._set_session_phase("inserting", session_id):
+                self.overlay.update("inserting", stream_command["display"])
             self._apply_command(stream_command, state)
+            if self._set_session_phase("success", session_id):
+                self.overlay.update("success", stream_command["display"])
             self._hide_overlay_after_delay(session_id=session_id)
             self._log_metrics(state, final_text=stream_command["display"])
             return
@@ -1005,9 +1022,11 @@ class BoloApp(rumps.App):
 
         command = parse_command(transcript, correction_active=self._correction_active())
         if command:
-            if self._set_session_phase("final", session_id):
-                self.overlay.update("final", command["display"])
+            if self._set_session_phase("inserting", session_id):
+                self.overlay.update("inserting", command["display"])
             self._apply_command(command, state)
+            if self._set_session_phase("success", session_id):
+                self.overlay.update("success", command["display"])
             self._hide_overlay_after_delay(session_id=session_id)
             self._log_metrics(state, final_text=command["display"])
             return
@@ -1029,6 +1048,9 @@ class BoloApp(rumps.App):
             if self._current_context:
                 self._log(f"[context] capitalization applied, context ends with: '{self._current_context[-1]}'")
 
+        if self._set_session_phase("inserting", session_id):
+            self.overlay.update("inserting", result)
+
         self._render_text(result)
 
         if state and state.correction_target:
@@ -1044,8 +1066,8 @@ class BoloApp(rumps.App):
         self.last_paste_time = time.time()
         self.correction_window_until = self.last_paste_time + CORRECTION_WINDOW_SECONDS
         self.last_pipeline = time.time()
-        if self._set_session_phase("final", session_id):
-            self.overlay.update("final", result)
+        if self._set_session_phase("success", session_id):
+            self.overlay.update("success", result)
         self._hide_overlay_after_delay(session_id=session_id)
         self._log_metrics(state, final_text=result)
         self._log(f"[done] injected and popped")
@@ -1606,7 +1628,7 @@ class BoloApp(rumps.App):
             return
         chars_to_delete = len(raw_text)
         self._delete_text(chars_to_delete)
-        self._type_text(cleaned)
+        self._inject_text(cleaned)
         # Update last_result so corrections reference the cleaned version
         self.last_result = cleaned
         if state:
@@ -1659,7 +1681,7 @@ class BoloApp(rumps.App):
             if target:
                 if not (state and state.correction_target):
                     self._delete_text(len(target))
-                self._type_text(command["text"])
+                self._inject_text(command["text"])
                 self._remember_result(command["text"])
                 self.last_paste_time = time.time()
                 self.correction_window_until = self.last_paste_time + CORRECTION_WINDOW_SECONDS
@@ -1669,7 +1691,7 @@ class BoloApp(rumps.App):
             self.correction_mode = False
             self._play("Pop")
         elif kind == "insert":
-            self._type_text(command["text"])
+            self._inject_text(command["text"])
             self._remember_result(command["text"])
             self.last_paste_time = time.time()
             self.correction_window_until = self.last_paste_time + CORRECTION_WINDOW_SECONDS
@@ -1688,10 +1710,13 @@ class BoloApp(rumps.App):
         prefix = longest_common_prefix(previous, target)
         to_delete = len(previous) - prefix
         if to_delete > 0:
-            self._delete_text(to_delete)
+            if self._should_use_clipboard():
+                self._delete_text(to_delete)
+            else:
+                self._delete_text(to_delete)
         suffix = target[prefix:]
         if suffix:
-            self._type_text(suffix)
+            self._inject_text(suffix)
             if state.first_visible_at is None:
                 state.first_visible_at = time.time()
         state.visible_text = target
@@ -1716,6 +1741,120 @@ class BoloApp(rumps.App):
             CGEventSetFlags(up, 0)
             CGEventPost(kCGHIDEventTap, down)
             CGEventPost(kCGHIDEventTap, up)
+
+    # ── Clipboard paste fallback ────────────────────────────────────────────
+
+    # Apps known to reject CGEvent keyboard simulation (sandboxed, Electron, etc.)
+    KNOWN_CLIPBOARD_APPS = {
+        "1Password",
+        "Bitwarden",
+        "Discord",
+        "Figma",
+        "Notion",
+        "Signal",
+        "Slack",
+        "Spotify",
+        "Teams",
+        "WhatsApp",
+    }
+
+    def _should_use_clipboard(self) -> bool:
+        """Check if clipboard paste mode should be used."""
+        # User preference overrides everything
+        if self._clipboard_mode_enabled:
+            return True
+        # Auto-detect: frontmost app is known to reject CGEvent
+        app_name = self._frontmost_app_name()
+        if app_name in self.KNOWN_CLIPBOARD_APPS:
+            return True
+        return False
+
+    def _type_text_via_clipboard(self, text: str):
+        """Insert text by saving it to clipboard and simulating Cmd+V.
+
+        This is a fallback for apps that reject CGEvent keyboard simulation.
+        The user's original clipboard contents are restored after paste.
+        """
+        if not text:
+            return
+        pb = NSPasteboard.generalPasteboard()
+
+        # Save current clipboard contents
+        saved_clipboard = None
+        try:
+            saved_clipboard = pb.stringForType_(NSPasteboardTypeString)
+        except Exception:
+            pass
+
+        # Set clipboard to our text
+        pb.clearContents()
+        pb.setString_forType_(text, NSPasteboardTypeString)
+
+        # Small delay to ensure clipboard is set
+        time.sleep(0.02)
+
+        # Simulate Cmd+V
+        cmd_key = 55  # kVK_Command
+        v_keycode = 9  # kVK_ANSI_V
+
+        cmd_down = CGEventCreateKeyboardEvent(None, cmd_key, True)
+        v_down = CGEventCreateKeyboardEvent(None, v_keycode, True)
+        v_up = CGEventCreateKeyboardEvent(None, v_keycode, False)
+        cmd_up = CGEventCreateKeyboardEvent(None, cmd_key, False)
+
+        # Set Cmd flag on all events
+        cmd_flag = 1 << 20  # kCGEventFlagMaskCommand
+        CGEventSetFlags(cmd_down, cmd_flag)
+        CGEventSetFlags(v_down, cmd_flag)
+        CGEventSetFlags(v_up, cmd_flag)
+        CGEventSetFlags(cmd_up, cmd_flag)
+
+        CGEventPost(kCGHIDEventTap, cmd_down)
+        CGEventPost(kCGHIDEventTap, v_down)
+        CGEventPost(kCGHIDEventTap, v_up)
+        CGEventPost(kCGHIDEventTap, cmd_up)
+
+        # Wait for paste to complete before restoring clipboard
+        time.sleep(0.05)
+
+        # Restore original clipboard contents
+        try:
+            pb.clearContents()
+            if saved_clipboard is not None:
+                pb.setString_forType_(saved_clipboard, NSPasteboardTypeString)
+        except Exception:
+            pass
+
+        self._log(f"[clipboard] pasted {len(text)} chars via clipboard fallback")
+
+    def _delete_text_via_clipboard(self, count: int):
+        """Delete text by selecting it and replacing via clipboard.
+
+        Used as fallback when CGEvent backspace simulation fails.
+        Selects characters via Shift+Left, then deletes via Backspace.
+        """
+        if count <= 0:
+            return
+
+        # Try regular CGEvent delete first
+        self._delete_text(count)
+        return
+
+    def _inject_text(self, text: str):
+        """Insert text using the best available method.
+
+        Tries CGEvent first, falls back to clipboard paste if the app
+        is known to reject simulated keystrokes or clipboard mode is enabled.
+        """
+        if not text:
+            return
+
+        if self._should_use_clipboard():
+            self._log("[inject] using clipboard paste method")
+            self._type_text_via_clipboard(text)
+        else:
+            self._log("[inject] using CGEvent keyboard simulation")
+            self._type_text(text)
 
     def _log_metrics(self, state, final_text):
         if state is None:

@@ -97,7 +97,9 @@ win.orderFrontRegardless()
 
 phase = "listening"
 preview = ""
-frames = ["Speak", "Speak .", "Speak ..", "Speak ..."]
+listening_frames = ["Listening", "Listening .", "Listening ..", "Listening ..."]
+transcribing_frames = ["Transcribing", "Transcribing .", "Transcribing ..", "Transcribing ..."]
+inserting_frames = ["Inserting", "Inserting .", "Inserting ..", "Inserting ..."]
 frame_idx = 0
 
 
@@ -121,16 +123,43 @@ def resize_for_text(text):
     preview_label.setFrame_(NSMakeRect(H_PADDING, BOTTOM_PADDING, preview_width, preview_height))
 
 
+# Status label colors per phase
+_COLOR_LISTENING = NSColor.colorWithCalibratedRed_green_blue_alpha_(0.55, 0.76, 1.0, 0.9)   # light blue
+_COLOR_TRANSCRIBING = NSColor.colorWithCalibratedRed_green_blue_alpha_(1.0, 0.76, 0.33, 0.9)  # amber
+_COLOR_INSERTING = NSColor.colorWithCalibratedRed_green_blue_alpha_(0.45, 0.65, 1.0, 0.9)     # blue
+_COLOR_SUCCESS = NSColor.colorWithCalibratedRed_green_blue_alpha_(0.30, 0.85, 0.50, 0.9)     # green
+_COLOR_ERROR = NSColor.colorWithCalibratedRed_green_blue_alpha_(1.0, 0.35, 0.35, 0.9)        # red
+_COLOR_FINAL = NSColor.colorWithCalibratedWhite_alpha_(1.0, 0.7)                              # dim white
+
+
 def render():
     global frame_idx
-    if phase == "processing":
-        status_label.setStringValue_("Processing")
+    if phase == "transcribing":
+        status_label.setStringValue_(transcribing_frames[frame_idx % len(transcribing_frames)])
+        status_label.setTextColor_(_COLOR_TRANSCRIBING)
+        frame_idx += 1
+    elif phase == "processing":
+        # Legacy alias: treat as transcribing
+        status_label.setStringValue_(transcribing_frames[frame_idx % len(transcribing_frames)])
+        status_label.setTextColor_(_COLOR_TRANSCRIBING)
+        frame_idx += 1
+    elif phase == "inserting":
+        status_label.setStringValue_(inserting_frames[frame_idx % len(inserting_frames)])
+        status_label.setTextColor_(_COLOR_INSERTING)
+        frame_idx += 1
+    elif phase == "success":
+        status_label.setStringValue_("✓ Inserted")
+        status_label.setTextColor_(_COLOR_SUCCESS)
     elif phase == "error":
         status_label.setStringValue_("Error")
+        status_label.setTextColor_(_COLOR_ERROR)
     elif phase == "final":
         status_label.setStringValue_("Done")
+        status_label.setTextColor_(_COLOR_FINAL)
     else:
-        status_label.setStringValue_(frames[frame_idx % len(frames)])
+        # listening (default)
+        status_label.setStringValue_(listening_frames[frame_idx % len(listening_frames)])
+        status_label.setTextColor_(_COLOR_LISTENING)
         frame_idx += 1
     resize_for_text(preview)
 
