@@ -44,9 +44,23 @@ from Quartz import (
     CGEventPost,
     CGEventSetFlags,
     CGEventSourceFlagsState,
+    CGEventTapCreate,
+    CGEventTapEnable,
+    CGEventTapIsEnabled,
+    CFMachPortCreateRunLoopSource,
+    CFRunLoopAddSource,
+    CFRunLoopGetCurrent,
+    CFRunLoopRun,
+    CGEventGetFlags,
+    CGEventMaskBit,
+    kCGEventTapOptionListenOnly,
+    kCGHeadInsertEventTap,
+    kCGSessionEventTap,
     kCGHIDEventTap,
     kCGEventSourceStateCombinedSessionState,
+    kCGEventFlagsChanged,
 )
+from CoreFoundation import kCFRunLoopDefaultMode
 import HIServices
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -364,15 +378,26 @@ class BoloApp(rumps.App):
         self._current_context = ""
         self._context_aware = True
         self._ropt_held = False
-        self._ns_monitor = None
+        self._ns_monitor = None  # deprecated: using CGEventTap now
         self._key_event = None  # "press" or "release" set by handler
         self._last_press_at = 0.0
+        self._last_key_recovery_check = 0.0
 
-        # Start global hotkey listener via NSEvent (never disabled by macOS)
-        self._start_nsevent_monitor()
-        # Poll key events and watchdog on main thread
+        # CGEventTap state
+        self._cg_tap = None
+        self._cg_tap_thread = None
+        self._cg_tap_enabled = False
+
+        # Panic reset: triple-tap Right Option to force reset
+        self._panic_presses = []
+        self._PANIC_WINDOW = 1.0  # 1 second to triple-tap
+
+        # Start CGEventTap hotkey listener (more reliable than NSEvent)
+        self._start_cgevent_tap()
+        # Poll key events and watchdogs on main thread
         rumps.Timer(self._process_key_events, 0.02).start()
-        rumps.Timer(self._watchdog_tap, 2).start()
+        rumps.Timer(self._watchdog_cg_tap, 2).start()  # Restart tap if disabled
+        rumps.Timer(self._watchdog_overlay_health, 1.0).start()  # Monitor overlay
         rumps.Timer(self._watchdog_overlay_preview, 0.5).start()
         rumps.Timer(self._watchdog_recording, 5).start()
         self._ensure_warm_stream()
@@ -573,13 +598,26 @@ class BoloApp(rumps.App):
                     self._silence.set_silence_threshold(threshold)
             return
 
-        # Recover from a missed modifier release. This is the main hotkey wedge.
-        if self._ropt_held and not self._is_right_option_down():
-            if time.time() - self._last_press_at > 0.08:
-                self._ropt_held = False
-                if self._key_event != "release":
-                    self._log("[key] synthesized Right Option release after missed tap event")
-                    self._key_event = "release"
+        # AGGRESSIVE RECOVERY: Check actual key state every tick
+        is_down = self._is_right_option_down()
+
+        # Case 1: We think key is held, but it's actually up -> force release
+        if self._ropt_held and not is_down:
+            self._ropt_held = False
+            if self._key_event != "release":
+                self._log("[key] RECOVERY: synthesized release (missed event)")
+                self._key_event = "release"
+
+        # Case 2: We think key is up, but it's actually held -> might be stuck from previous session
+        # Only recover if not currently recording (avoid double-trigger while active)
+        elif not self._ropt_held and is_down and not self.recording:
+            # Check if we've been stuck for a while (key held but we missed the press)
+            if time.time() - self._last_key_recovery_check > 2.0:
+                self._ropt_held = True
+                self._last_press_at = time.time()
+                self._log("[key] RECOVERY: synthesized press (missed event)")
+                self._key_event = "press"
+        self._last_key_recovery_check = time.time()
 
         event = self._key_event
         if event is None:
@@ -643,6 +681,142 @@ class BoloApp(rumps.App):
         elif not ropt_down and self._ropt_held:
             self._ropt_held = False
             self._key_event = "release"
+
+    # ── CGEventTap Hotkey Listener (Primary) ───────────────────────────────
+
+    def _cgevent_callback(self, proxy, event_type, event, refcon):
+        """Callback for CGEventTap - called on every event in the tap.
+
+        More reliable than NSEvent global monitor because it runs at lower level
+        and can be re-enabled if macOS disables it.
+
+        Also implements panic reset: triple-tap Right Option to force reset.
+        """
+        if event_type == kCGEventFlagsChanged:
+            flags = CGEventGetFlags(event)
+            ropt_down = bool(flags & self._NX_DEVICERALTKEYMASK)
+
+            # Panic reset detection: track press releases in a 1-second window
+            if ropt_down:
+                now = time.time()
+                self._panic_presses.append(now)
+                # Keep only presses in the last second
+                self._panic_presses = [t for t in self._panic_presses if now - t < self._PANIC_WINDOW]
+                # Triple-tap detected
+                if len(self._panic_presses) >= 3:
+                    self._log("[panic] triple-tap Right Option detected — forcing reset")
+                    self._panic_reset()
+                    self._panic_presses = []
+
+            if ropt_down and not self._ropt_held:
+                if self.recording:
+                    # Spurious key-down while already recording — ignore
+                    self._log("[tap] spurious Right Option down while recording — ignored")
+                    self._ropt_held = True
+                else:
+                    self._ropt_held = True
+                    self._last_press_at = time.time()
+                    self._key_event = "press"
+                    self._log("[tap] Right Option pressed (CGEventTap)")
+            elif not ropt_down and self._ropt_held:
+                self._ropt_held = False
+                self._key_event = "release"
+                self._log("[tap] Right Option released (CGEventTap)")
+
+        return event
+
+    def _panic_reset(self):
+        """Force reset all state — emergency recovery for wedged hotkey."""
+        self._log("[panic] executing force reset")
+
+        # Force stop recording if active
+        if self.recording:
+            self._log("[panic] forcing recording stop")
+            try:
+                self._stop_recording()
+            except Exception as e:
+                self._log(f"[panic] error stopping recording: {e}")
+
+        # Reset key state
+        self._ropt_held = False
+        self._key_event = None
+
+        # Force kill overlay
+        try:
+            self.overlay.force_kill()
+        except Exception as e:
+            self._log(f"[panic] error killing overlay: {e}")
+
+        # Play error sound so user knows reset happened
+        try:
+            self._play("Basso")
+        except Exception:
+            pass
+
+        self._log("[panic] force reset complete")
+
+    def _start_cgevent_tap(self):
+        """Create and enable a CGEventTap for modifier key events.
+
+        CGEventTap is lower-level than NSEvent and more reliable, but can be
+        disabled by macOS if the process stalls. We watchdog-re-enable it.
+        """
+        def tap_thread():
+            # Create the event tap for flags changed events
+            self._cg_tap = CGEventTapCreate(
+                kCGSessionEventTap,  # Session scope (not HID - works without root)
+                kCGHeadInsertEventTap,  # Insert at head of event stream
+                kCGEventTapOptionListenOnly,  # Don't intercept, just observe
+                CGEventMaskBit(kCGEventFlagsChanged),  # Only modifier key events
+                self._cgevent_callback,
+                None
+            )
+
+            if self._cg_tap is None:
+                self._log("[tap] CGEventTap creation failed — need Accessibility permission")
+                # Fall back to NSEvent
+                self._start_nsevent_monitor()
+                return
+
+            # Get the runloop source
+            run_loop_source = CFMachPortCreateRunLoopSource(None, self._cg_tap, 0)
+
+            # Add to current runloop (default mode)
+            from CoreFoundation import kCFRunLoopDefaultMode
+            CFRunLoopAddSource(CFRunLoopGetCurrent(), run_loop_source, kCFRunLoopDefaultMode)
+
+            # Enable the tap
+            CGEventTapEnable(self._cg_tap, True)
+            self._cg_tap_enabled = True
+            self._log("[tap] CGEventTap active (with watchdog)")
+
+            # Run the loop
+            CFRunLoopRun()
+
+        # Start in a daemon thread
+        self._cg_tap_thread = threading.Thread(target=tap_thread, daemon=True)
+        self._cg_tap_thread.start()
+
+    def _watchdog_cg_tap(self, _):
+        """Watchdog: re-enable CGEventTap if macOS disabled it."""
+        if self._cg_tap is None:
+            return  # Fall back mode
+
+        if not CGEventTapIsEnabled(self._cg_tap):
+            self._log("[tap] CGEventTap was disabled by macOS — re-enabling")
+            CGEventTapEnable(self._cg_tap, True)
+
+    def _watchdog_overlay_health(self, _):
+        """Watchdog: monitor overlay process and restart if dead while showing."""
+        # If overlay died while supposed to be showing, force hide to clean state
+        if self.overlay._is_showing and not self.overlay.is_alive():
+            self._log("[overlay] died while showing — forcing hide to reset")
+            self.overlay._proc = None
+            self.overlay._is_showing = False
+            # If we're recording, stop to avoid stuck state
+            if self.recording:
+                self._log("[overlay] overlay died during recording — stopping")
+                self._stop_recording()
 
     # ── Record ────────────────────────────────────────────────────────────────
 
@@ -1970,11 +2144,25 @@ class BoloApp(rumps.App):
     # ── Quit ──────────────────────────────────────────────────────────────────
 
     def quit_app(self, _):
+        # Cancel any pending overlay hide timer and force hide overlay before
+        # invalidating the session, so background threads don't get stuck
+        if self._overlay_hide_timer is not None:
+            self._overlay_hide_timer.cancel()
+            self._overlay_hide_timer = None
+        self.overlay.hide()
+        self.recording = False
+        self.icon = ICON_IDLE
+        self.title = "⌥"
         self._active_session_id += 1
         self._session_phase = "idle"
+        # Synchronously close audio stream to dismiss macOS recording indicator
         if self.stream:
-            self.stream.stop()
-            self.stream.close()
+            try:
+                self.stream.stop()
+                self.stream.close()
+            except Exception:
+                pass
+            self.stream = None
         if self._stt:
             self._stt.close()
             self._stt = None
@@ -2015,13 +2203,40 @@ if __name__ == "__main__":
             pass
 
     import atexit
-    atexit.register(_release_instance_lock)
+    
+    def _cleanup_and_release_lock():
+        # Reset icon on normal exit
+        if _app_instance:
+            _app_instance.recording = False
+            _app_instance.icon = ICON_IDLE
+            _app_instance.title = "⌥"
+            _app_instance.overlay.hide()
+        _release_instance_lock()
+    
+    atexit.register(_cleanup_and_release_lock)
 
-    # Also release on SIGTERM so the supervisor can clean up cleanly.
-    def _sigterm_handler(signum, frame):
+    # Also release on SIGTERM/SIGINT so the supervisor can clean up cleanly.
+    _app_instance = None  # Will hold the BoloApp instance for signal handlers
+    
+    def _signal_handler(signum, frame):
+        # Clean shutdown: close audio stream first to dismiss system recording indicator
+        if _app_instance:
+            _app_instance.recording = False
+            # Force close the audio stream to dismiss macOS recording indicator
+            if _app_instance.stream:
+                try:
+                    _app_instance.stream.stop()
+                    _app_instance.stream.close()
+                except Exception:
+                    pass
+            _app_instance.icon = ICON_IDLE
+            _app_instance.title = "⌥"
+            _app_instance.overlay.hide()
         _release_instance_lock()
         sys.exit(0)
-    signal.signal(signal.SIGTERM, _sigterm_handler)
+    
+    signal.signal(signal.SIGTERM, _signal_handler)
+    signal.signal(signal.SIGINT, _signal_handler)
 
     # ── API key check ─────────────────────────────────────────────────────────
     if not TELNYX_API_KEY:
@@ -2040,4 +2255,5 @@ if __name__ == "__main__":
     from AppKit import NSApplication, NSApplicationActivationPolicyAccessory
     NSApplication.sharedApplication().setActivationPolicy_(
         NSApplicationActivationPolicyAccessory)
-    BoloApp().run()
+    _app_instance = BoloApp()
+    _app_instance.run()

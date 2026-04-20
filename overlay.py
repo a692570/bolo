@@ -7,6 +7,7 @@ Receives JSON messages on stdin to update phase and preview text.
 import json
 import select
 import sys
+import time
 
 from AppKit import (
     NSApplication,
@@ -164,11 +165,17 @@ def render():
     resize_for_text(preview)
 
 
+import os
+
+STALL_TIMEOUT = 30.0  # Exit if no messages for 30s (parent probably died)
+last_message_at = time.time()
+
 while True:
     ready, _, _ = select.select([sys.stdin], [], [], 0)
     if ready:
         line = sys.stdin.readline()
         if line == "":
+            # Stdin closed - parent died, exit immediately
             break
         try:
             message = json.loads(line)
@@ -176,9 +183,18 @@ while True:
             message = {}
         phase = message.get("phase", phase)
         preview = message.get("text", preview)
+        last_message_at = time.time()
+
+    # Auto-exit if parent stopped sending updates (overlay stuck prevention)
+    if time.time() - last_message_at > STALL_TIMEOUT:
+        break
 
     render()
     NSRunLoop.mainRunLoop().runMode_beforeDate_(
         NSDefaultRunLoopMode,
         NSDate.dateWithTimeIntervalSinceNow_(0.1),
     )
+
+# Clean exit - close window
+win.orderOut_(None)
+os._exit(0)
