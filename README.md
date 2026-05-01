@@ -17,7 +17,7 @@ cd bolo
 - **Category**: Voice dictation, Speech-to-text, Productivity tool
 - **Platform**: macOS 12+
 - **Language**: Rust 1.88+
-- **Dependencies**: cpal, rdev, reqwest, arboard
+- **Dependencies**: cpal, rdev, reqwest, arboard, PyObjC AppKit for the native macOS status HUD
 - **Use-case tags**: voice-to-text, global hotkey, accessibility, speech recognition, STT
 - **Related tools**: Wispr Flow alternative, Whisper, macOS Dictation
 - **License**: MIT
@@ -34,13 +34,14 @@ Bolo runs as a menu bar app that monitors global input events and processes audi
 5. **Speech-to-text**: Sends audio to Telnyx AI API calling `deepgram/nova-3`, with `distil-whisper/distil-large-v2` fallback on rate limits.
 6. **Text cleanup**: Applies local transcript cleanup by default. Optional LLM cleanup can be enabled with `BOLO_LLM_CLEANUP=on`.
 7. **Text injection**: Uses the system clipboard plus `osascript` Cmd+V automation to paste processed text at the current cursor position.
-8. **Audio feedback**: Plays system Tink sound on record start and Pop sound on completion.
+8. **Status HUD**: Shows a native macOS HUD for Dictating, Thinking, Inserting, and Inserted states.
+9. **Audio feedback**: Plays system Tink sound on record start and Pop sound on completion.
 
 Latency varies with utterance length and network conditions. Short phrases can feel quick; longer dictation is currently slower.
 
 ## Installation
 
-Requires macOS 12+, Rust/Cargo, and a Telnyx API key.
+Requires macOS 12+, Rust/Cargo, Python 3, and a Telnyx API key. The install script checks for PyObjC AppKit and installs it if needed for the native macOS status HUD.
 
 ```bash
 git clone https://github.com/a692570/bolo.git
@@ -74,7 +75,7 @@ Grant both in **System Settings > Privacy & Security**. Restart Bolo after grant
 4. Release Right Option (Pop sound plays)
 5. Transcribed text appears at cursor after finalization
 
-While dictating, Bolo shows a small bottom-centered borderless overlay that moves through Dictating, Thinking, Inserting, and Inserted states. Use the Bolo menu bar item to choose a microphone or quit.
+While dictating, Bolo shows a small bottom-centered native macOS HUD that moves through Dictating, Thinking, Inserting, and Inserted states. Use the Bolo menu bar item to choose a microphone or quit.
 
 ## Configuration
 

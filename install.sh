@@ -9,6 +9,14 @@ if ! command -v cargo &>/dev/null; then
   exit 1
 fi
 
+if ! python3 - <<'PY' >/dev/null 2>&1
+import AppKit
+PY
+then
+  echo "Installing native macOS HUD dependency..."
+  python3 -m pip install --user pyobjc-framework-AppKit
+fi
+
 echo "Building Rust binary..."
 cargo build --release
 
