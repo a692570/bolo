@@ -35,8 +35,8 @@ const TELNYX_STT_ENDPOINT: &str = "https://api.telnyx.com/v2/ai/audio/transcript
 const TELNYX_LLM_ENDPOINT: &str = "https://api.telnyx.com/v2/ai/chat/completions";
 const CORRECTION_WINDOW: Duration = Duration::from_secs(3);
 const MIN_RECORDING: Duration = Duration::from_secs(1);
-const OVERLAY_WIDTH: u32 = 272;
-const OVERLAY_HEIGHT: u32 = 72;
+const OVERLAY_WIDTH: u32 = 176;
+const OVERLAY_HEIGHT: u32 = 38;
 const OVERLAY_BOTTOM_MARGIN: u32 = 220;
 
 #[derive(Debug, Error)]
@@ -201,24 +201,29 @@ impl OverlayPhase {
     const fn colors(self) -> OverlayColors {
         match self {
             Self::Dictating => OverlayColors {
-                background: rgb(16, 30, 27),
-                text: rgb(207, 255, 232),
+                background: rgb(24, 26, 28),
+                text: rgb(244, 247, 250),
+                accent: rgb(84, 214, 153),
             },
             Self::Thinking => OverlayColors {
-                background: rgb(24, 24, 35),
-                text: rgb(224, 229, 255),
+                background: rgb(24, 26, 28),
+                text: rgb(244, 247, 250),
+                accent: rgb(149, 164, 255),
             },
             Self::Inserting => OverlayColors {
-                background: rgb(33, 27, 17),
-                text: rgb(255, 224, 166),
+                background: rgb(24, 26, 28),
+                text: rgb(244, 247, 250),
+                accent: rgb(255, 180, 87),
             },
             Self::Inserted => OverlayColors {
-                background: rgb(17, 32, 22),
-                text: rgb(195, 255, 206),
+                background: rgb(24, 26, 28),
+                text: rgb(244, 247, 250),
+                accent: rgb(104, 222, 126),
             },
             Self::Error => OverlayColors {
-                background: rgb(38, 18, 18),
-                text: rgb(255, 183, 183),
+                background: rgb(24, 26, 28),
+                text: rgb(244, 247, 250),
+                accent: rgb(255, 105, 105),
             },
         }
     }
@@ -228,6 +233,7 @@ impl OverlayPhase {
 struct OverlayColors {
     background: u32,
     text: u32,
+    accent: u32,
 }
 
 struct TrayUi {
@@ -1263,11 +1269,11 @@ fn create_recording_overlay(
         .with_inner_size(size)
         .with_position(position)
         .with_decorations(false)
-        .with_transparent(true)
+        .with_transparent(false)
         .with_always_on_top(true)
         .with_visible_on_all_workspaces(true)
         .with_focusable(false)
-        .with_background_color((0, 0, 0, 190))
+        .with_background_color((24, 26, 28, 245))
         .build(target)
         .map_err(|error| AppError::MenuBar(error.to_string()))?;
     render_recording_overlay(target, &window, OVERLAY_WIDTH, OVERLAY_HEIGHT, phase)?;
@@ -1301,14 +1307,22 @@ fn render_recording_overlay(
     for pixel in buffer.iter_mut() {
         *pixel = colors.background;
     }
-    draw_overlay_text(&mut buffer, stride, rows, phase.text(), colors.text);
+    draw_status_chip(&mut buffer, stride, rows, phase.text(), colors);
     buffer
         .present()
         .map_err(|error| AppError::MenuBar(error.to_string()))
 }
 
-fn draw_overlay_text(buffer: &mut [u32], stride: usize, rows: usize, text: &str, color: u32) {
-    let scale = 4_usize;
+fn draw_status_chip(
+    buffer: &mut [u32],
+    stride: usize,
+    rows: usize,
+    text: &str,
+    colors: OverlayColors,
+) {
+    let scale = 2_usize;
+    let dot_size = 8_usize;
+    let dot_gap = 12_usize;
     let letter_width = 5_usize * scale;
     let letter_gap = 2_usize * scale;
     let text_width = text
@@ -1322,9 +1336,21 @@ fn draw_overlay_text(buffer: &mut [u32], stride: usize, rows: usize, text: &str,
                 .saturating_mul(letter_gap),
         );
     let text_height = 7_usize * scale;
-    let start_x = stride.saturating_sub(text_width) / 2;
+    let group_width = dot_size.saturating_add(dot_gap).saturating_add(text_width);
+    let start_x = stride.saturating_sub(group_width) / 2;
     let start_y = rows.saturating_sub(text_height) / 2;
-    let mut cursor_x = start_x;
+    fill_disc(
+        buffer,
+        stride,
+        rows,
+        Point {
+            x: start_x.saturating_add(dot_size / 2),
+            y: rows / 2,
+        },
+        dot_size / 2,
+        colors.accent,
+    );
+    let mut cursor_x = start_x.saturating_add(dot_size).saturating_add(dot_gap);
     for character in text.chars() {
         draw_block_character(
             buffer,
@@ -1336,11 +1362,41 @@ fn draw_overlay_text(buffer: &mut [u32], stride: usize, rows: usize, text: &str,
             },
             scale,
             character,
-            color,
+            colors.text,
         );
         cursor_x = cursor_x
             .saturating_add(letter_width)
             .saturating_add(letter_gap);
+    }
+}
+
+fn fill_disc(
+    buffer: &mut [u32],
+    stride: usize,
+    rows: usize,
+    center: Point,
+    radius: usize,
+    color: u32,
+) {
+    let radius_squared = radius.saturating_mul(radius);
+    let min_x = center.x.saturating_sub(radius);
+    let max_x = center
+        .x
+        .saturating_add(radius)
+        .min(stride.saturating_sub(1));
+    let min_y = center.y.saturating_sub(radius);
+    let max_y = center.y.saturating_add(radius).min(rows.saturating_sub(1));
+    for row in min_y..=max_y {
+        for column in min_x..=max_x {
+            let dx = column.abs_diff(center.x);
+            let dy = row.abs_diff(center.y);
+            if dx.saturating_mul(dx).saturating_add(dy.saturating_mul(dy)) <= radius_squared {
+                let index = row.saturating_mul(stride).saturating_add(column);
+                if let Some(pixel) = buffer.get_mut(index) {
+                    *pixel = color;
+                }
+            }
+        }
     }
 }
 
