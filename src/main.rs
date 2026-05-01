@@ -17,7 +17,7 @@ use rdev::{Event, EventType, Key};
 use regex::Regex;
 use reqwest::blocking::{Client, multipart};
 use serde::{Deserialize, Serialize};
-use tao::dpi::{LogicalSize, PhysicalPosition};
+use tao::dpi::{LogicalPosition, LogicalSize};
 use tao::event::{Event as TaoEvent, StartCause};
 use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy, EventLoopWindowTarget};
 use tao::window::{Window, WindowBuilder};
@@ -37,6 +37,7 @@ const CORRECTION_WINDOW: Duration = Duration::from_secs(3);
 const MIN_RECORDING: Duration = Duration::from_secs(1);
 const OVERLAY_WIDTH: u32 = 272;
 const OVERLAY_HEIGHT: u32 = 72;
+const OVERLAY_BOTTOM_MARGIN: u32 = 220;
 
 #[derive(Debug, Error)]
 enum AppError {
@@ -1244,23 +1245,17 @@ fn create_recording_overlay(
 ) -> Result<Window, AppError> {
     let size = LogicalSize::new(f64::from(OVERLAY_WIDTH), f64::from(OVERLAY_HEIGHT));
     let position = target.primary_monitor().map_or_else(
-        || PhysicalPosition::new(180, 760),
+        || LogicalPosition::new(180.0, 760.0),
         |monitor| {
-            let monitor_position = monitor.position();
-            let monitor_size = monitor.size();
-            let x_offset =
-                i32::try_from(monitor_size.width.saturating_sub(OVERLAY_WIDTH) / 2).unwrap_or(0);
-            let y_offset = i32::try_from(
-                monitor_size
-                    .height
-                    .saturating_sub(OVERLAY_HEIGHT)
-                    .saturating_sub(120),
-            )
-            .unwrap_or(0);
-            PhysicalPosition::new(
-                monitor_position.x.saturating_add(x_offset),
-                monitor_position.y.saturating_add(y_offset),
-            )
+            let scale_factor = monitor.scale_factor();
+            let monitor_position = monitor.position().to_logical::<f64>(scale_factor);
+            let monitor_size = monitor.size().to_logical::<f64>(scale_factor);
+            let x_offset = (monitor_size.width - f64::from(OVERLAY_WIDTH)).max(0.0) / 2.0;
+            let y_offset = (monitor_size.height
+                - f64::from(OVERLAY_HEIGHT)
+                - f64::from(OVERLAY_BOTTOM_MARGIN))
+            .max(0.0);
+            LogicalPosition::new(monitor_position.x + x_offset, monitor_position.y + y_offset)
         },
     );
     let window = WindowBuilder::new()
