@@ -18,6 +18,8 @@ use reqwest::blocking::{Client, multipart};
 use serde::{Deserialize, Serialize};
 use tao::event::{Event as TaoEvent, StartCause};
 use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
+#[cfg(target_os = "macos")]
+use tao::platform::macos::{ActivationPolicy, EventLoopExtMacOS};
 use thiserror::Error;
 use tracing::{error, info, warn};
 use tracing_appender::non_blocking::WorkerGuard;
@@ -334,6 +336,13 @@ fn run_hotkey_listener(app: Arc<App>) -> Result<(), AppError> {
 fn run_app_event_loop(app: Arc<App>) -> Result<(), AppError> {
     let mut event_loop_builder = EventLoopBuilder::<UserEvent>::with_user_event();
     let event_loop = event_loop_builder.build();
+    #[cfg(target_os = "macos")]
+    let event_loop = {
+        let mut event_loop = event_loop;
+        event_loop.set_activation_policy(ActivationPolicy::Accessory);
+        event_loop.set_dock_visibility(false);
+        event_loop
+    };
     let proxy = event_loop.create_proxy();
     app.set_event_proxy(proxy.clone())?;
     MenuEvent::set_event_handler(Some(move |event| {

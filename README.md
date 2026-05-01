@@ -25,7 +25,7 @@ cd bolo
 
 ## How it works
 
-Bolo runs as a menu bar app that monitors global input events and processes audio only while the hotkey is held.
+Bolo runs as a menu bar-only app that monitors global input events and processes audio only while the hotkey is held.
 
 1. **Global hotkey monitoring**: Uses Rust's `rdev` event listener to listen for Option key events system-wide without interfering with other applications.
 2. **Audio capture**: On Option press, initializes a `cpal` input stream to capture PCM audio directly to memory.
