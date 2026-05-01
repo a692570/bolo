@@ -74,7 +74,7 @@ Grant both in **System Settings > Privacy & Security**. Restart Bolo after grant
 4. Release Right Option (Pop sound plays)
 5. Transcribed text appears at cursor after finalization
 
-While recording, Bolo shows a small bottom-centered borderless "Listening" overlay. Use the Bolo menu bar item to choose a microphone or quit.
+While dictating, Bolo shows a small bottom-centered borderless overlay that moves through Dictating, Thinking, Inserting, and Inserted states. Use the Bolo menu bar item to choose a microphone or quit.
 
 ## Configuration
 
@@ -115,7 +115,7 @@ Bolo merges that with its built-in vocabulary and uses it to preserve known term
 - Short dictation works well today. Longer dictation and latency are still improving.
 - Long dictation still needs more real-world validation than short phrases.
 - Cleanup is intentionally conservative to preserve literal meaning.
-- The legacy Python overlay, streaming preview, and learned correction memory are not part of the Rust runtime.
+- Streaming preview and learned correction memory are not part of the Rust runtime.
 
 ## Logs
 

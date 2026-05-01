@@ -35,6 +35,8 @@ const TELNYX_STT_ENDPOINT: &str = "https://api.telnyx.com/v2/ai/audio/transcript
 const TELNYX_LLM_ENDPOINT: &str = "https://api.telnyx.com/v2/ai/chat/completions";
 const CORRECTION_WINDOW: Duration = Duration::from_secs(3);
 const MIN_RECORDING: Duration = Duration::from_secs(1);
+const OVERLAY_WIDTH: u32 = 272;
+const OVERLAY_HEIGHT: u32 = 72;
 
 #[derive(Debug, Error)]
 enum AppError {
@@ -150,8 +152,81 @@ impl std::fmt::Debug for App {
 #[derive(Clone, Debug)]
 enum UserEvent {
     Menu(MenuEvent),
-    RecordingStarted,
-    RecordingStopped,
+    Overlay(OverlayPhase),
+    HideOverlay,
+    HideOverlayAfter(Duration),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OverlayPhase {
+    Dictating,
+    Thinking,
+    Inserting,
+    Inserted,
+    Error,
+}
+
+impl OverlayPhase {
+    const fn text(self) -> &'static str {
+        match self {
+            Self::Dictating => "DICTATING",
+            Self::Thinking => "THINKING",
+            Self::Inserting => "INSERTING",
+            Self::Inserted => "INSERTED",
+            Self::Error => "ERROR",
+        }
+    }
+
+    const fn tray_title(self) -> &'static str {
+        match self {
+            Self::Dictating => "Bolo Dictating",
+            Self::Thinking => "Bolo Thinking",
+            Self::Inserting => "Bolo Inserting",
+            Self::Inserted => "Bolo Inserted",
+            Self::Error => "Bolo Error",
+        }
+    }
+
+    const fn window_title(self) -> &'static str {
+        match self {
+            Self::Dictating => "Dictating",
+            Self::Thinking => "Thinking",
+            Self::Inserting => "Inserting",
+            Self::Inserted => "Inserted",
+            Self::Error => "Error",
+        }
+    }
+
+    const fn colors(self) -> OverlayColors {
+        match self {
+            Self::Dictating => OverlayColors {
+                background: rgb(16, 30, 27),
+                text: rgb(207, 255, 232),
+            },
+            Self::Thinking => OverlayColors {
+                background: rgb(24, 24, 35),
+                text: rgb(224, 229, 255),
+            },
+            Self::Inserting => OverlayColors {
+                background: rgb(33, 27, 17),
+                text: rgb(255, 224, 166),
+            },
+            Self::Inserted => OverlayColors {
+                background: rgb(17, 32, 22),
+                text: rgb(195, 255, 206),
+            },
+            Self::Error => OverlayColors {
+                background: rgb(38, 18, 18),
+                text: rgb(255, 183, 183),
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct OverlayColors {
+    background: u32,
+    text: u32,
 }
 
 struct TrayUi {
@@ -311,8 +386,9 @@ fn run_app_event_loop(app: Arc<App>) -> Result<(), AppError> {
 
     let mut tray_ui: Option<TrayUi> = None;
     let mut overlay_window: Option<Window> = None;
+    let mut overlay_hide_at: Option<Instant> = None;
     event_loop.run(move |event, event_loop_target, control_flow| {
-        *control_flow = ControlFlow::Wait;
+        *control_flow = overlay_hide_at.map_or(ControlFlow::Wait, ControlFlow::WaitUntil);
         match event {
             TaoEvent::NewEvents(StartCause::Init) => match create_tray_ui(&app) {
                 Ok(ui) => {
@@ -326,20 +402,56 @@ fn run_app_event_loop(app: Arc<App>) -> Result<(), AppError> {
                     handle_menu_event(&app, ui, &menu_event, control_flow);
                 }
             }
-            TaoEvent::UserEvent(UserEvent::RecordingStarted) => {
+            TaoEvent::UserEvent(UserEvent::Overlay(phase)) => {
+                overlay_hide_at = None;
+                *control_flow = ControlFlow::Wait;
                 if overlay_window.is_none() {
-                    match create_recording_overlay(event_loop_target) {
+                    match create_recording_overlay(event_loop_target, phase) {
                         Ok(window) => {
                             overlay_window = Some(window);
                             info!("recording overlay shown");
                         }
                         Err(error) => error!("{error}"),
                     }
+                } else if let Some(window) = overlay_window.as_ref()
+                    && let Err(error) = render_recording_overlay(
+                        event_loop_target,
+                        window,
+                        OVERLAY_WIDTH,
+                        OVERLAY_HEIGHT,
+                        phase,
+                    )
+                {
+                    error!("{error}");
+                }
+                if let Some(ui) = tray_ui.as_ref() {
+                    ui.tray_icon.set_title(Some(phase.tray_title()));
                 }
             }
-            TaoEvent::UserEvent(UserEvent::RecordingStopped) => {
+            TaoEvent::UserEvent(UserEvent::HideOverlay) => {
+                overlay_hide_at = None;
+                *control_flow = ControlFlow::Wait;
                 hide_recording_overlay(&mut overlay_window);
+                if let Some(ui) = tray_ui.as_ref() {
+                    ui.tray_icon.set_title(Some("Bolo"));
+                }
                 info!("recording overlay hidden");
+            }
+            TaoEvent::UserEvent(UserEvent::HideOverlayAfter(duration)) => {
+                let deadline = Instant::now() + duration;
+                overlay_hide_at = Some(deadline);
+                *control_flow = ControlFlow::WaitUntil(deadline);
+            }
+            TaoEvent::NewEvents(StartCause::ResumeTimeReached { .. }) => {
+                if overlay_hide_at.is_some_and(|deadline| Instant::now() >= deadline) {
+                    overlay_hide_at = None;
+                    *control_flow = ControlFlow::Wait;
+                    hide_recording_overlay(&mut overlay_window);
+                    if let Some(ui) = tray_ui.as_ref() {
+                        ui.tray_icon.set_title(Some("Bolo"));
+                    }
+                    info!("recording overlay hidden after delay");
+                }
             }
             TaoEvent::NewEvents(_)
             | TaoEvent::WindowEvent { .. }
@@ -414,7 +526,7 @@ impl App {
         }
         info!("recording started");
         play_sound("Tink");
-        self.send_user_event(UserEvent::RecordingStarted);
+        self.send_user_event(UserEvent::Overlay(OverlayPhase::Dictating));
         Ok(())
     }
 
@@ -431,6 +543,10 @@ impl App {
                 .spawn(move || {
                     if let Err(error) = app.finish_recording(recording) {
                         error!("{error}");
+                        app.send_user_event(UserEvent::Overlay(OverlayPhase::Error));
+                        app.send_user_event(UserEvent::HideOverlayAfter(Duration::from_millis(
+                            1_200,
+                        )));
                         play_sound("Basso");
                     }
                 })?;
@@ -441,9 +557,9 @@ impl App {
     fn finish_recording(&self, recording: ActiveRecording) -> Result<(), AppError> {
         let elapsed = recording.started_at.elapsed();
         drop(recording.stream);
-        self.send_user_event(UserEvent::RecordingStopped);
         if elapsed < MIN_RECORDING {
             info!("recording ignored because it was too short");
+            self.send_user_event(UserEvent::HideOverlay);
             return Ok(());
         }
         let samples = recording
@@ -453,8 +569,10 @@ impl App {
             .clone();
         if samples.is_empty() {
             info!("recording contained no samples");
+            self.send_user_event(UserEvent::HideOverlay);
             return Ok(());
         }
+        self.send_user_event(UserEvent::Overlay(OverlayPhase::Thinking));
         info!(
             "recording stopped; samples={}, sample_rate={}",
             samples.len(),
@@ -482,12 +600,14 @@ impl App {
         let text = self.prepare_text(&raw)?;
         if text.is_empty() {
             info!("[pipeline] final_text_empty");
+            self.send_user_event(UserEvent::HideOverlay);
             return Ok(());
         }
         let command = {
             let state = self.lock_state()?;
             parse_command(&text, correction_active(&state))
         };
+        self.send_user_event(UserEvent::Overlay(OverlayPhase::Inserting));
         if let Some(command) = command {
             info!(
                 "[pipeline] command_detected {}",
@@ -510,6 +630,8 @@ impl App {
             self.remember_result(text)?;
             play_sound("Pop");
         }
+        self.send_user_event(UserEvent::Overlay(OverlayPhase::Inserted));
+        self.send_user_event(UserEvent::HideOverlayAfter(Duration::from_millis(900)));
         Ok(())
     }
 
@@ -1076,6 +1198,7 @@ fn create_tray_ui(app: &App) -> Result<TrayUi, AppError> {
 
     let tray_icon = TrayIconBuilder::new()
         .with_menu(Box::new(tray_menu))
+        .with_title("Bolo")
         .with_tooltip("Bolo")
         .with_icon(tray_icon_image()?)
         .with_icon_as_template(true)
@@ -1115,20 +1238,22 @@ fn handle_menu_event(
     }
 }
 
-fn create_recording_overlay(target: &EventLoopWindowTarget<UserEvent>) -> Result<Window, AppError> {
-    let width = 272_u32;
-    let height = 72_u32;
-    let size = LogicalSize::new(f64::from(width), f64::from(height));
+fn create_recording_overlay(
+    target: &EventLoopWindowTarget<UserEvent>,
+    phase: OverlayPhase,
+) -> Result<Window, AppError> {
+    let size = LogicalSize::new(f64::from(OVERLAY_WIDTH), f64::from(OVERLAY_HEIGHT));
     let position = target.primary_monitor().map_or_else(
         || PhysicalPosition::new(180, 760),
         |monitor| {
             let monitor_position = monitor.position();
             let monitor_size = monitor.size();
-            let x_offset = i32::try_from(monitor_size.width.saturating_sub(width) / 2).unwrap_or(0);
+            let x_offset =
+                i32::try_from(monitor_size.width.saturating_sub(OVERLAY_WIDTH) / 2).unwrap_or(0);
             let y_offset = i32::try_from(
                 monitor_size
                     .height
-                    .saturating_sub(height)
+                    .saturating_sub(OVERLAY_HEIGHT)
                     .saturating_sub(120),
             )
             .unwrap_or(0);
@@ -1139,7 +1264,7 @@ fn create_recording_overlay(target: &EventLoopWindowTarget<UserEvent>) -> Result
         },
     );
     let window = WindowBuilder::new()
-        .with_title("Listening")
+        .with_title(phase.window_title())
         .with_inner_size(size)
         .with_position(position)
         .with_decorations(false)
@@ -1150,7 +1275,7 @@ fn create_recording_overlay(target: &EventLoopWindowTarget<UserEvent>) -> Result
         .with_background_color((0, 0, 0, 190))
         .build(target)
         .map_err(|error| AppError::MenuBar(error.to_string()))?;
-    render_recording_overlay(target, &window, width, height)?;
+    render_recording_overlay(target, &window, OVERLAY_WIDTH, OVERLAY_HEIGHT, phase)?;
     Ok(window)
 }
 
@@ -1159,6 +1284,7 @@ fn render_recording_overlay(
     window: &Window,
     width: u32,
     height: u32,
+    phase: OverlayPhase,
 ) -> Result<(), AppError> {
     let context =
         softbuffer::Context::new(target).map_err(|error| AppError::MenuBar(error.to_string()))?;
@@ -1176,17 +1302,17 @@ fn render_recording_overlay(
         .map_err(|error| AppError::MenuBar(error.to_string()))?;
     let stride = usize::try_from(width).map_err(|error| AppError::MenuBar(error.to_string()))?;
     let rows = usize::try_from(height).map_err(|error| AppError::MenuBar(error.to_string()))?;
+    let colors = phase.colors();
     for pixel in buffer.iter_mut() {
-        *pixel = rgb(15, 15, 15);
+        *pixel = colors.background;
     }
-    draw_listening_text(&mut buffer, stride, rows);
+    draw_overlay_text(&mut buffer, stride, rows, phase.text(), colors.text);
     buffer
         .present()
         .map_err(|error| AppError::MenuBar(error.to_string()))
 }
 
-fn draw_listening_text(buffer: &mut [u32], stride: usize, rows: usize) {
-    let text = "LISTENING";
+fn draw_overlay_text(buffer: &mut [u32], stride: usize, rows: usize, text: &str, color: u32) {
     let scale = 4_usize;
     let letter_width = 5_usize * scale;
     let letter_gap = 2_usize * scale;
@@ -1205,7 +1331,18 @@ fn draw_listening_text(buffer: &mut [u32], stride: usize, rows: usize) {
     let start_y = rows.saturating_sub(text_height) / 2;
     let mut cursor_x = start_x;
     for character in text.chars() {
-        draw_block_character(buffer, stride, rows, cursor_x, start_y, scale, character);
+        draw_block_character(
+            buffer,
+            stride,
+            rows,
+            Point {
+                x: cursor_x,
+                y: start_y,
+            },
+            scale,
+            character,
+            color,
+        );
         cursor_x = cursor_x
             .saturating_add(letter_width)
             .saturating_add(letter_gap);
@@ -1216,10 +1353,10 @@ fn draw_block_character(
     buffer: &mut [u32],
     stride: usize,
     rows: usize,
-    origin_x: usize,
-    origin_y: usize,
+    origin: Point,
     scale: usize,
     character: char,
+    color: u32,
 ) {
     let Some(pattern) = block_letter_pattern(character) else {
         return;
@@ -1234,15 +1371,21 @@ fn draw_block_character(
                 stride,
                 rows,
                 Rect {
-                    x: origin_x.saturating_add(column_index.saturating_mul(scale)),
-                    y: origin_y.saturating_add(row_index.saturating_mul(scale)),
+                    x: origin.x.saturating_add(column_index.saturating_mul(scale)),
+                    y: origin.y.saturating_add(row_index.saturating_mul(scale)),
                     width: scale,
                     height: scale,
                 },
-                rgb(245, 245, 245),
+                color,
             );
         }
     }
+}
+
+#[derive(Clone, Copy)]
+struct Point {
+    x: usize,
+    y: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -1272,20 +1415,41 @@ const fn rgb(red: u32, green: u32, blue: u32) -> u32 {
 
 const fn block_letter_pattern(character: char) -> Option<[&'static str; 7]> {
     match character {
+        'A' => Some([
+            "01110", "10001", "10001", "11111", "10001", "10001", "10001",
+        ]),
+        'C' => Some([
+            "01111", "10000", "10000", "10000", "10000", "10000", "01111",
+        ]),
+        'D' => Some([
+            "11110", "10001", "10001", "10001", "10001", "10001", "11110",
+        ]),
         'E' => Some([
             "11111", "10000", "10000", "11110", "10000", "10000", "11111",
         ]),
         'G' => Some([
             "01111", "10000", "10000", "10111", "10001", "10001", "01110",
         ]),
+        'H' => Some([
+            "10001", "10001", "10001", "11111", "10001", "10001", "10001",
+        ]),
         'I' => Some([
             "11111", "00100", "00100", "00100", "00100", "00100", "11111",
+        ]),
+        'K' => Some([
+            "10001", "10010", "10100", "11000", "10100", "10010", "10001",
         ]),
         'L' => Some([
             "10000", "10000", "10000", "10000", "10000", "10000", "11111",
         ]),
         'N' => Some([
             "10001", "11001", "10101", "10011", "10001", "10001", "10001",
+        ]),
+        'O' => Some([
+            "01110", "10001", "10001", "10001", "10001", "10001", "01110",
+        ]),
+        'R' => Some([
+            "11110", "10001", "10001", "11110", "10100", "10010", "10001",
         ]),
         'S' => Some([
             "01111", "10000", "10000", "01110", "00001", "00001", "11110",
@@ -1305,14 +1469,19 @@ fn hide_recording_overlay(overlay_window: &mut Option<Window>) {
 }
 
 fn tray_icon_image() -> Result<Icon, AppError> {
-    let width = 16_u32;
-    let height = 16_u32;
+    let width = 18_u32;
+    let height = 18_u32;
     let pixel_count = usize::try_from(width.saturating_mul(height).saturating_mul(4))
         .map_err(|error| AppError::MenuBar(error.to_string()))?;
     let mut rgba = Vec::with_capacity(pixel_count);
     for y in 0..height {
         for x in 0..width {
-            let in_mark = (4..=11).contains(&x) && (3..=12).contains(&y);
+            let capsule = (7..=10).contains(&x) && (2..=10).contains(&y);
+            let yoke = ((5..=6).contains(&x) || (11..=12).contains(&x)) && (8..=12).contains(&y);
+            let yoke_bottom = (6..=11).contains(&x) && y == 13;
+            let stem = (8..=9).contains(&x) && (13..=15).contains(&y);
+            let base = (5..=12).contains(&x) && y == 16;
+            let in_mark = capsule || yoke || yoke_bottom || stem || base;
             if in_mark {
                 rgba.extend_from_slice(&[0, 0, 0, 255]);
             } else {
