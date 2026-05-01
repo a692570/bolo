@@ -3,10 +3,9 @@
 use std::collections::VecDeque;
 use std::env;
 use std::fs::{self, File};
-use std::io::ErrorKind;
-use std::num::NonZeroU32;
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -17,10 +16,8 @@ use rdev::{Event, EventType, Key};
 use regex::Regex;
 use reqwest::blocking::{Client, multipart};
 use serde::{Deserialize, Serialize};
-use tao::dpi::{LogicalPosition, LogicalSize};
 use tao::event::{Event as TaoEvent, StartCause};
-use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy, EventLoopWindowTarget};
-use tao::window::{Window, WindowBuilder};
+use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
 use thiserror::Error;
 use tracing::{error, info, warn};
 use tracing_appender::non_blocking::WorkerGuard;
@@ -35,9 +32,6 @@ const TELNYX_STT_ENDPOINT: &str = "https://api.telnyx.com/v2/ai/audio/transcript
 const TELNYX_LLM_ENDPOINT: &str = "https://api.telnyx.com/v2/ai/chat/completions";
 const CORRECTION_WINDOW: Duration = Duration::from_secs(3);
 const MIN_RECORDING: Duration = Duration::from_secs(1);
-const OVERLAY_WIDTH: u32 = 176;
-const OVERLAY_HEIGHT: u32 = 38;
-const OVERLAY_BOTTOM_MARGIN: u32 = 220;
 
 #[derive(Debug, Error)]
 enum AppError {
@@ -168,16 +162,6 @@ enum OverlayPhase {
 }
 
 impl OverlayPhase {
-    const fn text(self) -> &'static str {
-        match self {
-            Self::Dictating => "DICTATING",
-            Self::Thinking => "THINKING",
-            Self::Inserting => "INSERTING",
-            Self::Inserted => "INSERTED",
-            Self::Error => "ERROR",
-        }
-    }
-
     const fn tray_title(self) -> &'static str {
         match self {
             Self::Dictating => "Bolo Dictating",
@@ -188,52 +172,15 @@ impl OverlayPhase {
         }
     }
 
-    const fn window_title(self) -> &'static str {
+    const fn overlay_phase(self) -> &'static str {
         match self {
-            Self::Dictating => "Dictating",
-            Self::Thinking => "Thinking",
-            Self::Inserting => "Inserting",
-            Self::Inserted => "Inserted",
-            Self::Error => "Error",
+            Self::Dictating => "dictating",
+            Self::Thinking => "thinking",
+            Self::Inserting => "inserting",
+            Self::Inserted => "inserted",
+            Self::Error => "error",
         }
     }
-
-    const fn colors(self) -> OverlayColors {
-        match self {
-            Self::Dictating => OverlayColors {
-                background: rgb(24, 26, 28),
-                text: rgb(244, 247, 250),
-                accent: rgb(84, 214, 153),
-            },
-            Self::Thinking => OverlayColors {
-                background: rgb(24, 26, 28),
-                text: rgb(244, 247, 250),
-                accent: rgb(149, 164, 255),
-            },
-            Self::Inserting => OverlayColors {
-                background: rgb(24, 26, 28),
-                text: rgb(244, 247, 250),
-                accent: rgb(255, 180, 87),
-            },
-            Self::Inserted => OverlayColors {
-                background: rgb(24, 26, 28),
-                text: rgb(244, 247, 250),
-                accent: rgb(104, 222, 126),
-            },
-            Self::Error => OverlayColors {
-                background: rgb(24, 26, 28),
-                text: rgb(244, 247, 250),
-                accent: rgb(255, 105, 105),
-            },
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct OverlayColors {
-    background: u32,
-    text: u32,
-    accent: u32,
 }
 
 struct TrayUi {
@@ -248,6 +195,20 @@ impl std::fmt::Debug for TrayUi {
             .debug_struct("TrayUi")
             .field("tray_id", self.tray_icon.id())
             .field("microphone_count", &self.microphone_items.len())
+            .finish_non_exhaustive()
+    }
+}
+
+struct NativeOverlay {
+    child: Child,
+    stdin: ChildStdin,
+}
+
+impl std::fmt::Debug for NativeOverlay {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NativeOverlay")
+            .field("child_id", &self.child.id())
             .finish_non_exhaustive()
     }
 }
@@ -392,9 +353,9 @@ fn run_app_event_loop(app: Arc<App>) -> Result<(), AppError> {
     drop(listener_handle);
 
     let mut tray_ui: Option<TrayUi> = None;
-    let mut overlay_window: Option<Window> = None;
+    let mut native_overlay: Option<NativeOverlay> = None;
     let mut overlay_hide_at: Option<Instant> = None;
-    event_loop.run(move |event, event_loop_target, control_flow| {
+    event_loop.run(move |event, _event_loop_target, control_flow| {
         *control_flow = overlay_hide_at.map_or(ControlFlow::Wait, ControlFlow::WaitUntil);
         match event {
             TaoEvent::NewEvents(StartCause::Init) => match create_tray_ui(&app) {
@@ -412,22 +373,8 @@ fn run_app_event_loop(app: Arc<App>) -> Result<(), AppError> {
             TaoEvent::UserEvent(UserEvent::Overlay(phase)) => {
                 overlay_hide_at = None;
                 *control_flow = ControlFlow::Wait;
-                if overlay_window.is_none() {
-                    match create_recording_overlay(event_loop_target, phase) {
-                        Ok(window) => {
-                            overlay_window = Some(window);
-                            info!("recording overlay shown");
-                        }
-                        Err(error) => error!("{error}"),
-                    }
-                } else if let Some(window) = overlay_window.as_ref()
-                    && let Err(error) = render_recording_overlay(
-                        event_loop_target,
-                        window,
-                        OVERLAY_WIDTH,
-                        OVERLAY_HEIGHT,
-                        phase,
-                    )
+                if let Err(error) =
+                    show_native_overlay(&mut native_overlay, &app.config.root_dir, phase)
                 {
                     error!("{error}");
                 }
@@ -438,7 +385,7 @@ fn run_app_event_loop(app: Arc<App>) -> Result<(), AppError> {
             TaoEvent::UserEvent(UserEvent::HideOverlay) => {
                 overlay_hide_at = None;
                 *control_flow = ControlFlow::Wait;
-                hide_recording_overlay(&mut overlay_window);
+                hide_native_overlay(&mut native_overlay);
                 if let Some(ui) = tray_ui.as_ref() {
                     ui.tray_icon.set_title(Some("Bolo"));
                 }
@@ -453,7 +400,7 @@ fn run_app_event_loop(app: Arc<App>) -> Result<(), AppError> {
                 if overlay_hide_at.is_some_and(|deadline| Instant::now() >= deadline) {
                     overlay_hide_at = None;
                     *control_flow = ControlFlow::Wait;
-                    hide_recording_overlay(&mut overlay_window);
+                    hide_native_overlay(&mut native_overlay);
                     if let Some(ui) = tray_ui.as_ref() {
                         ui.tray_icon.set_title(Some("Bolo"));
                     }
@@ -1245,277 +1192,94 @@ fn handle_menu_event(
     }
 }
 
-fn create_recording_overlay(
-    target: &EventLoopWindowTarget<UserEvent>,
-    phase: OverlayPhase,
-) -> Result<Window, AppError> {
-    let size = LogicalSize::new(f64::from(OVERLAY_WIDTH), f64::from(OVERLAY_HEIGHT));
-    let position = target.primary_monitor().map_or_else(
-        || LogicalPosition::new(180.0, 760.0),
-        |monitor| {
-            let scale_factor = monitor.scale_factor();
-            let monitor_position = monitor.position().to_logical::<f64>(scale_factor);
-            let monitor_size = monitor.size().to_logical::<f64>(scale_factor);
-            let x_offset = (monitor_size.width - f64::from(OVERLAY_WIDTH)).max(0.0) / 2.0;
-            let y_offset = (monitor_size.height
-                - f64::from(OVERLAY_HEIGHT)
-                - f64::from(OVERLAY_BOTTOM_MARGIN))
-            .max(0.0);
-            LogicalPosition::new(monitor_position.x + x_offset, monitor_position.y + y_offset)
-        },
-    );
-    let window = WindowBuilder::new()
-        .with_title(phase.window_title())
-        .with_inner_size(size)
-        .with_position(position)
-        .with_decorations(false)
-        .with_transparent(false)
-        .with_always_on_top(true)
-        .with_visible_on_all_workspaces(true)
-        .with_focusable(false)
-        .with_background_color((24, 26, 28, 245))
-        .build(target)
-        .map_err(|error| AppError::MenuBar(error.to_string()))?;
-    render_recording_overlay(target, &window, OVERLAY_WIDTH, OVERLAY_HEIGHT, phase)?;
-    Ok(window)
-}
-
-fn render_recording_overlay(
-    target: &EventLoopWindowTarget<UserEvent>,
-    window: &Window,
-    width: u32,
-    height: u32,
+fn show_native_overlay(
+    overlay: &mut Option<NativeOverlay>,
+    root_dir: &Path,
     phase: OverlayPhase,
 ) -> Result<(), AppError> {
-    let context =
-        softbuffer::Context::new(target).map_err(|error| AppError::MenuBar(error.to_string()))?;
-    let mut surface = softbuffer::Surface::new(&context, window)
-        .map_err(|error| AppError::MenuBar(error.to_string()))?;
-    let width_nonzero = NonZeroU32::new(width)
-        .ok_or_else(|| AppError::MenuBar(String::from("zero overlay width")))?;
-    let height_nonzero = NonZeroU32::new(height)
-        .ok_or_else(|| AppError::MenuBar(String::from("zero overlay height")))?;
-    surface
-        .resize(width_nonzero, height_nonzero)
-        .map_err(|error| AppError::MenuBar(error.to_string()))?;
-    let mut buffer = surface
-        .buffer_mut()
-        .map_err(|error| AppError::MenuBar(error.to_string()))?;
-    let stride = usize::try_from(width).map_err(|error| AppError::MenuBar(error.to_string()))?;
-    let rows = usize::try_from(height).map_err(|error| AppError::MenuBar(error.to_string()))?;
-    let colors = phase.colors();
-    for pixel in buffer.iter_mut() {
-        *pixel = colors.background;
+    let needs_spawn = match overlay.as_mut() {
+        Some(existing) => !existing.is_running()?,
+        None => true,
+    };
+    if needs_spawn {
+        hide_native_overlay(overlay);
+        *overlay = Some(spawn_native_overlay(root_dir)?);
+        info!("recording overlay shown");
     }
-    draw_status_chip(&mut buffer, stride, rows, phase.text(), colors);
-    buffer
-        .present()
-        .map_err(|error| AppError::MenuBar(error.to_string()))
+    if let Some(existing) = overlay.as_mut()
+        && let Err(error) = existing.update(phase)
+    {
+        warn!("overlay update failed, restarting: {error}");
+        hide_native_overlay(overlay);
+        let mut replacement = spawn_native_overlay(root_dir)?;
+        replacement.update(phase)?;
+        *overlay = Some(replacement);
+    }
+    Ok(())
 }
 
-fn draw_status_chip(
-    buffer: &mut [u32],
-    stride: usize,
-    rows: usize,
-    text: &str,
-    colors: OverlayColors,
-) {
-    let scale = 2_usize;
-    let dot_size = 8_usize;
-    let dot_gap = 12_usize;
-    let letter_width = 5_usize * scale;
-    let letter_gap = 2_usize * scale;
-    let text_width = text
-        .chars()
-        .count()
-        .saturating_mul(letter_width)
-        .saturating_add(
-            text.chars()
-                .count()
-                .saturating_sub(1)
-                .saturating_mul(letter_gap),
-        );
-    let text_height = 7_usize * scale;
-    let group_width = dot_size.saturating_add(dot_gap).saturating_add(text_width);
-    let start_x = stride.saturating_sub(group_width) / 2;
-    let start_y = rows.saturating_sub(text_height) / 2;
-    fill_disc(
-        buffer,
-        stride,
-        rows,
-        Point {
-            x: start_x.saturating_add(dot_size / 2),
-            y: rows / 2,
-        },
-        dot_size / 2,
-        colors.accent,
-    );
-    let mut cursor_x = start_x.saturating_add(dot_size).saturating_add(dot_gap);
-    for character in text.chars() {
-        draw_block_character(
-            buffer,
-            stride,
-            rows,
-            Point {
-                x: cursor_x,
-                y: start_y,
-            },
-            scale,
-            character,
-            colors.text,
-        );
-        cursor_x = cursor_x
-            .saturating_add(letter_width)
-            .saturating_add(letter_gap);
-    }
+fn spawn_native_overlay(root_dir: &Path) -> Result<NativeOverlay, AppError> {
+    let script = root_dir.join("overlay.py");
+    let mut child = Command::new("python3")
+        .arg(script)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| AppError::MenuBar(format!("overlay launch failed: {error}")))?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| AppError::MenuBar(String::from("overlay stdin unavailable")))?;
+    Ok(NativeOverlay { child, stdin })
 }
 
-fn fill_disc(
-    buffer: &mut [u32],
-    stride: usize,
-    rows: usize,
-    center: Point,
-    radius: usize,
-    color: u32,
-) {
-    let radius_squared = radius.saturating_mul(radius);
-    let min_x = center.x.saturating_sub(radius);
-    let max_x = center
-        .x
-        .saturating_add(radius)
-        .min(stride.saturating_sub(1));
-    let min_y = center.y.saturating_sub(radius);
-    let max_y = center.y.saturating_add(radius).min(rows.saturating_sub(1));
-    for row in min_y..=max_y {
-        for column in min_x..=max_x {
-            let dx = column.abs_diff(center.x);
-            let dy = row.abs_diff(center.y);
-            if dx.saturating_mul(dx).saturating_add(dy.saturating_mul(dy)) <= radius_squared {
-                let index = row.saturating_mul(stride).saturating_add(column);
-                if let Some(pixel) = buffer.get_mut(index) {
-                    *pixel = color;
-                }
-            }
-        }
-    }
-}
-
-fn draw_block_character(
-    buffer: &mut [u32],
-    stride: usize,
-    rows: usize,
-    origin: Point,
-    scale: usize,
-    character: char,
-    color: u32,
-) {
-    let Some(pattern) = block_letter_pattern(character) else {
+fn hide_native_overlay(overlay: &mut Option<NativeOverlay>) {
+    let Some(existing) = overlay.take() else {
         return;
     };
-    for (row_index, row) in pattern.iter().enumerate() {
-        for (column_index, bit) in row.chars().enumerate() {
-            if bit != '1' {
-                continue;
-            }
-            fill_rect(
-                buffer,
-                stride,
-                rows,
-                Rect {
-                    x: origin.x.saturating_add(column_index.saturating_mul(scale)),
-                    y: origin.y.saturating_add(row_index.saturating_mul(scale)),
-                    width: scale,
-                    height: scale,
-                },
-                color,
-            );
-        }
+    let NativeOverlay {
+        mut child,
+        mut stdin,
+    } = existing;
+    if let Err(error) = stdin.flush() {
+        warn!("overlay flush failed before hide: {error}");
     }
-}
-
-#[derive(Clone, Copy)]
-struct Point {
-    x: usize,
-    y: usize,
-}
-
-#[derive(Clone, Copy)]
-struct Rect {
-    x: usize,
-    y: usize,
-    width: usize,
-    height: usize,
-}
-
-fn fill_rect(buffer: &mut [u32], stride: usize, rows: usize, rect: Rect, color: u32) {
-    let max_y = rect.y.saturating_add(rect.height).min(rows);
-    let max_x = rect.x.saturating_add(rect.width).min(stride);
-    for row in rect.y..max_y {
-        for column in rect.x..max_x {
-            let index = row.saturating_mul(stride).saturating_add(column);
-            if let Some(pixel) = buffer.get_mut(index) {
-                *pixel = color;
+    drop(stdin);
+    for _ in 0..20 {
+        match child.try_wait() {
+            Ok(Some(_status)) => return,
+            Ok(None) => std::thread::sleep(Duration::from_millis(25)),
+            Err(error) => {
+                warn!("overlay status check failed: {error}");
+                return;
             }
         }
     }
-}
-
-const fn rgb(red: u32, green: u32, blue: u32) -> u32 {
-    blue | (green << 8) | (red << 16)
-}
-
-const fn block_letter_pattern(character: char) -> Option<[&'static str; 7]> {
-    match character {
-        'A' => Some([
-            "01110", "10001", "10001", "11111", "10001", "10001", "10001",
-        ]),
-        'C' => Some([
-            "01111", "10000", "10000", "10000", "10000", "10000", "01111",
-        ]),
-        'D' => Some([
-            "11110", "10001", "10001", "10001", "10001", "10001", "11110",
-        ]),
-        'E' => Some([
-            "11111", "10000", "10000", "11110", "10000", "10000", "11111",
-        ]),
-        'G' => Some([
-            "01111", "10000", "10000", "10111", "10001", "10001", "01110",
-        ]),
-        'H' => Some([
-            "10001", "10001", "10001", "11111", "10001", "10001", "10001",
-        ]),
-        'I' => Some([
-            "11111", "00100", "00100", "00100", "00100", "00100", "11111",
-        ]),
-        'K' => Some([
-            "10001", "10010", "10100", "11000", "10100", "10010", "10001",
-        ]),
-        'L' => Some([
-            "10000", "10000", "10000", "10000", "10000", "10000", "11111",
-        ]),
-        'N' => Some([
-            "10001", "11001", "10101", "10011", "10001", "10001", "10001",
-        ]),
-        'O' => Some([
-            "01110", "10001", "10001", "10001", "10001", "10001", "01110",
-        ]),
-        'R' => Some([
-            "11110", "10001", "10001", "11110", "10100", "10010", "10001",
-        ]),
-        'S' => Some([
-            "01111", "10000", "10000", "01110", "00001", "00001", "11110",
-        ]),
-        'T' => Some([
-            "11111", "00100", "00100", "00100", "00100", "00100", "00100",
-        ]),
-        _ => None,
+    if let Err(error) = child.kill() {
+        warn!("overlay kill failed: {error}");
+    }
+    if let Err(error) = child.wait() {
+        warn!("overlay wait failed: {error}");
     }
 }
 
-fn hide_recording_overlay(overlay_window: &mut Option<Window>) {
-    if let Some(window) = overlay_window.take() {
-        window.set_visible(false);
-        drop(window);
+impl NativeOverlay {
+    fn is_running(&mut self) -> Result<bool, AppError> {
+        self.child
+            .try_wait()
+            .map(|status| status.is_none())
+            .map_err(AppError::Io)
+    }
+
+    fn update(&mut self, phase: OverlayPhase) -> Result<(), AppError> {
+        let payload = serde_json::json!({
+            "phase": phase.overlay_phase(),
+            "text": "",
+        });
+        writeln!(self.stdin, "{payload}")?;
+        self.stdin.flush()?;
+        Ok(())
     }
 }
 
