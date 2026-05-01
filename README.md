@@ -74,7 +74,7 @@ Grant both in **System Settings > Privacy & Security**. Restart Bolo after grant
 4. Release Right Option (Pop sound plays)
 5. Transcribed text appears at cursor after finalization
 
-Use the Bolo menu bar item to choose a microphone or quit. Stop Bolo from Terminal with `pkill -f target/release/bolo`.
+While recording, Bolo shows a small bottom-centered borderless “Listening” overlay. Use the Bolo menu bar item to choose a microphone or quit. Stop Bolo from Terminal with `pkill -f target/release/bolo`.
 
 ## Configuration
 
@@ -114,6 +114,8 @@ Bolo merges that with its built-in vocabulary and uses it to preserve known term
 ```bash
 tail -f /tmp/bolo.log
 ```
+
+Each dictation logs the pipeline stages: audio metadata, Telnyx STT endpoint/model/request metadata, raw STT transcript, local cleanup transformations, LLM cleanup endpoint/model/input/output when enabled, and the final text sent for insertion. Authorization headers and API keys are not logged.
 
 ## Evaluation
 

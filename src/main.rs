@@ -3,6 +3,7 @@
 use std::collections::VecDeque;
 use std::env;
 use std::fs::{self, File};
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -15,8 +16,10 @@ use rdev::{Event, EventType, Key};
 use regex::Regex;
 use reqwest::blocking::{Client, multipart};
 use serde::{Deserialize, Serialize};
+use tao::dpi::{LogicalSize, PhysicalPosition};
 use tao::event::{Event as TaoEvent, StartCause};
-use tao::event_loop::{ControlFlow, EventLoopBuilder};
+use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy, EventLoopWindowTarget};
+use tao::window::{Window, WindowBuilder};
 use thiserror::Error;
 use tracing::{error, info, warn};
 use tracing_appender::non_blocking::WorkerGuard;
@@ -115,17 +118,29 @@ impl std::fmt::Debug for ActiveRecording {
     }
 }
 
-#[derive(Debug)]
 struct App {
     config: Config,
     http: Client,
     vocabulary: Vec<String>,
     state: Mutex<AppState>,
+    event_proxy: Mutex<Option<EventLoopProxy<UserEvent>>>,
+}
+
+impl std::fmt::Debug for App {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("App")
+            .field("config", &self.config)
+            .field("vocabulary_count", &self.vocabulary.len())
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Clone, Debug)]
 enum UserEvent {
     Menu(MenuEvent),
+    RecordingStarted,
+    RecordingStopped,
 }
 
 struct TrayUi {
@@ -213,6 +228,7 @@ fn run_app_event_loop(app: Arc<App>) -> Result<(), AppError> {
     let mut event_loop_builder = EventLoopBuilder::<UserEvent>::with_user_event();
     let event_loop = event_loop_builder.build();
     let proxy = event_loop.create_proxy();
+    app.set_event_proxy(proxy.clone())?;
     MenuEvent::set_event_handler(Some(move |event| {
         if proxy.send_event(UserEvent::Menu(event)).is_err() {
             warn!("menu event dropped because event loop is closed");
@@ -230,7 +246,8 @@ fn run_app_event_loop(app: Arc<App>) -> Result<(), AppError> {
     drop(listener_handle);
 
     let mut tray_ui: Option<TrayUi> = None;
-    event_loop.run(move |event, _, control_flow| {
+    let mut overlay_window: Option<Window> = None;
+    event_loop.run(move |event, event_loop_target, control_flow| {
         *control_flow = ControlFlow::Wait;
         match event {
             TaoEvent::NewEvents(StartCause::Init) => match create_tray_ui(&app) {
@@ -244,6 +261,21 @@ fn run_app_event_loop(app: Arc<App>) -> Result<(), AppError> {
                 if let Some(ui) = tray_ui.as_mut() {
                     handle_menu_event(&app, ui, &menu_event, control_flow);
                 }
+            }
+            TaoEvent::UserEvent(UserEvent::RecordingStarted) => {
+                if overlay_window.is_none() {
+                    match create_recording_overlay(event_loop_target) {
+                        Ok(window) => {
+                            overlay_window = Some(window);
+                            info!("recording overlay shown");
+                        }
+                        Err(error) => error!("{error}"),
+                    }
+                }
+            }
+            TaoEvent::UserEvent(UserEvent::RecordingStopped) => {
+                hide_recording_overlay(&mut overlay_window);
+                info!("recording overlay hidden");
             }
             TaoEvent::NewEvents(_)
             | TaoEvent::WindowEvent { .. }
@@ -274,6 +306,7 @@ impl App {
                 selected_microphone,
                 ..AppState::default()
             }),
+            event_proxy: Mutex::new(None),
         })
     }
 
@@ -317,6 +350,7 @@ impl App {
         }
         info!("recording started");
         play_sound("Tink");
+        self.send_user_event(UserEvent::RecordingStarted);
         Ok(())
     }
 
@@ -343,6 +377,7 @@ impl App {
     fn finish_recording(&self, recording: ActiveRecording) -> Result<(), AppError> {
         let elapsed = recording.started_at.elapsed();
         drop(recording.stream);
+        self.send_user_event(UserEvent::RecordingStopped);
         if elapsed < MIN_RECORDING {
             info!("recording ignored because it was too short");
             return Ok(());
@@ -362,9 +397,27 @@ impl App {
             recording.sample_rate
         );
         let wav = wav_bytes(&samples, recording.sample_rate)?;
+        info!(
+            "[pipeline] audio_finalized {}",
+            serde_json::json!({
+                "samples": samples.len(),
+                "sample_rate": recording.sample_rate,
+                "wav_bytes": wav.len(),
+                "duration_ms": elapsed.as_millis(),
+            })
+        );
         let raw = self.transcribe(&wav)?;
+        info!(
+            "[pipeline] stt_understanding {}",
+            serde_json::json!({
+                    "transcript": &raw,
+                "chars": raw.chars().count(),
+                "words": raw.split_whitespace().count(),
+            })
+        );
         let text = self.prepare_text(&raw)?;
         if text.is_empty() {
+            info!("[pipeline] final_text_empty");
             return Ok(());
         }
         let command = {
@@ -372,8 +425,23 @@ impl App {
             parse_command(&text, correction_active(&state))
         };
         if let Some(command) = command {
+            info!(
+                "[pipeline] command_detected {}",
+                serde_json::json!({
+                    "kind": format!("{:?}", command.kind),
+                    "text": &command.text,
+                    "display": &command.display,
+                })
+            );
             self.apply_command(command)?;
         } else {
+            info!(
+                "[pipeline] injecting_text {}",
+                serde_json::json!({
+                    "text": &text,
+                    "chars": text.chars().count(),
+                })
+            );
             paste_text(&text)?;
             self.remember_result(text)?;
             play_sound("Pop");
@@ -389,6 +457,18 @@ impl App {
             "keyterms": self.vocabulary.iter().take(50).collect::<Vec<_>>()
         });
         let prompt = build_stt_prompt(&self.vocabulary);
+        info!(
+            "[stt] request {}",
+            serde_json::json!({
+                "endpoint": TELNYX_STT_ENDPOINT,
+                "model": "deepgram/nova-3",
+                "language": "en",
+                "audio_mime": "audio/wav",
+                "audio_bytes": wav.len(),
+                "model_config": &model_config,
+                "prompt": &prompt,
+            })
+        );
         let part = multipart::Part::bytes(wav.to_vec())
             .file_name(String::from("audio.wav"))
             .mime_str("audio/wav")?;
@@ -407,28 +487,114 @@ impl App {
             .multipart(form)
             .send()?;
         let status = response.status();
+        info!(
+            "[stt] response_status {}",
+            serde_json::json!({
+                "endpoint": TELNYX_STT_ENDPOINT,
+                "model": "deepgram/nova-3",
+                "status": status.as_u16(),
+            })
+        );
         if !status.is_success() {
             return Err(AppError::Transcription(format!(
                 "Telnyx STT returned {status}"
             )));
         }
         let parsed: SttResponse = response.json()?;
-        Ok(parsed.text.unwrap_or_default())
+        let transcript = parsed.text.unwrap_or_default();
+        info!(
+            "[stt] response_text {}",
+            serde_json::json!({
+                "endpoint": TELNYX_STT_ENDPOINT,
+                "model": "deepgram/nova-3",
+                "transcript": &transcript,
+            })
+        );
+        Ok(transcript)
     }
 
     fn prepare_text(&self, raw: &str) -> Result<String, AppError> {
-        let normalized = canonicalize_known_terms(&normalize_transcript(raw));
+        info!(
+            "[cleanup] input {}",
+            serde_json::json!({
+                "raw_stt": raw,
+            })
+        );
+        let whitespace_normalized = normalize_transcript(raw);
+        info!(
+            "[cleanup] normalize_whitespace {}",
+            serde_json::json!({
+                "before": raw,
+                "after": &whitespace_normalized,
+            })
+        );
+        let normalized = canonicalize_known_terms(&whitespace_normalized);
+        info!(
+            "[cleanup] canonicalize_terms {}",
+            serde_json::json!({
+                "before": &whitespace_normalized,
+                "after": &normalized,
+            })
+        );
         let stripped = remove_fillers(&normalized)?;
-        if !should_run_cleanup(&self.config, &stripped) {
+        info!(
+            "[cleanup] remove_fillers {}",
+            serde_json::json!({
+                "before": &normalized,
+                "after": &stripped,
+            })
+        );
+        let (should_cleanup, cleanup_reason) = cleanup_decision(&self.config, &stripped);
+        info!(
+            "[cleanup] llm_decision {}",
+            serde_json::json!({
+                "run": should_cleanup,
+                "reason": cleanup_reason,
+                "mode": format!("{:?}", self.config.llm_cleanup),
+                "word_count": stripped.split_whitespace().count(),
+            })
+        );
+        if !should_cleanup {
+            info!(
+                "[cleanup] final_without_llm {}",
+                serde_json::json!({
+                    "text": &stripped,
+                })
+            );
             return Ok(stripped);
         }
         match self.cleanup_transcript(&stripped) {
-            Ok(cleaned) if !cleaned.is_empty() => Ok(canonicalize_known_terms(
-                &normalize_transcript(cleaned.trim()),
-            )),
-            Ok(_) => Ok(stripped),
+            Ok(cleaned) if !cleaned.is_empty() => {
+                let normalized_cleaned = normalize_transcript(cleaned.trim());
+                let final_text = canonicalize_known_terms(&normalized_cleaned);
+                info!(
+                    "[cleanup] final_with_llm {}",
+                    serde_json::json!({
+                        "llm_output": &cleaned,
+                        "normalized_llm_output": &normalized_cleaned,
+                        "final_text": &final_text,
+                    })
+                );
+                Ok(final_text)
+            }
+            Ok(_) => {
+                info!(
+                    "[cleanup] llm_empty_fallback {}",
+                    serde_json::json!({
+                        "fallback_text": &stripped,
+                    })
+                );
+                Ok(stripped)
+            }
             Err(error) => {
                 warn!("cleanup skipped after error: {error}");
+                info!(
+                    "[cleanup] llm_error_fallback {}",
+                    serde_json::json!({
+                        "error": error.to_string(),
+                        "fallback_text": &stripped,
+                    })
+                );
                 Ok(stripped)
             }
         }
@@ -437,12 +603,13 @@ impl App {
     fn cleanup_transcript(&self, transcript: &str) -> Result<String, AppError> {
         let endpoint = self.config.llm_endpoint();
         let model = self.config.llm_model();
+        let system_prompt = cleanup_prompt();
         let request = ChatRequest {
             model: &model,
             messages: vec![
                 ChatMessageRequest {
                     role: "system",
-                    content: cleanup_prompt(),
+                    content: system_prompt,
                 },
                 ChatMessageRequest {
                     role: "user",
@@ -453,19 +620,49 @@ impl App {
             temperature: 0,
             enable_thinking: false,
         };
-        let mut builder = self.http.post(endpoint).json(&request);
+        info!(
+            "[llm] request {}",
+            serde_json::json!({
+                "endpoint": &endpoint,
+                "model": &model,
+                "system_prompt": system_prompt,
+                "user_transcript": transcript,
+                "max_tokens": request.max_tokens,
+                "temperature": request.temperature,
+                "enable_thinking": request.enable_thinking,
+            })
+        );
+        let mut builder = self.http.post(&endpoint).json(&request);
         if let Some(key) = self.config.llm_key() {
             builder = builder.bearer_auth(key);
         }
         let response = builder.send()?;
-        if !response.status().is_success() {
+        let status = response.status();
+        info!(
+            "[llm] response_status {}",
+            serde_json::json!({
+                "endpoint": &endpoint,
+                "model": &model,
+                "status": status.as_u16(),
+            })
+        );
+        if !status.is_success() {
             return Ok(String::new());
         }
         let parsed: ChatResponse = response.json()?;
-        Ok(parsed
+        let output = parsed
             .choices
             .first()
-            .map_or_else(String::new, |choice| choice.message.content.clone()))
+            .map_or_else(String::new, |choice| choice.message.content.clone());
+        info!(
+            "[llm] response_text {}",
+            serde_json::json!({
+                "endpoint": &endpoint,
+                "model": &model,
+                "output": &output,
+            })
+        );
+        Ok(output)
     }
 
     fn apply_command(&self, command: DictationCommand) -> Result<(), AppError> {
@@ -515,6 +712,29 @@ impl App {
         self.state
             .lock()
             .map_err(|error| AppError::PoisonedMutex(error.to_string()))
+    }
+
+    fn set_event_proxy(&self, proxy: EventLoopProxy<UserEvent>) -> Result<(), AppError> {
+        let mut stored = self
+            .event_proxy
+            .lock()
+            .map_err(|error| AppError::PoisonedMutex(error.to_string()))?;
+        *stored = Some(proxy);
+        drop(stored);
+        Ok(())
+    }
+
+    fn send_user_event(&self, event: UserEvent) {
+        let proxy = self
+            .event_proxy
+            .lock()
+            .ok()
+            .and_then(|stored| stored.clone());
+        if let Some(proxy) = proxy
+            && proxy.send_event(event).is_err()
+        {
+            warn!("event loop is closed");
+        }
     }
 
     fn selected_microphone(&self) -> Result<Option<String>, AppError> {
@@ -774,6 +994,195 @@ fn handle_menu_event(
     }
 }
 
+fn create_recording_overlay(target: &EventLoopWindowTarget<UserEvent>) -> Result<Window, AppError> {
+    let width = 272_u32;
+    let height = 72_u32;
+    let size = LogicalSize::new(f64::from(width), f64::from(height));
+    let position = target.primary_monitor().map_or_else(
+        || PhysicalPosition::new(180, 760),
+        |monitor| {
+            let monitor_position = monitor.position();
+            let monitor_size = monitor.size();
+            let x_offset = i32::try_from(monitor_size.width.saturating_sub(width) / 2).unwrap_or(0);
+            let y_offset = i32::try_from(
+                monitor_size
+                    .height
+                    .saturating_sub(height)
+                    .saturating_sub(120),
+            )
+            .unwrap_or(0);
+            PhysicalPosition::new(
+                monitor_position.x.saturating_add(x_offset),
+                monitor_position.y.saturating_add(y_offset),
+            )
+        },
+    );
+    let window = WindowBuilder::new()
+        .with_title("Listening")
+        .with_inner_size(size)
+        .with_position(position)
+        .with_decorations(false)
+        .with_transparent(true)
+        .with_always_on_top(true)
+        .with_visible_on_all_workspaces(true)
+        .with_focusable(false)
+        .with_background_color((0, 0, 0, 190))
+        .build(target)
+        .map_err(|error| AppError::MenuBar(error.to_string()))?;
+    render_recording_overlay(target, &window, width, height)?;
+    Ok(window)
+}
+
+fn render_recording_overlay(
+    target: &EventLoopWindowTarget<UserEvent>,
+    window: &Window,
+    width: u32,
+    height: u32,
+) -> Result<(), AppError> {
+    let context =
+        softbuffer::Context::new(target).map_err(|error| AppError::MenuBar(error.to_string()))?;
+    let mut surface = softbuffer::Surface::new(&context, window)
+        .map_err(|error| AppError::MenuBar(error.to_string()))?;
+    let width_nonzero = NonZeroU32::new(width)
+        .ok_or_else(|| AppError::MenuBar(String::from("zero overlay width")))?;
+    let height_nonzero = NonZeroU32::new(height)
+        .ok_or_else(|| AppError::MenuBar(String::from("zero overlay height")))?;
+    surface
+        .resize(width_nonzero, height_nonzero)
+        .map_err(|error| AppError::MenuBar(error.to_string()))?;
+    let mut buffer = surface
+        .buffer_mut()
+        .map_err(|error| AppError::MenuBar(error.to_string()))?;
+    let stride = usize::try_from(width).map_err(|error| AppError::MenuBar(error.to_string()))?;
+    let rows = usize::try_from(height).map_err(|error| AppError::MenuBar(error.to_string()))?;
+    for pixel in buffer.iter_mut() {
+        *pixel = rgb(15, 15, 15);
+    }
+    draw_listening_text(&mut buffer, stride, rows);
+    buffer
+        .present()
+        .map_err(|error| AppError::MenuBar(error.to_string()))
+}
+
+fn draw_listening_text(buffer: &mut [u32], stride: usize, rows: usize) {
+    let text = "LISTENING";
+    let scale = 4_usize;
+    let letter_width = 5_usize * scale;
+    let letter_gap = 2_usize * scale;
+    let text_width = text
+        .chars()
+        .count()
+        .saturating_mul(letter_width)
+        .saturating_add(
+            text.chars()
+                .count()
+                .saturating_sub(1)
+                .saturating_mul(letter_gap),
+        );
+    let text_height = 7_usize * scale;
+    let start_x = stride.saturating_sub(text_width) / 2;
+    let start_y = rows.saturating_sub(text_height) / 2;
+    let mut cursor_x = start_x;
+    for character in text.chars() {
+        draw_block_character(buffer, stride, rows, cursor_x, start_y, scale, character);
+        cursor_x = cursor_x
+            .saturating_add(letter_width)
+            .saturating_add(letter_gap);
+    }
+}
+
+fn draw_block_character(
+    buffer: &mut [u32],
+    stride: usize,
+    rows: usize,
+    origin_x: usize,
+    origin_y: usize,
+    scale: usize,
+    character: char,
+) {
+    let Some(pattern) = block_letter_pattern(character) else {
+        return;
+    };
+    for (row_index, row) in pattern.iter().enumerate() {
+        for (column_index, bit) in row.chars().enumerate() {
+            if bit != '1' {
+                continue;
+            }
+            fill_rect(
+                buffer,
+                stride,
+                rows,
+                Rect {
+                    x: origin_x.saturating_add(column_index.saturating_mul(scale)),
+                    y: origin_y.saturating_add(row_index.saturating_mul(scale)),
+                    width: scale,
+                    height: scale,
+                },
+                rgb(245, 245, 245),
+            );
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Rect {
+    x: usize,
+    y: usize,
+    width: usize,
+    height: usize,
+}
+
+fn fill_rect(buffer: &mut [u32], stride: usize, rows: usize, rect: Rect, color: u32) {
+    let max_y = rect.y.saturating_add(rect.height).min(rows);
+    let max_x = rect.x.saturating_add(rect.width).min(stride);
+    for row in rect.y..max_y {
+        for column in rect.x..max_x {
+            let index = row.saturating_mul(stride).saturating_add(column);
+            if let Some(pixel) = buffer.get_mut(index) {
+                *pixel = color;
+            }
+        }
+    }
+}
+
+const fn rgb(red: u32, green: u32, blue: u32) -> u32 {
+    blue | (green << 8) | (red << 16)
+}
+
+const fn block_letter_pattern(character: char) -> Option<[&'static str; 7]> {
+    match character {
+        'E' => Some([
+            "11111", "10000", "10000", "11110", "10000", "10000", "11111",
+        ]),
+        'G' => Some([
+            "01111", "10000", "10000", "10111", "10001", "10001", "01110",
+        ]),
+        'I' => Some([
+            "11111", "00100", "00100", "00100", "00100", "00100", "11111",
+        ]),
+        'L' => Some([
+            "10000", "10000", "10000", "10000", "10000", "10000", "11111",
+        ]),
+        'N' => Some([
+            "10001", "11001", "10101", "10011", "10001", "10001", "10001",
+        ]),
+        'S' => Some([
+            "01111", "10000", "10000", "01110", "00001", "00001", "11110",
+        ]),
+        'T' => Some([
+            "11111", "00100", "00100", "00100", "00100", "00100", "00100",
+        ]),
+        _ => None,
+    }
+}
+
+fn hide_recording_overlay(overlay_window: &mut Option<Window>) {
+    if let Some(window) = overlay_window.take() {
+        window.set_visible(false);
+        drop(window);
+    }
+}
+
 fn tray_icon_image() -> Result<Icon, AppError> {
     let width = 16_u32;
     let height = 16_u32;
@@ -946,12 +1355,19 @@ fn remove_fillers(text: &str) -> Result<String, AppError> {
     Ok(result.trim().to_owned())
 }
 
-fn should_run_cleanup(config: &Config, transcript: &str) -> bool {
+fn cleanup_decision(config: &Config, transcript: &str) -> (bool, &'static str) {
     match config.llm_cleanup {
-        CleanupMode::Off => false,
-        CleanupMode::On => true,
+        CleanupMode::Off => (false, "mode_off"),
+        CleanupMode::On => (true, "mode_on"),
         CleanupMode::Auto => {
-            transcript.split_whitespace().count() >= 6 && !looks_codeish(transcript)
+            let word_count = transcript.split_whitespace().count();
+            if word_count < 6 {
+                (false, "auto_too_short")
+            } else if looks_codeish(transcript) {
+                (false, "auto_codeish")
+            } else {
+                (true, "auto_prose")
+            }
         }
     }
 }
