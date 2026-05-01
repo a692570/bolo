@@ -3,6 +3,7 @@
 use std::collections::VecDeque;
 use std::env;
 use std::fs::{self, File};
+use std::io::ErrorKind;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -29,10 +30,11 @@ use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
 const LOG_FILE: &str = "/tmp/bolo.log";
 const CHANNELS: u16 = 1;
+const LOCK_DIR: &str = "/tmp/bolo-instance.lock";
 const TELNYX_STT_ENDPOINT: &str = "https://api.telnyx.com/v2/ai/audio/transcriptions";
 const TELNYX_LLM_ENDPOINT: &str = "https://api.telnyx.com/v2/ai/chat/completions";
 const CORRECTION_WINDOW: Duration = Duration::from_secs(3);
-const MIN_RECORDING: Duration = Duration::from_millis(500);
+const MIN_RECORDING: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Error)]
 enum AppError {
@@ -56,6 +58,10 @@ enum AppError {
     Json(#[from] serde_json::Error),
     #[error("event listener failed: {0:?}")]
     Listener(rdev::ListenError),
+    #[error("another Bolo instance is already running")]
+    AlreadyRunning,
+    #[error("STT primary model is rate limited")]
+    RateLimited,
     #[error("transcription failed: {0}")]
     Transcription(String),
 }
@@ -106,6 +112,11 @@ struct ActiveRecording {
     samples: Arc<Mutex<Vec<i16>>>,
     started_at: Instant,
     sample_rate: u32,
+}
+
+#[derive(Debug)]
+struct AppLock {
+    path: PathBuf,
 }
 
 impl std::fmt::Debug for ActiveRecording {
@@ -196,10 +207,56 @@ struct ChatMessageRequest<'a> {
 
 fn main() -> Result<(), AppError> {
     let _guard = setup_logging()?;
+    let _lock = AppLock::acquire()?;
     let app = Arc::new(App::new()?);
     info!("Bolo Rust runtime started. Hold Right Option to dictate.");
-    play_sound("Tink");
     run_app_event_loop(app)
+}
+
+impl AppLock {
+    fn acquire() -> Result<Self, AppError> {
+        let path = PathBuf::from(LOCK_DIR);
+        match fs::create_dir(&path) {
+            Ok(()) => {
+                Self::write_pid(&path)?;
+                Ok(Self { path })
+            }
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                if Self::lock_is_stale(&path) {
+                    fs::remove_dir_all(&path)?;
+                    fs::create_dir(&path)?;
+                    Self::write_pid(&path)?;
+                    Ok(Self { path })
+                } else {
+                    Err(AppError::AlreadyRunning)
+                }
+            }
+            Err(error) => Err(AppError::Io(error)),
+        }
+    }
+
+    fn write_pid(path: &Path) -> Result<(), AppError> {
+        fs::write(path.join("pid"), std::process::id().to_string())?;
+        Ok(())
+    }
+
+    fn lock_is_stale(path: &Path) -> bool {
+        let Some(pid) = fs::read_to_string(path.join("pid"))
+            .ok()
+            .and_then(|text| text.trim().parse::<u32>().ok())
+        else {
+            return true;
+        };
+        !process_is_running(pid)
+    }
+}
+
+impl Drop for AppLock {
+    fn drop(&mut self) {
+        if let Err(error) = fs::remove_dir_all(&self.path) {
+            warn!("failed to remove instance lock: {error}");
+        }
+    }
 }
 
 fn setup_logging() -> Result<WorkerGuard, AppError> {
@@ -213,6 +270,13 @@ fn setup_logging() -> Result<WorkerGuard, AppError> {
         .try_init()
         .map_err(|error| AppError::AudioStream(error.to_string()))?;
     Ok(guard)
+}
+
+fn process_is_running(pid: u32) -> bool {
+    matches!(
+        Command::new("kill").arg("-0").arg(pid.to_string()).status(),
+        Ok(status) if status.success()
+    )
 }
 
 fn run_hotkey_listener(app: Arc<App>) -> Result<(), AppError> {
@@ -457,15 +521,56 @@ impl App {
             "keyterms": self.vocabulary.iter().take(50).collect::<Vec<_>>()
         });
         let prompt = build_stt_prompt(&self.vocabulary);
+        match self.transcribe_with_model(
+            wav,
+            "deepgram/nova-3",
+            Some(&model_config),
+            prompt.as_deref(),
+            true,
+        ) {
+            Ok(transcript) => Ok(transcript),
+            Err(AppError::RateLimited) => {
+                warn!("primary STT model rate limited; falling back to distil-whisper");
+                self.transcribe_with_model(
+                    wav,
+                    "distil-whisper/distil-large-v2",
+                    None,
+                    prompt.as_deref(),
+                    false,
+                )
+            }
+            Err(AppError::Http(error)) => {
+                warn!("primary STT request failed; retrying once after delay: {error}");
+                std::thread::sleep(Duration::from_millis(300));
+                self.transcribe_with_model(
+                    wav,
+                    "deepgram/nova-3",
+                    Some(&model_config),
+                    prompt.as_deref(),
+                    true,
+                )
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn transcribe_with_model(
+        &self,
+        wav: &[u8],
+        model: &str,
+        model_config: Option<&serde_json::Value>,
+        prompt: Option<&str>,
+        include_language: bool,
+    ) -> Result<String, AppError> {
         info!(
             "[stt] request {}",
             serde_json::json!({
                 "endpoint": TELNYX_STT_ENDPOINT,
-                "model": "deepgram/nova-3",
-                "language": "en",
+                "model": model,
+                "language": if include_language { Some("en") } else { None },
                 "audio_mime": "audio/wav",
                 "audio_bytes": wav.len(),
-                "model_config": &model_config,
+                "model_config": model_config,
                 "prompt": &prompt,
             })
         );
@@ -473,12 +578,16 @@ impl App {
             .file_name(String::from("audio.wav"))
             .mime_str("audio/wav")?;
         let mut form = multipart::Form::new()
-            .text("model", String::from("deepgram/nova-3"))
-            .text("language", String::from("en"))
-            .text("model_config", serde_json::to_string(&model_config)?)
+            .text("model", model.to_owned())
             .part("file", part);
+        if include_language {
+            form = form.text("language", String::from("en"));
+        }
+        if let Some(model_config) = model_config {
+            form = form.text("model_config", serde_json::to_string(model_config)?);
+        }
         if let Some(prompt) = prompt {
-            form = form.text("prompt", prompt);
+            form = form.text("prompt", prompt.to_owned());
         }
         let response = self
             .http
@@ -491,13 +600,23 @@ impl App {
             "[stt] response_status {}",
             serde_json::json!({
                 "endpoint": TELNYX_STT_ENDPOINT,
-                "model": "deepgram/nova-3",
+                "model": model,
                 "status": status.as_u16(),
             })
         );
+        if status.as_u16() == 429 {
+            return Err(AppError::RateLimited);
+        }
+        if status.as_u16() == 401 {
+            return Err(AppError::Transcription(String::from(
+                "401 Unauthorized: check TELNYX_API_KEY",
+            )));
+        }
         if !status.is_success() {
+            let body = response.text().unwrap_or_default();
             return Err(AppError::Transcription(format!(
-                "Telnyx STT returned {status}"
+                "Telnyx STT returned {status}: {}",
+                body.chars().take(200).collect::<String>()
             )));
         }
         let parsed: SttResponse = response.json()?;
@@ -506,7 +625,7 @@ impl App {
             "[stt] response_text {}",
             serde_json::json!({
                 "endpoint": TELNYX_STT_ENDPOINT,
-                "model": "deepgram/nova-3",
+                "model": model,
                 "transcript": &transcript,
             })
         );
@@ -1447,6 +1566,10 @@ fn load_env_value(name: &'static str) -> Option<String> {
     }
     let env_file = home_path(".bolo/env");
     if let Some(value) = read_key_value_file(&env_file, name) {
+        return Some(value);
+    }
+    let codex_env_file = home_path(".codex/.env");
+    if let Some(value) = read_key_value_file(&codex_env_file, name) {
         return Some(value);
     }
     read_shell_export(&home_path(".zshrc"), name)

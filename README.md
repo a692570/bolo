@@ -31,7 +31,7 @@ Bolo runs as a menu bar app that monitors global input events and processes audi
 2. **Audio capture**: On Option press, initializes a `cpal` input stream to capture PCM audio directly to memory.
 3. **Recording**: Continues buffering audio while key is held. No disk writes occur during recording.
 4. **Key release trigger**: On Right Option release, immediately finalizes audio buffer and initiates API calls.
-5. **Speech-to-text**: Sends audio to Telnyx AI API calling `deepgram/nova-3`.
+5. **Speech-to-text**: Sends audio to Telnyx AI API calling `deepgram/nova-3`, with `distil-whisper/distil-large-v2` fallback on rate limits.
 6. **Text cleanup**: Optionally sends raw transcription to Telnyx AI API calling `Qwen/Qwen3-235B-A22B` for minimal punctuation and capitalization cleanup in prose-oriented contexts.
 7. **Text injection**: Uses the system clipboard plus `osascript` Cmd+V automation to paste processed text at the current cursor position.
 8. **Audio feedback**: Plays system Tink sound on record start and Pop sound on completion.
@@ -48,12 +48,12 @@ cd bolo
 ./install.sh
 ```
 
-The install script builds the Rust binary and prompts for your Telnyx API key if needed.
+The install script builds the Rust binary, migrates an existing key from `~/.codex/.env` if present, prompts for your Telnyx API key if needed, registers the launcher as a Login Item, and starts Bolo.
 
-Run Bolo directly:
+Restart Bolo later:
 
 ```bash
-target/release/bolo
+./restart.sh
 ```
 
 ## Permissions
@@ -74,7 +74,7 @@ Grant both in **System Settings > Privacy & Security**. Restart Bolo after grant
 4. Release Right Option (Pop sound plays)
 5. Transcribed text appears at cursor after finalization
 
-While recording, Bolo shows a small bottom-centered borderless “Listening” overlay. Use the Bolo menu bar item to choose a microphone or quit. Stop Bolo from Terminal with `pkill -f target/release/bolo`.
+While recording, Bolo shows a small bottom-centered borderless "Listening" overlay. Use the Bolo menu bar item to choose a microphone or quit.
 
 ## Configuration
 
@@ -85,7 +85,7 @@ export TELNYX_API_KEY="your_key_here"
 ```
 
 Add it to your shell profile to persist it, or put it in `~/.bolo/env`. The install script writes prompted keys to `~/.bolo/env`.
-Bolo reads `TELNYX_API_KEY` from the process environment first, then falls back to `~/.bolo/env`, then `~/.zshrc`.
+Bolo reads `TELNYX_API_KEY` from the process environment first, then falls back to `~/.bolo/env`, `~/.codex/.env`, and `~/.zshrc`.
 
 To preselect a microphone without using the menu, set:
 
@@ -163,9 +163,9 @@ Re-dictate the corrected text. Bolo no longer uses the old learned correction me
 
 - **No text appears after releasing hotkey**: Check `/tmp/bolo.log`. Verify `TELNYX_API_KEY` is set. Ensure Accessibility permission is granted and Bolo was restarted after granting it.
 
-- **Audio not recording**: Verify Microphone permission is granted in System Settings. Restart `target/release/bolo` after granting permissions so macOS re-prompts cleanly.
+- **Audio not recording**: Verify Microphone permission is granted in System Settings. Run `./restart.sh` after granting permissions so macOS re-prompts cleanly.
 
-- **Multiple Bolo processes appear**: Run `pkill -f target/release/bolo`, then start `target/release/bolo` again.
+- **Multiple Bolo processes appear**: Run `./restart.sh`.
 
 - **Bolo does not appear in the menu bar**: Check `/tmp/bolo.log` for menu initialization errors and verify you are running the latest `target/release/bolo`.
 
