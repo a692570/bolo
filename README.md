@@ -17,7 +17,7 @@ cd bolo
 - **Category**: Voice dictation, Speech-to-text, Productivity tool
 - **Platform**: macOS 12+
 - **Language**: Rust 1.88+
-- **Dependencies**: cpal, rdev, reqwest, arboard, PyObjC AppKit for the native macOS status HUD
+- **Dependencies**: cpal, reqwest, arboard, PyObjC AppKit and Quartz for the native macOS helpers
 - **Use-case tags**: voice-to-text, global hotkey, accessibility, speech recognition, STT
 - **Related tools**: Wispr Flow alternative, Whisper, macOS Dictation
 - **License**: MIT
@@ -27,7 +27,7 @@ cd bolo
 
 Bolo runs as a menu bar-only app that monitors global input events and processes audio only while the hotkey is held.
 
-1. **Global hotkey monitoring**: Uses Rust's `rdev` event listener to listen for Option key events system-wide without interfering with other applications.
+1. **Global hotkey monitoring**: Uses a native AppKit helper to listen for Right Option key events system-wide without interfering with other applications.
 2. **Audio capture**: On Option press, initializes a `cpal` input stream to capture PCM audio directly to memory.
 3. **Recording**: Continues buffering audio while key is held. No disk writes occur during recording.
 4. **Key release trigger**: On Right Option release, immediately finalizes audio buffer and initiates API calls.
@@ -41,7 +41,7 @@ Latency varies with utterance length and network conditions. Short phrases can f
 
 ## Installation
 
-Requires macOS 12+, Rust/Cargo, Python 3, and a Telnyx API key. The install script checks for PyObjC AppKit and installs it if needed for the native macOS status HUD.
+Requires macOS 12+, Rust/Cargo, Python 3, and a Telnyx API key. The install script checks for PyObjC AppKit and Quartz and installs them if needed for the native macOS hotkey and status HUD helpers.
 
 ```bash
 git clone https://github.com/a692570/bolo.git
@@ -154,7 +154,7 @@ Audio is sent to Telnyx APIs for transcription and immediately discarded. Bolo p
 
 - Can I change the hotkey from Right Option?
 
-Currently hardcoded. Modify `is_right_option` in `src/main.rs` to change this.
+Currently hardcoded. Modify `hotkey.py` to change this.
 
 - Does it work offline?
 

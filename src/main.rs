@@ -3,7 +3,7 @@
 use std::collections::VecDeque;
 use std::env;
 use std::fs::{self, File};
-use std::io::{ErrorKind, Write};
+use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -12,7 +12,6 @@ use std::time::{Duration, Instant};
 use arboard::Clipboard;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, Sample, SampleFormat, SizedSample, Stream, StreamConfig};
-use rdev::{Event, EventType, Key};
 use regex::Regex;
 use reqwest::blocking::{Client, multipart};
 use serde::{Deserialize, Serialize};
@@ -55,8 +54,6 @@ enum AppError {
     Http(#[from] reqwest::Error),
     #[error("JSON failed: {0}")]
     Json(#[from] serde_json::Error),
-    #[error("event listener failed: {0:?}")]
-    Listener(rdev::ListenError),
     #[error("another Bolo instance is already running")]
     AlreadyRunning,
     #[error("STT primary model is rate limited")]
@@ -324,13 +321,58 @@ fn process_is_running(pid: u32) -> bool {
     )
 }
 
-fn run_hotkey_listener(app: Arc<App>) -> Result<(), AppError> {
-    rdev::listen(move |event| {
-        if let Err(error) = app.handle_event(&event) {
-            error!("{error}");
+fn run_hotkey_listener(app: &Arc<App>) {
+    let root_dir = app.config.root_dir.clone();
+    loop {
+        if let Err(error) = run_hotkey_helper(app, &root_dir) {
+            warn!("{error}");
         }
-    })
-    .map_err(AppError::Listener)
+        std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
+fn run_hotkey_helper(app: &Arc<App>, root_dir: &Path) -> Result<(), AppError> {
+    let script = root_dir.join("hotkey.py");
+    let mut child = Command::new("python3")
+        .arg(script)
+        .env("BOLO_PARENT_PID", std::process::id().to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(|error| AppError::MenuBar(format!("hotkey launch failed: {error}")))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| AppError::MenuBar(String::from("hotkey stdout unavailable")))?;
+    info!("hotkey helper started");
+
+    let reader = BufReader::new(stdout);
+    for line in reader.lines() {
+        let line = line?;
+        let Ok(message) = serde_json::from_str::<serde_json::Value>(&line) else {
+            warn!("invalid hotkey helper message: {line}");
+            continue;
+        };
+        match message.get("event").and_then(serde_json::Value::as_str) {
+            Some("press") => {
+                if let Err(error) = app.handle_press() {
+                    error!("{error}");
+                }
+            }
+            Some("release") => {
+                if let Err(error) = app.handle_release() {
+                    error!("{error}");
+                }
+            }
+            Some(other) => warn!("unknown hotkey helper event: {other}"),
+            None => warn!("missing hotkey helper event"),
+        }
+    }
+
+    let status = child.wait()?;
+    warn!("hotkey helper exited: {status}");
+    Ok(())
 }
 
 fn run_app_event_loop(app: Arc<App>) -> Result<(), AppError> {
@@ -355,9 +397,7 @@ fn run_app_event_loop(app: Arc<App>) -> Result<(), AppError> {
     let listener_handle = std::thread::Builder::new()
         .name(String::from("bolo-hotkeys"))
         .spawn(move || {
-            if let Err(error) = run_hotkey_listener(listener_app) {
-                error!("{error}");
-            }
+            run_hotkey_listener(&listener_app);
         })?;
     drop(listener_handle);
 
@@ -447,19 +487,6 @@ impl App {
             }),
             event_proxy: Mutex::new(None),
         })
-    }
-
-    fn handle_event(self: &Arc<Self>, event: &Event) -> Result<(), AppError> {
-        match event.event_type {
-            EventType::KeyPress(key) if is_right_option(key) => self.handle_press(),
-            EventType::KeyRelease(key) if is_right_option(key) => self.handle_release(),
-            EventType::KeyPress(_)
-            | EventType::KeyRelease(_)
-            | EventType::ButtonPress(_)
-            | EventType::ButtonRelease(_)
-            | EventType::MouseMove { .. }
-            | EventType::Wheel { .. } => Ok(()),
-        }
     }
 
     fn handle_press(&self) -> Result<(), AppError> {
@@ -1373,10 +1400,6 @@ fn wav_bytes(samples: &[i16], sample_rate: u32) -> Result<Vec<u8>, AppError> {
     Ok(bytes)
 }
 
-const fn is_right_option(key: Key) -> bool {
-    matches!(key, Key::AltGr)
-}
-
 fn parse_command(text: &str, correction_active: bool) -> Option<DictationCommand> {
     let stripped = text.trim();
     let lowered = stripped.to_ascii_lowercase();
@@ -1665,9 +1688,8 @@ fn app_root_dir() -> Result<PathBuf, AppError> {
 mod tests {
     use super::{
         CleanupMode, Config, DictationCommandKind, build_stt_prompt, canonicalize_known_terms,
-        is_right_option, parse_command, remove_fillers, strip_reasoning_tags, wav_bytes,
+        parse_command, remove_fillers, strip_reasoning_tags, wav_bytes,
     };
-    use rdev::Key;
     use std::path::PathBuf;
 
     #[test]
@@ -1697,12 +1719,6 @@ mod tests {
             replace.as_ref().map(|command| command.text.as_str()),
             Some("corrected text")
         );
-    }
-
-    #[test]
-    fn only_right_option_triggers_recording() {
-        assert!(is_right_option(Key::AltGr));
-        assert!(!is_right_option(Key::Alt));
     }
 
     #[test]

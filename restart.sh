@@ -15,6 +15,7 @@ fi
 
 pkill -f "$BIN" 2>/dev/null || true
 pkill -f "$DIR/bolo.py" 2>/dev/null || true
+pkill -f "$DIR/hotkey.py" 2>/dev/null || true
 pkill -f "$DIR/overlay.py" 2>/dev/null || true
 rm -f /tmp/bolo.pid 2>/dev/null || true
 rm -rf "$LOCK_DIR" /tmp/bolo-instance.lock 2>/dev/null || true

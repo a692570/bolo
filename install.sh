@@ -11,10 +11,11 @@ fi
 
 if ! python3 - <<'PY' >/dev/null 2>&1
 import AppKit
+import Quartz
 PY
 then
-  echo "Installing native macOS HUD dependency..."
-  python3 -m pip install --user pyobjc-framework-AppKit
+  echo "Installing native macOS helper dependencies..."
+  python3 -m pip install --user pyobjc-framework-AppKit pyobjc-framework-Quartz
 fi
 
 echo "Building Rust binary..."
