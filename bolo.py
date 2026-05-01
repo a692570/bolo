@@ -61,7 +61,6 @@ from Quartz import (
     kCGEventFlagsChanged,
 )
 from CoreFoundation import kCFRunLoopDefaultMode
-import HIServices
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 
@@ -82,12 +81,15 @@ def _load_env_value(name: str) -> str:
     """Load a config value.
 
     Priority (highest first):
-      1. ~/.codex/.env — authoritative on-disk source; always wins so that
-         stale shell env vars (from a previous session) cannot shadow the key.
-      2. os.environ — useful for CI/test overrides when .codex/.env is absent.
+      1. os.environ — explicit process configuration wins.
+      2. ~/.bolo/env — app-specific on-disk fallback.
       3. ~/.zshrc — last-resort fallback.
     """
-    env_file = os.path.expanduser("~/.codex/.env")
+    value = os.environ.get(name, "").strip()
+    if value:
+        return value
+
+    env_file = os.path.expanduser("~/.bolo/env")
     if os.path.exists(env_file):
         try:
             with open(env_file, "r", encoding="utf-8") as fh:
@@ -102,10 +104,6 @@ def _load_env_value(name: str) -> str:
                             return val
         except OSError:
             pass
-
-    value = os.environ.get(name, "").strip()
-    if value:
-        return value
 
     shell_file = os.path.expanduser("~/.zshrc")
     if os.path.exists(shell_file):
@@ -493,13 +491,13 @@ class BoloApp(rumps.App):
     def _get_focused_text_context(self) -> str:
         """Read the last 500 chars of the currently focused text field via accessibility API."""
         try:
-            focused_system = HIServices.AXUIElementCreateSystemWide()
-            err, focused_el = HIServices.AXUIElementCopyAttributeValue(
+            focused_system = Quartz.HIServices.AXUIElementCreateSystemWide()
+            err, focused_el = Quartz.HIServices.AXUIElementCopyAttributeValue(
                 focused_system, "AXFocusedUIElement", None
             )
             if err != 0 or focused_el is None:
                 return ""
-            err, value = HIServices.AXUIElementCopyAttributeValue(
+            err, value = Quartz.HIServices.AXUIElementCopyAttributeValue(
                 focused_el, "AXValue", None
             )
             if err != 0 or not value:
@@ -646,13 +644,13 @@ class BoloApp(rumps.App):
         NSEvent monitors are never disabled by macOS (unlike CGEventTap),
         so no watchdog re-enable loop is needed.
         """
-        if not HIServices.AXIsProcessTrusted():
+        if not Quartz.HIServices.AXIsProcessTrusted():
             self._log(
                 "[accessibility] NOT TRUSTED. Open System Settings > "
                 "Privacy & Security > Accessibility and add this app."
             )
-            HIServices.AXIsProcessTrustedWithOptions(
-                {HIServices.kAXTrustedCheckOptionPrompt: True}
+            Quartz.HIServices.AXIsProcessTrustedWithOptions(
+                {Quartz.HIServices.kAXTrustedCheckOptionPrompt: True}
             )
 
         self._ns_monitor = NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(
@@ -843,7 +841,7 @@ class BoloApp(rumps.App):
                 self._stream_auth_failed = True
                 self._rate_limit_backoff_until = time.time() + 86400.0
                 self._log("[stream] 401 auth failure — disabling stream. Fix API key and restart.")
-                self._show_error("Invalid API key — check ~/.codex/.env")
+                self._show_error("Invalid API key — check ~/.bolo/env")
             with self._warm_stt_lock:
                 self._warm_stt_connecting = False
             return
@@ -965,7 +963,7 @@ class BoloApp(rumps.App):
                 self._stream_auth_failed = True
                 self._rate_limit_backoff_until = time.time() + 86400.0
                 self._log("[stream] 401 auth failure — disabling stream. Fix API key and restart.")
-                self._show_error("Invalid API key — check ~/.codex/.env")
+                self._show_error("Invalid API key — check ~/.bolo/env")
             return
         if not self.recording:
             # Recording ended before we connected — discard
@@ -1380,7 +1378,7 @@ class BoloApp(rumps.App):
                 timeout=8,
             )
             if resp.status_code == 401:
-                self._log("[stt] 401 Unauthorized — check TELNYX_API_KEY in ~/.codex/.env")
+                self._log("[stt] 401 Unauthorized — check TELNYX_API_KEY in ~/.bolo/env")
                 raise RuntimeError("STT auth failed (401): invalid or missing API key")
             rate_limited = resp.status_code == 429
             if resp.status_code == 429:
@@ -1443,7 +1441,7 @@ class BoloApp(rumps.App):
                 # Auth failure: freeze backoff so no further requests are made.
                 # User must fix the key and restart.
                 self._rate_limit_backoff_until = time.time() + 86400.0  # 24h
-                self._show_error("Invalid API key — check ~/.codex/.env")
+                self._show_error("Invalid API key — check ~/.bolo/env")
             else:
                 self._show_error(f"STT failed: {e}")
             return "", "batch"
@@ -2188,7 +2186,7 @@ if __name__ == "__main__":
 
     # ── Single-instance guard ─────────────────────────────────────────────────
     # Use a lock directory (atomic on all POSIX systems) so two launches of
-    # bolo.py (e.g. Bolo.app + start-bolo.command) cannot coexist.
+    # bolo.py (e.g. a packaged app plus direct script launch) cannot coexist.
     _LOCK_DIR = pathlib.Path("/tmp/bolo-instance.lock")
     try:
         _LOCK_DIR.mkdir(parents=False, exist_ok=False)
@@ -2215,7 +2213,7 @@ if __name__ == "__main__":
     
     atexit.register(_cleanup_and_release_lock)
 
-    # Also release on SIGTERM/SIGINT so the supervisor can clean up cleanly.
+    # Also release on SIGTERM/SIGINT so process managers can clean up cleanly.
     _app_instance = None  # Will hold the BoloApp instance for signal handlers
     
     def _signal_handler(signum, frame):
@@ -2240,7 +2238,7 @@ if __name__ == "__main__":
 
     # ── API key check ─────────────────────────────────────────────────────────
     if not TELNYX_API_KEY:
-        _logger.error("ERROR: TELNYX_API_KEY not set. Add to ~/.codex/.env and restart.")
+        _logger.error("ERROR: TELNYX_API_KEY not set. Add to ~/.bolo/env and restart.")
         sys.exit(1)
 
     def _crash_handler(signum, frame):
