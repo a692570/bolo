@@ -159,7 +159,7 @@ def _llm_headers() -> dict:
 def _llm_model() -> str:
     """Return model ID appropriate for the active backend."""
     if _LITELLM_BASE:
-        return "MiniMax-M2.5-drop"
+        return "Kimi-K2.5"
     return "Qwen/Qwen3-235B-A22B"
 
 

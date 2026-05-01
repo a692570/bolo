@@ -99,6 +99,8 @@ To opt into LLM cleanup, set:
 export BOLO_LLM_CLEANUP="on"
 ```
 
+When LiteLLM is configured, Bolo uses `Kimi-K2.5` for cleanup. Without LiteLLM, it uses Telnyx `Qwen/Qwen3-235B-A22B` with thinking disabled. MiniMax is intentionally not used for cleanup because it can leak reasoning text into the output.
+
 You can also add personal vocabulary in `~/.bolo_vocabulary.json` as a JSON string array, for example:
 
 ```json

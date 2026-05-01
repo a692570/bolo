@@ -918,7 +918,7 @@ impl Config {
 
     fn llm_model(&self) -> String {
         if self.litellm_base.is_some() {
-            String::from("MiniMax-M2.5-drop")
+            String::from("Kimi-K2.5")
         } else {
             String::from("Qwen/Qwen3-235B-A22B")
         }
@@ -1671,10 +1671,11 @@ fn app_root_dir() -> Result<PathBuf, AppError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DictationCommandKind, build_stt_prompt, canonicalize_known_terms, is_right_option,
-        parse_command, remove_fillers, strip_reasoning_tags, wav_bytes,
+        CleanupMode, Config, DictationCommandKind, build_stt_prompt, canonicalize_known_terms,
+        is_right_option, parse_command, remove_fillers, strip_reasoning_tags, wav_bytes,
     };
     use rdev::Key;
+    use std::path::PathBuf;
 
     #[test]
     fn parses_dictation_commands() {
@@ -1746,6 +1747,20 @@ mod tests {
     fn strips_llm_reasoning_tags() {
         let output = "<think>internal reasoning</think>\n\nFinal text.";
         assert_eq!(strip_reasoning_tags(output), "Final text.");
+    }
+
+    #[test]
+    fn litellm_cleanup_uses_kimi() {
+        let config = Config {
+            telnyx_api_key: String::from("test"),
+            llm_cleanup: CleanupMode::On,
+            litellm_base: Some(String::from("http://localhost:4000")),
+            litellm_key: None,
+            microphone: None,
+            root_dir: PathBuf::new(),
+        };
+
+        assert_eq!(config.llm_model(), "Kimi-K2.5");
     }
 
     #[test]
