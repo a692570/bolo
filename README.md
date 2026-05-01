@@ -32,7 +32,7 @@ Bolo runs as a menu bar app that monitors global input events and processes audi
 3. **Recording**: Continues buffering audio while key is held. No disk writes occur during recording.
 4. **Key release trigger**: On Right Option release, immediately finalizes audio buffer and initiates API calls.
 5. **Speech-to-text**: Sends audio to Telnyx AI API calling `deepgram/nova-3`, with `distil-whisper/distil-large-v2` fallback on rate limits.
-6. **Text cleanup**: Optionally sends raw transcription to Telnyx AI API calling `Qwen/Qwen3-235B-A22B` for minimal punctuation and capitalization cleanup in prose-oriented contexts.
+6. **Text cleanup**: Applies local transcript cleanup by default. Optional LLM cleanup can be enabled with `BOLO_LLM_CLEANUP=on`.
 7. **Text injection**: Uses the system clipboard plus `osascript` Cmd+V automation to paste processed text at the current cursor position.
 8. **Audio feedback**: Plays system Tink sound on record start and Pop sound on completion.
 
@@ -91,6 +91,12 @@ To preselect a microphone without using the menu, set:
 
 ```bash
 export BOLO_MICROPHONE="Microphone name"
+```
+
+To opt into LLM cleanup, set:
+
+```bash
+export BOLO_LLM_CLEANUP="on"
 ```
 
 You can also add personal vocabulary in `~/.bolo_vocabulary.json` as a JSON string array, for example:

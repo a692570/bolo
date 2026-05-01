@@ -773,15 +773,17 @@ impl App {
             .choices
             .first()
             .map_or_else(String::new, |choice| choice.message.content.clone());
+        let sanitized = strip_reasoning_tags(&output);
         info!(
             "[llm] response_text {}",
             serde_json::json!({
                 "endpoint": &endpoint,
                 "model": &model,
                 "output": &output,
+                "sanitized_output": &sanitized,
             })
         );
-        Ok(output)
+        Ok(sanitized)
     }
 
     fn apply_command(&self, command: DictationCommand) -> Result<(), AppError> {
@@ -875,7 +877,7 @@ impl Config {
         let telnyx_api_key =
             load_env_value("TELNYX_API_KEY").ok_or(AppError::MissingConfig("TELNYX_API_KEY"))?;
         let llm_cleanup = match load_env_value("BOLO_LLM_CLEANUP")
-            .unwrap_or_else(|| String::from("auto"))
+            .unwrap_or_else(|| String::from("off"))
             .to_ascii_lowercase()
             .as_str()
         {
@@ -1440,7 +1442,11 @@ fn canonicalize_known_terms(text: &str) -> String {
             r"(?i)\bwhisper flow\b|\bwisper flow\b|\bvoisei\b|\bvoisey\b",
             "Wispr Flow",
         ),
-        (r"(?i)\btelnyx\b|\btelenix\b|\btennix\b", "Telnyx"),
+        (r"(?i)\btenley'?s\b|\btelnyx'?s\b", "Telnyx's"),
+        (
+            r"(?i)\btelnyx\b|\btelenix\b|\btennix\b|\btenlex\b|\btenlix\b|\btelx\b",
+            "Telnyx",
+        ),
         (r"(?i)\bbolo\b|\bbollo\b", "Bolo"),
         (r"(?i)\bremotion\b|\bemotion\b|\bemotions\b", "Remotion"),
         (r"(?i)\bnova[ -]three\b|\bnova 3\b", "nova-3"),
@@ -1461,6 +1467,7 @@ fn remove_fillers(text: &str) -> Result<String, AppError> {
         (r"(?i)\byou know[,.]?\s*", ""),
         (r"(?i)\band all[,.]?\s*$", ""),
         (r"(?i),?\s*\bright\??\s*$", ""),
+        (r"([.!?])([A-Z])", "$1 $2"),
         (r" {2,}", " "),
         (r"^\s*[,;]\s*", ""),
         (r"\s+([.,!?;:])", "$1"),
@@ -1474,38 +1481,12 @@ fn remove_fillers(text: &str) -> Result<String, AppError> {
     Ok(result.trim().to_owned())
 }
 
-fn cleanup_decision(config: &Config, transcript: &str) -> (bool, &'static str) {
+const fn cleanup_decision(config: &Config, _transcript: &str) -> (bool, &'static str) {
     match config.llm_cleanup {
         CleanupMode::Off => (false, "mode_off"),
         CleanupMode::On => (true, "mode_on"),
-        CleanupMode::Auto => {
-            let word_count = transcript.split_whitespace().count();
-            if word_count < 6 {
-                (false, "auto_too_short")
-            } else if looks_codeish(transcript) {
-                (false, "auto_codeish")
-            } else {
-                (true, "auto_prose")
-            }
-        }
+        CleanupMode::Auto => (false, "auto_disabled_for_latency"),
     }
-}
-
-fn looks_codeish(transcript: &str) -> bool {
-    transcript.contains([
-        '`', '{', '}', '(', ')', '[', ']', '<', '>', '_', '=', '\\', '/',
-    ]) || [
-        "function ",
-        "const ",
-        "let ",
-        "class ",
-        "import ",
-        "return ",
-        "camel case",
-        "snake case",
-    ]
-    .iter()
-    .any(|token| transcript.to_ascii_lowercase().contains(token))
 }
 
 fn build_stt_prompt(vocabulary: &[String]) -> Option<String> {
@@ -1523,6 +1504,17 @@ fn build_stt_prompt(vocabulary: &[String]) -> Option<String> {
 
 const fn cleanup_prompt() -> &'static str {
     "Apply minimal capitalization and punctuation fixes to a raw speech transcript. Do not rewrite meaning, summarize, add facts, or remove meaningful content. Remove only clear filler words. Output only the cleaned transcript."
+}
+
+fn strip_reasoning_tags(text: &str) -> String {
+    let stripped = Regex::new(r"(?is)<think>.*?</think>\s*").map_or_else(
+        |_| text.to_owned(),
+        |regex| regex.replace_all(text, "").into_owned(),
+    );
+    let Some((before_reasoning, _)) = stripped.split_once("<think>") else {
+        return stripped.trim().to_owned();
+    };
+    before_reasoning.trim().to_owned()
 }
 
 fn load_vocabulary(root_dir: &Path) -> Vec<String> {
@@ -1680,7 +1672,7 @@ fn app_root_dir() -> Result<PathBuf, AppError> {
 mod tests {
     use super::{
         DictationCommandKind, build_stt_prompt, canonicalize_known_terms, is_right_option,
-        parse_command, remove_fillers, wav_bytes,
+        parse_command, remove_fillers, strip_reasoning_tags, wav_bytes,
     };
     use rdev::Key;
 
@@ -1721,14 +1713,17 @@ mod tests {
 
     #[test]
     fn normalizes_common_transcription_artifacts() {
-        let canonical = canonicalize_known_terms("telnyx uses nova three for bolo");
+        let canonical = canonicalize_known_terms("tenlex uses nova three for bolo");
         assert_eq!(canonical, "Telnyx uses nova-3 for Bolo");
 
+        let possessive = canonicalize_known_terms("tenley's brand standards");
+        assert_eq!(possessive, "Telnyx's brand standards");
+
         assert_eq!(
-            remove_fillers("um, you know, ship it, right?")
+            remove_fillers("um, you know, ship it.Thanks, right?")
                 .ok()
                 .as_deref(),
-            Some("ship it")
+            Some("ship it. Thanks")
         );
     }
 
@@ -1745,6 +1740,12 @@ mod tests {
             build_stt_prompt(&long).map(|prompt| prompt.len()),
             Some(896)
         );
+    }
+
+    #[test]
+    fn strips_llm_reasoning_tags() {
+        let output = "<think>internal reasoning</think>\n\nFinal text.";
+        assert_eq!(strip_reasoning_tags(output), "Final text.");
     }
 
     #[test]
