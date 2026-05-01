@@ -2,7 +2,7 @@
 
 Free, self-hosted voice dictation powered by Telnyx AI. Hold Right Option anywhere to dictate. Release to paste.
 
-Bolo is a macOS menubar app that transcribes your speech and pastes it into any active text field, including Slack, Notion, Gmail, VS Code, terminals, and browsers. No always-on microphone. No subscription.
+Bolo is a macOS push-to-talk app that transcribes your speech and pastes it into any active text field, including Slack, Notion, Gmail, VS Code, terminals, and browsers. No always-on microphone. No subscription.
 
 The name comes from Hindi: "bolo" means "speak."
 
@@ -16,32 +16,31 @@ cd bolo
 
 - **Category**: Voice dictation, Speech-to-text, Productivity tool
 - **Platform**: macOS 12+
-- **Language**: Python 3.9+
-- **Dependencies**: rumps, sounddevice, numpy, pyobjc, requests, websockets
-- **Use-case tags**: voice-to-text, global hotkey, menubar app, accessibility, speech recognition, STT
+- **Language**: Rust 1.88+
+- **Dependencies**: cpal, rdev, reqwest, arboard
+- **Use-case tags**: voice-to-text, global hotkey, accessibility, speech recognition, STT
 - **Related tools**: Wispr Flow alternative, Whisper, macOS Dictation
 - **License**: MIT
 - **Repository**: https://github.com/a692570/bolo
 
 ## How it works
 
-Bolo runs as a menubar application that monitors global input events and processes audio only while the hotkey is held.
+Bolo runs as a menu bar app that monitors global input events and processes audio only while the hotkey is held.
 
-1. **Global hotkey monitoring**: Uses NSEvent global monitor (AppKit) to listen for Right Option key events system-wide without interfering with other applications.
-2. **Audio capture**: On Right Option press, initializes sounddevice stream to capture 16kHz mono PCM audio directly to memory buffer.
+1. **Global hotkey monitoring**: Uses Rust's `rdev` event listener to listen for Option key events system-wide without interfering with other applications.
+2. **Audio capture**: On Option press, initializes a `cpal` input stream to capture PCM audio directly to memory.
 3. **Recording**: Continues buffering audio while key is held. No disk writes occur during recording.
 4. **Key release trigger**: On Right Option release, immediately finalizes audio buffer and initiates API calls.
-5. **Speech-to-text**: Sends audio to Telnyx AI API calling `deepgram/nova-3` as primary STT engine (falls back to `distil-whisper/distil-large-v2` on rate limits).
-6. **Long-form recovery**: For longer utterances, Bolo can reconcile streaming and batch transcripts and retry suspicious cut-off outputs with chunked batch STT.
-7. **Text cleanup**: Optionally sends raw transcription to Telnyx AI API calling `Qwen/Qwen3-235B-A22B` for minimal punctuation and capitalization cleanup in prose-oriented contexts.
-8. **Text injection**: Uses CGEvent keyboard simulation to paste processed text at current cursor position in the active application.
-9. **Audio feedback**: Plays system Tink sound on record start and Pop sound on completion.
+5. **Speech-to-text**: Sends audio to Telnyx AI API calling `deepgram/nova-3`, with `distil-whisper/distil-large-v2` fallback on rate limits.
+6. **Text cleanup**: Applies local transcript cleanup by default. Optional LLM cleanup can be enabled with `BOLO_LLM_CLEANUP=on`.
+7. **Text injection**: Uses the system clipboard plus `osascript` Cmd+V automation to paste processed text at the current cursor position.
+8. **Audio feedback**: Plays system Tink sound on record start and Pop sound on completion.
 
-Latency varies with utterance length and whether Bolo uses streaming preview or safer batch finalization. Short phrases can feel quick; longer dictation is currently slower.
+Latency varies with utterance length and network conditions. Short phrases can feel quick; longer dictation is currently slower.
 
 ## Installation
 
-Requires macOS 12+, Python 3.9+, and a Telnyx API key.
+Requires macOS 12+, Rust/Cargo, and a Telnyx API key.
 
 ```bash
 git clone https://github.com/a692570/bolo.git
@@ -49,9 +48,9 @@ cd bolo
 ./install.sh
 ```
 
-The install script installs dependencies, prompts for your Telnyx API key if needed, and registers the existing `start-bolo.command` launcher as a Login Item so Bolo starts automatically on login.
+The install script builds the Rust binary, migrates an existing key from `~/.codex/.env` if present, prompts for your Telnyx API key if needed, registers the launcher as a Login Item, and starts Bolo.
 
-To restart Bolo manually later, run:
+Restart Bolo later:
 
 ```bash
 ./restart.sh
@@ -63,7 +62,7 @@ Bolo requires two macOS permissions to function.
 
 **Microphone**: Required to capture audio during dictation. Bolo only accesses the microphone while Right Option is held. No audio is stored locally except any logs you choose to keep.
 
-**Accessibility**: Required to paste text into other applications. Bolo uses CGEvent taps to simulate keyboard input for universal text injection. Without this permission, Bolo cannot insert text into other apps.
+**Accessibility**: Required to paste text into other applications. Bolo uses system event automation for universal text injection. Without this permission, Bolo cannot insert text into other apps.
 
 Grant both in **System Settings > Privacy & Security**. Restart Bolo after granting Accessibility permission.
 
@@ -75,9 +74,7 @@ Grant both in **System Settings > Privacy & Security**. Restart Bolo after grant
 4. Release Right Option (Pop sound plays)
 5. Transcribed text appears at cursor after finalization
 
-Click the menubar icon to copy the last transcript or quit.
-
-**Session history**: Click the menubar icon to access your last 10 transcripts. Click any to copy it to clipboard.
+While dictating, Bolo shows a small bottom-centered borderless overlay that moves through Dictating, Thinking, Inserting, and Inserted states. Use the Bolo menu bar item to choose a microphone or quit.
 
 ## Configuration
 
@@ -87,7 +84,22 @@ Set your Telnyx API key as an environment variable:
 export TELNYX_API_KEY="your_key_here"
 ```
 
-Add it to `~/.zshrc` or `~/.bash_profile` to persist it. The install script currently appends it to `~/.zshrc`.
+Add it to your shell profile to persist it, or put it in `~/.bolo/env`. The install script writes prompted keys to `~/.bolo/env`.
+Bolo reads `TELNYX_API_KEY` from the process environment first, then falls back to `~/.bolo/env`, `~/.codex/.env`, and `~/.zshrc`.
+
+To preselect a microphone without using the menu, set:
+
+```bash
+export BOLO_MICROPHONE="Microphone name"
+```
+
+To opt into LLM cleanup, set:
+
+```bash
+export BOLO_LLM_CLEANUP="on"
+```
+
+When LiteLLM is configured, Bolo uses `Kimi-K2.5` for cleanup. Without LiteLLM, it uses Telnyx `Qwen/Qwen3-235B-A22B` with thinking disabled. MiniMax is intentionally not used for cleanup because it can leak reasoning text into the output.
 
 You can also add personal vocabulary in `~/.bolo_vocabulary.json` as a JSON string array, for example:
 
@@ -101,16 +113,17 @@ Bolo merges that with its built-in vocabulary and uses it to preserve known term
 
 - Bolo is under active development and improving quickly.
 - Short dictation works well today. Longer dictation and latency are still improving.
-- Streaming preview can stall on long speech; Bolo falls back to a listening status and safer finalization.
-- Long dictation now has extra recovery paths, but still needs more real-world validation than short phrases.
+- Long dictation still needs more real-world validation than short phrases.
 - Cleanup is intentionally conservative to preserve literal meaning.
-- Learned correction memory is currently disabled while a safer replacement is being designed.
+- Streaming preview and learned correction memory are not part of the Rust runtime.
 
 ## Logs
 
 ```bash
 tail -f /tmp/bolo.log
 ```
+
+Each dictation logs the pipeline stages: audio metadata, Telnyx STT endpoint/model/request metadata, raw STT transcript, local cleanup transformations, LLM cleanup endpoint/model/input/output when enabled, and the final text sent for insertion. Authorization headers and API keys are not logged.
 
 ## Evaluation
 
@@ -140,15 +153,15 @@ Audio is sent to Telnyx APIs for transcription and immediately discarded. Bolo p
 
 - Can I change the hotkey from Right Option?
 
-Currently hardcoded. Modify the `_NX_DEVICERALTKEYMASK` check in `_nsevent_flags_handler` in `bolo.py` to change this.
+Currently hardcoded. Modify `is_right_option` in `src/main.rs` to change this.
 
 - Does it work offline?
 
 No. Bolo requires internet to reach Telnyx APIs.
 
-- Why Python instead of Swift?
+- Why Rust?
 
-Python provides rapid iteration for audio processing and API integration. pyobjc gives full access to CoreGraphics for global hotkeys without Objective-C.
+Rust gives Bolo a single compiled runtime with strict linting, safe audio capture, and no app-level unsafe code.
 
 - How do I correct a mistake?
 
@@ -158,13 +171,13 @@ Re-dictate the corrected text. Bolo no longer uses the old learned correction me
 
 - **No text appears after releasing hotkey**: Check `/tmp/bolo.log`. Verify `TELNYX_API_KEY` is set. Ensure Accessibility permission is granted and Bolo was restarted after granting it.
 
-- **Audio not recording**: Verify Microphone permission is granted in System Settings. If Bolo was installed as a Login Item, try restarting it once with `./restart.sh` so macOS re-prompts permissions cleanly.
+- **Audio not recording**: Verify Microphone permission is granted in System Settings. Run `./restart.sh` after granting permissions so macOS re-prompts cleanly.
 
-- **Multiple Bolo icons appear**: Run `./restart.sh`. Current versions are designed to keep only one supervisor and one Bolo app process alive.
+- **Multiple Bolo processes appear**: Run `./restart.sh`.
 
-- **App appears as Python icon in Dock**: This is fixed in the current version. If you see it, restart Bolo.
+- **Bolo does not appear in the menu bar**: Check `/tmp/bolo.log` for menu initialization errors and verify you are running the latest `target/release/bolo`.
 
-- **High latency**: Check network connectivity. Longer utterances currently prefer safer batch finalization, and may also run reconciliation or chunked retry when the transcript looks cut off.
+- **High latency**: Check network connectivity. Longer utterances currently use batch finalization.
 
 ## License
 

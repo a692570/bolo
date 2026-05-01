@@ -3,6 +3,7 @@
 import json
 import os
 import subprocess
+import sys
 import threading
 import time
 
@@ -31,7 +32,7 @@ class RecordingOverlay:
                 return
 
             self._proc = subprocess.Popen(
-                ["/usr/bin/python3", self.script],
+                [sys.executable, self.script],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,

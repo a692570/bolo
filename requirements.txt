@@ -4,5 +4,4 @@ numpy
 requests
 websockets
 pyobjc-framework-Quartz
-pyobjc-framework-HIServices
 pyobjc-framework-AppKit

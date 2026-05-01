@@ -3,6 +3,7 @@ __pycache__/
 .env
 build/
 dist/
+target/
 Bolo.app/
 *.egg-info/
 icon_options/

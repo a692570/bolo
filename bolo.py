@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Bolo — Telnyx voice dictation menubar app.
+Bolo - Telnyx voice dictation menubar app.
 Hold Right Option anywhere to dictate. Release to transcribe and inject.
 """
 
@@ -61,7 +61,6 @@ from Quartz import (
     kCGEventFlagsChanged,
 )
 from CoreFoundation import kCFRunLoopDefaultMode
-import HIServices
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 
@@ -82,12 +81,16 @@ def _load_env_value(name: str) -> str:
     """Load a config value.
 
     Priority (highest first):
-      1. ~/.codex/.env — authoritative on-disk source; always wins so that
-         stale shell env vars (from a previous session) cannot shadow the key.
-      2. os.environ — useful for CI/test overrides when .codex/.env is absent.
-      3. ~/.zshrc — last-resort fallback.
+      1. os.environ - explicit process configuration wins.
+      2. ~/.bolo/env - app-specific on-disk fallback.
+      3. ~/.codex/.env - migration fallback for existing local installs.
+      4. ~/.zshrc - last-resort fallback.
     """
-    env_file = os.path.expanduser("~/.codex/.env")
+    value = os.environ.get(name, "").strip()
+    if value:
+        return value
+
+    env_file = os.path.expanduser("~/.bolo/env")
     if os.path.exists(env_file):
         try:
             with open(env_file, "r", encoding="utf-8") as fh:
@@ -103,9 +106,15 @@ def _load_env_value(name: str) -> str:
         except OSError:
             pass
 
-    value = os.environ.get(name, "").strip()
-    if value:
-        return value
+    codex_env_file = os.path.expanduser("~/.codex/.env")
+    if os.path.exists(codex_env_file):
+        try:
+            with open(codex_env_file, "r", encoding="utf-8") as fh:
+                for line in fh:
+                    if line.strip().startswith(f"{name}="):
+                        return line.split("=", 1)[1].strip().strip('"').strip("'")
+        except OSError:
+            pass
 
     shell_file = os.path.expanduser("~/.zshrc")
     if os.path.exists(shell_file):
@@ -150,7 +159,7 @@ def _llm_headers() -> dict:
 def _llm_model() -> str:
     """Return model ID appropriate for the active backend."""
     if _LITELLM_BASE:
-        return "MiniMax-M2.5-drop"
+        return "Kimi-K2.5"
     return "Qwen/Qwen3-235B-A22B"
 
 
@@ -164,7 +173,7 @@ DELETE_KEYCODE = 51
 RATE_LIMIT_BACKOFF_SECONDS = 45.0
 MAX_RECORDING_SECONDS = 90.0  # force-stop if stuck recording longer than this
 AUTO_SILENCE_SECONDS = 5.0    # stop after this many seconds of silence
-AUTO_SILENCE_MAX_SECONDS = 5.0  # flat threshold — no extension logic
+AUTO_SILENCE_MAX_SECONDS = 5.0  # flat threshold - no extension logic
 AUTO_SILENCE_EXTEND_STEP = 2.0  # unused, kept for reference
 AUTO_SILENCE_MIN_SPEAKING = 2.0  # only trigger auto-stop after user has been speaking this long
 BOLO_PREFS_FILE = os.path.expanduser("~/.bolo_prefs.json")
@@ -196,7 +205,7 @@ def build_stt_prompt(vocab_terms: list, context_text: str = "") -> str:
     """
     Build a short STT hint string for the Telnyx/Whisper `prompt` parameter.
 
-    Proper nouns and domain terms are listed first (highest leverage), followed
+    Proper nouns and domain terms are listed first (highest priority), followed
     by a tail of the active text-field context so the model continues in the
     right register.  The result is capped at _STT_PROMPT_MAX_CHARS to stay
     within Whisper's 224-token prompt window.
@@ -210,7 +219,7 @@ def build_stt_prompt(vocab_terms: list, context_text: str = "") -> str:
         parts.append(", ".join(vocab_terms))
 
     if context_text:
-        # Append the last 120 chars of the active field — enough for register
+        # Append the last 120 chars of the active field - enough for register
         # continuity without blowing the token budget.
         tail = context_text.strip()[-120:]
         if tail:
@@ -322,7 +331,7 @@ class BoloApp(rumps.App):
         self.last_pipeline = 0.0
 
         self.menu = [
-            rumps.MenuItem("Bolo — Voice Dictation", callback=None),
+            rumps.MenuItem("Bolo - Voice Dictation", callback=None),
             None,
             rumps.MenuItem("Hold Right Option to dictate", callback=None),
             None,
@@ -334,7 +343,7 @@ class BoloApp(rumps.App):
             None,
             rumps.MenuItem("Quit Bolo", callback=self.quit_app),
         ]
-        self.menu["Bolo — Voice Dictation"].set_callback(None)
+        self.menu["Bolo - Voice Dictation"].set_callback(None)
         self.menu["Hold Right Option to dictate"].set_callback(None)
         self.menu["History"].set_callback(None)
         self.last_result     = None
@@ -493,13 +502,13 @@ class BoloApp(rumps.App):
     def _get_focused_text_context(self) -> str:
         """Read the last 500 chars of the currently focused text field via accessibility API."""
         try:
-            focused_system = HIServices.AXUIElementCreateSystemWide()
-            err, focused_el = HIServices.AXUIElementCopyAttributeValue(
+            focused_system = Quartz.HIServices.AXUIElementCreateSystemWide()
+            err, focused_el = Quartz.HIServices.AXUIElementCopyAttributeValue(
                 focused_system, "AXFocusedUIElement", None
             )
             if err != 0 or focused_el is None:
                 return ""
-            err, value = HIServices.AXUIElementCopyAttributeValue(
+            err, value = Quartz.HIServices.AXUIElementCopyAttributeValue(
                 focused_el, "AXValue", None
             )
             if err != 0 or not value:
@@ -635,9 +644,9 @@ class BoloApp(rumps.App):
                 self._stop_recording()
 
     def _watchdog_tap(self, _):
-        # NSEvent monitors are never disabled by macOS — just log if monitor was lost.
+        # NSEvent monitors are never disabled by macOS - just log if monitor was lost.
         if self._ns_monitor is None:
-            self._log("[tap] NSEvent monitor is None — re-registering")
+            self._log("[tap] NSEvent monitor is None - re-registering")
             self._start_nsevent_monitor()
 
     def _start_nsevent_monitor(self):
@@ -646,13 +655,13 @@ class BoloApp(rumps.App):
         NSEvent monitors are never disabled by macOS (unlike CGEventTap),
         so no watchdog re-enable loop is needed.
         """
-        if not HIServices.AXIsProcessTrusted():
+        if not Quartz.HIServices.AXIsProcessTrusted():
             self._log(
                 "[accessibility] NOT TRUSTED. Open System Settings > "
                 "Privacy & Security > Accessibility and add this app."
             )
-            HIServices.AXIsProcessTrustedWithOptions(
-                {HIServices.kAXTrustedCheckOptionPrompt: True}
+            Quartz.HIServices.AXIsProcessTrustedWithOptions(
+                {Quartz.HIServices.kAXTrustedCheckOptionPrompt: True}
             )
 
         self._ns_monitor = NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(
@@ -660,7 +669,7 @@ class BoloApp(rumps.App):
             self._nsevent_flags_handler,
         )
         if self._ns_monitor is None:
-            self._log("[tap] NSEvent monitor creation failed — Accessibility not granted?")
+            self._log("[tap] NSEvent monitor creation failed - Accessibility not granted?")
         else:
             self._log("[tap] NSEvent global monitor active, listening for Right Option")
 
@@ -671,8 +680,8 @@ class BoloApp(rumps.App):
 
         if ropt_down and not self._ropt_held:
             if self.recording:
-                # Spurious key-down while already recording — ignore to prevent state reset
-                self._log("[key] spurious Right Option down while recording — ignored")
+                # Spurious key-down while already recording - ignore to prevent state reset
+                self._log("[key] spurious Right Option down while recording - ignored")
                 self._ropt_held = True  # still track so release is recognized
                 return
             self._ropt_held = True
@@ -704,14 +713,14 @@ class BoloApp(rumps.App):
                 self._panic_presses = [t for t in self._panic_presses if now - t < self._PANIC_WINDOW]
                 # Triple-tap detected
                 if len(self._panic_presses) >= 3:
-                    self._log("[panic] triple-tap Right Option detected — forcing reset")
+                    self._log("[panic] triple-tap Right Option detected - forcing reset")
                     self._panic_reset()
                     self._panic_presses = []
 
             if ropt_down and not self._ropt_held:
                 if self.recording:
-                    # Spurious key-down while already recording — ignore
-                    self._log("[tap] spurious Right Option down while recording — ignored")
+                    # Spurious key-down while already recording - ignore
+                    self._log("[tap] spurious Right Option down while recording - ignored")
                     self._ropt_held = True
                 else:
                     self._ropt_held = True
@@ -726,7 +735,7 @@ class BoloApp(rumps.App):
         return event
 
     def _panic_reset(self):
-        """Force reset all state — emergency recovery for wedged hotkey."""
+        """Force reset all state - emergency recovery for wedged hotkey."""
         self._log("[panic] executing force reset")
 
         # Force stop recording if active
@@ -773,7 +782,7 @@ class BoloApp(rumps.App):
             )
 
             if self._cg_tap is None:
-                self._log("[tap] CGEventTap creation failed — need Accessibility permission")
+                self._log("[tap] CGEventTap creation failed - need Accessibility permission")
                 # Fall back to NSEvent
                 self._start_nsevent_monitor()
                 return
@@ -803,19 +812,19 @@ class BoloApp(rumps.App):
             return  # Fall back mode
 
         if not CGEventTapIsEnabled(self._cg_tap):
-            self._log("[tap] CGEventTap was disabled by macOS — re-enabling")
+            self._log("[tap] CGEventTap was disabled by macOS - re-enabling")
             CGEventTapEnable(self._cg_tap, True)
 
     def _watchdog_overlay_health(self, _):
         """Watchdog: monitor overlay process and restart if dead while showing."""
         # If overlay died while supposed to be showing, force hide to clean state
         if self.overlay._is_showing and not self.overlay.is_alive():
-            self._log("[overlay] died while showing — forcing hide to reset")
+            self._log("[overlay] died while showing - forcing hide to reset")
             self.overlay._proc = None
             self.overlay._is_showing = False
             # If we're recording, stop to avoid stuck state
             if self.recording:
-                self._log("[overlay] overlay died during recording — stopping")
+                self._log("[overlay] overlay died during recording - stopping")
                 self._stop_recording()
 
     # ── Record ────────────────────────────────────────────────────────────────
@@ -825,7 +834,7 @@ class BoloApp(rumps.App):
 
     def _ensure_warm_stream(self):
         if self._stream_auth_failed:
-            return  # API key is bad — don't hammer the endpoint
+            return  # API key is bad - don't hammer the endpoint
         with self._warm_stt_lock:
             if self.recording or self._stt or self._warm_stt or self._warm_stt_connecting:
                 return
@@ -842,8 +851,8 @@ class BoloApp(rumps.App):
             if "401" in err_msg or "Unauthorized" in err_msg or "auth" in err_msg.lower():
                 self._stream_auth_failed = True
                 self._rate_limit_backoff_until = time.time() + 86400.0
-                self._log("[stream] 401 auth failure — disabling stream. Fix API key and restart.")
-                self._show_error("Invalid API key — check ~/.codex/.env")
+                self._log("[stream] 401 auth failure - disabling stream. Fix API key and restart.")
+                self._show_error("Invalid API key - check ~/.bolo/env")
             with self._warm_stt_lock:
                 self._warm_stt_connecting = False
             return
@@ -881,13 +890,13 @@ class BoloApp(rumps.App):
             self._overlay_hide_timer.cancel()
             self._overlay_hide_timer = None
 
-        # Backoff / auth-failure check — give user feedback instead of silently ignoring
+        # Backoff / auth-failure check - give user feedback instead of silently ignoring
         backoff_remaining = self._rate_limit_backoff_until - time.time()
         if backoff_remaining > 0:
             self._play("Basso")
             self.overlay.show()
             if self._stream_auth_failed:
-                self.overlay.update("error", "Invalid API key — restart required")
+                self.overlay.update("error", "Invalid API key - restart required")
             else:
                 wait_sec = int(backoff_remaining) + 1
                 self.overlay.update("error", f"Rate limited - wait {wait_sec}s")
@@ -921,7 +930,7 @@ class BoloApp(rumps.App):
         self._chunk_time = time.time()
         self._transcript_state = TranscriptState()
 
-        # IMMEDIATELY give user feedback — don't wait for stream/context
+        # IMMEDIATELY give user feedback - don't wait for stream/context
         self._play("Tink")
         self.overlay.show()
         self.overlay.update("listening", "")
@@ -944,7 +953,7 @@ class BoloApp(rumps.App):
                 self._log(f"[mic] error opening stream (attempt {attempt+1}): {e}")
                 time.sleep(0.5)
         else:
-            self._log("[mic] failed to open after 3 attempts — skipping")
+            self._log("[mic] failed to open after 3 attempts - skipping")
             if self._stt:
                 self._stt.close()
                 self._stt = None
@@ -964,11 +973,11 @@ class BoloApp(rumps.App):
             if "401" in err_msg or "Unauthorized" in err_msg or "auth" in err_msg.lower():
                 self._stream_auth_failed = True
                 self._rate_limit_backoff_until = time.time() + 86400.0
-                self._log("[stream] 401 auth failure — disabling stream. Fix API key and restart.")
-                self._show_error("Invalid API key — check ~/.codex/.env")
+                self._log("[stream] 401 auth failure - disabling stream. Fix API key and restart.")
+                self._show_error("Invalid API key - check ~/.bolo/env")
             return
         if not self.recording:
-            # Recording ended before we connected — discard
+            # Recording ended before we connected - discard
             try:
                 stt.close()
             except Exception:
@@ -1009,9 +1018,9 @@ class BoloApp(rumps.App):
         elapsed = time.time() - self._record_started_at
         if elapsed < MAX_RECORDING_SECONDS:
             return
-        # Only force-stop if the key is genuinely not held — avoids cutting off long voice notes
+        # Only force-stop if the key is genuinely not held - avoids cutting off long voice notes
         if not self._is_right_option_down():
-            self._log(f"[watchdog] recording stuck for {elapsed:.0f}s, key not held — force-stopping")
+            self._log(f"[watchdog] recording stuck for {elapsed:.0f}s, key not held - force-stopping")
             self._stop_recording()
 
     def _shutdown_stream_async(self, stream):
@@ -1093,7 +1102,7 @@ class BoloApp(rumps.App):
             if not self._is_current_session(session_id):
                 return
             self._play("Basso")
-            self._show_error("Timed out — check network", session_id=session_id)
+            self._show_error("Timed out - check network", session_id=session_id)
             self._log("[pipeline] timed out")
         watchdog = threading.Timer(8.0, _timeout_watchdog)
         watchdog.start()
@@ -1118,7 +1127,7 @@ class BoloApp(rumps.App):
 
     def _pipeline_inner(self, wav_bytes, state, session_id):
         rms = int(np.sqrt(np.mean(np.frombuffer(wav_bytes[44:], dtype=np.int16).astype(np.float32)**2)))
-        self._log(f"[pipeline] starting — audio RMS: {rms} ({'SILENT' if rms < 100 else 'OK'})")
+        self._log(f"[pipeline] starting - audio RMS: {rms} ({'SILENT' if rms < 100 else 'OK'})")
         app_context = self._cleanup_context()
 
         duration_seconds = max(0.0, (len(wav_bytes) - 44) / float(SAMPLE_RATE * CHANNELS * 2))
@@ -1176,7 +1185,7 @@ class BoloApp(rumps.App):
         if not transcript:
             return
 
-        # Reconcile removed from critical path — batch nova-3 is accurate enough
+        # Reconcile removed from critical path - batch nova-3 is accurate enough
         # if not use_stream and self._should_reconcile_long_form(stream_preview, transcript, duration_seconds):
         #     reconciled = self._reconcile_transcripts(stream_preview, transcript, app_context, state)
         #     if reconciled:
@@ -1246,7 +1255,7 @@ class BoloApp(rumps.App):
         self._log_metrics(state, final_text=result)
         self._log(f"[done] injected and popped")
 
-        # Async LLM cleanup: log only, no in-place replacement (disabled — fires into wrong window)
+        # Async LLM cleanup: log only, no in-place replacement (disabled - fires into wrong window)
         if run_async_cleanup:
             raw_for_cleanup = result
             threading.Thread(
@@ -1343,7 +1352,7 @@ class BoloApp(rumps.App):
             )
             return False
 
-        # If Deepgram sent a final, trust it — don't gate on word count
+        # If Deepgram sent a final, trust it - don't gate on word count
         if state and state.first_final_at is not None:
             self._log(
                 f"[stream] final candidate words={word_count} duration_s={duration_seconds:.2f} accepted=True"
@@ -1380,7 +1389,7 @@ class BoloApp(rumps.App):
                 timeout=8,
             )
             if resp.status_code == 401:
-                self._log("[stt] 401 Unauthorized — check TELNYX_API_KEY in ~/.codex/.env")
+                self._log("[stt] 401 Unauthorized - check TELNYX_API_KEY in ~/.bolo/env")
                 raise RuntimeError("STT auth failed (401): invalid or missing API key")
             rate_limited = resp.status_code == 429
             if resp.status_code == 429:
@@ -1443,7 +1452,7 @@ class BoloApp(rumps.App):
                 # Auth failure: freeze backoff so no further requests are made.
                 # User must fix the key and restart.
                 self._rate_limit_backoff_until = time.time() + 86400.0  # 24h
-                self._show_error("Invalid API key — check ~/.codex/.env")
+                self._show_error("Invalid API key - check ~/.bolo/env")
             else:
                 self._show_error(f"STT failed: {e}")
             return "", "batch"
@@ -1613,7 +1622,7 @@ class BoloApp(rumps.App):
         if LLM_CLEANUP_MODE == "on":
             self._log("[llm] running (mode=on)")
             return True
-        # auto mode — relaxed thresholds
+        # auto mode - relaxed thresholds
         word_count = len(transcript.split())
         if word_count < 6:
             self._log(f"[llm] skipped (too short: {word_count} words)")
@@ -1649,7 +1658,7 @@ class BoloApp(rumps.App):
             "temperature": 0,
             "stream": True,
         }
-        # Telnyx-specific param — harmless to omit on LiteLLM
+        # Telnyx-specific param - harmless to omit on LiteLLM
         if not _LITELLM_BASE:
             payload["enable_thinking"] = False
 
@@ -1730,7 +1739,7 @@ class BoloApp(rumps.App):
                     continue
                 choice = data.get("choices", [{}])[0]
                 delta = choice.get("delta", {}).get("content", "") or ""
-                # Some models (GLM-5, Kimi) stream reasoning in a separate field — ignore it
+                # Some models (GLM-5, Kimi) stream reasoning in a separate field - ignore it
                 if not delta:
                     delta = ""
                 result += delta or ""
@@ -2188,7 +2197,7 @@ if __name__ == "__main__":
 
     # ── Single-instance guard ─────────────────────────────────────────────────
     # Use a lock directory (atomic on all POSIX systems) so two launches of
-    # bolo.py (e.g. Bolo.app + start-bolo.command) cannot coexist.
+    # bolo.py (e.g. a packaged app plus direct script launch) cannot coexist.
     _LOCK_DIR = pathlib.Path("/tmp/bolo-instance.lock")
     try:
         _LOCK_DIR.mkdir(parents=False, exist_ok=False)
@@ -2215,7 +2224,7 @@ if __name__ == "__main__":
     
     atexit.register(_cleanup_and_release_lock)
 
-    # Also release on SIGTERM/SIGINT so the supervisor can clean up cleanly.
+    # Also release on SIGTERM/SIGINT so process managers can clean up cleanly.
     _app_instance = None  # Will hold the BoloApp instance for signal handlers
     
     def _signal_handler(signum, frame):
@@ -2240,7 +2249,7 @@ if __name__ == "__main__":
 
     # ── API key check ─────────────────────────────────────────────────────────
     if not TELNYX_API_KEY:
-        _logger.error("ERROR: TELNYX_API_KEY not set. Add to ~/.codex/.env and restart.")
+        _logger.error("ERROR: TELNYX_API_KEY not set. Add to ~/.bolo/env and restart.")
         sys.exit(1)
 
     def _crash_handler(signum, frame):
