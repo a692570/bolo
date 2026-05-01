@@ -1260,7 +1260,7 @@ fn wav_bytes(samples: &[i16], sample_rate: u32) -> Result<Vec<u8>, AppError> {
 }
 
 const fn is_right_option(key: Key) -> bool {
-    matches!(key, Key::AltGr | Key::Alt)
+    matches!(key, Key::AltGr)
 }
 
 fn parse_command(text: &str, correction_active: bool) -> Option<DictationCommand> {
@@ -1556,9 +1556,10 @@ fn app_root_dir() -> Result<PathBuf, AppError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DictationCommandKind, build_stt_prompt, canonicalize_known_terms, parse_command,
-        remove_fillers, wav_bytes,
+        DictationCommandKind, build_stt_prompt, canonicalize_known_terms, is_right_option,
+        parse_command, remove_fillers, wav_bytes,
     };
+    use rdev::Key;
 
     #[test]
     fn parses_dictation_commands() {
@@ -1587,6 +1588,12 @@ mod tests {
             replace.as_ref().map(|command| command.text.as_str()),
             Some("corrected text")
         );
+    }
+
+    #[test]
+    fn only_right_option_triggers_recording() {
+        assert!(is_right_option(Key::AltGr));
+        assert!(!is_right_option(Key::Alt));
     }
 
     #[test]
