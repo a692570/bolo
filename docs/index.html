@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Bolo</title>
+    <meta
+      name="description"
+      content="Bolo is an open source push-to-talk dictation app for macOS, powered by Telnyx AI."
+    >
+    <meta property="og:title" content="Bolo">
+    <meta
+      property="og:description"
+      content="Open source push-to-talk dictation for macOS, powered by Telnyx AI."
+    >
+    <meta property="og:type" content="website">
+    <meta property="og:image" content="assets/bolo-icon.png">
+    <link rel="icon" href="assets/icon-idle.png">
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body>
+    <header class="site-header" aria-label="Primary">
+      <a class="brand" href="#top" aria-label="Bolo home">
+        <img src="assets/icon-idle.png" width="44" height="44" alt="">
+        <span>Bolo</span>
+      </a>
+      <nav class="nav-links">
+        <a href="#install">Install</a>
+        <a href="#privacy">Privacy</a>
+        <a href="https://github.com/a692570/bolo">GitHub</a>
+      </nav>
+    </header>
+
+    <main id="top">
+      <section class="hero" aria-labelledby="hero-title">
+        <canvas class="voice-field" aria-hidden="true"></canvas>
+        <div class="hero-grid">
+          <div class="hero-copy">
+            <p class="eyebrow">Open source macOS dictation</p>
+            <h1 id="hero-title">Bolo</h1>
+            <p class="hero-subtitle">
+              Hold Right Option, say what you mean, release, and Bolo pastes
+              the cleaned text at your cursor.
+            </p>
+            <div class="hero-actions" aria-label="Primary actions">
+              <a class="button button-primary" href="#install">Install Bolo</a>
+              <a class="button button-secondary" href="https://github.com/a692570/bolo">View source</a>
+            </div>
+            <div class="hero-proof" aria-label="Recent local performance notes">
+              <span><strong>188 ms</strong> average menu-ready startup</span>
+              <span><strong>715 ms</strong> fastest recent release-to-paste</span>
+              <span><strong>1.2.3</strong> current release</span>
+            </div>
+          </div>
+
+          <div class="product-scene" aria-label="Bolo dictation preview">
+            <div class="mac-bar">
+              <span class="traffic traffic-red"></span>
+              <span class="traffic traffic-yellow"></span>
+              <span class="traffic traffic-green"></span>
+              <span class="mac-title">Notes</span>
+              <span class="menu-pill">
+                <img src="assets/icon-recording.png" width="22" height="22" alt="">
+                Bolo
+              </span>
+            </div>
+            <div class="editor-surface">
+              <div class="document-line muted">Voice draft</div>
+              <p class="dictation-text" id="dictationText">
+                Bolo turns short spoken thoughts into clean text in the app you are already using.
+              </p>
+              <span class="cursor" aria-hidden="true"></span>
+            </div>
+            <div class="hud" id="hud">
+              <span class="live-dot" aria-hidden="true"></span>
+              <span id="hudText">Dictating</span>
+              <span class="hud-bars" aria-hidden="true">
+                <i></i><i></i><i></i><i></i><i></i>
+              </span>
+            </div>
+            <button class="demo-button" id="demoButton" type="button">
+              Try the flow
+            </button>
+          </div>
+        </div>
+      </section>
+
+      <section class="metric-band" aria-label="What changed">
+        <div>
+          <span class="metric-label">Rust runtime</span>
+          <strong>Faster launch</strong>
+          <p>Recent local logs show menu-ready startup averaging 188 ms.</p>
+        </div>
+        <div>
+          <span class="metric-label">Native helpers</span>
+          <strong>Feels more like macOS</strong>
+          <p>Menu bar app, AppKit hotkey listener, and a smaller status HUD.</p>
+        </div>
+        <div>
+          <span class="metric-label">Telnyx AI</span>
+          <strong>Cloud STT with cleanup</strong>
+          <p>Nova 3 transcription, fallback handling, vocabulary, and optional LLM cleanup.</p>
+        </div>
+      </section>
+
+      <section class="section split" id="why">
+        <div>
+          <p class="eyebrow">Why it exists</p>
+          <h2>A free Wispr Flow alternative you can inspect.</h2>
+        </div>
+        <div class="feature-grid">
+          <article>
+            <span class="feature-mark">01</span>
+            <h3>No always-on microphone</h3>
+            <p>Bolo captures audio only while Right Option is held.</p>
+          </article>
+          <article>
+            <span class="feature-mark">02</span>
+            <h3>No subscription</h3>
+            <p>Bring a Telnyx API key and run the app locally.</p>
+          </article>
+          <article>
+            <span class="feature-mark">03</span>
+            <h3>Plain app behavior</h3>
+            <p>Dictate in Slack, Notion, Gmail, VS Code, terminals, and browsers.</p>
+          </article>
+          <article>
+            <span class="feature-mark">04</span>
+            <h3>Readable internals</h3>
+            <p>Rust core, Python AppKit helpers, local cleanup, and open logs.</p>
+          </article>
+        </div>
+      </section>
+
+      <section class="section flow">
+        <div class="flow-step">
+          <span>1</span>
+          <strong>Hold Right Option</strong>
+          <p>A small HUD appears when Bolo is actually listening.</p>
+        </div>
+        <div class="flow-step">
+          <span>2</span>
+          <strong>Speak naturally</strong>
+          <p>Audio is buffered in memory and sent to Telnyx for transcription.</p>
+        </div>
+        <div class="flow-step">
+          <span>3</span>
+          <strong>Release to paste</strong>
+          <p>Bolo cleans the text and inserts it at the active cursor.</p>
+        </div>
+      </section>
+
+      <section class="section architecture" id="privacy">
+        <div class="architecture-copy">
+          <p class="eyebrow">How it works</p>
+          <h2>Fast local control, cloud transcription.</h2>
+          <p>
+            Bolo runs as a menu bar-only macOS app. It records only while the
+            hotkey is held, sends audio to Telnyx APIs for transcription, then
+            discards the audio. No dictation history is retained by Bolo.
+          </p>
+        </div>
+        <div class="architecture-list" aria-label="Bolo runtime pieces">
+          <div><span>Runtime</span><strong>Rust 1.88+</strong></div>
+          <div><span>Hotkey and HUD</span><strong>Native AppKit helpers</strong></div>
+          <div><span>Speech-to-text</span><strong>Telnyx AI</strong></div>
+          <div><span>Cleanup</span><strong>Local by default, LLM optional</strong></div>
+        </div>
+      </section>
+
+      <section class="install-section" id="install">
+        <div class="install-copy">
+          <p class="eyebrow">Install</p>
+          <h2>Run Bolo on macOS.</h2>
+          <p>Requires macOS 12+, Rust, Python 3, and a Telnyx API key.</p>
+        </div>
+        <div class="terminal" aria-label="Install command">
+          <div class="terminal-top">
+            <span></span><span></span><span></span>
+          </div>
+          <pre><code>git clone https://github.com/a692570/bolo.git
+cd bolo
+./install.sh</code></pre>
+        </div>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+      <span>Bolo is MIT licensed.</span>
+      <a href="https://github.com/a692570/bolo">GitHub</a>
+      <a href="https://github.com/a692570/bolo/blob/main/README.md">README</a>
+    </footer>
+
+    <script src="site.js"></script>
+  </body>
+</html>
