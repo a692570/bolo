@@ -181,11 +181,27 @@ h1 {
   background: rgba(255, 255, 255, 0.62);
 }
 
+.button {
+  transition: opacity 0.15s ease, transform 0.15s ease;
+}
+
+.button:hover {
+  opacity: 0.82;
+  transform: translateY(-2px);
+}
+
+.button:focus-visible {
+  outline: 2px solid var(--green);
+  outline-offset: 3px;
+  opacity: 0.82;
+  transform: translateY(-2px);
+}
+
 .hero-proof {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 10px;
-  max-width: 650px;
+  max-width: 440px;
 }
 
 .hero-proof span {
@@ -609,11 +625,37 @@ h3 {
 }
 
 .terminal {
+  position: relative;
   overflow: hidden;
   background: #050706;
   border: 1px solid rgba(255, 255, 255, 0.16);
   border-radius: 8px;
   box-shadow: 0 30px 70px rgba(0, 0, 0, 0.28);
+}
+
+.copy-btn {
+  position: absolute;
+  top: 54px;
+  right: 12px;
+  z-index: 2;
+  padding: 4px 10px;
+  color: #a8ffd0;
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-radius: 5px;
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+
+.copy-btn:hover {
+  background: rgba(255, 255, 255, 0.14);
+}
+
+.copy-btn.copied {
+  color: #06b66a;
 }
 
 .terminal-top {

@@ -3,6 +3,8 @@ const ctx = canvas.getContext("2d");
 let width = 0;
 let height = 0;
 let tick = 0;
+let animating = true;
+let rafId = null;
 
 function resizeCanvas() {
   const ratio = window.devicePixelRatio || 1;
@@ -14,6 +16,7 @@ function resizeCanvas() {
 }
 
 function drawWave() {
+  if (!animating) return;
   tick += 0.014;
   ctx.clearRect(0, 0, width, height);
 
@@ -42,29 +45,51 @@ function drawWave() {
     ctx.stroke();
   }
 
-  window.requestAnimationFrame(drawWave);
+  rafId = window.requestAnimationFrame(drawWave);
 }
 
 resizeCanvas();
 drawWave();
 window.addEventListener("resize", resizeCanvas);
 
+// Pause RAF when canvas scrolls off screen
+const canvasObserver = new IntersectionObserver(
+  (entries) => {
+    const visible = entries[0].isIntersecting;
+    if (visible && !animating) {
+      animating = true;
+      drawWave();
+    } else if (!visible && animating) {
+      animating = false;
+      if (rafId !== null) {
+        cancelAnimationFrame(rafId);
+        rafId = null;
+      }
+    }
+  },
+  { threshold: 0 }
+);
+canvasObserver.observe(canvas);
+
+// Demo button cycling
 const demoButton = document.querySelector("#demoButton");
 const hudText = document.querySelector("#hudText");
 const dictationText = document.querySelector("#dictationText");
 
+const SPOKEN = "Send that email to the team about Thursday's sprint review.";
+
 const states = [
   {
     hud: "Dictating",
-    text: "Testing one two three. Bolo is now faster to launch and feels better on macOS.",
+    text: SPOKEN,
   },
   {
     hud: "Thinking",
-    text: "Testing one two three. Bolo is now faster to launch and feels better on macOS.",
+    text: SPOKEN,
   },
   {
     hud: "Inserted",
-    text: "Testing one two three. Bolo is now faster to launch and feels better on macOS.",
+    text: SPOKEN,
   },
 ];
 
@@ -75,4 +100,28 @@ demoButton.addEventListener("click", () => {
   hudText.textContent = state.hud;
   dictationText.textContent = state.text;
   stateIndex = (stateIndex + 1) % states.length;
+  demoButton.textContent = stateIndex === 0 ? "Try again" : "Next step";
 });
+
+// Copy button for install section
+const terminal = document.querySelector(".terminal");
+if (terminal) {
+  const pre = terminal.querySelector("pre");
+  const copyBtn = document.createElement("button");
+  copyBtn.className = "copy-btn";
+  copyBtn.type = "button";
+  copyBtn.textContent = "Copy";
+  terminal.appendChild(copyBtn);
+
+  copyBtn.addEventListener("click", () => {
+    const text = pre ? pre.textContent : "";
+    navigator.clipboard.writeText(text).then(() => {
+      copyBtn.textContent = "Copied!";
+      copyBtn.classList.add("copied");
+      setTimeout(() => {
+        copyBtn.textContent = "Copy";
+        copyBtn.classList.remove("copied");
+      }, 1500);
+    });
+  });
+}
