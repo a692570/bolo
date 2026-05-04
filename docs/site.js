@@ -71,37 +71,131 @@ const canvasObserver = new IntersectionObserver(
 );
 canvasObserver.observe(canvas);
 
-// Demo button cycling
+// Auto-playing hero demo
 const demoButton = document.querySelector("#demoButton");
 const hudText = document.querySelector("#hudText");
 const dictationText = document.querySelector("#dictationText");
+const liveDot = document.querySelector(".live-dot");
+const hudEl = document.querySelector(".hud");
+const hudBars = document.querySelectorAll(".hud-bars i");
+const cursorEl = document.querySelector(".cursor");
+const editorSurface = document.querySelector(".editor-surface");
 
-const SPOKEN = "Send that email to the team about Thursday's sprint review.";
+const WORDS = ["Send", "that", "email", "to", "the", "team", "about", "Thursday's", "sprint", "review."];
 
-const states = [
-  {
-    hud: "Dictating",
-    text: SPOKEN,
-  },
-  {
-    hud: "Thinking",
-    text: SPOKEN,
-  },
-  {
-    hud: "Inserted",
-    text: SPOKEN,
-  },
-];
+let demoTimers = [];
+let wordInterval = null;
 
-let stateIndex = 0;
+function clearDemo() {
+  demoTimers.forEach((id) => clearTimeout(id));
+  demoTimers = [];
+  if (wordInterval !== null) {
+    clearInterval(wordInterval);
+    wordInterval = null;
+  }
+}
 
+function schedule(fn, delay) {
+  const id = setTimeout(fn, delay);
+  demoTimers.push(id);
+}
+
+function resetToIdle() {
+  // Clear text
+  dictationText.textContent = "";
+  // HUD back to dictating
+  hudText.textContent = "Dictating";
+  hudEl.classList.remove("hud--processing");
+  // Dot green
+  liveDot.style.background = "";
+  liveDot.style.boxShadow = "";
+  // Bars resume
+  hudBars.forEach((bar) => {
+    bar.style.animationPlayState = "";
+  });
+  // Cursor resumes blinking, blue
+  cursorEl.style.animationPlayState = "";
+  cursorEl.style.background = "";
+}
+
+function runDemo() {
+  clearDemo();
+  resetToIdle();
+
+  // --- STATE 1: DICTATING (0ms) ---
+  // Words appear one by one every 280ms
+  let wordIndex = 0;
+  wordInterval = setInterval(() => {
+    if (wordIndex < WORDS.length) {
+      dictationText.textContent = WORDS.slice(0, wordIndex + 1).join(" ");
+      wordIndex += 1;
+    } else {
+      clearInterval(wordInterval);
+      wordInterval = null;
+    }
+  }, 280);
+
+  // --- STATE 2: TRANSCRIBING (3500ms) ---
+  schedule(() => {
+    // Stop word interval if somehow still running
+    if (wordInterval !== null) {
+      clearInterval(wordInterval);
+      wordInterval = null;
+    }
+    // Ensure all words visible
+    dictationText.textContent = WORDS.join(" ");
+    // HUD label
+    hudText.textContent = "Transcribing";
+    // HUD background shift
+    hudEl.classList.add("hud--processing");
+    // Dot amber
+    liveDot.style.background = "#f4b23b";
+    liveDot.style.boxShadow = "0 0 0 7px rgba(244,178,59,0.16)";
+    // Bars pause (handled by .hud--processing CSS, but also set inline for safety)
+    hudBars.forEach((bar) => {
+      bar.style.animationPlayState = "paused";
+    });
+    // Cursor stops blinking
+    cursorEl.style.animationPlayState = "paused";
+  }, 3500);
+
+  // --- STATE 3: INSERTED (3500 + 1800 = 5300ms) ---
+  schedule(() => {
+    hudText.textContent = "Inserted";
+    hudEl.classList.remove("hud--processing");
+    // Dot green
+    liveDot.style.background = "";
+    liveDot.style.boxShadow = "";
+    // Bars resume
+    hudBars.forEach((bar) => {
+      bar.style.animationPlayState = "";
+    });
+    // Editor flash
+    editorSurface.classList.add("editor-surface--flash");
+    schedule(() => {
+      editorSurface.classList.remove("editor-surface--flash");
+    }, 400);
+    // Cursor flash green then reset to blue
+    cursorEl.style.animationPlayState = "";
+    cursorEl.style.background = "var(--green)";
+    schedule(() => {
+      cursorEl.style.background = "";
+    }, 300);
+  }, 5300);
+
+  // --- RESET PAUSE then loop (5300 + 1500 + 1200 = 8000ms) ---
+  schedule(() => {
+    runDemo();
+  }, 8000);
+}
+
+demoButton.textContent = "Replay";
 demoButton.addEventListener("click", () => {
-  const state = states[stateIndex];
-  hudText.textContent = state.hud;
-  dictationText.textContent = state.text;
-  stateIndex = (stateIndex + 1) % states.length;
-  demoButton.textContent = stateIndex === 0 ? "Try again" : "Next step";
+  runDemo();
 });
+
+// Auto-start after page settles
+setTimeout(runDemo, 1000);
 
 // Copy button for install section
 const terminal = document.querySelector(".terminal");

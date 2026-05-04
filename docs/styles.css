@@ -775,6 +775,27 @@ code {
   }
 }
 
+/* Pause bar animation when transcribing */
+.hud--processing .hud-bars i {
+  animation-play-state: paused;
+  height: 6px;
+}
+
+/* HUD color shift for processing state */
+.hud--processing {
+  background: rgba(26, 18, 8, 0.92);
+}
+
+/* Flash the editor on insert */
+@keyframes editorFlash {
+  0%, 100% { background: #fbfcf8; }
+  50% { background: rgba(6, 182, 106, 0.07); }
+}
+
+.editor-surface--flash {
+  animation: editorFlash 0.4s ease;
+}
+
 @media (max-width: 980px) {
   .site-header {
     height: 58px;
