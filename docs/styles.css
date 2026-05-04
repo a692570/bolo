@@ -1,8 +1,8 @@
 :root {
   color-scheme: light;
   --ink: #101312;
-  --muted: #5d6862;
-  --paper: #f6f8f5;
+  --muted: #4d6359;
+  --paper: #f5f7f4;
   --white: #ffffff;
   --line: #d9dfd8;
   --green: #06b66a;
@@ -24,9 +24,7 @@ body {
   margin: 0;
   color: var(--ink);
   background: var(--paper);
-  font-family:
-    Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
-    sans-serif;
+  font-family: 'Space Grotesk', ui-sans-serif, system-ui, -apple-system, sans-serif;
   letter-spacing: 0;
 }
 
@@ -49,7 +47,7 @@ a {
   justify-content: space-between;
   height: 64px;
   padding: 0 28px;
-  background: rgba(246, 248, 245, 0.88);
+  background: rgba(245, 247, 244, 0.88);
   border-bottom: 1px solid rgba(16, 19, 18, 0.08);
   backdrop-filter: blur(16px);
 }
@@ -82,6 +80,11 @@ a {
   min-height: 36px;
   display: inline-flex;
   align-items: center;
+  transition: color 0.15s ease;
+}
+
+.nav-links a:hover {
+  color: var(--green-dark);
 }
 
 .hero {
@@ -109,6 +112,16 @@ a {
   pointer-events: none;
 }
 
+.hero::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noise'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noise)' opacity='0.4'/%3E%3C/svg%3E");
+  opacity: 0.028;
+  pointer-events: none;
+  z-index: 0;
+}
+
 .hero-grid {
   position: relative;
   z-index: 1;
@@ -124,9 +137,10 @@ a {
 .eyebrow {
   margin: 0 0 14px;
   color: var(--green-dark);
-  font-size: 13px;
+  font-size: 11px;
   font-weight: 850;
   text-transform: uppercase;
+  letter-spacing: 0.12em;
 }
 
 h1,
@@ -136,11 +150,16 @@ p {
   margin-top: 0;
 }
 
+h1, h2, h3 {
+  text-wrap: balance;
+}
+
 h1 {
   margin-bottom: 18px;
   font-size: 92px;
   line-height: 0.95;
   font-weight: 900;
+  letter-spacing: -0.04em;
 }
 
 .hero-subtitle {
@@ -182,19 +201,28 @@ h1 {
 }
 
 .button {
-  transition: opacity 0.15s ease, transform 0.15s ease;
+  transition: transform 0.18s cubic-bezier(0.16, 1, 0.3, 1),
+              box-shadow 0.18s cubic-bezier(0.16, 1, 0.3, 1),
+              opacity 0.18s ease;
 }
 
-.button:hover {
-  opacity: 0.82;
+.button-primary:hover {
   transform: translateY(-2px);
+  box-shadow: 0 6px 20px rgba(6, 182, 106, 0.25);
+}
+
+.button-primary:active {
+  transform: scale(0.97) translateY(0);
+}
+
+.button-secondary:hover {
+  background: rgba(255, 255, 255, 0.9);
+  transform: translateY(-1px);
 }
 
 .button:focus-visible {
   outline: 2px solid var(--green);
   outline-offset: 3px;
-  opacity: 0.82;
-  transform: translateY(-2px);
 }
 
 .hero-proof {
@@ -223,6 +251,8 @@ h1 {
   color: var(--ink);
   font-size: 22px;
   line-height: 1;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.02em;
 }
 
 .product-scene {
@@ -231,7 +261,7 @@ h1 {
   aspect-ratio: 1.08;
   min-height: 520px;
   overflow: hidden;
-  background: #151816;
+  background: linear-gradient(160deg, #1a2e20 0%, #151816 30%);
   border: 1px solid #101312;
   border-radius: 16px;
   box-shadow: 0 34px 80px rgba(16, 19, 18, 0.22);
@@ -461,11 +491,17 @@ h1 {
   text-transform: uppercase;
 }
 
+.metric-label {
+  letter-spacing: 0.1em;
+}
+
 .metric-band strong {
   display: block;
   margin-bottom: 10px;
-  font-size: 24px;
+  font-size: 22px;
   line-height: 1.15;
+  letter-spacing: -0.02em;
+  font-weight: 700;
 }
 
 .metric-band p,
@@ -494,6 +530,7 @@ h2 {
   font-size: 48px;
   line-height: 1.02;
   font-weight: 900;
+  letter-spacing: -0.025em;
 }
 
 .feature-grid {
@@ -508,6 +545,11 @@ h2 {
   min-height: 190px;
   padding: 24px;
   background: var(--paper);
+  transition: background 0.15s ease;
+}
+
+.feature-grid article:hover {
+  background: #ffffff;
 }
 
 h3 {
@@ -527,17 +569,17 @@ h3 {
   position: relative;
   min-height: 212px;
   padding: 26px;
-  background: #101312;
+  background: #0e1a12;
   border-radius: 8px;
   color: #ffffff;
 }
 
 .flow-step:nth-child(2) {
-  background: #17453a;
+  background: #163829;
 }
 
 .flow-step:nth-child(3) {
-  background: #243d7a;
+  background: #0f2d22;
 }
 
 .flow-step span {
@@ -589,8 +631,14 @@ h3 {
   min-height: 70px;
   padding: 18px;
   background: #ffffff;
-  border: 1px solid var(--line);
+  border: 1px solid rgba(16, 19, 18, 0.08);
   border-radius: 8px;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.architecture-list div:hover {
+  border-color: rgba(6, 182, 106, 0.25);
+  box-shadow: 0 2px 8px rgba(6, 182, 106, 0.06);
 }
 
 .architecture-list span {
