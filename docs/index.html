@@ -134,21 +134,46 @@
         </div>
       </section>
 
-      <section class="section flow">
-        <div class="flow-step">
-          <span>1</span>
-          <strong>Hold Right Option</strong>
-          <p>A small HUD appears when Bolo is actually listening.</p>
-        </div>
-        <div class="flow-step">
-          <span>2</span>
-          <strong>Speak naturally</strong>
-          <p>Audio is buffered in memory and sent to Telnyx for transcription.</p>
-        </div>
-        <div class="flow-step">
-          <span>3</span>
-          <strong>Release to paste</strong>
-          <p>Bolo cleans the text and inserts it at the active cursor.</p>
+      <section class="section flow-section">
+        <p class="eyebrow" style="text-align:center; margin-bottom: 48px;">How it works</p>
+        <div class="flow-diagram">
+
+          <div class="flow-node">
+            <div class="flow-icon">⌥</div>
+            <strong>Hold Right Option</strong>
+            <p>HUD appears. Bolo is listening.</p>
+          </div>
+
+          <div class="flow-arrow">→</div>
+
+          <div class="flow-node">
+            <div class="flow-icon">
+              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="22"/></svg>
+            </div>
+            <strong>Speak naturally</strong>
+            <p>Audio captured only while held.</p>
+          </div>
+
+          <div class="flow-arrow">→</div>
+
+          <div class="flow-node">
+            <div class="flow-icon">
+              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+            </div>
+            <strong>Release</strong>
+            <p>Audio sent, transcript cleaned.</p>
+          </div>
+
+          <div class="flow-arrow">→</div>
+
+          <div class="flow-node flow-node--end">
+            <div class="flow-icon">
+              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
+            </div>
+            <strong>Text at cursor</strong>
+            <p>Pasted into any app, instantly.</p>
+          </div>
+
         </div>
       </section>
 
