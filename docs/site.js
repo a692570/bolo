@@ -197,6 +197,48 @@ demoButton.addEventListener("click", () => {
 // Auto-start after page settles
 setTimeout(runDemo, 1000);
 
+// Flow diagram — staggered reveal + active step pulse loop
+(function () {
+  const diagram = document.querySelector('.flow-diagram');
+  if (!diagram) return;
+
+  const items = Array.from(diagram.children); // nodes + arrows in DOM order
+  const nodes = Array.from(diagram.querySelectorAll('.flow-node'));
+
+  let revealed = false;
+  const observer = new IntersectionObserver(function (entries) {
+    if (revealed || !entries[0].isIntersecting) return;
+    revealed = true;
+    observer.disconnect();
+
+    items.forEach(function (el, i) {
+      setTimeout(function () {
+        el.style.opacity = '1';
+        el.style.transform = 'translateY(0)';
+      }, i * 120);
+    });
+
+    // Start pulse after all items have entered + small buffer
+    var totalDelay = items.length * 120 + 400;
+    setTimeout(startPulse, totalDelay);
+  }, { threshold: 0.3 });
+
+  observer.observe(diagram);
+
+  var pulseIndex = 0;
+  var pulseTimer = null;
+
+  function startPulse() {
+    if (pulseTimer !== null) clearTimeout(pulseTimer);
+    nodes.forEach(function (n) { n.classList.remove('flow-active'); });
+    nodes[pulseIndex].classList.add('flow-active');
+    pulseIndex = (pulseIndex + 1) % nodes.length;
+    // After the last node, pause 1s longer before looping
+    var delay = pulseIndex === 0 ? 2800 : 1800;
+    pulseTimer = setTimeout(startPulse, delay);
+  }
+})();
+
 // Copy button for install section
 const terminal = document.querySelector(".terminal");
 if (terminal) {

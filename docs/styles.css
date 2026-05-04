@@ -996,6 +996,33 @@ code {
   }
 }
 
+/* Flow diagram — initial hidden state for staggered reveal */
+.flow-diagram .flow-node,
+.flow-diagram .flow-arrow {
+  opacity: 0;
+  transform: translateY(12px);
+  transition: opacity 0.32s cubic-bezier(0.16, 1, 0.3, 1),
+              transform 0.32s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+/* Active pulse on flow nodes */
+.flow-node .flow-icon {
+  transition: background 0.25s ease, border-color 0.25s ease,
+              color 0.25s ease, box-shadow 0.25s ease;
+}
+
+.flow-node.flow-active .flow-icon {
+  background: var(--green-dark);
+  border-color: rgba(6, 182, 106, 0.4);
+  color: #fff;
+}
+
+.flow-node--end.flow-active .flow-icon {
+  background: var(--green-dark);
+  border-color: transparent;
+  box-shadow: 0 0 0 5px rgba(6, 182, 106, 0.2);
+}
+
 @media (prefers-reduced-motion: reduce) {
   html {
     scroll-behavior: auto;
