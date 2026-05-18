@@ -34,7 +34,7 @@ Bolo runs as a menu bar-only app that monitors global input events and processes
 2. **Audio capture**: On Option press, initializes a `cpal` input stream to capture PCM audio directly to memory.
 3. **Recording**: Continues buffering audio while key is held. No disk writes occur during recording.
 4. **Key release trigger**: On Right Option release, immediately finalizes audio buffer and initiates API calls.
-5. **Speech-to-text**: Sends audio to Telnyx AI API calling `deepgram/nova-3`, with `distil-whisper/distil-large-v2` fallback on rate limits.
+5. **Speech-to-text**: Sends audio to Telnyx AI API calling `deepgram/nova-3`, with `openai/whisper-large-v3-turbo` fallback on rate limits. The primary and fallback models can be changed with environment variables.
 6. **Text cleanup**: Applies local transcript cleanup by default. Optional LLM cleanup can be enabled with `BOLO_LLM_CLEANUP=on`.
 7. **Text injection**: Uses the system clipboard plus `osascript` Cmd+V automation to paste processed text at the current cursor position.
 8. **Status HUD**: Shows a native macOS HUD for Dictating, Thinking, Inserting, and Inserted states.
@@ -96,6 +96,15 @@ To preselect a microphone without using the menu, set:
 ```bash
 export BOLO_MICROPHONE="Microphone name"
 ```
+
+To test another Telnyx STT model, set:
+
+```bash
+export BOLO_STT_MODEL="deepgram/nova-3"
+export BOLO_STT_FALLBACK_MODEL="openai/whisper-large-v3-turbo"
+```
+
+Set `BOLO_STT_FALLBACK_MODEL=off` to fail fast instead of retrying on the fallback model when the primary model is rate limited.
 
 To opt into LLM cleanup, set:
 

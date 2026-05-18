@@ -68,6 +68,8 @@ struct Config {
     llm_cleanup: CleanupMode,
     litellm_base: Option<String>,
     litellm_key: Option<String>,
+    stt_model: String,
+    stt_fallback_model: Option<String>,
     microphone: Option<String>,
     root_dir: PathBuf,
 }
@@ -627,28 +629,29 @@ impl App {
 
     fn transcribe(&self, wav: &[u8]) -> Result<String, AppError> {
         info!("sending batch transcription request");
-        let model_config = serde_json::json!({
-            "smart_format": true,
-            "punctuate": true,
-            "keyterms": self.vocabulary.iter().take(50).collect::<Vec<_>>()
-        });
+        let primary_model = self.config.stt_model.as_str();
+        let model_config = stt_model_config(primary_model, &self.vocabulary);
         let prompt = build_stt_prompt(&self.vocabulary);
+        let include_language = stt_include_language(primary_model);
         match self.transcribe_with_model(
             wav,
-            "deepgram/nova-3",
-            Some(&model_config),
+            primary_model,
+            model_config.as_ref(),
             prompt.as_deref(),
-            true,
+            include_language,
         ) {
             Ok(transcript) => Ok(transcript),
             Err(AppError::RateLimited) => {
-                warn!("primary STT model rate limited; falling back to distil-whisper");
+                let Some(fallback_model) = self.config.stt_fallback_model.as_deref() else {
+                    return Err(AppError::RateLimited);
+                };
+                warn!("primary STT model rate limited; falling back to {fallback_model}");
                 self.transcribe_with_model(
                     wav,
-                    "distil-whisper/distil-large-v2",
-                    None,
+                    fallback_model,
+                    stt_model_config(fallback_model, &self.vocabulary).as_ref(),
                     prompt.as_deref(),
-                    false,
+                    stt_include_language(fallback_model),
                 )
             }
             Err(AppError::Http(error)) => {
@@ -656,10 +659,10 @@ impl App {
                 std::thread::sleep(Duration::from_millis(300));
                 self.transcribe_with_model(
                     wav,
-                    "deepgram/nova-3",
-                    Some(&model_config),
+                    primary_model,
+                    model_config.as_ref(),
                     prompt.as_deref(),
-                    true,
+                    include_language,
                 )
             }
             Err(error) => Err(error),
@@ -1002,6 +1005,12 @@ impl Config {
             llm_cleanup,
             litellm_base: load_env_value("LITELLM_BASE"),
             litellm_key: load_env_value("LITELLM_KEY"),
+            stt_model: load_env_value("BOLO_STT_MODEL")
+                .unwrap_or_else(|| String::from("deepgram/nova-3")),
+            stt_fallback_model: load_env_value("BOLO_STT_FALLBACK_MODEL")
+                .as_deref()
+                .and_then(non_empty_str)
+                .or_else(|| Some(String::from("openai/whisper-large-v3-turbo"))),
             microphone: load_env_value("BOLO_MICROPHONE"),
             root_dir,
         })
@@ -1518,6 +1527,30 @@ fn build_stt_prompt(vocabulary: &[String]) -> Option<String> {
     Some(prompt.chars().take(896).collect())
 }
 
+fn stt_model_config(model: &str, vocabulary: &[String]) -> Option<serde_json::Value> {
+    if model != "deepgram/nova-3" {
+        return None;
+    }
+    Some(serde_json::json!({
+        "smart_format": true,
+        "punctuate": true,
+        "keyterms": vocabulary.iter().take(50).collect::<Vec<_>>()
+    }))
+}
+
+fn stt_include_language(model: &str) -> bool {
+    model == "deepgram/nova-3"
+}
+
+fn non_empty_str(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("off") {
+        None
+    } else {
+        Some(trimmed.to_owned())
+    }
+}
+
 const fn cleanup_prompt() -> &'static str {
     "Apply minimal capitalization and punctuation fixes to a raw speech transcript. Do not rewrite meaning, summarize, add facts, or remove meaningful content. Remove only clear filler words. Output only the cleaned transcript."
 }
@@ -1688,7 +1721,8 @@ fn app_root_dir() -> Result<PathBuf, AppError> {
 mod tests {
     use super::{
         CleanupMode, Config, DictationCommandKind, build_stt_prompt, canonicalize_known_terms,
-        parse_command, remove_fillers, strip_reasoning_tags, wav_bytes,
+        parse_command, remove_fillers, strip_reasoning_tags, stt_include_language,
+        stt_model_config, wav_bytes,
     };
     use std::path::PathBuf;
 
@@ -1765,11 +1799,21 @@ mod tests {
             llm_cleanup: CleanupMode::On,
             litellm_base: Some(String::from("http://localhost:4000")),
             litellm_key: None,
+            stt_model: String::from("deepgram/nova-3"),
+            stt_fallback_model: Some(String::from("openai/whisper-large-v3-turbo")),
             microphone: None,
             root_dir: PathBuf::new(),
         };
 
         assert_eq!(config.llm_model(), "Kimi-K2.5");
+    }
+
+    #[test]
+    fn deepgram_stt_gets_model_config() {
+        assert!(stt_include_language("deepgram/nova-3"));
+        assert!(stt_model_config("deepgram/nova-3", &[String::from("Telnyx")]).is_some());
+        assert!(!stt_include_language("openai/whisper-large-v3-turbo"));
+        assert!(stt_model_config("openai/whisper-large-v3-turbo", &[]).is_none());
     }
 
     #[test]
