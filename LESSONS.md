@@ -10,8 +10,8 @@
 
 - Do not assume old Python entrypoints are authoritative. The launcher stops older `bolo.py`, `hotkey.py`, and `overlay.py` processes before starting the Rust binary.
 - macOS accessibility, microphone, and hotkey behavior should be verified after runtime changes.
-- Keep STT model names aligned with the public Telnyx STT REST API docs. The default primary is `deepgram/nova-3`, and the rate-limit fallback is `openai/whisper-large-v3-turbo`.
-- Do not hardcode experimental ASR models before they are available through the API Bolo actually calls. Expose model selection through `BOLO_STT_MODEL` and `BOLO_STT_FALLBACK_MODEL` so others can test new models without code changes.
+- Keep STT model names aligned with the public provider API docs. The default primary is Telnyx `deepgram/nova-3`, and the default rate-limit fallback is Telnyx `openai/whisper-large-v3-turbo`.
+- Do not hardcode experimental ASR models before they are available through the API Bolo actually calls. Expose model selection through `BOLO_STT_MODEL` and provider fallback through `BOLO_STT_FALLBACKS` so others can test new models without code changes.
 
 ## Verification Commands
 

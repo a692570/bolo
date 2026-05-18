@@ -104,7 +104,19 @@ export BOLO_STT_MODEL="deepgram/nova-3"
 export BOLO_STT_FALLBACK_MODEL="openai/whisper-large-v3-turbo"
 ```
 
-Set `BOLO_STT_FALLBACK_MODEL=off` to fail fast instead of retrying on the fallback model when the primary model is rate limited.
+For provider fallback, set a comma-separated chain:
+
+```bash
+export BOLO_STT_FALLBACKS="xai,assemblyai,telnyx:openai/whisper-large-v3-turbo"
+```
+
+Supported fallback entries:
+
+- `telnyx:<model>` uses the existing Telnyx API key.
+- `xai` uses `XAI_API_KEY` and xAI's REST STT API.
+- `assemblyai` or `assemblyai:<speech_model>` uses `ASSEMBLYAI_API_KEY`. This uploads and polls, so it is best as an emergency fallback rather than the first low-latency backup.
+
+Set `BOLO_STT_FALLBACKS=off` to fail fast instead of retrying when the primary model is rate limited. `BOLO_STT_FALLBACK_MODEL` still works for a single Telnyx fallback model.
 
 To opt into LLM cleanup, set:
 

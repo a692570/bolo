@@ -31,6 +31,9 @@ const CHANNELS: u16 = 1;
 const LOCK_DIR: &str = "/tmp/bolo-instance.lock";
 const TELNYX_STT_ENDPOINT: &str = "https://api.telnyx.com/v2/ai/audio/transcriptions";
 const TELNYX_LLM_ENDPOINT: &str = "https://api.telnyx.com/v2/ai/chat/completions";
+const XAI_STT_ENDPOINT: &str = "https://api.x.ai/v1/stt";
+const ASSEMBLYAI_UPLOAD_ENDPOINT: &str = "https://api.assemblyai.com/v2/upload";
+const ASSEMBLYAI_TRANSCRIPT_ENDPOINT: &str = "https://api.assemblyai.com/v2/transcript";
 const CORRECTION_WINDOW: Duration = Duration::from_secs(3);
 const MIN_RECORDING: Duration = Duration::from_secs(1);
 
@@ -69,9 +72,16 @@ struct Config {
     litellm_base: Option<String>,
     litellm_key: Option<String>,
     stt_model: String,
-    stt_fallback_model: Option<String>,
+    stt_fallbacks: Vec<SttFallback>,
     microphone: Option<String>,
     root_dir: PathBuf,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum SttFallback {
+    Telnyx(String),
+    Xai,
+    AssemblyAi(Option<String>),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -217,6 +227,19 @@ impl std::fmt::Debug for NativeOverlay {
 #[derive(Debug, Deserialize)]
 struct SttResponse {
     text: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AssemblyUploadResponse {
+    upload_url: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AssemblyTranscriptResponse {
+    id: String,
+    status: String,
+    text: Option<String>,
+    error: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -642,17 +665,8 @@ impl App {
         ) {
             Ok(transcript) => Ok(transcript),
             Err(AppError::RateLimited) => {
-                let Some(fallback_model) = self.config.stt_fallback_model.as_deref() else {
-                    return Err(AppError::RateLimited);
-                };
-                warn!("primary STT model rate limited; falling back to {fallback_model}");
-                self.transcribe_with_model(
-                    wav,
-                    fallback_model,
-                    stt_model_config(fallback_model, &self.vocabulary).as_ref(),
-                    prompt.as_deref(),
-                    stt_include_language(fallback_model),
-                )
+                warn!("primary STT model rate limited; trying fallback chain");
+                self.transcribe_with_fallbacks(wav, prompt.as_deref())
             }
             Err(AppError::Http(error)) => {
                 warn!("primary STT request failed; retrying once after delay: {error}");
@@ -666,6 +680,50 @@ impl App {
                 )
             }
             Err(error) => Err(error),
+        }
+    }
+
+    fn transcribe_with_fallbacks(
+        &self,
+        wav: &[u8],
+        prompt: Option<&str>,
+    ) -> Result<String, AppError> {
+        if self.config.stt_fallbacks.is_empty() {
+            return Err(AppError::RateLimited);
+        }
+
+        let mut last_error = AppError::RateLimited;
+        for fallback in &self.config.stt_fallbacks {
+            info!("[stt] trying_fallback {}", fallback.label());
+            match self.transcribe_with_fallback(wav, fallback, prompt) {
+                Ok(transcript) => return Ok(transcript),
+                Err(error) => {
+                    warn!("[stt] fallback_failed {}: {error}", fallback.label());
+                    last_error = error;
+                }
+            }
+        }
+        Err(last_error)
+    }
+
+    fn transcribe_with_fallback(
+        &self,
+        wav: &[u8],
+        fallback: &SttFallback,
+        prompt: Option<&str>,
+    ) -> Result<String, AppError> {
+        match fallback {
+            SttFallback::Telnyx(model) => self.transcribe_with_model(
+                wav,
+                model,
+                stt_model_config(model, &self.vocabulary).as_ref(),
+                prompt,
+                stt_include_language(model),
+            ),
+            SttFallback::Xai => self.transcribe_with_xai(wav),
+            SttFallback::AssemblyAi(model) => {
+                self.transcribe_with_assemblyai(wav, model.as_deref())
+            }
         }
     }
 
@@ -745,6 +803,168 @@ impl App {
             })
         );
         Ok(transcript)
+    }
+
+    fn transcribe_with_xai(&self, wav: &[u8]) -> Result<String, AppError> {
+        let api_key =
+            load_env_value("XAI_API_KEY").ok_or(AppError::MissingConfig("XAI_API_KEY"))?;
+        info!(
+            "[stt] request {}",
+            serde_json::json!({
+                "endpoint": XAI_STT_ENDPOINT,
+                "provider": "xai",
+                "language": "en",
+                "audio_mime": "audio/wav",
+                "audio_bytes": wav.len(),
+                "keyterms": self.vocabulary.iter().take(100).collect::<Vec<_>>()
+            })
+        );
+        let mut form = multipart::Form::new()
+            .text("format", String::from("true"))
+            .text("language", String::from("en"));
+        for term in self.vocabulary.iter().take(100) {
+            form = form.text("keyterm", term.clone());
+        }
+        let part = multipart::Part::bytes(wav.to_vec())
+            .file_name(String::from("audio.wav"))
+            .mime_str("audio/wav")?;
+        form = form.part("file", part);
+        let response = self
+            .http
+            .post(XAI_STT_ENDPOINT)
+            .bearer_auth(api_key)
+            .multipart(form)
+            .send()?;
+        let status = response.status();
+        info!(
+            "[stt] response_status {}",
+            serde_json::json!({
+                "endpoint": XAI_STT_ENDPOINT,
+                "provider": "xai",
+                "status": status.as_u16(),
+            })
+        );
+        if status.as_u16() == 429 {
+            return Err(AppError::RateLimited);
+        }
+        if !status.is_success() {
+            let body = response.text().unwrap_or_default();
+            return Err(AppError::Transcription(format!(
+                "xAI STT returned {status}: {}",
+                body.chars().take(200).collect::<String>()
+            )));
+        }
+        let parsed: SttResponse = response.json()?;
+        non_empty_transcript(parsed.text.as_deref(), "xAI")
+    }
+
+    fn transcribe_with_assemblyai(
+        &self,
+        wav: &[u8],
+        model: Option<&str>,
+    ) -> Result<String, AppError> {
+        let api_key = load_env_value("ASSEMBLYAI_API_KEY")
+            .ok_or(AppError::MissingConfig("ASSEMBLYAI_API_KEY"))?;
+        info!(
+            "[stt] request {}",
+            serde_json::json!({
+                "endpoint": ASSEMBLYAI_UPLOAD_ENDPOINT,
+                "provider": "assemblyai",
+                "audio_mime": "audio/wav",
+                "audio_bytes": wav.len(),
+                "speech_model": model,
+            })
+        );
+        let upload = self
+            .http
+            .post(ASSEMBLYAI_UPLOAD_ENDPOINT)
+            .header("Authorization", api_key.as_str())
+            .header("Content-Type", "application/octet-stream")
+            .body(wav.to_vec())
+            .send()?;
+        let upload_status = upload.status();
+        if !upload_status.is_success() {
+            let body = upload.text().unwrap_or_default();
+            return Err(AppError::Transcription(format!(
+                "AssemblyAI upload returned {upload_status}: {}",
+                body.chars().take(200).collect::<String>()
+            )));
+        }
+        let upload: AssemblyUploadResponse = upload.json()?;
+        let mut request = serde_json::json!({
+            "audio_url": upload.upload_url,
+            "format_text": true,
+            "punctuate": true,
+            "disfluencies": false,
+        });
+        if let Some(model) = model {
+            request["speech_models"] = serde_json::json!([model]);
+        }
+        let submitted = self
+            .http
+            .post(ASSEMBLYAI_TRANSCRIPT_ENDPOINT)
+            .header("Authorization", api_key.as_str())
+            .json(&request)
+            .send()?;
+        let submit_status = submitted.status();
+        if submit_status.as_u16() == 429 {
+            return Err(AppError::RateLimited);
+        }
+        if !submit_status.is_success() {
+            let body = submitted.text().unwrap_or_default();
+            return Err(AppError::Transcription(format!(
+                "AssemblyAI transcript returned {submit_status}: {}",
+                body.chars().take(200).collect::<String>()
+            )));
+        }
+        let submitted: AssemblyTranscriptResponse = submitted.json()?;
+        self.poll_assemblyai_transcript(&api_key, &submitted)
+    }
+
+    fn poll_assemblyai_transcript(
+        &self,
+        api_key: &str,
+        submitted: &AssemblyTranscriptResponse,
+    ) -> Result<String, AppError> {
+        if submitted.status == "completed" {
+            return non_empty_transcript(submitted.text.as_deref(), "AssemblyAI");
+        }
+        let endpoint = format!("{ASSEMBLYAI_TRANSCRIPT_ENDPOINT}/{}", submitted.id);
+        for _ in 0..30 {
+            std::thread::sleep(Duration::from_millis(500));
+            let response = self
+                .http
+                .get(&endpoint)
+                .header("Authorization", api_key)
+                .send()?;
+            let status = response.status();
+            if status.as_u16() == 429 {
+                return Err(AppError::RateLimited);
+            }
+            if !status.is_success() {
+                let body = response.text().unwrap_or_default();
+                return Err(AppError::Transcription(format!(
+                    "AssemblyAI poll returned {status}: {}",
+                    body.chars().take(200).collect::<String>()
+                )));
+            }
+            let result: AssemblyTranscriptResponse = response.json()?;
+            match result.status.as_str() {
+                "completed" => return non_empty_transcript(result.text.as_deref(), "AssemblyAI"),
+                "error" => {
+                    return Err(AppError::Transcription(format!(
+                        "AssemblyAI transcription failed: {}",
+                        result
+                            .error
+                            .unwrap_or_else(|| String::from("unknown error"))
+                    )));
+                }
+                _ => {}
+            }
+        }
+        Err(AppError::Transcription(String::from(
+            "AssemblyAI transcription timed out",
+        )))
     }
 
     fn prepare_text(&self, raw: &str) -> Result<String, AppError> {
@@ -1007,10 +1227,7 @@ impl Config {
             litellm_key: load_env_value("LITELLM_KEY"),
             stt_model: load_env_value("BOLO_STT_MODEL")
                 .unwrap_or_else(|| String::from("deepgram/nova-3")),
-            stt_fallback_model: load_env_value("BOLO_STT_FALLBACK_MODEL")
-                .as_deref()
-                .and_then(non_empty_str)
-                .or_else(|| Some(String::from("openai/whisper-large-v3-turbo"))),
+            stt_fallbacks: load_stt_fallbacks(),
             microphone: load_env_value("BOLO_MICROPHONE"),
             root_dir,
         })
@@ -1042,6 +1259,17 @@ impl Config {
             String::from("Kimi-K2.5")
         } else {
             String::from("Qwen/Qwen3-235B-A22B")
+        }
+    }
+}
+
+impl SttFallback {
+    fn label(&self) -> String {
+        match self {
+            Self::Telnyx(model) => format!("telnyx:{model}"),
+            Self::Xai => String::from("xai"),
+            Self::AssemblyAi(Some(model)) => format!("assemblyai:{model}"),
+            Self::AssemblyAi(None) => String::from("assemblyai"),
         }
     }
 }
@@ -1542,6 +1770,65 @@ fn stt_include_language(model: &str) -> bool {
     model == "deepgram/nova-3"
 }
 
+fn load_stt_fallbacks() -> Vec<SttFallback> {
+    if let Some(value) = load_env_value("BOLO_STT_FALLBACKS") {
+        return parse_stt_fallbacks(&value);
+    }
+    load_env_value("BOLO_STT_FALLBACK_MODEL")
+        .as_deref()
+        .map_or_else(default_stt_fallbacks, parse_stt_fallbacks)
+}
+
+fn default_stt_fallbacks() -> Vec<SttFallback> {
+    vec![SttFallback::Telnyx(String::from(
+        "openai/whisper-large-v3-turbo",
+    ))]
+}
+
+fn parse_stt_fallbacks(value: &str) -> Vec<SttFallback> {
+    value
+        .split(',')
+        .filter_map(|item| parse_stt_fallback(item.trim()))
+        .collect()
+}
+
+fn parse_stt_fallback(value: &str) -> Option<SttFallback> {
+    let value = value.trim();
+    if value.is_empty()
+        || value.eq_ignore_ascii_case("off")
+        || value.eq_ignore_ascii_case("none")
+        || value.eq_ignore_ascii_case("false")
+    {
+        return None;
+    }
+    let Some((provider, rest)) = value.split_once(':') else {
+        return Some(match value.to_ascii_lowercase().as_str() {
+            "xai" => SttFallback::Xai,
+            "assemblyai" => SttFallback::AssemblyAi(None),
+            _ => SttFallback::Telnyx(value.to_owned()),
+        });
+    };
+    let provider = provider.trim().to_ascii_lowercase();
+    let rest = non_empty_str(rest);
+    match provider.as_str() {
+        "telnyx" => rest.map(SttFallback::Telnyx),
+        "xai" => Some(SttFallback::Xai),
+        "assemblyai" | "assembly" => Some(SttFallback::AssemblyAi(rest)),
+        _ => Some(SttFallback::Telnyx(value.to_owned())),
+    }
+}
+
+fn non_empty_transcript(text: Option<&str>, provider: &str) -> Result<String, AppError> {
+    let transcript = text.unwrap_or_default().trim();
+    if transcript.is_empty() {
+        Err(AppError::Transcription(format!(
+            "{provider} STT returned empty transcript"
+        )))
+    } else {
+        Ok(transcript.to_owned())
+    }
+}
+
 fn non_empty_str(value: &str) -> Option<String> {
     let trimmed = value.trim();
     if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("off") {
@@ -1720,9 +2007,9 @@ fn app_root_dir() -> Result<PathBuf, AppError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CleanupMode, Config, DictationCommandKind, build_stt_prompt, canonicalize_known_terms,
-        parse_command, remove_fillers, strip_reasoning_tags, stt_include_language,
-        stt_model_config, wav_bytes,
+        CleanupMode, Config, DictationCommandKind, SttFallback, build_stt_prompt,
+        canonicalize_known_terms, parse_command, parse_stt_fallbacks, remove_fillers,
+        strip_reasoning_tags, stt_include_language, stt_model_config, wav_bytes,
     };
     use std::path::PathBuf;
 
@@ -1800,7 +2087,9 @@ mod tests {
             litellm_base: Some(String::from("http://localhost:4000")),
             litellm_key: None,
             stt_model: String::from("deepgram/nova-3"),
-            stt_fallback_model: Some(String::from("openai/whisper-large-v3-turbo")),
+            stt_fallbacks: vec![SttFallback::Telnyx(String::from(
+                "openai/whisper-large-v3-turbo",
+            ))],
             microphone: None,
             root_dir: PathBuf::new(),
         };
@@ -1814,6 +2103,19 @@ mod tests {
         assert!(stt_model_config("deepgram/nova-3", &[String::from("Telnyx")]).is_some());
         assert!(!stt_include_language("openai/whisper-large-v3-turbo"));
         assert!(stt_model_config("openai/whisper-large-v3-turbo", &[]).is_none());
+    }
+
+    #[test]
+    fn parses_multi_provider_stt_fallbacks() {
+        assert_eq!(
+            parse_stt_fallbacks("xai,assemblyai:universal-2,telnyx:openai/whisper-large-v3-turbo"),
+            vec![
+                SttFallback::Xai,
+                SttFallback::AssemblyAi(Some(String::from("universal-2"))),
+                SttFallback::Telnyx(String::from("openai/whisper-large-v3-turbo")),
+            ]
+        );
+        assert!(parse_stt_fallbacks("off").is_empty());
     }
 
     #[test]
