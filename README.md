@@ -1,4 +1,4 @@
-# Bolo <img src="https://raw.githubusercontent.com/a692570/bolo/main/bolo-icon.png" align="right" width="120" alt="Bolo logo">
+# Bolo
 
 ```
  ██████╗  ██████╗ ██╗      ██████╗
