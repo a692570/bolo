@@ -18,12 +18,13 @@ The name comes from Hindi: "bolo" means "speak."
 macOS 12+ · Rust 1.88+ · MIT · [Website](https://a692570.github.io/bolo/)
 
 ```bash
-# Human install
+# Install manually
 git clone https://github.com/a692570/bolo.git && cd bolo && ./install.sh
-
-# AI agent install (single command)
-curl -fsSL https://raw.githubusercontent.com/a692570/bolo/main/install.sh | bash
 ```
+
+> **AI agent prompt:** Copy and paste this into Claude Code, ChatGPT, Cursor, or any coding agent:
+>
+> *"Install Bolo from github.com/a692570/bolo on my Mac. It needs Rust, Python 3, and a Telnyx API key. Run install.sh, then help me grant Microphone and Accessibility permissions. Pick a hotkey that works with my keyboard."*
 
 The install script does the following, in order:
 1. Installs PyObjC native macOS helpers if needed
