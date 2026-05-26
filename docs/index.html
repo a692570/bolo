@@ -3,16 +3,10 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Bolo</title>
-    <meta
-      name="description"
-      content="Bolo is an open source push-to-talk dictation app for macOS, powered by Telnyx AI."
-    >
-    <meta property="og:title" content="Bolo">
-    <meta
-      property="og:description"
-      content="Open source push-to-talk dictation for macOS, powered by Telnyx AI."
-    >
+    <title>Bolo — Open source dictation for macOS</title>
+    <meta name="description" content="Bolo is an open source push-to-talk dictation app for macOS, powered by Telnyx AI.">
+    <meta property="og:title" content="Bolo — Open source dictation for macOS">
+    <meta property="og:description" content="Hold a key. Speak. Text appears. Free, private, no subscription.">
     <meta property="og:type" content="website">
     <meta property="og:image" content="assets/bolo-icon.png">
     <link rel="icon" href="assets/icon-idle.png">
@@ -22,14 +16,14 @@
     <link rel="stylesheet" href="styles.css">
   </head>
   <body>
-    <header class="site-header" aria-label="Primary">
+    <header class="site-header">
       <a class="brand" href="#top" aria-label="Bolo home">
-        <img src="assets/icon-idle.png" width="44" height="44" alt="">
+        <img src="assets/icon-idle.png" width="32" height="32" alt="">
         <span>Bolo</span>
       </a>
       <nav class="nav-links">
+        <a href="#how-it-works">How it works</a>
         <a href="#install">Install</a>
-        <a href="#privacy">Privacy</a>
         <a href="https://github.com/a692570/bolo">GitHub</a>
       </nav>
     </header>
@@ -37,20 +31,17 @@
     <main id="top">
       <section class="hero" aria-labelledby="hero-title">
         <canvas class="voice-field" aria-hidden="true"></canvas>
-        <div class="hero-grid">
+        <div class="hero-inner">
           <div class="hero-copy">
-            <p class="eyebrow">Open source macOS dictation</p>
-            <h1 id="hero-title">Bolo</h1>
+            <p class="eyebrow">Open source voice dictation</p>
+            <h1 id="hero-title">Speak.<br>Text appears.</h1>
             <p class="hero-subtitle">
-              Open source push-to-talk dictation for macOS. Works with any keyboard. No subscription.
+              Hold a key, talk, release. Your words land in any app.
+              Works with every keyboard. No subscription.
             </p>
-            <div class="hero-actions" aria-label="Primary actions">
+            <div class="hero-actions">
               <a class="button button-primary" href="#install">Install Bolo</a>
               <a class="button button-secondary" href="https://github.com/a692570/bolo">View source</a>
-            </div>
-            <div class="hero-proof" aria-label="Recent local performance notes">
-              <span><strong>188 ms</strong> average menu-ready startup</span>
-              <span><strong>715 ms</strong> fastest recent release-to-paste</span>
             </div>
           </div>
 
@@ -66,7 +57,7 @@
               </span>
             </div>
             <div class="editor-surface">
-              <div class="document-line muted">Voice draft</div>
+              <div class="document-label">Voice draft</div>
               <p class="dictation-text" id="dictationText">
                 Bolo turns short spoken thoughts into clean text in the app you are already using.
               </p>
@@ -86,111 +77,99 @@
         </div>
       </section>
 
-      <section class="metric-band" aria-label="What changed">
+      <section class="proof-strip" aria-label="Key facts">
         <div>
-          <span class="metric-label">Rust runtime</span>
-          <strong>Faster launch</strong>
-          <p>Recent local logs show menu-ready startup averaging 188 ms.</p>
+          <strong>188 ms</strong>
+          <span>average startup</span>
         </div>
         <div>
-          <span class="metric-label">Native helpers</span>
-          <strong>Feels more like macOS</strong>
-          <p>Menu bar app, AppKit hotkey listener, and a smaller status HUD.</p>
+          <strong>715 ms</strong>
+          <span>fastest release-to-paste</span>
         </div>
         <div>
-          <span class="metric-label">Telnyx AI</span>
-          <strong>Cloud STT with cleanup</strong>
-          <p>Nova 3 transcription, provider fallback options, vocabulary, and optional LLM cleanup.</p>
+          <strong>Any keyboard</strong>
+          <span>Right Option, F19, Caps Lock, or pick your own</span>
         </div>
       </section>
 
-      <section class="section split" id="why">
-        <div>
-          <p class="eyebrow">Why it exists</p>
-          <h2>A free Wispr Flow alternative you can inspect.</h2>
-        </div>
-        <div class="feature-grid">
-          <article>
-            <span class="feature-mark">01</span>
-            <h3>No always-on microphone</h3>
-            <p>Bolo captures audio only while your hotkey is held.</p>
-          </article>
-          <article>
-            <span class="feature-mark">02</span>
-            <h3>No subscription</h3>
-            <p>Bring a Telnyx API key and run the app locally.</p>
-          </article>
-          <article>
-            <span class="feature-mark">03</span>
-            <h3>Any keyboard, any key</h3>
-            <p>Pick Right Option, Right Control, F19, Caps Lock, or any key you want.</p>
-          </article>
-          <article>
-            <span class="feature-mark">04</span>
-            <h3>Readable internals</h3>
-            <p>Rust core, Python AppKit helpers, local cleanup, and open logs.</p>
-          </article>
-        </div>
-      </section>
-
-      <section class="section flow-section">
-        <p class="eyebrow" style="text-align:center; margin-bottom: 48px;">How it works</p>
-        <div class="flow-diagram">
-
-          <div class="flow-node">
-            <div class="flow-icon">⌥</div>
-            <strong>Hold your hotkey</strong>
-            <p>HUD appears. Bolo is listening.</p>
+      <section class="section" id="how-it-works">
+        <div class="section-grid">
+          <div class="section-copy">
+            <p class="eyebrow">How it works</p>
+            <h2>Fast local control, cloud transcription.</h2>
+            <p>
+              Bolo runs as a menu bar app. It records only while your
+              hotkey is held, sends audio to Telnyx AI for transcription, then
+              discards it. No dictation history is retained. Text is always copied
+              to your clipboard so nothing is lost.
+            </p>
           </div>
-
-          <div class="flow-arrow">→</div>
-
-          <div class="flow-node">
-            <div class="flow-icon">
-              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="22"/></svg>
-            </div>
-            <strong>Speak naturally</strong>
-            <p>Audio captured only while held.</p>
+          <div class="feature-stack">
+            <article class="feature-card">
+              <div class="feature-icon">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="22"/></svg>
+              </div>
+              <div>
+                <h3>No always-on microphone</h3>
+                <p>Audio captured only while your hotkey is held. Nothing before, nothing after.</p>
+              </div>
+            </article>
+            <article class="feature-card">
+              <div class="feature-icon">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="M6 8h.01"/><path d="M10 8h.01"/><path d="M14 8h.01"/><path d="M18 8h.01"/><path d="M6 12h.01"/><path d="M10 12h.01"/><path d="M14 12h.01"/><path d="M18 12h.01"/><path d="M6 16h12"/></svg>
+              </div>
+              <div>
+                <h3>Any keyboard, any key</h3>
+                <p>Right Option on MacBooks, Right Control on external keyboards, F19 on mechanical boards, or pick your own.</p>
+              </div>
+            </article>
+            <article class="feature-card">
+              <div class="feature-icon">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
+              </div>
+              <div>
+                <h3>Always copied to clipboard</h3>
+                <p>Text lands at your cursor and in your clipboard. Even if no text field is active, nothing is lost.</p>
+              </div>
+            </article>
+            <article class="feature-card">
+              <div class="feature-icon">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+              </div>
+              <div>
+                <h3>No subscription, no cloud storage</h3>
+                <p>Bring a Telnyx API key. Audio is transcribed and discarded. No history retained by Bolo.</p>
+              </div>
+            </article>
           </div>
-
-          <div class="flow-arrow">→</div>
-
-          <div class="flow-node">
-            <div class="flow-icon">
-              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
-            </div>
-            <strong>Release</strong>
-            <p>Audio sent, transcript cleaned.</p>
-          </div>
-
-          <div class="flow-arrow">→</div>
-
-          <div class="flow-node flow-node--end">
-            <div class="flow-icon">
-              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
-            </div>
-            <strong>Text at cursor</strong>
-            <p>Pasted into any app. Also copied to clipboard.</p>
-          </div>
-
         </div>
       </section>
 
-      <section class="section architecture" id="privacy">
-        <div class="architecture-copy">
-          <p class="eyebrow">How it works</p>
-          <h2>Fast local control, cloud transcription.</h2>
-          <p>
-            Bolo runs as a menu bar-only macOS app. It records only while the
-            hotkey is held, sends audio to Telnyx APIs for transcription, then
-            discards the audio. No dictation history is retained by Bolo.
-          </p>
-        </div>
-        <div class="architecture-list" aria-label="Bolo runtime pieces">
-          <div><span>Runtime</span><strong>Rust 1.88+</strong></div>
-          <div><span>Hotkey and HUD</span><strong>Configurable, native AppKit helpers</strong></div>
-          <div><span>Speech-to-text</span><strong>Telnyx AI</strong></div>
-          <div><span>Cleanup</span><strong>Local by default, LLM optional</strong></div>
+      <section class="tech-section">
+        <div class="tech-inner">
+          <div class="tech-copy">
+            <p class="eyebrow">Under the hood</p>
+            <h3>Built for speed and transparency.</h3>
+            <p>Rust runtime, native AppKit hotkey listener, Telnyx AI transcription with Nova 3, optional LLM cleanup, and open logs you can actually read.</p>
+          </div>
+          <div class="tech-grid">
+            <div class="tech-item">
+              <span>Runtime</span>
+              <strong>Rust 1.88+</strong>
+            </div>
+            <div class="tech-item">
+              <span>Hotkey</span>
+              <strong>Configurable AppKit listener</strong>
+            </div>
+            <div class="tech-item">
+              <span>STT</span>
+              <strong>Telnyx AI, Nova 3</strong>
+            </div>
+            <div class="tech-item">
+              <span>Cleanup</span>
+              <strong>Local default, LLM optional</strong>
+            </div>
+          </div>
         </div>
       </section>
 

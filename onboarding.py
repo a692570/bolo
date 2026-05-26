@@ -16,9 +16,11 @@ ENV_FILE = os.path.expanduser("~/.bolo/env")
 
 
 def _find_icon():
+    root = os.path.dirname(os.path.abspath(__file__))
     candidates = [
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), "icon_options", "bolo_mic.png"),
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "icon-idle.png"),
+        os.path.join(root, "bolo-icon.png"),
+        os.path.join(root, "docs", "assets", "bolo-icon.png"),
+        os.path.join(root, "icon_options", "bolo_mic.png"),
     ]
     for path in candidates:
         if os.path.exists(path):

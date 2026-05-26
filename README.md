@@ -1,6 +1,6 @@
 # Bolo, an open source Wispr Flow alternative for macOS
 
-Free, self-hosted voice dictation powered by Telnyx AI. Hold Right Option anywhere to dictate. Release to paste.
+Free, self-hosted voice dictation powered by Telnyx AI. Hold a key anywhere to dictate. Release to paste.
 
 Bolo is a macOS push-to-talk app that transcribes your speech and pastes it into any active text field, including Slack, Notion, Gmail, VS Code, terminals, and browsers. No always-on microphone. No subscription.
 
@@ -31,13 +31,13 @@ cd bolo
 Bolo runs as a menu bar-only app that monitors global input events and processes audio only while the hotkey is held.
 
 1. **Global hotkey monitoring**: Uses a native AppKit helper to listen for the configured hotkey (default: Right Option) system-wide without interfering with other applications.
-2. **Audio capture**: On Option press, initializes a `cpal` input stream to capture PCM audio directly to memory.
+2. **Audio capture**: On hotkey press, initializes a `cpal` input stream to capture PCM audio directly to memory.
 3. **Recording**: Continues buffering audio while key is held. No disk writes occur during recording.
-4. **Key release trigger**: On Right Option release, immediately finalizes audio buffer and initiates API calls.
+4. **Key release trigger**: On hotkey release, immediately finalizes audio buffer and initiates API calls.
 5. **Speech-to-text**: Sends audio to Telnyx AI API calling `deepgram/nova-3`, with `openai/whisper-large-v3-turbo` fallback on rate limits. The primary and fallback models can be changed with environment variables.
 6. **Text cleanup**: Applies local transcript cleanup by default. Optional LLM cleanup can be enabled with `BOLO_LLM_CLEANUP=on`.
 7. **Text injection**: Uses the system clipboard plus `osascript` Cmd+V automation to paste processed text at the current cursor position.
-8. **Status HUD**: Shows a native macOS HUD for Dictating, Thinking, Inserting, and Inserted states.
+8. **Status HUD**: Shows a native macOS HUD for Dictating, Thinking, Inserting, and Copied states.
 9. **Audio feedback**: Plays system Tink sound on record start and Pop sound on completion.
 
 Latency varies with utterance length and network conditions. Short phrases can feel quick; longer dictation is currently slower.
@@ -78,7 +78,7 @@ Grant both in **System Settings > Privacy & Security**. Restart Bolo after grant
 4. Release Right Option (Pop sound plays)
 5. Transcribed text appears at cursor after finalization
 
-While dictating, Bolo shows a small bottom-centered native macOS HUD that moves through Dictating, Thinking, Inserting, and Inserted states. Use the Bolo menu bar item to choose a microphone or quit.
+While dictating, Bolo shows a small bottom-centered native macOS HUD that moves through Dictating, Thinking, Inserting, and Copied states. Text is always copied to your clipboard so nothing is lost. Use the Bolo menu bar item to choose a microphone or quit.
 
 ## Configuration
 
@@ -156,6 +156,7 @@ Bolo merges that with its built-in vocabulary and uses it to preserve known term
 - Long dictation still needs more real-world validation than short phrases.
 - Cleanup is intentionally conservative to preserve literal meaning.
 - Streaming preview and learned correction memory are not part of the Rust runtime.
+- A first-run onboarding dialog asks for your preferred hotkey so you never start with the wrong key.
 
 ## Logs
 
