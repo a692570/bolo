@@ -9,10 +9,11 @@ The name comes from Hindi: "bolo" means "speak."
 Website: https://a692570.github.io/bolo/
 
 ```bash
-git clone https://github.com/a692570/bolo.git
-cd bolo
-./install.sh
-```
+# Human install
+git clone https://github.com/a692570/bolo.git && cd bolo && ./install.sh
+
+# AI agent install (single command)
+curl -fsSL https://raw.githubusercontent.com/a692570/bolo/main/install.sh | bash
 
 ## Metadata
 
@@ -91,7 +92,7 @@ Grant both in **System Settings > Privacy & Security**. Restart Bolo after grant
 
 **Step 4: Dictate**
 
-Place your cursor in any text field, hold your hotkey (Tink sound plays), speak, and release (Pop sound plays). Text appears at your cursor and is copied to your clipboard. A native HUD at the bottom of the screen shows Dictating → Thinking → Inserting → Copied. Use the menu bar icon to choose a microphone or quit.
+Place your cursor in any text field, hold your hotkey, speak, and release. Transcribed text appears at your cursor and is copied to your clipboard.
 
 Restart Bolo anytime with:
 ```bash
