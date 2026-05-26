@@ -24,7 +24,7 @@ git clone https://github.com/a692570/bolo.git && cd bolo && ./install.sh
 
 > **AI agent prompt:** Copy and paste this into Claude Code, ChatGPT, Cursor, or any coding agent:
 >
-> *"Install Bolo from github.com/a692570/bolo on my Mac. It needs Rust, Python 3, and a Telnyx API key. Run install.sh, then help me grant Microphone and Accessibility permissions. Pick a hotkey that works with my keyboard."*
+> *"Install Bolo from github.com/a692570/bolo on my Mac. It needs Rust, Python 3, and a Telnyx API key. Run install.sh, then help me grant Microphone and Accessibility permissions."*
 
 The install script does the following, in order:
 1. Installs PyObjC native macOS helpers if needed
