@@ -44,7 +44,16 @@ Latency varies with utterance length and network conditions. Short phrases can f
 
 ## Installation
 
-Requires macOS 12+, Rust/Cargo, Python 3, and a Telnyx API key. The install script checks for PyObjC AppKit and Quartz and installs them if needed for the native macOS hotkey and status HUD helpers.
+### Prerequisites
+
+- macOS 12 or later
+- Rust and Cargo (install from [rustup.rs](https://rustup.rs))
+- Python 3
+- A Telnyx API key ([sign up here](https://telnyx.com))
+
+### Step by step
+
+**Step 1: Clone and install**
 
 ```bash
 git clone https://github.com/a692570/bolo.git
@@ -52,33 +61,42 @@ cd bolo
 ./install.sh
 ```
 
-The install script builds the Rust binary, migrates an existing key from `~/.codex/.env` if present, prompts for your Telnyx API key if needed, registers the launcher as a Login Item, and starts Bolo.
+The install script does the following, in order:
+1. Installs PyObjC native macOS helpers if needed
+2. Builds the Rust binary
+3. Checks for an existing Telnyx API key in `~/.codex/.env` or your environment — if none is found, prompts you for one and saves it to `~/.bolo/env`
+4. Registers Bolo as a login item so it starts automatically
+5. Starts Bolo
 
-Restart Bolo later:
+**Step 2: Pick your hotkey**
+
+On first launch, an onboarding dialog appears asking you to pick which key to hold for dictation. Options include Right Option (MacBook built-in), Right Control (external keyboards), F19 (mechanical keyboards), and Caps Lock. Your choice is saved to `~/.bolo/env` and you can change it anytime:
+
+```bash
+export BOLO_HOTKEY="right_control"
+```
+
+**Step 3: Grant permissions**
+
+Bolo needs two macOS permissions to work. You'll be prompted on first use, or you can grant them manually:
+
+- **Microphone** — Needed to capture audio while you're dictating. Audio is only recorded while your hotkey is held. Nothing is saved to disk.
+- **Accessibility** — Needed to paste text into other apps. Without this, Bolo can't insert text.
+
+Grant both in **System Settings > Privacy & Security**. Restart Bolo after granting Accessibility:
 
 ```bash
 ./restart.sh
 ```
 
-## Permissions
+**Step 4: Dictate**
 
-Bolo requires two macOS permissions to function.
+Place your cursor in any text field, hold your hotkey (Tink sound plays), speak, and release (Pop sound plays). Text appears at your cursor and is copied to your clipboard. A native HUD at the bottom of the screen shows Dictating → Thinking → Inserting → Copied. Use the menu bar icon to choose a microphone or quit.
 
-**Microphone**: Required to capture audio during dictation. Bolo only accesses the microphone while Right Option is held. No audio is stored locally except any logs you choose to keep.
-
-**Accessibility**: Required to paste text into other applications. Bolo uses system event automation for universal text injection. Without this permission, Bolo cannot insert text into other apps.
-
-Grant both in **System Settings > Privacy & Security**. Restart Bolo after granting Accessibility permission.
-
-## Usage
-
-1. Place cursor in any text field
-2. Hold Right Option (Tink sound plays)
-3. Speak naturally
-4. Release Right Option (Pop sound plays)
-5. Transcribed text appears at cursor after finalization
-
-While dictating, Bolo shows a small bottom-centered native macOS HUD that moves through Dictating, Thinking, Inserting, and Copied states. Text is always copied to your clipboard so nothing is lost. Use the Bolo menu bar item to choose a microphone or quit.
+Restart Bolo anytime with:
+```bash
+./restart.sh
+```
 
 ## Configuration
 
