@@ -36,6 +36,8 @@ const ASSEMBLYAI_UPLOAD_ENDPOINT: &str = "https://api.assemblyai.com/v2/upload";
 const ASSEMBLYAI_TRANSCRIPT_ENDPOINT: &str = "https://api.assemblyai.com/v2/transcript";
 const CORRECTION_WINDOW: Duration = Duration::from_secs(3);
 const MIN_RECORDING: Duration = Duration::from_secs(1);
+const RECORDING_WATCHDOG_INTERVAL: Duration = Duration::from_secs(5);
+const RECORDING_STALE_SECONDS: u64 = 30;
 
 #[derive(Debug, Error)]
 enum AppError {
@@ -75,6 +77,7 @@ struct Config {
     stt_fallbacks: Vec<SttFallback>,
     microphone: Option<String>,
     root_dir: PathBuf,
+    hotkey: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -108,7 +111,7 @@ struct DictationCommand {
 #[derive(Debug, Default)]
 struct AppState {
     active: Option<ActiveRecording>,
-    right_option_down: bool,
+    hotkey_down: bool,
     last_result: Option<String>,
     correction_until: Option<Instant>,
     history: VecDeque<String>,
@@ -161,6 +164,7 @@ enum UserEvent {
     Overlay(OverlayPhase),
     HideOverlay,
     HideOverlayAfter(Duration),
+    RecordingWatchdog,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -168,7 +172,7 @@ enum OverlayPhase {
     Dictating,
     Thinking,
     Inserting,
-    Inserted,
+    Copied,
     Error,
 }
 
@@ -178,7 +182,7 @@ impl OverlayPhase {
             Self::Dictating => "Bolo Dictating",
             Self::Thinking => "Bolo Thinking",
             Self::Inserting => "Bolo Inserting",
-            Self::Inserted => "Bolo Inserted",
+            Self::Copied => "Bolo Copied",
             Self::Error => "Bolo Error",
         }
     }
@@ -188,7 +192,7 @@ impl OverlayPhase {
             Self::Dictating => "dictating",
             Self::Thinking => "thinking",
             Self::Inserting => "inserting",
-            Self::Inserted => "inserted",
+            Self::Copied => "copied",
             Self::Error => "error",
         }
     }
@@ -275,8 +279,12 @@ struct ChatMessageRequest<'a> {
 fn main() -> Result<(), AppError> {
     let _guard = setup_logging()?;
     let _lock = AppLock::acquire()?;
+    run_onboarding_if_needed();
     let app = Arc::new(App::new()?);
-    info!("Bolo Rust runtime started. Hold Right Option to dictate.");
+    info!(
+        "Bolo Rust runtime started. Hold {} to dictate.",
+        human_readable_hotkey(&app.config.hotkey),
+    );
     run_app_event_loop(app)
 }
 
@@ -361,6 +369,7 @@ fn run_hotkey_helper(app: &Arc<App>, root_dir: &Path) -> Result<(), AppError> {
     let mut child = Command::new("python3")
         .arg(script)
         .env("BOLO_PARENT_PID", std::process::id().to_string())
+        .env("BOLO_HOTKEY", app.config.hotkey.as_str())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -429,16 +438,27 @@ fn run_app_event_loop(app: Arc<App>) -> Result<(), AppError> {
     let mut tray_ui: Option<TrayUi> = None;
     let mut native_overlay: Option<NativeOverlay> = None;
     let mut overlay_hide_at: Option<Instant> = None;
+    let mut recording_check_at: Option<Instant> = None;
     event_loop.run(move |event, _event_loop_target, control_flow| {
-        *control_flow = overlay_hide_at.map_or(ControlFlow::Wait, ControlFlow::WaitUntil);
+        let deadline = match (overlay_hide_at, recording_check_at) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        };
+        *control_flow = deadline.map_or(ControlFlow::Wait, ControlFlow::WaitUntil);
         match event {
-            TaoEvent::NewEvents(StartCause::Init) => match create_tray_ui(&app) {
-                Ok(ui) => {
-                    tray_ui = Some(ui);
-                    info!("menu bar icon ready");
+            TaoEvent::NewEvents(StartCause::Init) => {
+                recording_check_at = Some(Instant::now() + RECORDING_WATCHDOG_INTERVAL);
+                *control_flow = ControlFlow::WaitUntil(recording_check_at.unwrap());
+                match create_tray_ui(&app) {
+                    Ok(ui) => {
+                        tray_ui = Some(ui);
+                        info!("menu bar icon ready");
+                    }
+                    Err(error) => error!("{error}"),
                 }
-                Err(error) => error!("{error}"),
-            },
+            }
             TaoEvent::UserEvent(UserEvent::Menu(menu_event)) => {
                 if let Some(ui) = tray_ui.as_mut() {
                     handle_menu_event(&app, ui, &menu_event, control_flow);
@@ -470,8 +490,31 @@ fn run_app_event_loop(app: Arc<App>) -> Result<(), AppError> {
                 overlay_hide_at = Some(deadline);
                 *control_flow = ControlFlow::WaitUntil(deadline);
             }
+            TaoEvent::UserEvent(UserEvent::RecordingWatchdog) => {
+                let stale = {
+                    let Ok(state) = app.state.lock() else {
+                        return;
+                    };
+                    match state.active {
+                        Some(ref recording) => {
+                            let elapsed = recording.started_at.elapsed().as_secs();
+                            let hotkey_stuck = state.hotkey_down && elapsed > RECORDING_STALE_SECONDS;
+                            let orphaned = !state.hotkey_down;
+                            hotkey_stuck || orphaned
+                        }
+                        None => false,
+                    }
+                };
+                if stale {
+                    warn!("recording watchdog: auto-releasing stuck recording");
+                    if let Err(error) = app.handle_release() {
+                        error!("{error}");
+                    }
+                }
+            }
             TaoEvent::NewEvents(StartCause::ResumeTimeReached { .. }) => {
-                if overlay_hide_at.is_some_and(|deadline| Instant::now() >= deadline) {
+                let now = Instant::now();
+                if overlay_hide_at.is_some_and(|deadline| now >= deadline) {
                     overlay_hide_at = None;
                     *control_flow = ControlFlow::Wait;
                     hide_native_overlay(&mut native_overlay);
@@ -479,6 +522,10 @@ fn run_app_event_loop(app: Arc<App>) -> Result<(), AppError> {
                         ui.tray_icon.set_title(Some("Bolo"));
                     }
                     info!("recording overlay hidden after delay");
+                }
+                if recording_check_at.is_some_and(|deadline| now >= deadline) {
+                    recording_check_at = Some(now + RECORDING_WATCHDOG_INTERVAL);
+                    app.send_user_event(UserEvent::RecordingWatchdog);
                 }
             }
             TaoEvent::NewEvents(_)
@@ -517,10 +564,10 @@ impl App {
     fn handle_press(&self) -> Result<(), AppError> {
         {
             let mut state = self.lock_state()?;
-            if state.right_option_down || state.active.is_some() {
+            if state.hotkey_down || state.active.is_some() {
                 return Ok(());
             }
-            state.right_option_down = true;
+            state.hotkey_down = true;
         }
         let selected_microphone = {
             let state = self.lock_state()?;
@@ -530,7 +577,7 @@ impl App {
             Ok(recording) => recording,
             Err(error) => {
                 let mut state = self.lock_state()?;
-                state.right_option_down = false;
+                state.hotkey_down = false;
                 drop(state);
                 return Err(error);
             }
@@ -548,7 +595,7 @@ impl App {
     fn handle_release(self: &Arc<Self>) -> Result<(), AppError> {
         let recording = {
             let mut state = self.lock_state()?;
-            state.right_option_down = false;
+            state.hotkey_down = false;
             state.active.take()
         };
         if let Some(recording) = recording {
@@ -645,7 +692,7 @@ impl App {
             self.remember_result(text)?;
             play_sound("Pop");
         }
-        self.send_user_event(UserEvent::Overlay(OverlayPhase::Inserted));
+        self.send_user_event(UserEvent::Overlay(OverlayPhase::Copied));
         self.send_user_event(UserEvent::HideOverlayAfter(Duration::from_millis(900)));
         Ok(())
     }
@@ -1158,9 +1205,12 @@ impl App {
         let mut state = self.lock_state()?;
         state.last_result = Some(text.clone());
         state.correction_until = Some(Instant::now() + CORRECTION_WINDOW);
-        state.history.push_front(text);
+        state.history.push_front(text.clone());
         state.history.truncate(10);
         drop(state);
+        if let Err(error) = copy_to_clipboard(&text) {
+            warn!("clipboard backup failed: {error}");
+        }
         Ok(())
     }
 
@@ -1230,6 +1280,8 @@ impl Config {
             stt_fallbacks: load_stt_fallbacks(),
             microphone: load_env_value("BOLO_MICROPHONE"),
             root_dir,
+            hotkey: load_env_value("BOLO_HOTKEY")
+                .unwrap_or_else(|| String::from("right_option")),
         })
     }
 
@@ -1379,9 +1431,32 @@ fn device_name(device: &cpal::Device) -> String {
     )
 }
 
+fn human_readable_hotkey(hotkey: &str) -> String {
+    match hotkey {
+        "right_option" => String::from("Right Option"),
+        "right_control" => String::from("Right Control"),
+        "right_shift" => String::from("Right Shift"),
+        "fn" => String::from("Fn"),
+        _ => {
+            let mut chars = hotkey.chars();
+            match chars.next() {
+                Some(first) => {
+                    let rest: String = chars.collect();
+                    format!("{}{rest}", first.to_ascii_uppercase())
+                }
+                None => hotkey.to_owned(),
+            }
+        }
+    }
+}
+
 fn create_tray_ui(app: &App) -> Result<TrayUi, AppError> {
     let tray_menu = Menu::new();
-    let title = MenuItem::new("Bolo - Hold Right Option", false, None);
+    let title = MenuItem::new(
+        &format!("Bolo - Hold {}", human_readable_hotkey(&app.config.hotkey)),
+        false,
+        None,
+    );
     tray_menu
         .append(&title)
         .map_err(|error| AppError::MenuBar(error.to_string()))?;
@@ -1938,6 +2013,14 @@ fn read_shell_export(path: &Path, name: &str) -> Option<String> {
     None
 }
 
+fn copy_to_clipboard(text: &str) -> Result<(), AppError> {
+    let mut clipboard = Clipboard::new().map_err(|error| AppError::Clipboard(error.to_string()))?;
+    clipboard
+        .set_text(text.to_owned())
+        .map_err(|error| AppError::Clipboard(error.to_string()))?;
+    Ok(())
+}
+
 fn paste_text(text: &str) -> Result<(), AppError> {
     let mut clipboard = Clipboard::new().map_err(|error| AppError::Clipboard(error.to_string()))?;
     let previous = clipboard.get_text().ok();
@@ -1988,6 +2071,42 @@ fn home_path(relative: &str) -> PathBuf {
         || PathBuf::from(relative),
         |home| PathBuf::from(home).join(relative),
     )
+}
+
+fn run_onboarding_if_needed() {
+    if env::var("BOLO_HOTKEY").is_ok() {
+        return;
+    }
+    let env_file = home_path(".bolo/env");
+    if let Ok(contents) = fs::read_to_string(&env_file) {
+        for line in contents.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('#') || trimmed.is_empty() {
+                continue;
+            }
+            if let Some((key, _)) = trimmed.split_once('=') {
+                if key.trim() == "BOLO_HOTKEY" {
+                    return;
+                }
+            }
+        }
+    }
+    let script = match app_root_dir() {
+        Ok(dir) => dir.join("onboarding.py"),
+        Err(_) => return,
+    };
+    if !script.exists() {
+        return;
+    }
+    info!("running first-run onboarding");
+    let result = Command::new("python3")
+        .arg(&script)
+        .status();
+    match result {
+        Ok(status) if status.success() => info!("onboarding completed"),
+        Ok(status) => warn!("onboarding exited with {status}"),
+        Err(error) => warn!("onboarding failed: {error}"),
+    }
 }
 
 fn app_root_dir() -> Result<PathBuf, AppError> {
@@ -2092,6 +2211,7 @@ mod tests {
             ))],
             microphone: None,
             root_dir: PathBuf::new(),
+            hotkey: String::from("right_option"),
         };
 
         assert_eq!(config.llm_model(), "Kimi-K2.5");

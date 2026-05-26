@@ -30,7 +30,7 @@ cd bolo
 
 Bolo runs as a menu bar-only app that monitors global input events and processes audio only while the hotkey is held.
 
-1. **Global hotkey monitoring**: Uses a native AppKit helper to listen for Right Option key events system-wide without interfering with other applications.
+1. **Global hotkey monitoring**: Uses a native AppKit helper to listen for the configured hotkey (default: Right Option) system-wide without interfering with other applications.
 2. **Audio capture**: On Option press, initializes a `cpal` input stream to capture PCM audio directly to memory.
 3. **Recording**: Continues buffering audio while key is held. No disk writes occur during recording.
 4. **Key release trigger**: On Right Option release, immediately finalizes audio buffer and initiates API calls.
@@ -90,6 +90,21 @@ export TELNYX_API_KEY="your_key_here"
 
 Add it to your shell profile to persist it, or put it in `~/.bolo/env`. The install script writes prompted keys to `~/.bolo/env`.
 Bolo reads `TELNYX_API_KEY` from the process environment first, then falls back to `~/.bolo/env`, `~/.codex/.env`, and `~/.zshrc`.
+
+To change the push-to-talk hotkey, set:
+
+```bash
+export BOLO_HOTKEY="right_option"
+```
+
+Supported values:
+
+- `right_option` (default): Right Option key
+- `right_control`: Right Control key
+- `right_shift`: Right Shift key
+- `fn`: Fn key
+- `f1` through `f19`: Function keys
+- `caps_lock`: Caps Lock key
 
 To preselect a microphone without using the menu, set:
 
@@ -178,7 +193,7 @@ Audio is sent to Telnyx APIs for transcription and immediately discarded. Bolo p
 
 - Can I change the hotkey from Right Option?
 
-Currently hardcoded. Modify `hotkey.py` to change this.
+Yes. Set `BOLO_HOTKEY` to `right_control`, `right_shift`, `fn`, `f1` through `f19`, or `caps_lock`. See Configuration above.
 
 - Does it work offline?
 

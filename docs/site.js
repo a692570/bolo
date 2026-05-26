@@ -159,9 +159,9 @@ function runDemo() {
     cursorEl.style.animationPlayState = "paused";
   }, 3500);
 
-  // --- STATE 3: INSERTED (3500 + 1800 = 5300ms) ---
+  // --- STATE 3: COPIED (3500 + 1800 = 5300ms) ---
   schedule(() => {
-    hudText.textContent = "Inserted";
+    hudText.textContent = "Copied";
     hudEl.classList.remove("hud--processing");
     // Dot green
     liveDot.style.background = "";

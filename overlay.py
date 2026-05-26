@@ -57,6 +57,7 @@ PHASES = {
     "processing": ("Thinking", color(0.58, 0.65, 1.0)),
     "inserting": ("Inserting", color(1.0, 0.68, 0.34)),
     "inserted": ("Inserted", color(0.45, 0.88, 0.49)),
+    "copied": ("Copied", color(0.45, 0.88, 0.49)),
     "success": ("Inserted", color(0.45, 0.88, 0.49)),
     "final": ("Done", color(0.80, 0.84, 0.88)),
     "error": ("Try again", color(1.0, 0.36, 0.36)),
