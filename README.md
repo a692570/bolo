@@ -1,4 +1,13 @@
-# Bolo, an open source Wispr Flow alternative for macOS
+# Bolo
+
+```
+ ██████╗  ██████╗ ██╗      ██████╗
+ ██╔══██╗██╔═══██╗██║     ██╔═══██╗
+ ██████╔╝██║   ██║██║     ██║   ██║
+ ██╔══██╗██║   ██║██║     ██║   ██║
+ ██████╔╝╚██████╔╝███████╗╚██████╔╝
+ ╚═════╝  ╚═════╝ ╚══════╝ ╚═════╝
+```
 
 Free, self-hosted voice dictation powered by Telnyx AI. Hold a key anywhere to dictate. Release to paste.
 
@@ -8,48 +17,12 @@ The name comes from Hindi: "bolo" means "speak."
 
 macOS 12+ · Rust 1.88+ · MIT · [Website](https://a692570.github.io/bolo/)
 
-Website: https://a692570.github.io/bolo/
-
 ```bash
 # Human install
 git clone https://github.com/a692570/bolo.git && cd bolo && ./install.sh
 
 # AI agent install (single command)
 curl -fsSL https://raw.githubusercontent.com/a692570/bolo/main/install.sh | bash
-
-## How it works
-
-Bolo runs as a menu bar-only app that monitors global input events and processes audio only while the hotkey is held.
-
-1. **Global hotkey monitoring**: Uses a native AppKit helper to listen for the configured hotkey (default: Right Option) system-wide without interfering with other applications.
-2. **Audio capture**: On hotkey press, initializes a `cpal` input stream to capture PCM audio directly to memory.
-3. **Recording**: Continues buffering audio while key is held. No disk writes occur during recording.
-4. **Key release trigger**: On hotkey release, immediately finalizes audio buffer and initiates API calls.
-5. **Speech-to-text**: Sends audio to Telnyx AI API calling `deepgram/nova-3`, with `openai/whisper-large-v3-turbo` fallback on rate limits. The primary and fallback models can be changed with environment variables.
-6. **Text cleanup**: Applies local transcript cleanup by default. Optional LLM cleanup can be enabled with `BOLO_LLM_CLEANUP=on`.
-7. **Text injection**: Uses the system clipboard plus `osascript` Cmd+V automation to paste processed text at the current cursor position.
-8. **Status HUD**: Shows a native macOS HUD for Dictating, Thinking, Inserting, and Copied states.
-9. **Audio feedback**: Plays system Tink sound on record start and Pop sound on completion.
-
-Latency varies with utterance length and network conditions. Short phrases can feel quick; longer dictation is currently slower.
-
-## Installation
-
-### Prerequisites
-
-- macOS 12 or later
-- Rust and Cargo (install from [rustup.rs](https://rustup.rs))
-- Python 3
-- A Telnyx API key ([sign up here](https://telnyx.com))
-
-### Step by step
-
-**Step 1: Clone and install**
-
-```bash
-git clone https://github.com/a692570/bolo.git
-cd bolo
-./install.sh
 ```
 
 The install script does the following, in order:
@@ -61,31 +34,31 @@ The install script does the following, in order:
 
 **Step 2: Pick your hotkey**
 
-On first launch, an onboarding dialog appears asking you to pick which key to hold for dictation. Options include Right Option (MacBook built-in), Right Control (external keyboards), F19 (mechanical keyboards), and Caps Lock. Your choice is saved to `~/.bolo/env` and you can change it anytime:
+On first launch, an onboarding dialog asks which key you want to hold for dictation. Options include Right Option (MacBook built-in), Right Control (external keyboards), F19 (mechanical keyboards), and Caps Lock. Your choice is saved to `~/.bolo/env`.
 
 ```bash
+# Change it anytime
 export BOLO_HOTKEY="right_control"
 ```
 
 **Step 3: Grant permissions**
 
-Bolo needs two macOS permissions to work. You'll be prompted on first use, or you can grant them manually:
+Bolo needs two macOS permissions. Grant both in **System Settings > Privacy & Security**:
 
-- **Microphone** — Needed to capture audio while you're dictating. Audio is only recorded while your hotkey is held. Nothing is saved to disk.
-- **Accessibility** — Needed to paste text into other apps. Without this, Bolo can't insert text.
-
-Grant both in **System Settings > Privacy & Security**. Restart Bolo after granting Accessibility:
+- **Microphone** — Captures audio only while your hotkey is held. Nothing saved to disk.
+- **Accessibility** — Pastes text into other apps.
 
 ```bash
+# Restart after granting Accessibility
 ./restart.sh
 ```
 
 **Step 4: Dictate**
 
-Place your cursor in any text field, hold your hotkey, speak, and release. Transcribed text appears at your cursor and is copied to your clipboard.
+Place your cursor in any text field, hold your hotkey, speak, and release. Text appears at your cursor and is copied to your clipboard.
 
-Restart Bolo anytime with:
 ```bash
+# Restart anytime
 ./restart.sh
 ```
 
