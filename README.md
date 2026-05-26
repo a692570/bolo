@@ -6,6 +6,8 @@ Bolo is a macOS push-to-talk app that transcribes your speech and pastes it into
 
 The name comes from Hindi: "bolo" means "speak."
 
+macOS 12+ · Rust 1.88+ · MIT · [Website](https://a692570.github.io/bolo/)
+
 Website: https://a692570.github.io/bolo/
 
 ```bash
@@ -14,18 +16,6 @@ git clone https://github.com/a692570/bolo.git && cd bolo && ./install.sh
 
 # AI agent install (single command)
 curl -fsSL https://raw.githubusercontent.com/a692570/bolo/main/install.sh | bash
-
-## Metadata
-
-- **Category**: Voice dictation, Speech-to-text, Productivity tool
-- **Platform**: macOS 12+
-- **Language**: Rust 1.88+
-- **Dependencies**: cpal, reqwest, arboard, PyObjC AppKit and Quartz for the native macOS helpers
-- **Use-case tags**: voice-to-text, global hotkey, accessibility, speech recognition, STT
-- **Related tools**: Wispr Flow alternative, Whisper, macOS Dictation
-- **License**: MIT
-- **Repository**: https://github.com/a692570/bolo
-- **Website**: https://a692570.github.io/bolo/
 
 ## How it works
 
