@@ -6,6 +6,8 @@ use std::collections::{BTreeMap, VecDeque};
 use std::env;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, ErrorKind, Write};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -33,6 +35,7 @@ use recording_fsm::{Command as RecordingCommand, Event as RecordingEvent, Record
 const LOG_FILE: &str = "/tmp/bolo.log";
 const CHANNELS: u16 = 1;
 const LOCK_DIR: &str = "/tmp/bolo-instance.lock";
+const TRANSCRIPT_HISTORY_LIMIT: usize = 10;
 const TELNYX_STT_ENDPOINT: &str = "https://api.telnyx.com/v2/ai/audio/transcriptions";
 const TELNYX_LLM_ENDPOINT: &str = "https://api.telnyx.com/v2/ai/chat/completions";
 const XAI_STT_ENDPOINT: &str = "https://api.x.ai/v1/stt";
@@ -192,6 +195,7 @@ enum UserEvent {
     Overlay(OverlayPhase),
     HideOverlay,
     HideOverlayAfter(Duration),
+    HistoryChanged,
     RecordingWatchdog,
 }
 
@@ -229,6 +233,9 @@ impl OverlayPhase {
 struct TrayUi {
     tray_icon: TrayIcon,
     microphone_items: Vec<(String, CheckMenuItem)>,
+    copy_last_item: MenuItem,
+    history_menu: Submenu,
+    history_items: Vec<MenuItem>,
     quit_item: MenuItem,
 }
 
@@ -238,6 +245,7 @@ impl std::fmt::Debug for TrayUi {
             .debug_struct("TrayUi")
             .field("tray_id", self.tray_icon.id())
             .field("microphone_count", &self.microphone_items.len())
+            .field("history_count", &self.history_items.len())
             .finish_non_exhaustive()
     }
 }
@@ -528,6 +536,13 @@ fn run_app_event_loop(app: Arc<App>) -> Result<(), AppError> {
                 overlay_hide_at = Some(deadline);
                 *control_flow = ControlFlow::WaitUntil(deadline);
             }
+            TaoEvent::UserEvent(UserEvent::HistoryChanged) => {
+                if let Some(ui) = tray_ui.as_mut()
+                    && let Err(error) = update_history_menu(&app, ui)
+                {
+                    error!("{error}");
+                }
+            }
             TaoEvent::UserEvent(UserEvent::RecordingWatchdog) => {
                 let stale = {
                     let Ok(state) = app.state.lock() else {
@@ -580,12 +595,14 @@ impl App {
         let config = Config::load(root_dir)?;
         let selected_microphone = config.microphone.clone();
         let vocabulary = load_vocabulary(&config.root_dir);
+        let history = load_transcript_history();
         let http = Client::builder().timeout(Duration::from_secs(12)).build()?;
         Ok(Self {
             config,
             http,
             vocabulary,
             state: Mutex::new(AppState {
+                history,
                 selected_microphone,
                 ..AppState::default()
             }),
@@ -1294,18 +1311,34 @@ impl App {
     }
 
     fn remember_result(&self, text: String) -> Result<(), AppError> {
-        let mut state = self.lock_state()?;
-        state.last_result = Some(text.clone());
-        state.correction_until = Some(Instant::now() + CORRECTION_WINDOW);
-        state.history.push_front(text.clone());
-        state.history.truncate(10);
-        drop(state);
+        let history = {
+            let mut state = self.lock_state()?;
+            state.last_result = Some(text.clone());
+            state.correction_until = Some(Instant::now() + CORRECTION_WINDOW);
+            state.history.push_front(text.clone());
+            state.history.truncate(TRANSCRIPT_HISTORY_LIMIT);
+            state.history.iter().cloned().collect::<Vec<_>>()
+        };
+        #[cfg(not(test))]
+        {
+            if let Err(error) = save_transcript_history(&history) {
+                warn!("transcript history save failed: {error}");
+            }
+        }
+        #[cfg(test)]
+        drop(history);
+        self.send_user_event(UserEvent::HistoryChanged);
         if !self.config.preserve_clipboard {
             if let Err(error) = copy_to_clipboard(&text) {
                 warn!("clipboard backup failed: {error}");
             }
         }
         Ok(())
+    }
+
+    fn history_snapshot(&self) -> Result<Vec<String>, AppError> {
+        let state = self.lock_state()?;
+        Ok(state.history.iter().cloned().collect())
     }
 
     fn lock_state(&self) -> Result<MutexGuard<'_, AppState>, AppError> {
@@ -1556,6 +1589,17 @@ fn create_tray_ui(app: &App) -> Result<TrayUi, AppError> {
         .append(&title)
         .map_err(|error| AppError::MenuBar(error.to_string()))?;
 
+    let copy_last_item =
+        MenuItem::with_id("copy-last-transcript", "Copy Last Transcript", true, None);
+    tray_menu
+        .append(&copy_last_item)
+        .map_err(|error| AppError::MenuBar(error.to_string()))?;
+
+    let history_menu = Submenu::new("Transcript History", true);
+    tray_menu
+        .append(&history_menu)
+        .map_err(|error| AppError::MenuBar(error.to_string()))?;
+
     let microphone_menu = Submenu::new("Microphone", true);
     let selected_microphone = app.selected_microphone()?;
     let devices = input_device_names()?;
@@ -1602,22 +1646,38 @@ fn create_tray_ui(app: &App) -> Result<TrayUi, AppError> {
         .build()
         .map_err(|error| AppError::MenuBar(error.to_string()))?;
 
-    Ok(TrayUi {
+    let mut ui = TrayUi {
         tray_icon,
         microphone_items,
+        copy_last_item,
+        history_menu,
+        history_items: Vec::new(),
         quit_item,
-    })
+    };
+    update_history_menu(app, &mut ui)?;
+    Ok(ui)
 }
 
 fn handle_menu_event(
     app: &App,
-    tray_ui: &TrayUi,
+    tray_ui: &mut TrayUi,
     event: &MenuEvent,
     control_flow: &mut ControlFlow,
 ) {
     let event_id = event.id().as_ref();
     if event_id == tray_ui.quit_item.id().as_ref() {
         *control_flow = ControlFlow::Exit;
+        return;
+    }
+    if event_id == tray_ui.copy_last_item.id().as_ref() {
+        copy_history_item(app, 0);
+        return;
+    }
+    if let Some(index) = event_id
+        .strip_prefix("transcript-history:")
+        .and_then(|value| value.parse::<usize>().ok())
+    {
+        copy_history_item(app, index);
         return;
     }
     if let Some((selected_name, _)) = tray_ui
@@ -1633,6 +1693,59 @@ fn handle_menu_event(
             item.set_checked(name == selected_name);
         }
     }
+}
+
+fn update_history_menu(app: &App, tray_ui: &mut TrayUi) -> Result<(), AppError> {
+    for item in tray_ui.history_items.drain(..) {
+        tray_ui
+            .history_menu
+            .remove(&item)
+            .map_err(|error| AppError::MenuBar(error.to_string()))?;
+    }
+    let history = app.history_snapshot()?;
+    tray_ui.copy_last_item.set_enabled(!history.is_empty());
+    if history.is_empty() {
+        let item = MenuItem::with_id(
+            "transcript-history:empty",
+            "No transcripts yet",
+            false,
+            None,
+        );
+        tray_ui
+            .history_menu
+            .append(&item)
+            .map_err(|error| AppError::MenuBar(error.to_string()))?;
+        tray_ui.history_items.push(item);
+        return Ok(());
+    }
+    for (index, text) in history.iter().enumerate() {
+        let label = format!("Copy {}: {}", index + 1, transcript_menu_preview(text));
+        let item = MenuItem::with_id(format!("transcript-history:{index}"), label, true, None);
+        tray_ui
+            .history_menu
+            .append(&item)
+            .map_err(|error| AppError::MenuBar(error.to_string()))?;
+        tray_ui.history_items.push(item);
+    }
+    Ok(())
+}
+
+fn copy_history_item(app: &App, index: usize) {
+    let history = match app.history_snapshot() {
+        Ok(history) => history,
+        Err(error) => {
+            error!("{error}");
+            return;
+        }
+    };
+    let Some(text) = history.get(index) else {
+        return;
+    };
+    if let Err(error) = copy_to_clipboard(text) {
+        warn!("transcript history copy failed: {error}");
+        return;
+    }
+    info!("copied transcript history item {index}");
 }
 
 fn show_native_overlay(
@@ -2055,6 +2168,16 @@ fn normalize_for_matching(text: &str) -> String {
     normalized.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+fn transcript_menu_preview(text: &str) -> String {
+    const MAX_CHARS: usize = 72;
+    let single_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut preview = single_line.chars().take(MAX_CHARS).collect::<String>();
+    if single_line.chars().count() > MAX_CHARS {
+        preview.push_str("...");
+    }
+    preview
+}
+
 const fn cleanup_decision(config: &Config, _transcript: &str) -> (bool, &'static str) {
     match config.llm_cleanup {
         CleanupMode::Off => (false, "mode_off"),
@@ -2302,6 +2425,53 @@ fn read_replacements_file(path: &Path) -> Result<Vec<TextReplacement>, AppError>
     Ok(parse_replacements_json(&text)?)
 }
 
+fn load_transcript_history() -> VecDeque<String> {
+    let path = transcript_history_path();
+    match read_transcript_history_file(&path) {
+        Ok(history) => history.into(),
+        Err(AppError::Io(error)) if error.kind() == ErrorKind::NotFound => VecDeque::new(),
+        Err(error) => {
+            warn!("transcript history ignored at {}: {error}", path.display());
+            VecDeque::new()
+        }
+    }
+}
+
+fn read_transcript_history_file(path: &Path) -> Result<Vec<String>, AppError> {
+    let text = fs::read_to_string(path)?;
+    Ok(sanitize_transcript_history(serde_json::from_str::<
+        Vec<String>,
+    >(&text)?))
+}
+
+#[cfg_attr(test, allow(dead_code))]
+fn save_transcript_history(history: &[String]) -> Result<(), AppError> {
+    let path = transcript_history_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    let text = serde_json::to_string_pretty(&sanitize_transcript_history(history.to_vec()))?;
+    fs::write(&tmp, format!("{text}\n"))?;
+    #[cfg(unix)]
+    fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))?;
+    fs::rename(tmp, path)?;
+    Ok(())
+}
+
+fn sanitize_transcript_history(history: Vec<String>) -> Vec<String> {
+    history
+        .into_iter()
+        .map(|text| text.trim().to_owned())
+        .filter(|text| !text.is_empty())
+        .take(TRANSCRIPT_HISTORY_LIMIT)
+        .collect()
+}
+
+fn transcript_history_path() -> PathBuf {
+    home_path(".bolo/transcripts.json")
+}
+
 fn parse_replacements_json(text: &str) -> Result<Vec<TextReplacement>, serde_json::Error> {
     let values = serde_json::from_str::<BTreeMap<String, String>>(text)?;
     let mut replacements = Vec::new();
@@ -2508,10 +2678,11 @@ fn app_root_dir() -> Result<PathBuf, AppError> {
 mod tests {
     use super::{
         AccessibilityContext, App, AppError, AppState, CleanupMode, Config, DictationCommandKind,
-        SttFallback, TextReplacement, apply_text_replacements, build_cleanup_user_content,
-        build_stt_prompt, canonicalize_known_terms, is_known_no_speech_transcript, parse_command,
-        parse_stt_fallbacks, remove_fillers, speech_stats, strip_reasoning_tags,
-        stt_include_language, stt_model_config, wav_bytes,
+        SttFallback, TRANSCRIPT_HISTORY_LIMIT, TextReplacement, apply_text_replacements,
+        build_cleanup_user_content, build_stt_prompt, canonicalize_known_terms,
+        is_known_no_speech_transcript, parse_command, parse_stt_fallbacks, remove_fillers,
+        sanitize_transcript_history, speech_stats, strip_reasoning_tags, stt_include_language,
+        stt_model_config, transcript_menu_preview, wav_bytes,
     };
     use std::path::PathBuf;
     use std::sync::Mutex;
@@ -2649,6 +2820,37 @@ mod tests {
             Some("dictated text")
         );
         Ok(())
+    }
+
+    #[test]
+    fn transcript_history_is_trimmed_and_limited() {
+        let history = sanitize_transcript_history(vec![
+            String::from(" first "),
+            String::new(),
+            String::from("second"),
+            String::from("third"),
+            String::from("fourth"),
+            String::from("fifth"),
+            String::from("sixth"),
+            String::from("seventh"),
+            String::from("eighth"),
+            String::from("ninth"),
+            String::from("tenth"),
+            String::from("eleventh"),
+        ]);
+
+        assert_eq!(history.len(), TRANSCRIPT_HISTORY_LIMIT);
+        assert_eq!(history.first().map(String::as_str), Some("first"));
+        assert_eq!(history.last().map(String::as_str), Some("tenth"));
+    }
+
+    #[test]
+    fn transcript_menu_preview_is_single_line() {
+        assert_eq!(
+            transcript_menu_preview("line one\nline two"),
+            "line one line two"
+        );
+        assert!(transcript_menu_preview(&"a".repeat(80)).ends_with("..."));
     }
 
     #[test]

@@ -56,7 +56,7 @@ Bolo needs two macOS permissions. Grant both in **System Settings > Privacy & Se
 
 **Step 4: Dictate**
 
-Place your cursor in any text field, hold your hotkey, speak, and release. Text appears at your cursor. Bolo uses the clipboard for paste insertion, then restores the previous clipboard contents by default.
+Place your cursor in any text field, hold your hotkey, speak, and release. Text appears at your cursor. Bolo uses the clipboard for paste insertion, then restores the previous clipboard contents by default. Recent transcripts are available from the Bolo menu bar icon when you need to copy one manually.
 
 ```bash
 # Restart anytime
@@ -122,7 +122,9 @@ To keep dictated text on the clipboard after insertion, set:
 export BOLO_PRESERVE_CLIPBOARD="off"
 ```
 
-By default, Bolo restores whatever was on your clipboard before dictation. The dictated text is still kept in Bolo's in-memory correction state for commands like `scratch that` and `actually ...`.
+By default, Bolo restores whatever was on your clipboard before dictation. The dictated text is still kept in Bolo's correction state for commands like `scratch that` and `actually ...`.
+
+Bolo also stores your 10 most recent transcripts locally at `~/.bolo/transcripts.json`. Use the menu bar icon to copy the latest transcript or a recent transcript into the clipboard on demand.
 
 To opt into LLM cleanup, set:
 
@@ -196,7 +198,7 @@ Bolo is a free open source alternative with similar push-to-talk mechanics. Both
 
 - Is my audio stored or used for training?
 
-Audio is sent to Telnyx APIs for transcription and immediately discarded. Bolo processes audio in memory only and does not retain any history.
+Audio is sent to Telnyx APIs for transcription and immediately discarded. Bolo processes audio in memory only. Text transcripts are stored locally at `~/.bolo/transcripts.json` for menu bar history.
 
 - Can I change the hotkey from Right Option?
 
