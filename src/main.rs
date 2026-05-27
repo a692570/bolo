@@ -226,6 +226,14 @@ impl SttRequestParts {
 struct PreparedText {
     text: String,
     llm_cleanup_ran: bool,
+    llm_cleanup_deferred: bool,
+    cleanup_input: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DeferredCleanupOutcome {
+    Updated,
+    Skipped(&'static str),
 }
 
 #[derive(Debug)]
@@ -235,6 +243,7 @@ struct DictationLatencyMetrics {
     cleanup_duration: Option<Duration>,
     insert_duration: Option<Duration>,
     llm_cleanup_ran: bool,
+    llm_cleanup_deferred: bool,
     outcome: &'static str,
     released_at: Instant,
 }
@@ -247,6 +256,7 @@ impl DictationLatencyMetrics {
             cleanup_duration: None,
             insert_duration: None,
             llm_cleanup_ran: false,
+            llm_cleanup_deferred: false,
             outcome: "started",
             released_at,
         }
@@ -264,6 +274,7 @@ impl Drop for DictationLatencyMetrics {
                 "insert_duration_ms": self.insert_duration.map(|duration| duration.as_millis()),
                 "total_post_release_latency_ms": self.released_at.elapsed().as_millis(),
                 "llm_cleanup_ran": self.llm_cleanup_ran,
+                "llm_cleanup_deferred": self.llm_cleanup_deferred,
                 "outcome": self.outcome,
             })
         );
@@ -859,7 +870,7 @@ impl App {
     }
 
     fn finish_recording(
-        &self,
+        self: &Arc<Self>,
         recording: ActiveRecording,
         released_at: Instant,
     ) -> Result<(), AppError> {
@@ -934,6 +945,7 @@ impl App {
         let prepared = self.prepare_text(&raw, &recording.warmup)?;
         metrics.cleanup_duration = Some(cleanup_started.elapsed());
         metrics.llm_cleanup_ran = prepared.llm_cleanup_ran;
+        metrics.llm_cleanup_deferred = prepared.llm_cleanup_deferred;
         if prepared.text.is_empty() {
             metrics.outcome = "empty_text";
             info!("[pipeline] final_text_empty");
@@ -965,8 +977,12 @@ impl App {
                     "chars": prepared.text.chars().count(),
                 })
             );
+            let pasted_text = prepared.text.clone();
             paste_text(&prepared.text)?;
             self.remember_result(prepared.text)?;
+            if let Some(cleanup_input) = prepared.cleanup_input {
+                self.start_deferred_cleanup(cleanup_input, pasted_text, &recording.warmup)?;
+            }
             play_sound("Pop");
         }
         metrics.insert_duration = Some(insert_started.elapsed());
@@ -1357,7 +1373,7 @@ impl App {
         )))
     }
 
-    fn prepare_text(&self, raw: &str, warmup: &DictationWarmup) -> Result<PreparedText, AppError> {
+    fn prepare_text(&self, raw: &str, _warmup: &DictationWarmup) -> Result<PreparedText, AppError> {
         info!(
             "[cleanup] input {}",
             serde_json::json!({
@@ -1370,6 +1386,8 @@ impl App {
             return Ok(PreparedText {
                 text: String::new(),
                 llm_cleanup_ran: false,
+                llm_cleanup_deferred: false,
+                cleanup_input: None,
             });
         }
         info!(
@@ -1400,6 +1418,8 @@ impl App {
             return Ok(PreparedText {
                 text: String::new(),
                 llm_cleanup_ran: false,
+                llm_cleanup_deferred: false,
+                cleanup_input: None,
             });
         }
         let (should_cleanup, cleanup_reason) = cleanup_decision(&self.config, &stripped);
@@ -1424,67 +1444,25 @@ impl App {
             return Ok(PreparedText {
                 text: final_text,
                 llm_cleanup_ran: false,
+                llm_cleanup_deferred: false,
+                cleanup_input: None,
             });
         }
-        match self.cleanup_transcript(&stripped, warmup) {
-            Ok(cleaned) if !cleaned.is_empty() => {
-                let normalized_cleaned = normalize_transcript(cleaned.trim());
-                let final_text = apply_text_replacements(
-                    &canonicalize_known_terms(&normalized_cleaned),
-                    &self.config.replacements,
-                );
-                if is_known_no_speech_transcript(&final_text) {
-                    info!("[cleanup] dropped_known_no_speech_transcript");
-                    return Ok(PreparedText {
-                        text: String::new(),
-                        llm_cleanup_ran: true,
-                    });
-                }
-                info!(
-                    "[cleanup] final_with_llm {}",
-                    serde_json::json!({
-                        "llm_output": &cleaned,
-                        "normalized_llm_output": &normalized_cleaned,
-                        "final_text": &final_text,
-                        "replacement_count": self.config.replacements.len(),
-                    })
-                );
-                Ok(PreparedText {
-                    text: final_text,
-                    llm_cleanup_ran: true,
-                })
-            }
-            Ok(_) => {
-                let fallback_text = apply_text_replacements(&stripped, &self.config.replacements);
-                info!(
-                    "[cleanup] llm_empty_fallback {}",
-                    serde_json::json!({
-                        "fallback_text": &fallback_text,
-                        "replacement_count": self.config.replacements.len(),
-                    })
-                );
-                Ok(PreparedText {
-                    text: fallback_text,
-                    llm_cleanup_ran: true,
-                })
-            }
-            Err(error) => {
-                warn!("cleanup skipped after error: {error}");
-                let fallback_text = apply_text_replacements(&stripped, &self.config.replacements);
-                info!(
-                    "[cleanup] llm_error_fallback {}",
-                    serde_json::json!({
-                        "error": error.to_string(),
-                        "fallback_text": &fallback_text,
-                        "replacement_count": self.config.replacements.len(),
-                    })
-                );
-                Ok(PreparedText {
-                    text: fallback_text,
-                    llm_cleanup_ran: true,
-                })
-            }
-        }
+        let fallback_text = apply_text_replacements(&stripped, &self.config.replacements);
+        info!(
+            "[cleanup] deferred_llm_cleanup {}",
+            serde_json::json!({
+                "fallback_text": &fallback_text,
+                "reason": cleanup_reason,
+                "replacement_count": self.config.replacements.len(),
+            })
+        );
+        Ok(PreparedText {
+            text: fallback_text,
+            llm_cleanup_ran: false,
+            llm_cleanup_deferred: true,
+            cleanup_input: Some(stripped),
+        })
     }
 
     fn cleanup_transcript(
@@ -1571,6 +1549,73 @@ impl App {
         Ok(sanitized)
     }
 
+    fn start_deferred_cleanup(
+        self: &Arc<Self>,
+        cleanup_input: String,
+        pasted_text: String,
+        warmup: &DictationWarmup,
+    ) -> Result<(), AppError> {
+        let app = Arc::clone(self);
+        let warmup = warmup.clone();
+        let join_handle = std::thread::Builder::new()
+            .name(String::from("bolo-deferred-cleanup"))
+            .spawn(move || {
+                let started = Instant::now();
+                match app.deferred_cleanup(cleanup_input, pasted_text, &warmup) {
+                    Ok(DeferredCleanupOutcome::Updated) => {
+                        info!(
+                            "[cleanup] deferred_llm_history_updated {}",
+                            serde_json::json!({
+                                "duration_ms": started.elapsed().as_millis(),
+                            })
+                        );
+                    }
+                    Ok(DeferredCleanupOutcome::Skipped(reason)) => {
+                        info!(
+                            "[cleanup] deferred_llm_skipped {}",
+                            serde_json::json!({
+                                "duration_ms": started.elapsed().as_millis(),
+                                "reason": reason,
+                            })
+                        );
+                    }
+                    Err(error) => {
+                        warn!("deferred cleanup failed: {error}");
+                    }
+                }
+            })?;
+        drop(join_handle);
+        Ok(())
+    }
+
+    fn deferred_cleanup(
+        &self,
+        cleanup_input: String,
+        pasted_text: String,
+        warmup: &DictationWarmup,
+    ) -> Result<DeferredCleanupOutcome, AppError> {
+        let cleaned = self.cleanup_transcript(&cleanup_input, warmup)?;
+        if cleaned.trim().is_empty() {
+            return Ok(DeferredCleanupOutcome::Skipped("empty_llm_output"));
+        }
+        let normalized_cleaned = normalize_transcript(cleaned.trim());
+        let final_text = apply_text_replacements(
+            &canonicalize_known_terms(&normalized_cleaned),
+            &self.config.replacements,
+        );
+        if final_text.is_empty() || is_known_no_speech_transcript(&final_text) {
+            return Ok(DeferredCleanupOutcome::Skipped("empty_final_text"));
+        }
+        if final_text == pasted_text {
+            return Ok(DeferredCleanupOutcome::Skipped("unchanged"));
+        }
+        if self.replace_latest_history_entry(&pasted_text, final_text)? {
+            Ok(DeferredCleanupOutcome::Updated)
+        } else {
+            Ok(DeferredCleanupOutcome::Skipped("history_changed"))
+        }
+    }
+
     fn apply_command(&self, command: DictationCommand) -> Result<(), AppError> {
         match command.kind {
             DictationCommandKind::Scratch => {
@@ -1630,6 +1675,34 @@ impl App {
         Ok(())
     }
 
+    fn replace_latest_history_entry(
+        &self,
+        original: &str,
+        replacement: String,
+    ) -> Result<bool, AppError> {
+        let history = {
+            let mut state = self.lock_state()?;
+            let Some(first) = state.history.front_mut() else {
+                return Ok(false);
+            };
+            if first != original {
+                return Ok(false);
+            }
+            *first = replacement;
+            state.history.iter().cloned().collect::<Vec<_>>()
+        };
+        #[cfg(not(test))]
+        {
+            if let Err(error) = save_transcript_history(&history) {
+                warn!("transcript history save failed: {error}");
+            }
+        }
+        #[cfg(test)]
+        drop(history);
+        self.send_user_event(UserEvent::HistoryChanged);
+        Ok(true)
+    }
+
     fn history_snapshot(&self) -> Result<Vec<String>, AppError> {
         let state = self.lock_state()?;
         Ok(state.history.iter().cloned().collect())
@@ -1638,9 +1711,10 @@ impl App {
     fn latest_transcript(&self) -> Result<Option<String>, AppError> {
         let state = self.lock_state()?;
         Ok(state
-            .last_result
-            .clone()
-            .or_else(|| state.history.front().cloned()))
+            .history
+            .front()
+            .cloned()
+            .or_else(|| state.last_result.clone()))
     }
 
     fn paste_last_transcript(&self) -> Result<(), AppError> {
@@ -3291,6 +3365,50 @@ mod tests {
 
         assert_eq!(prepared.text, "Telnyx ships");
         assert!(!prepared.llm_cleanup_ran);
+        assert!(!prepared.llm_cleanup_deferred);
+        Ok(())
+    }
+
+    #[test]
+    fn prepare_text_defers_llm_cleanup_for_long_text() -> Result<(), AppError> {
+        let app = App {
+            config: Config {
+                telnyx_api_key: String::from("test"),
+                llm_cleanup: CleanupMode::Auto,
+                litellm_base: None,
+                litellm_key: None,
+                stt_model: String::from("deepgram/nova-3"),
+                stt_fallbacks: Vec::new(),
+                microphone: None,
+                replacements: Vec::new(),
+                root_dir: PathBuf::new(),
+                hotkey: String::from("right_option"),
+                paste_last_hotkey: None,
+                preserve_clipboard: true,
+            },
+            http: reqwest::blocking::Client::new(),
+            vocabulary: Vec::new(),
+            state: Mutex::new(AppState::default()),
+            event_proxy: Mutex::new(None),
+        };
+
+        let prepared = app.prepare_text(
+            "this is a longer dictated sentence that should probably get grammar cleanup before insertion",
+            &DictationWarmup::default(),
+        )?;
+
+        assert_eq!(
+            prepared.text,
+            "this is a longer dictated sentence that should probably get grammar cleanup before insertion"
+        );
+        assert!(!prepared.llm_cleanup_ran);
+        assert!(prepared.llm_cleanup_deferred);
+        assert_eq!(
+            prepared.cleanup_input.as_deref(),
+            Some(
+                "this is a longer dictated sentence that should probably get grammar cleanup before insertion"
+            )
+        );
         Ok(())
     }
 
@@ -3329,7 +3447,7 @@ mod tests {
     }
 
     #[test]
-    fn latest_transcript_uses_current_state_before_history() {
+    fn latest_transcript_uses_history_before_current_state() {
         let app = App {
             config: Config {
                 telnyx_api_key: String::from("test"),
@@ -3356,7 +3474,7 @@ mod tests {
         };
 
         let latest = app.latest_transcript().ok().flatten();
-        assert_eq!(latest.as_deref(), Some("current transcript"));
+        assert_eq!(latest.as_deref(), Some("history transcript"));
 
         let history_app = App {
             config: Config {
