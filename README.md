@@ -56,7 +56,7 @@ Bolo needs two macOS permissions. Grant both in **System Settings > Privacy & Se
 
 **Step 4: Dictate**
 
-Place your cursor in any text field, hold your hotkey, speak, and release. Text appears at your cursor and is copied to your clipboard.
+Place your cursor in any text field, hold your hotkey, speak, and release. Text appears at your cursor. Bolo uses the clipboard for paste insertion, then restores the previous clipboard contents by default.
 
 ```bash
 # Restart anytime
@@ -116,6 +116,14 @@ Supported fallback entries:
 
 Set `BOLO_STT_FALLBACKS=off` to fail fast instead of retrying when the primary model is rate limited. `BOLO_STT_FALLBACK_MODEL` still works for a single Telnyx fallback model.
 
+To keep dictated text on the clipboard after insertion, set:
+
+```bash
+export BOLO_PRESERVE_CLIPBOARD="off"
+```
+
+By default, Bolo restores whatever was on your clipboard before dictation. The dictated text is still kept in Bolo's in-memory correction state for commands like `scratch that` and `actually ...`.
+
 To opt into LLM cleanup, set:
 
 ```bash
@@ -123,6 +131,8 @@ export BOLO_LLM_CLEANUP="on"
 ```
 
 When LiteLLM is configured, Bolo uses `Kimi-K2.5` for cleanup. Without LiteLLM, it uses Telnyx `Qwen/Qwen3-235B-A22B` with thinking disabled. MiniMax is intentionally not used for cleanup because it can leak reasoning text into the output.
+
+When LLM cleanup is enabled, Bolo also reads the frontmost app and nearby cursor text through macOS Accessibility so cleanup can choose natural spacing, capitalization, and continuation. That context is used only for cleanup prompting.
 
 You can also add personal vocabulary in `~/.bolo_vocabulary.json` as a JSON string array, for example:
 
@@ -132,6 +142,17 @@ You can also add personal vocabulary in `~/.bolo_vocabulary.json` as a JSON stri
 
 Bolo merges that with its built-in vocabulary and uses it to preserve known terms more reliably.
 
+For deterministic phrase fixes after transcription, add replacements in `~/.bolo/replacements.json`:
+
+```json
+{
+  "voice ai": "Voice AI",
+  "opsen sourced": "open sourced"
+}
+```
+
+Replacements are applied after local cleanup and before text insertion. Longer replacement triggers win before shorter ones.
+
 ## Current Limitations
 
 - Bolo is under active development and improving quickly.
@@ -140,6 +161,8 @@ Bolo merges that with its built-in vocabulary and uses it to preserve known term
 - Cleanup is intentionally conservative to preserve literal meaning.
 - Streaming preview and learned correction memory are not part of the Rust runtime.
 - A first-run onboarding dialog asks for your preferred hotkey so you never start with the wrong key.
+- Bolo rechecks OS key state while running so missed hotkey press or release events are corrected quickly.
+- A recording lifecycle state machine ignores duplicate press and release events and keeps stale-recording recovery predictable.
 
 ## Logs
 
@@ -147,7 +170,7 @@ Bolo merges that with its built-in vocabulary and uses it to preserve known term
 tail -f /tmp/bolo.log
 ```
 
-Each dictation logs the pipeline stages: audio metadata, Telnyx STT endpoint/model/request metadata, raw STT transcript, local cleanup transformations, LLM cleanup endpoint/model/input/output when enabled, and the final text sent for insertion. Authorization headers and API keys are not logged.
+Each dictation logs the pipeline stages: audio metadata, speech detection metrics, Telnyx STT endpoint/model/request metadata, raw STT transcript, local cleanup transformations, LLM cleanup endpoint/model/input/output when enabled, and the final text sent for insertion. Authorization headers, API keys, and clipboard contents are not logged.
 
 ## Evaluation
 

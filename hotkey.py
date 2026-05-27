@@ -19,10 +19,16 @@ from AppKit import (
 from Foundation import NSDate
 from Quartz import (
     CGEventSourceFlagsState,
+    CGEventSourceKeyState,
     kCGEventSourceStateCombinedSessionState,
 )
 
-if os.environ.get("BOLO_HOTKEY", "right_option") not in ("right_option", "right_control", "right_shift", "fn"):
+if os.environ.get("BOLO_HOTKEY", "right_option") not in (
+    "right_option",
+    "right_control",
+    "right_shift",
+    "fn",
+):
     from Quartz import CGEventMaskBit, kCGEventKeyDown, kCGEventKeyUp
 
 
@@ -34,7 +40,7 @@ NX_DEVICERCTLKEYMASK = 0x00002000
 NX_DEVICERSHIFTKEYMASK = 0x00000020
 NX_SECONDARYFNMASK = 0x00004000
 POLL_INTERVAL = 0.02
-STALE_THRESHOLD = 2.0
+RECHECK_INTERVAL = POLL_INTERVAL
 PARENT_PID = int(os.environ.get("BOLO_PARENT_PID") or "0")
 
 HOTKEY = os.environ.get("BOLO_HOTKEY", "right_option")
@@ -67,7 +73,7 @@ USE_FLAGS_CHANGED = HOTKEY in ("right_option", "right_control", "right_shift", "
 USE_KEY_EVENTS = TARGET_KEYCODE is not None and not USE_FLAGS_CHANGED
 
 state = False
-state_since = None
+last_recheck_at = 0.0
 
 
 def emit(event):
@@ -76,30 +82,57 @@ def emit(event):
 
 
 def is_hotkey_down():
-    try:
-        flags = CGEventSourceFlagsState(kCGEventSourceStateCombinedSessionState)
-    except Exception:
-        return state
+    if USE_FLAGS_CHANGED:
+        try:
+            flags = CGEventSourceFlagsState(kCGEventSourceStateCombinedSessionState)
+        except Exception:
+            return state
 
-    if HOTKEY == "right_option":
-        return bool(flags & NX_DEVICERALTKEYMASK)
-    elif HOTKEY == "right_control":
-        return bool(flags & NX_DEVICERCTLKEYMASK)
-    elif HOTKEY == "right_shift":
-        return bool(flags & NX_DEVICERSHIFTKEYMASK)
-    elif HOTKEY == "fn":
-        return bool(flags & NX_SECONDARYFNMASK)
+        if HOTKEY == "right_option":
+            return bool(flags & NX_DEVICERALTKEYMASK)
+        elif HOTKEY == "right_control":
+            return bool(flags & NX_DEVICERCTLKEYMASK)
+        elif HOTKEY == "right_shift":
+            return bool(flags & NX_DEVICERSHIFTKEYMASK)
+        elif HOTKEY == "fn":
+            return bool(flags & NX_SECONDARYFNMASK)
+
+    if TARGET_KEYCODE is not None:
+        try:
+            return bool(
+                CGEventSourceKeyState(
+                    kCGEventSourceStateCombinedSessionState,
+                    TARGET_KEYCODE,
+                )
+            )
+        except Exception:
+            return state
 
     return state
 
 
 def set_state(next_state):
-    global state, state_since
+    global state
     if next_state == state:
         return
     state = next_state
-    state_since = time.monotonic() if state else None
     emit("press" if state else "release")
+
+
+def recheck_os_state():
+    global last_recheck_at
+    now = time.monotonic()
+    if now - last_recheck_at < RECHECK_INTERVAL:
+        return
+    last_recheck_at = now
+
+    actual = is_hotkey_down()
+    if actual == state:
+        return
+
+    event = "press" if actual else "release"
+    print(f"[hotkey] OS recheck corrected missed {event}", file=sys.stderr, flush=True)
+    set_state(actual)
 
 
 def parent_is_alive():
@@ -164,11 +197,4 @@ while True:
         NSDefaultRunLoopMode,
         NSDate.dateWithTimeIntervalSinceNow_(POLL_INTERVAL),
     )
-    if USE_FLAGS_CHANGED:
-        actual = is_hotkey_down()
-        if state and not actual and state_since is not None:
-            if time.monotonic() - state_since > STALE_THRESHOLD:
-                print("[hotkey] stale state detected, forcing release", file=sys.stderr, flush=True)
-                set_state(False)
-                continue
-        set_state(actual)
+    recheck_os_state()
