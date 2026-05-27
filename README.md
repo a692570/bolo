@@ -126,15 +126,19 @@ By default, Bolo restores whatever was on your clipboard before dictation. The d
 
 Bolo also stores your 10 most recent transcripts locally at `~/.bolo/transcripts.json`. Use the menu bar icon to copy the latest transcript or a recent transcript into the clipboard on demand.
 
-To opt into LLM cleanup, set:
+LLM cleanup defaults to `auto`: short clean dictations skip the LLM, while longer or messy dictations use the LLM for grammar, punctuation, contractions, and missing articles.
+
+To force LLM cleanup for every dictation, set:
 
 ```bash
 export BOLO_LLM_CLEANUP="on"
 ```
 
+To disable LLM cleanup entirely, set `BOLO_LLM_CLEANUP="off"`.
+
 When LiteLLM is configured, Bolo uses `Kimi-K2.5` for cleanup. Without LiteLLM, it uses Telnyx `Qwen/Qwen3-235B-A22B` with thinking disabled. MiniMax is intentionally not used for cleanup because it can leak reasoning text into the output.
 
-When LLM cleanup is enabled, Bolo also reads the frontmost app and nearby cursor text through macOS Accessibility so cleanup can choose natural spacing, capitalization, and continuation. That context is used only for cleanup prompting.
+When LLM cleanup runs, Bolo also reads the frontmost app and nearby cursor text through macOS Accessibility so cleanup can choose natural spacing, capitalization, and continuation. That context is used only for cleanup prompting.
 
 You can also add personal vocabulary in `~/.bolo_vocabulary.json` as a JSON string array, for example:
 
