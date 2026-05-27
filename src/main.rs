@@ -142,6 +142,7 @@ struct AppState {
     correction_until: Option<Instant>,
     history: VecDeque<String>,
     selected_microphone: Option<String>,
+    cleanup_status: Option<String>,
 }
 
 struct ActiveRecording {
@@ -322,6 +323,7 @@ enum UserEvent {
     HideOverlay,
     HideOverlayAfter(Duration),
     HistoryChanged,
+    CleanupStatusChanged,
     RecordingWatchdog,
 }
 
@@ -360,6 +362,7 @@ struct TrayUi {
     tray_icon: TrayIcon,
     microphone_items: Vec<(String, CheckMenuItem)>,
     copy_last_item: MenuItem,
+    cleanup_status_item: MenuItem,
     history_menu: Submenu,
     history_items: Vec<MenuItem>,
     quit_item: MenuItem,
@@ -416,11 +419,13 @@ struct ChatResponse {
 #[derive(Debug, Deserialize)]
 struct ChatChoice {
     message: ChatMessage,
+    finish_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ChatMessage {
-    content: String,
+    content: Option<String>,
+    reasoning_content: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -732,6 +737,11 @@ fn run_app_event_loop(app: Arc<App>) -> Result<(), AppError> {
                     && let Err(error) = update_history_menu(&app, ui)
                 {
                     error!("{error}");
+                }
+            }
+            TaoEvent::UserEvent(UserEvent::CleanupStatusChanged) => {
+                if let Some(ui) = tray_ui.as_ref() {
+                    update_cleanup_status_item(&app, ui);
                 }
             }
             TaoEvent::UserEvent(UserEvent::RecordingWatchdog) => {
@@ -1532,16 +1542,17 @@ impl App {
             return Ok(String::new());
         }
         let parsed: ChatResponse = response.json()?;
-        let output = parsed
-            .choices
-            .first()
-            .map_or_else(String::new, |choice| choice.message.content.clone());
+        let output = parsed.choices.first().map_or_else(String::new, |choice| {
+            choice.message.content.clone().unwrap_or_default()
+        });
         let sanitized = strip_reasoning_tags(&output);
         info!(
             "[llm] response_text {}",
             serde_json::json!({
                 "endpoint": &endpoint,
                 "model": &model,
+                "finish_reason": parsed.choices.first().and_then(|choice| choice.finish_reason.as_deref()),
+                "reasoning_chars": parsed.choices.first().and_then(|choice| choice.message.reasoning_content.as_ref()).map_or(0, |reasoning| reasoning.chars().count()),
                 "output": &output,
                 "sanitized_output": &sanitized,
             })
@@ -1555,6 +1566,7 @@ impl App {
         pasted_text: String,
         warmup: &DictationWarmup,
     ) -> Result<(), AppError> {
+        self.set_cleanup_status(String::from("Cleanup: running in background"));
         let app = Arc::clone(self);
         let warmup = warmup.clone();
         let join_handle = std::thread::Builder::new()
@@ -1563,6 +1575,10 @@ impl App {
                 let started = Instant::now();
                 match app.deferred_cleanup(cleanup_input, pasted_text, &warmup) {
                     Ok(DeferredCleanupOutcome::Updated) => {
+                        app.set_cleanup_status(format!(
+                            "Cleanup: updated history in {}ms",
+                            started.elapsed().as_millis()
+                        ));
                         info!(
                             "[cleanup] deferred_llm_history_updated {}",
                             serde_json::json!({
@@ -1571,6 +1587,10 @@ impl App {
                         );
                     }
                     Ok(DeferredCleanupOutcome::Skipped(reason)) => {
+                        app.set_cleanup_status(format!(
+                            "Cleanup: {reason} in {}ms",
+                            started.elapsed().as_millis()
+                        ));
                         info!(
                             "[cleanup] deferred_llm_skipped {}",
                             serde_json::json!({
@@ -1580,6 +1600,10 @@ impl App {
                         );
                     }
                     Err(error) => {
+                        app.set_cleanup_status(format!(
+                            "Cleanup: failed in {}ms",
+                            started.elapsed().as_millis()
+                        ));
                         warn!("deferred cleanup failed: {error}");
                     }
                 }
@@ -1701,6 +1725,32 @@ impl App {
         drop(history);
         self.send_user_event(UserEvent::HistoryChanged);
         Ok(true)
+    }
+
+    fn set_cleanup_status(&self, status: String) {
+        match self.state.lock() {
+            Ok(mut state) => {
+                state.cleanup_status = Some(status);
+            }
+            Err(error) => {
+                warn!("cleanup status update failed: {error}");
+                return;
+            }
+        }
+        self.send_user_event(UserEvent::CleanupStatusChanged);
+    }
+
+    fn cleanup_status(&self) -> String {
+        match self.state.lock() {
+            Ok(state) => state
+                .cleanup_status
+                .clone()
+                .unwrap_or_else(|| String::from("Cleanup: no background run yet")),
+            Err(error) => {
+                warn!("cleanup status read failed: {error}");
+                String::from("Cleanup: status unavailable")
+            }
+        }
     }
 
     fn history_snapshot(&self) -> Result<Vec<String>, AppError> {
@@ -1983,6 +2033,12 @@ fn create_tray_ui(app: &App) -> Result<TrayUi, AppError> {
         .append(&copy_last_item)
         .map_err(|error| AppError::MenuBar(error.to_string()))?;
 
+    let cleanup_status_item =
+        MenuItem::with_id("cleanup-status", app.cleanup_status(), false, None);
+    tray_menu
+        .append(&cleanup_status_item)
+        .map_err(|error| AppError::MenuBar(error.to_string()))?;
+
     let history_menu = Submenu::new("Transcript History", true);
     tray_menu
         .append(&history_menu)
@@ -2038,6 +2094,7 @@ fn create_tray_ui(app: &App) -> Result<TrayUi, AppError> {
         tray_icon,
         microphone_items,
         copy_last_item,
+        cleanup_status_item,
         history_menu,
         history_items: Vec::new(),
         quit_item,
@@ -2116,6 +2173,10 @@ fn update_history_menu(app: &App, tray_ui: &mut TrayUi) -> Result<(), AppError> 
         tray_ui.history_items.push(item);
     }
     Ok(())
+}
+
+fn update_cleanup_status_item(app: &App, tray_ui: &TrayUi) {
+    tray_ui.cleanup_status_item.set_text(app.cleanup_status());
 }
 
 fn copy_history_item(app: &App, index: usize) {
@@ -2622,7 +2683,7 @@ fn has_terminal_punctuation(transcript: &str) -> bool {
 
 fn cleanup_max_tokens(transcript: &str) -> u16 {
     let word_count = transcript.split_whitespace().count().max(1);
-    ((word_count * 8).clamp(80, 700)) as u16
+    ((word_count * 8).clamp(600, 1_200)) as u16
 }
 
 fn cleanup_profile(context: Option<&AccessibilityContext>) -> CleanupProfile {
@@ -3310,8 +3371,8 @@ mod tests {
 
     #[test]
     fn cleanup_token_limit_scales_with_input() {
-        assert_eq!(cleanup_max_tokens("short text"), 80);
-        assert_eq!(cleanup_max_tokens(&"word ".repeat(200)), 700);
+        assert_eq!(cleanup_max_tokens("short text"), 600);
+        assert_eq!(cleanup_max_tokens(&"word ".repeat(200)), 1_200);
     }
 
     #[test]
