@@ -89,6 +89,14 @@ Supported values:
 - `f1` through `f19`: Function keys
 - `caps_lock`: Caps Lock key
 
+To paste the latest transcript again with a separate hotkey, set:
+
+```bash
+export BOLO_PASTE_LAST_HOTKEY="f19"
+```
+
+This is off unless configured. It accepts the same key names as `BOLO_HOTKEY` where supported, and uses the clipboard only long enough to paste before restoring the previous clipboard text.
+
 To preselect a microphone without using the menu, set:
 
 ```bash

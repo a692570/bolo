@@ -44,6 +44,7 @@ RECHECK_INTERVAL = POLL_INTERVAL
 PARENT_PID = int(os.environ.get("BOLO_PARENT_PID") or "0")
 
 HOTKEY = os.environ.get("BOLO_HOTKEY", "right_option")
+ACTION = os.environ.get("BOLO_HOTKEY_ACTION", "dictation")
 
 KEYCODE_MAP = {
     "f1": 122,
@@ -116,6 +117,10 @@ def set_state(next_state):
     if next_state == state:
         return
     state = next_state
+    if ACTION == "paste_last":
+        if state:
+            emit("paste_last")
+        return
     emit("press" if state else "release")
 
 
