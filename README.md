@@ -134,6 +134,15 @@ Supported fallback entries:
 
 Set `BOLO_STT_FALLBACKS=off` to fail fast instead of retrying when the primary model is rate limited. `BOLO_STT_FALLBACK_MODEL` still works for a single Telnyx fallback model.
 
+To try AssemblyAI streaming STT, set:
+
+```bash
+export ASSEMBLYAI_API_KEY="..."
+export BOLO_STT_STREAMING="assemblyai"
+```
+
+Streaming starts sending audio while you speak and falls back to the normal batch path if it does not produce a transcript quickly enough after release.
+
 To keep dictated text on the clipboard after insertion, set:
 
 ```bash
@@ -143,6 +152,8 @@ export BOLO_PRESERVE_CLIPBOARD="off"
 By default, Bolo restores whatever was on your clipboard before dictation. The dictated text is still kept in Bolo's correction state for commands like `scratch that` and `actually ...`.
 
 Bolo also stores your 10 most recent transcripts locally at `~/.bolo/transcripts.json`. Use the menu bar icon to copy the latest transcript or a recent transcript into the clipboard on demand. When cleanup changes the text, Bolo keeps both the raw STT transcript and the cleaned transcript so you can copy either one from history.
+
+Use **Clear Transcript History** from the menu bar to delete local transcript history, or **Run Health Check** to confirm Bolo can see microphones, the active language, STT mode, and history state.
 
 LLM cleanup defaults to `auto`: short clean dictations skip the LLM, while longer or messy dictations use the LLM for grammar, punctuation, contractions, and missing articles.
 

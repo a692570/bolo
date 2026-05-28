@@ -10,12 +10,15 @@ use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arboard::Clipboard;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, Sample, SampleFormat, SizedSample, Stream, StreamConfig};
+use futures_util::{SinkExt, StreamExt};
 use regex::Regex;
 use reqwest::blocking::{Client, multipart};
 use serde::{Deserialize, Serialize};
@@ -24,6 +27,11 @@ use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
 #[cfg(target_os = "macos")]
 use tao::platform::macos::{ActivationPolicy, EventLoopExtMacOS};
 use thiserror::Error;
+use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::http::HeaderValue;
+use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
 use tracing::{error, info, warn};
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::EnvFilter;
@@ -37,6 +45,7 @@ const CHANNELS: u16 = 1;
 const LOCK_DIR: &str = "/tmp/bolo-instance.lock";
 const TRANSCRIPT_HISTORY_LIMIT: usize = 10;
 const TELNYX_STT_ENDPOINT: &str = "https://api.telnyx.com/v2/ai/audio/transcriptions";
+const ASSEMBLYAI_STREAMING_ENDPOINT: &str = "wss://streaming.assemblyai.com/v3/ws";
 const TELNYX_LLM_ENDPOINT: &str = "https://api.telnyx.com/v2/ai/chat/completions";
 const XAI_STT_ENDPOINT: &str = "https://api.x.ai/v1/stt";
 const ASSEMBLYAI_UPLOAD_ENDPOINT: &str = "https://api.assemblyai.com/v2/upload";
@@ -84,6 +93,7 @@ struct Config {
     litellm_key: Option<String>,
     stt_model: String,
     stt_language: String,
+    streaming_stt: Option<StreamingProvider>,
     stt_fallbacks: Vec<SttFallback>,
     microphone: Option<String>,
     root_dir: PathBuf,
@@ -104,6 +114,11 @@ enum SttFallback {
     Telnyx(String),
     Xai,
     AssemblyAi(Option<String>),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StreamingProvider {
+    AssemblyAi,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -176,6 +191,21 @@ struct ActiveRecording {
     started_at: Instant,
     sample_rate: u32,
     warmup: DictationWarmup,
+    streaming: Option<StreamingRecording>,
+}
+
+#[derive(Debug)]
+struct StreamingRecording {
+    sender: Option<mpsc::Sender<Vec<i16>>>,
+    result: Arc<Mutex<StreamingTranscript>>,
+    _thread: JoinHandle<()>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct StreamingTranscript {
+    latest_partial: Option<String>,
+    latest_final: Option<String>,
+    error: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -322,6 +352,219 @@ impl std::fmt::Debug for ActiveRecording {
     }
 }
 
+impl StreamingRecording {
+    fn start(api_key: String, language: String, vocabulary: Vec<String>) -> Self {
+        let (sender, receiver) = mpsc::channel::<Vec<i16>>();
+        let result = Arc::new(Mutex::new(StreamingTranscript::default()));
+        let thread_result = Arc::clone(&result);
+        let thread = std::thread::Builder::new()
+            .name(String::from("bolo-streaming-stt"))
+            .spawn(move || {
+                match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(runtime) => runtime.block_on(async move {
+                        if let Err(error) = run_assemblyai_stream(
+                            api_key,
+                            language,
+                            vocabulary,
+                            receiver,
+                            thread_result,
+                        )
+                        .await
+                        {
+                            warn!("streaming STT failed: {error}");
+                        }
+                    }),
+                    Err(error) => warn!("streaming runtime failed: {error}"),
+                }
+            })
+            .unwrap_or_else(|error| {
+                warn!("streaming STT thread failed: {error}");
+                std::thread::spawn(|| {})
+            });
+        Self {
+            sender: Some(sender),
+            result,
+            _thread: thread,
+        }
+    }
+
+    fn finish(mut self) -> Option<String> {
+        drop(self.sender.take());
+        let deadline = Instant::now() + Duration::from_millis(1_200);
+        while Instant::now() < deadline {
+            match self.result.lock() {
+                Ok(result) => {
+                    if let Some(text) = result.latest_final.as_ref().filter(|text| !text.is_empty())
+                    {
+                        return Some(text.clone());
+                    }
+                    if let Some(error) = result.error.as_ref() {
+                        warn!("streaming STT result error: {error}");
+                        return None;
+                    }
+                }
+                Err(error) => {
+                    warn!("streaming result read failed: {error}");
+                    return None;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        match self.result.lock() {
+            Ok(result) => result
+                .latest_partial
+                .clone()
+                .filter(|text| !text.is_empty()),
+            Err(error) => {
+                warn!("streaming result read failed: {error}");
+                None
+            }
+        }
+    }
+}
+
+async fn run_assemblyai_stream(
+    api_key: String,
+    language: String,
+    vocabulary: Vec<String>,
+    receiver: Receiver<Vec<i16>>,
+    result: Arc<Mutex<StreamingTranscript>>,
+) -> Result<(), String> {
+    let query = assemblyai_stream_query(&language, &vocabulary);
+    let url = format!("{ASSEMBLYAI_STREAMING_ENDPOINT}?{query}");
+    let mut request = url
+        .into_client_request()
+        .map_err(|error| error.to_string())?;
+    let auth = format!("Bearer {api_key}");
+    let header = HeaderValue::from_str(&auth).map_err(|error| error.to_string())?;
+    drop(request.headers_mut().insert(AUTHORIZATION, header));
+    let (socket, _response) = connect_async(request)
+        .await
+        .map_err(|error| error.to_string())?;
+    info!("[stt] streaming_connected assemblyai");
+    let (mut write, mut read) = socket.split();
+    let mut input_closed = false;
+    let mut close_deadline = None;
+    loop {
+        loop {
+            match receiver.try_recv() {
+                Ok(samples) => {
+                    write
+                        .send(Message::Binary(pcm_bytes(&samples).into()))
+                        .await
+                        .map_err(|error| error.to_string())?;
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    input_closed = true;
+                    close_deadline = Some(Instant::now() + Duration::from_millis(1_000));
+                    if let Err(error) = write
+                        .send(Message::Text(
+                            String::from(r#"{"type":"Terminate"}"#).into(),
+                        ))
+                        .await
+                    {
+                        warn!("streaming terminate failed: {error}");
+                    }
+                    break;
+                }
+            }
+        }
+        if let Some(deadline) = close_deadline
+            && Instant::now() >= deadline
+        {
+            return Ok(());
+        }
+        match tokio::time::timeout(Duration::from_millis(20), read.next()).await {
+            Ok(Some(Ok(message))) => {
+                if message.is_close() {
+                    return Ok(());
+                }
+                if let Message::Text(text) = message {
+                    update_streaming_transcript(&result, &text);
+                }
+            }
+            Ok(Some(Err(error))) => return Err(error.to_string()),
+            Ok(None) => return Ok(()),
+            Err(_) if input_closed => {}
+            Err(_) => {}
+        }
+    }
+}
+
+fn assemblyai_stream_query(language: &str, vocabulary: &[String]) -> String {
+    let mut params = vec![
+        String::from("speech_model=universal-streaming"),
+        String::from("sample_rate=48000"),
+        String::from("encoding=pcm_s16le"),
+        String::from("format_turns=true"),
+    ];
+    if !language.is_empty() && !language.eq_ignore_ascii_case("auto") {
+        params.push(format!("language_code={}", query_escape(language)));
+    }
+    for term in vocabulary.iter().take(50) {
+        params.push(format!("keyterms_prompt={}", query_escape(term)));
+    }
+    params.join("&")
+}
+
+fn query_escape(value: &str) -> String {
+    let mut escaped = String::new();
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            escaped.push(char::from(byte));
+        } else {
+            escaped.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    escaped
+}
+
+fn update_streaming_transcript(result: &Arc<Mutex<StreamingTranscript>>, text: &str) {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
+        return;
+    };
+    if let Some(error) = value.get("error").and_then(serde_json::Value::as_str) {
+        if let Ok(mut result) = result.lock() {
+            result.error = Some(error.to_owned());
+        }
+        return;
+    }
+    let transcript = value
+        .get("transcript")
+        .or_else(|| value.get("text"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .trim();
+    if transcript.is_empty() {
+        return;
+    }
+    let is_final = value
+        .get("end_of_turn")
+        .or_else(|| value.get("turn_is_formatted"))
+        .or_else(|| value.get("is_final"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if let Ok(mut result) = result.lock() {
+        if is_final {
+            result.latest_final = Some(transcript.to_owned());
+        } else {
+            result.latest_partial = Some(transcript.to_owned());
+        }
+    }
+}
+
+fn pcm_bytes(samples: &[i16]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(samples.len().saturating_mul(2));
+    for sample in samples {
+        bytes.extend_from_slice(&sample.to_le_bytes());
+    }
+    bytes
+}
+
 struct App {
     config: Config,
     http: Client,
@@ -393,7 +636,9 @@ struct TrayUi {
     cleanup_status_item: MenuItem,
     history_menu: Submenu,
     history_items: Vec<MenuItem>,
+    clear_history_item: MenuItem,
     language_items: Vec<(String, CheckMenuItem)>,
+    health_check_item: MenuItem,
     add_vocabulary_item: MenuItem,
     add_replacement_item: MenuItem,
     quit_item: MenuItem,
@@ -853,7 +1098,12 @@ impl App {
             }
             state.selected_microphone.clone()
         };
-        let mut recording = match start_recording(selected_microphone.as_deref()) {
+        let streaming = self.start_streaming_recording();
+        let streaming_sender = streaming
+            .as_ref()
+            .and_then(|recording| recording.sender.as_ref().cloned());
+        let mut recording = match start_recording(selected_microphone.as_deref(), streaming_sender)
+        {
             Ok(recording) => recording,
             Err(error) => {
                 let mut state = self.lock_state()?;
@@ -865,6 +1115,7 @@ impl App {
                 return Err(error);
             }
         };
+        recording.streaming = streaming;
         recording.warmup = self.start_dictation_warmup();
         {
             let mut state = self.lock_state()?;
@@ -973,7 +1224,23 @@ impl App {
         );
         metrics.outcome = "stt_failed";
         let stt_started = Instant::now();
-        let raw = self.transcribe(&wav, &recording.warmup)?;
+        let raw = if let Some(streaming) = recording.streaming {
+            streaming.finish().unwrap_or_else(|| {
+                warn!("[stt] streaming_empty_fallback");
+                self.transcribe(&wav, &recording.warmup)
+                    .unwrap_or_else(|error| {
+                        warn!("batch fallback after streaming failed: {error}");
+                        String::new()
+                    })
+            })
+        } else {
+            self.transcribe(&wav, &recording.warmup)?
+        };
+        if raw.trim().is_empty() {
+            return Err(AppError::Transcription(String::from(
+                "STT returned empty transcript",
+            )));
+        }
         metrics.stt_duration = Some(stt_started.elapsed());
         self.check_stt_language_latency(metrics.stt_duration);
         info!(
@@ -1087,6 +1354,22 @@ impl App {
             .stt_language()
             .unwrap_or_else(|_| self.config.stt_language.clone());
         SttRequestParts::new(&self.config.stt_model, &language, &vocabulary)
+    }
+
+    fn start_streaming_recording(&self) -> Option<StreamingRecording> {
+        let StreamingProvider::AssemblyAi = self.config.streaming_stt?;
+        let api_key = match load_env_value("ASSEMBLYAI_API_KEY") {
+            Some(key) => key,
+            None => {
+                warn!("[stt] streaming disabled because ASSEMBLYAI_API_KEY is missing");
+                return None;
+            }
+        };
+        let language = self
+            .stt_language()
+            .unwrap_or_else(|_| self.config.stt_language.clone());
+        let vocabulary = self.vocabulary_snapshot().unwrap_or_default();
+        Some(StreamingRecording::start(api_key, language, vocabulary))
     }
 
     fn accessibility_context_for_cleanup(
@@ -1871,6 +2154,43 @@ impl App {
         Ok(())
     }
 
+    fn clear_transcript_history(&self) -> Result<(), AppError> {
+        {
+            let mut state = self.lock_state()?;
+            state.history.clear();
+            state.last_result = None;
+        }
+        #[cfg(not(test))]
+        save_transcript_history(&[])?;
+        self.send_user_event(UserEvent::HistoryChanged);
+        show_notification("Bolo", "Transcript history cleared.");
+        Ok(())
+    }
+
+    fn run_health_check(&self) {
+        let microphone_status = input_device_names()
+            .map(|devices| format!("{} mic(s)", devices.len()))
+            .unwrap_or_else(|error| format!("mic error: {error}"));
+        let language = self
+            .stt_language()
+            .unwrap_or_else(|_| self.config.stt_language.clone());
+        let history_count = self.history_entries().map_or(0, |history| history.len());
+        let streaming_status = match self.config.streaming_stt {
+            Some(StreamingProvider::AssemblyAi)
+                if load_env_value("ASSEMBLYAI_API_KEY").is_some() =>
+            {
+                "AssemblyAI streaming ready"
+            }
+            Some(StreamingProvider::AssemblyAi) => "AssemblyAI streaming missing key",
+            None => "Batch STT",
+        };
+        let message = format!(
+            "{microphone_status}. Language: {language}. STT: {streaming_status}. History: {history_count}."
+        );
+        info!("[health] {message}");
+        show_notification("Bolo Health Check", &message);
+    }
+
     fn lock_state(&self) -> Result<MutexGuard<'_, AppState>, AppError> {
         self.state
             .lock()
@@ -1995,6 +2315,7 @@ impl Config {
                 .unwrap_or_else(|| String::from("deepgram/nova-3")),
             stt_language: load_env_value("BOLO_STT_LANGUAGE")
                 .unwrap_or_else(|| String::from("en-US")),
+            streaming_stt: load_streaming_provider(),
             stt_fallbacks: load_stt_fallbacks(),
             microphone: load_env_value("BOLO_MICROPHONE"),
             replacements: load_replacements(),
@@ -2046,7 +2367,10 @@ impl SttFallback {
     }
 }
 
-fn start_recording(selected_microphone: Option<&str>) -> Result<ActiveRecording, AppError> {
+fn start_recording(
+    selected_microphone: Option<&str>,
+    streaming_sender: Option<mpsc::Sender<Vec<i16>>>,
+) -> Result<ActiveRecording, AppError> {
     let host = cpal::default_host();
     let device = select_input_device(&host, selected_microphone)?;
     let device_name = device_name(&device);
@@ -2063,9 +2387,27 @@ fn start_recording(selected_microphone: Option<&str>) -> Result<ActiveRecording,
         supported.sample_format()
     );
     let stream = match supported.sample_format() {
-        SampleFormat::I16 => build_stream::<i16>(&device, &config, channels, Arc::clone(&samples))?,
-        SampleFormat::F32 => build_stream::<f32>(&device, &config, channels, Arc::clone(&samples))?,
-        SampleFormat::U16 => build_stream::<u16>(&device, &config, channels, Arc::clone(&samples))?,
+        SampleFormat::I16 => build_stream::<i16>(
+            &device,
+            &config,
+            channels,
+            Arc::clone(&samples),
+            streaming_sender,
+        )?,
+        SampleFormat::F32 => build_stream::<f32>(
+            &device,
+            &config,
+            channels,
+            Arc::clone(&samples),
+            streaming_sender,
+        )?,
+        SampleFormat::U16 => build_stream::<u16>(
+            &device,
+            &config,
+            channels,
+            Arc::clone(&samples),
+            streaming_sender,
+        )?,
         other @ (SampleFormat::I8
         | SampleFormat::I24
         | SampleFormat::I32
@@ -2093,6 +2435,7 @@ fn start_recording(selected_microphone: Option<&str>) -> Result<ActiveRecording,
         started_at: Instant::now(),
         sample_rate: config.sample_rate,
         warmup: DictationWarmup::default(),
+        streaming: None,
     })
 }
 
@@ -2199,6 +2542,21 @@ fn create_tray_ui(app: &App) -> Result<TrayUi, AppError> {
         .append(&history_menu)
         .map_err(|error| AppError::MenuBar(error.to_string()))?;
 
+    let clear_history_item = MenuItem::with_id(
+        "clear-transcript-history",
+        "Clear Transcript History",
+        true,
+        None,
+    );
+    tray_menu
+        .append(&clear_history_item)
+        .map_err(|error| AppError::MenuBar(error.to_string()))?;
+
+    let health_check_item = MenuItem::with_id("health-check", "Run Health Check", true, None);
+    tray_menu
+        .append(&health_check_item)
+        .map_err(|error| AppError::MenuBar(error.to_string()))?;
+
     let language_menu = Submenu::new("Language", true);
     let selected_language = app.stt_language()?;
     let mut language_items = Vec::new();
@@ -2289,7 +2647,9 @@ fn create_tray_ui(app: &App) -> Result<TrayUi, AppError> {
         cleanup_status_item,
         history_menu,
         history_items: Vec::new(),
+        clear_history_item,
         language_items,
+        health_check_item,
         add_vocabulary_item,
         add_replacement_item,
         quit_item,
@@ -2311,6 +2671,16 @@ fn handle_menu_event(
     }
     if event_id == tray_ui.copy_last_item.id().as_ref() {
         copy_history_item(app, 0, HistoryCopyMode::Cleaned);
+        return;
+    }
+    if event_id == tray_ui.clear_history_item.id().as_ref() {
+        if let Err(error) = app.clear_transcript_history() {
+            warn!("history clear failed: {error}");
+        }
+        return;
+    }
+    if event_id == tray_ui.health_check_item.id().as_ref() {
+        app.run_health_check();
         return;
     }
     if event_id == tray_ui.add_vocabulary_item.id().as_ref() {
@@ -2619,17 +2989,37 @@ fn build_stream<T>(
     config: &StreamConfig,
     channels: usize,
     samples: Arc<Mutex<Vec<i16>>>,
+    streaming_sender: Option<mpsc::Sender<Vec<i16>>>,
 ) -> Result<Stream, AppError>
 where
     T: Sample + SizedSample,
     i16: FromSample<T>,
 {
+    let chunk_samples = usize::try_from(config.sample_rate / 10)
+        .map_err(|error| AppError::AudioStream(error.to_string()))?
+        .max(1);
+    let mut streaming_chunk = Vec::with_capacity(chunk_samples);
     device
         .build_input_stream(
             config,
             move |data: &[T], _info: &cpal::InputCallbackInfo| {
+                let mono = data
+                    .iter()
+                    .step_by(channels)
+                    .copied()
+                    .map(i16::from_sample)
+                    .collect::<Vec<_>>();
                 if let Ok(mut guard) = samples.try_lock() {
-                    guard.extend(data.iter().step_by(channels).copied().map(i16::from_sample));
+                    guard.extend(mono.iter().copied());
+                }
+                if let Some(sender) = streaming_sender.as_ref() {
+                    streaming_chunk.extend(mono);
+                    if streaming_chunk.len() >= chunk_samples {
+                        let chunk = std::mem::take(&mut streaming_chunk);
+                        if sender.send(chunk).is_err() {
+                            streaming_chunk.clear();
+                        }
+                    }
                 }
             },
             |error| {
@@ -3075,6 +3465,16 @@ fn stt_language_for_model(model: &str, configured_language: &str) -> Option<Stri
         };
     }
     Some(language.to_owned())
+}
+
+fn load_streaming_provider() -> Option<StreamingProvider> {
+    let value = load_env_value("BOLO_STT_STREAMING")
+        .or_else(|| load_env_value("BOLO_STREAMING_STT"))
+        .unwrap_or_else(|| String::from("off"));
+    match value.trim().to_ascii_lowercase().as_str() {
+        "assemblyai" | "assembly" | "on" | "true" | "1" => Some(StreamingProvider::AssemblyAi),
+        _ => None,
+    }
 }
 
 fn load_stt_fallbacks() -> Vec<SttFallback> {
@@ -3822,6 +4222,7 @@ mod tests {
             litellm_key: None,
             stt_model: String::from("deepgram/nova-3"),
             stt_language: String::from("en-US"),
+            streaming_stt: None,
             stt_fallbacks: vec![SttFallback::Telnyx(String::from(
                 "openai/whisper-large-v3-turbo",
             ))],
@@ -3845,6 +4246,7 @@ mod tests {
             litellm_key: None,
             stt_model: String::from("deepgram/nova-3"),
             stt_language: String::from("en-US"),
+            streaming_stt: None,
             stt_fallbacks: Vec::new(),
             microphone: None,
             replacements: Vec::new(),
@@ -3909,6 +4311,7 @@ mod tests {
                 litellm_key: None,
                 stt_model: String::from("deepgram/nova-3"),
                 stt_language: String::from("en-US"),
+                streaming_stt: None,
                 stt_fallbacks: Vec::new(),
                 microphone: None,
                 replacements: Vec::new(),
@@ -3941,6 +4344,7 @@ mod tests {
                 litellm_key: None,
                 stt_model: String::from("deepgram/nova-3"),
                 stt_language: String::from("en-US"),
+                streaming_stt: None,
                 stt_fallbacks: Vec::new(),
                 microphone: None,
                 replacements: Vec::new(),
@@ -3985,6 +4389,7 @@ mod tests {
                 litellm_key: None,
                 stt_model: String::from("deepgram/nova-3"),
                 stt_language: String::from("en-US"),
+                streaming_stt: None,
                 stt_fallbacks: Vec::new(),
                 microphone: None,
                 replacements: Vec::new(),
@@ -4024,6 +4429,7 @@ mod tests {
                 litellm_key: None,
                 stt_model: String::from("deepgram/nova-3"),
                 stt_language: String::from("en-US"),
+                streaming_stt: None,
                 stt_fallbacks: Vec::new(),
                 microphone: None,
                 replacements: Vec::new(),
@@ -4056,6 +4462,7 @@ mod tests {
                 litellm_key: None,
                 stt_model: String::from("deepgram/nova-3"),
                 stt_language: String::from("en-US"),
+                streaming_stt: None,
                 stt_fallbacks: Vec::new(),
                 microphone: None,
                 replacements: Vec::new(),
