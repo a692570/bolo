@@ -134,13 +134,13 @@ Supported fallback entries:
 
 Set `BOLO_STT_FALLBACKS=off` to fail fast instead of retrying when the primary model is rate limited. `BOLO_STT_FALLBACK_MODEL` still works for a single Telnyx fallback model.
 
-To try AssemblyAI streaming STT, set:
+To try streaming STT, set:
 
 ```bash
-export BOLO_STT_STREAMING="assemblyai"
+export BOLO_STT_STREAMING="deepgram"
 ```
 
-Streaming uses the existing Telnyx API key, starts sending audio while you speak, and falls back to the normal batch path if it does not produce a transcript quickly enough after release.
+Streaming uses the existing Telnyx API key, starts sending audio while you speak, and falls back to the normal batch path if it does not produce a transcript quickly enough after release. Supported values are `deepgram` for Nova-3 streaming and `assemblyai` for AssemblyAI Universal-Streaming through Telnyx.
 
 To keep dictated text on the clipboard after insertion, set:
 
@@ -164,7 +164,7 @@ export BOLO_LLM_CLEANUP="on"
 
 To disable LLM cleanup entirely, set `BOLO_LLM_CLEANUP="off"`.
 
-When LiteLLM is configured, Bolo uses `Kimi-K2.5` for cleanup. Without LiteLLM, it uses Telnyx `Qwen/Qwen3-235B-A22B` with thinking disabled. MiniMax is intentionally not used for cleanup because it can leak reasoning text into the output.
+When LiteLLM is configured, Bolo uses `Kimi-K2.5` for cleanup unless `BOLO_LLM_MODEL` is set. Without LiteLLM, it uses Telnyx `Qwen/Qwen3-235B-A22B` with thinking disabled. MiniMax is intentionally not used for cleanup because it can leak reasoning text into the output.
 
 When LLM cleanup runs, Bolo also reads the frontmost app and nearby cursor text through macOS Accessibility so cleanup can choose natural spacing, capitalization, and continuation. That context is used only for cleanup prompting.
 

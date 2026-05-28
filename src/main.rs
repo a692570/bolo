@@ -119,6 +119,7 @@ enum SttFallback {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum StreamingProvider {
     AssemblyAi,
+    Deepgram,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -205,6 +206,7 @@ struct StreamingRecording {
 struct StreamingTranscript {
     latest_partial: Option<String>,
     latest_final: Option<String>,
+    final_segments: Vec<String>,
     error: Option<String>,
 }
 
@@ -353,7 +355,12 @@ impl std::fmt::Debug for ActiveRecording {
 }
 
 impl StreamingRecording {
-    fn start(api_key: String, language: String, vocabulary: Vec<String>) -> Self {
+    fn start(
+        api_key: String,
+        provider: StreamingProvider,
+        language: String,
+        vocabulary: Vec<String>,
+    ) -> Self {
         let (sender, receiver) = mpsc::channel::<Vec<i16>>();
         let result = Arc::new(Mutex::new(StreamingTranscript::default()));
         let thread_result = Arc::clone(&result);
@@ -365,8 +372,9 @@ impl StreamingRecording {
                     .build()
                 {
                     Ok(runtime) => runtime.block_on(async move {
-                        if let Err(error) = run_telnyx_assemblyai_stream(
+                        if let Err(error) = run_telnyx_stream(
                             api_key,
+                            provider,
                             language,
                             vocabulary,
                             receiver,
@@ -426,14 +434,15 @@ impl StreamingRecording {
     }
 }
 
-async fn run_telnyx_assemblyai_stream(
+async fn run_telnyx_stream(
     api_key: String,
+    provider: StreamingProvider,
     language: String,
     vocabulary: Vec<String>,
     receiver: Receiver<Vec<i16>>,
     result: Arc<Mutex<StreamingTranscript>>,
 ) -> Result<(), String> {
-    let query = telnyx_assemblyai_stream_query(&language, &vocabulary);
+    let query = telnyx_stream_query(provider, &language, &vocabulary);
     let url = format!("{TELNYX_STT_STREAMING_ENDPOINT}?{query}");
     let mut request = url
         .into_client_request()
@@ -444,12 +453,8 @@ async fn run_telnyx_assemblyai_stream(
     let (socket, _response) = connect_async(request)
         .await
         .map_err(|error| error.to_string())?;
-    info!("[stt] streaming_connected telnyx_assemblyai");
+    info!("[stt] streaming_connected {}", provider.label());
     let (mut write, mut read) = socket.split();
-    write
-        .send(Message::Binary(streaming_wav_header(48_000).into()))
-        .await
-        .map_err(|error| error.to_string())?;
     let mut input_closed = false;
     let mut close_deadline = None;
     loop {
@@ -464,7 +469,17 @@ async fn run_telnyx_assemblyai_stream(
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => {
                     input_closed = true;
-                    close_deadline = Some(Instant::now() + Duration::from_millis(1_000));
+                    close_deadline = Some(Instant::now() + Duration::from_millis(1_500));
+                    if provider == StreamingProvider::Deepgram {
+                        if let Err(error) = write
+                            .send(Message::Text(
+                                String::from(r#"{"type":"CloseStream"}"#).into(),
+                            ))
+                            .await
+                        {
+                            warn!("streaming close failed: {error}");
+                        }
+                    }
                     break;
                 }
             }
@@ -491,14 +506,38 @@ async fn run_telnyx_assemblyai_stream(
     }
 }
 
-fn telnyx_assemblyai_stream_query(language: &str, _vocabulary: &[String]) -> String {
-    let mut params = vec![
-        String::from("transcription_engine=AssemblyAI"),
-        String::from("model=assemblyai%2Funiversal-streaming"),
-        String::from("input_format=wav"),
-    ];
+fn telnyx_stream_query(
+    provider: StreamingProvider,
+    language: &str,
+    vocabulary: &[String],
+) -> String {
+    let mut params = match provider {
+        StreamingProvider::AssemblyAi => vec![
+            String::from("transcription_engine=AssemblyAI"),
+            String::from("model=assemblyai%2Funiversal-streaming"),
+            String::from("input_format=linear16"),
+            String::from("sample_rate=48000"),
+        ],
+        StreamingProvider::Deepgram => vec![
+            String::from("transcription_engine=Deepgram"),
+            String::from("model=nova-3"),
+            String::from("input_format=linear16"),
+            String::from("sample_rate=48000"),
+            String::from("interim_results=true"),
+            String::from("endpointing=300"),
+        ],
+    };
     if !language.is_empty() && !language.eq_ignore_ascii_case("auto") {
         params.push(format!("language={}", query_escape(language)));
+    }
+    if provider == StreamingProvider::Deepgram && !vocabulary.is_empty() {
+        let keyterms = vocabulary
+            .iter()
+            .take(50)
+            .map(|term| query_escape(term))
+            .collect::<Vec<_>>()
+            .join(",");
+        params.push(format!("keyterm={keyterms}"));
     }
     params.join("&")
 }
@@ -519,9 +558,26 @@ fn update_streaming_transcript(result: &Arc<Mutex<StreamingTranscript>>, text: &
     let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
         return;
     };
-    if let Some(error) = value.get("error").and_then(serde_json::Value::as_str) {
+    let error = value
+        .get("error")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .or_else(|| {
+            value
+                .get("errors")
+                .and_then(serde_json::Value::as_array)
+                .map(|errors| {
+                    errors
+                        .iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                })
+                .filter(|errors| !errors.is_empty())
+        });
+    if let Some(error) = error {
         if let Ok(mut result) = result.lock() {
-            result.error = Some(error.to_owned());
+            result.error = Some(error);
         }
         return;
     }
@@ -542,7 +598,9 @@ fn update_streaming_transcript(result: &Arc<Mutex<StreamingTranscript>>, text: &
         .unwrap_or(false);
     if let Ok(mut result) = result.lock() {
         if is_final {
-            result.latest_final = Some(transcript.to_owned());
+            result.final_segments.push(transcript.to_owned());
+            result.latest_final = Some(result.final_segments.join(" "));
+            result.latest_partial = None;
         } else {
             result.latest_partial = Some(transcript.to_owned());
         }
@@ -554,26 +612,6 @@ fn pcm_bytes(samples: &[i16]) -> Vec<u8> {
     for sample in samples {
         bytes.extend_from_slice(&sample.to_le_bytes());
     }
-    bytes
-}
-
-fn streaming_wav_header(sample_rate: u32) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(44);
-    bytes.extend_from_slice(b"RIFF");
-    bytes.extend_from_slice(&u32::MAX.to_le_bytes());
-    bytes.extend_from_slice(b"WAVEfmt ");
-    bytes.extend_from_slice(&16_u32.to_le_bytes());
-    bytes.extend_from_slice(&1_u16.to_le_bytes());
-    bytes.extend_from_slice(&CHANNELS.to_le_bytes());
-    bytes.extend_from_slice(&sample_rate.to_le_bytes());
-    let byte_rate = sample_rate
-        .saturating_mul(u32::from(CHANNELS))
-        .saturating_mul(2);
-    bytes.extend_from_slice(&byte_rate.to_le_bytes());
-    bytes.extend_from_slice(&(CHANNELS.saturating_mul(2)).to_le_bytes());
-    bytes.extend_from_slice(&16_u16.to_le_bytes());
-    bytes.extend_from_slice(b"data");
-    bytes.extend_from_slice(&(u32::MAX - 36).to_le_bytes());
     bytes
 }
 
@@ -1369,13 +1407,15 @@ impl App {
     }
 
     fn start_streaming_recording(&self) -> Option<StreamingRecording> {
-        let StreamingProvider::AssemblyAi = self.config.streaming_stt?;
+        let provider = self.config.streaming_stt?;
         let api_key = self.config.telnyx_api_key.clone();
         let language = self
             .stt_language()
             .unwrap_or_else(|_| self.config.stt_language.clone());
         let vocabulary = self.vocabulary_snapshot().unwrap_or_default();
-        Some(StreamingRecording::start(api_key, language, vocabulary))
+        Some(StreamingRecording::start(
+            api_key, provider, language, vocabulary,
+        ))
     }
 
     fn accessibility_context_for_cleanup(
@@ -1973,6 +2013,9 @@ impl App {
         if final_text.is_empty() || is_known_no_speech_transcript(&final_text) {
             return Ok(DeferredCleanupOutcome::Skipped("empty_final_text"));
         }
+        if !valid_deferred_cleanup(&cleanup_input, &final_text) {
+            return Ok(DeferredCleanupOutcome::Skipped("low_quality_llm_output"));
+        }
         if final_text == pasted_text {
             return Ok(DeferredCleanupOutcome::Skipped("unchanged"));
         }
@@ -2183,6 +2226,7 @@ impl App {
         let history_count = self.history_entries().map_or(0, |history| history.len());
         let streaming_status = match self.config.streaming_stt {
             Some(StreamingProvider::AssemblyAi) => "AssemblyAI streaming via Telnyx",
+            Some(StreamingProvider::Deepgram) => "Deepgram streaming via Telnyx",
             None => "Batch STT",
         };
         let message = format!(
@@ -2349,6 +2393,9 @@ impl Config {
     }
 
     fn llm_model(&self) -> String {
+        if let Some(model) = load_env_value("BOLO_LLM_MODEL") {
+            return model;
+        }
         if self.litellm_base.is_some() {
             String::from("Kimi-K2.5")
         } else {
@@ -2364,6 +2411,15 @@ impl SttFallback {
             Self::Xai => String::from("xai"),
             Self::AssemblyAi(Some(model)) => format!("assemblyai:{model}"),
             Self::AssemblyAi(None) => String::from("assemblyai"),
+        }
+    }
+}
+
+impl StreamingProvider {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::AssemblyAi => "telnyx_assemblyai",
+            Self::Deepgram => "telnyx_deepgram",
         }
     }
 }
@@ -3159,7 +3215,7 @@ fn canonicalize_known_terms(text: &str) -> String {
         ),
         (r"(?i)\btenley'?s\b|\btelnyx'?s\b", "Telnyx's"),
         (
-            r"(?i)\btelnyx\b|\btelenix\b|\btennix\b|\btenlex\b|\btenlix\b|\btelx\b",
+            r"(?i)\btelnyx\b|\btelenix\b|\btelenex\b|\btelenyx\b|\btennix\b|\btenlex\b|\btenlix\b|\btelx\b",
             "Telnyx",
         ),
         (r"(?i)\bbolo\b|\bbollo\b|\bboro\b", "Bolo"),
@@ -3173,6 +3229,7 @@ fn canonicalize_known_terms(text: &str) -> String {
             "Claude $1",
         ),
         (r"(?i)\bchrome\b|\bcrone\b|\bcrohn\b", "cron"),
+        (r"(?i)\bspending for us\b", "pending for us"),
         (r"(?i)\bremotion\b|\bemotion\b|\bemotions\b", "Remotion"),
         (r"(?i)\bnova[ -]three\b|\bnova 3\b", "nova-3"),
         (r"(?i)\bquen\b|\bqueue when\b|\bkyuen\b|\bkwan\b", "Qwen"),
@@ -3390,7 +3447,24 @@ fn has_terminal_punctuation(transcript: &str) -> bool {
 
 fn cleanup_max_tokens(transcript: &str) -> u16 {
     let word_count = transcript.split_whitespace().count().max(1);
-    ((word_count * 8).clamp(600, 1_200)) as u16
+    ((word_count * 12).clamp(1_200, 3_000)) as u16
+}
+
+fn valid_deferred_cleanup(input: &str, output: &str) -> bool {
+    let input_words = input.split_whitespace().count();
+    let output_words = output.split_whitespace().count();
+    if output_words == 0 {
+        return false;
+    }
+    if input_words >= 6 && output_words < 3 {
+        return false;
+    }
+    let input_chars = input.trim().chars().count();
+    let output_chars = output.trim().chars().count();
+    if input_chars >= 40 && output_chars.saturating_mul(3) < input_chars {
+        return false;
+    }
+    true
 }
 
 fn cleanup_profile(context: Option<&AccessibilityContext>) -> CleanupProfile {
@@ -3474,6 +3548,7 @@ fn load_streaming_provider() -> Option<StreamingProvider> {
         .unwrap_or_else(|| String::from("off"));
     match value.trim().to_ascii_lowercase().as_str() {
         "assemblyai" | "assembly" | "on" | "true" | "1" => Some(StreamingProvider::AssemblyAi),
+        "deepgram" | "nova-3" | "nova3" => Some(StreamingProvider::Deepgram),
         _ => None,
     }
 }
@@ -4114,13 +4189,13 @@ fn app_root_dir() -> Result<PathBuf, AppError> {
 mod tests {
     use super::{
         AccessibilityContext, App, AppError, AppState, CleanupMode, CleanupProfile, Config,
-        DictationCommandKind, DictationWarmup, SttFallback, TRANSCRIPT_HISTORY_LIMIT,
-        TextReplacement, TranscriptHistoryEntry, apply_text_replacements,
+        DictationCommandKind, DictationWarmup, StreamingProvider, SttFallback,
+        TRANSCRIPT_HISTORY_LIMIT, TextReplacement, TranscriptHistoryEntry, apply_text_replacements,
         build_cleanup_user_content, build_stt_prompt, canonicalize_known_terms, cleanup_decision,
         cleanup_max_tokens, cleanup_profile, is_known_no_speech_transcript, parse_command,
         parse_stt_fallbacks, remove_fillers, sanitize_transcript_history, speech_stats,
-        strip_reasoning_tags, stt_language_for_model, stt_model_config, transcript_menu_preview,
-        wav_bytes,
+        strip_reasoning_tags, stt_language_for_model, stt_model_config, telnyx_stream_query,
+        transcript_menu_preview, valid_deferred_cleanup, wav_bytes,
     };
     use std::collections::VecDeque;
     use std::path::PathBuf;
@@ -4168,6 +4243,10 @@ mod tests {
         assert_eq!(
             accent_terms,
             "Bolo heard Claude doc cron and ClawdTalk as cron"
+        );
+        assert_eq!(
+            canonicalize_known_terms("telenex has spending for us"),
+            "Telnyx has pending for us"
         );
 
         assert_eq!(
@@ -4274,8 +4353,36 @@ mod tests {
 
     #[test]
     fn cleanup_token_limit_scales_with_input() {
-        assert_eq!(cleanup_max_tokens("short text"), 600);
-        assert_eq!(cleanup_max_tokens(&"word ".repeat(200)), 1_200);
+        assert_eq!(cleanup_max_tokens("short text"), 1_200);
+        assert_eq!(cleanup_max_tokens(&"word ".repeat(400)), 3_000);
+    }
+
+    #[test]
+    fn builds_telnyx_stream_queries() {
+        let vocabulary = vec![String::from("Telnyx"), String::from("Claude Code")];
+        let deepgram = telnyx_stream_query(StreamingProvider::Deepgram, "en-US", &vocabulary);
+        assert!(deepgram.contains("transcription_engine=Deepgram"));
+        assert!(deepgram.contains("input_format=linear16"));
+        assert!(deepgram.contains("sample_rate=48000"));
+        assert!(deepgram.contains("interim_results=true"));
+        assert!(deepgram.contains("keyterm=Telnyx,Claude%20Code"));
+
+        let assembly = telnyx_stream_query(StreamingProvider::AssemblyAi, "auto", &vocabulary);
+        assert!(assembly.contains("model=assemblyai%2Funiversal-streaming"));
+        assert!(assembly.contains("input_format=linear16"));
+        assert!(!assembly.contains("keyterm="));
+    }
+
+    #[test]
+    fn rejects_bad_deferred_cleanup_outputs() {
+        assert!(!valid_deferred_cleanup(
+            "This is a longer dictated sentence that should not become one letter.",
+            "I"
+        ));
+        assert!(valid_deferred_cleanup(
+            "This is a longer dictated sentence that needs cleanup.",
+            "This is a longer dictated sentence that needs cleanup."
+        ));
     }
 
     #[test]
