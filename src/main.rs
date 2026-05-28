@@ -56,6 +56,10 @@ const RECORDING_WATCHDOG_INTERVAL: Duration = Duration::from_secs(5);
 const RECORDING_STALE_SECONDS: u64 = 30;
 const SPEECH_RMS_THRESHOLD: f32 = 0.006;
 const SPEECH_FRAME_MS: usize = 20;
+const STREAMING_DRAIN_MIN: Duration = Duration::from_millis(450);
+const STREAMING_DRAIN_MAX: Duration = Duration::from_millis(1_600);
+const STREAMING_TRAILING_SILENCE_MS: usize = 350;
+const STREAMING_SAMPLE_RATE: u32 = 48_000;
 
 #[derive(Debug, Error)]
 enum AppError {
@@ -401,36 +405,70 @@ impl StreamingRecording {
 
     fn finish(mut self) -> Option<String> {
         drop(self.sender.take());
-        let deadline = Instant::now() + Duration::from_millis(1_200);
+        let started = Instant::now();
+        let deadline = started + STREAMING_DRAIN_MAX;
+        let mut best = String::new();
         while Instant::now() < deadline {
             match self.result.lock() {
                 Ok(result) => {
-                    if let Some(text) = result.latest_final.as_ref().filter(|text| !text.is_empty())
-                    {
-                        return Some(text.clone());
+                    if let Some(text) = best_streaming_text(&result) {
+                        if text.chars().count() > best.chars().count() {
+                            best = text;
+                        }
+                        if started.elapsed() >= STREAMING_DRAIN_MIN
+                            && result.latest_final.is_some()
+                            && result.latest_partial.is_none()
+                        {
+                            info!(
+                                "[stt] streaming_result {}",
+                                serde_json::json!({
+                                    "chars": best.chars().count(),
+                                    "drain_ms": started.elapsed().as_millis(),
+                                    "source": "final",
+                                })
+                            );
+                            return Some(best);
+                        }
                     }
                     if let Some(error) = result.error.as_ref() {
                         warn!("streaming STT result error: {error}");
-                        return None;
+                        break;
                     }
                 }
                 Err(error) => {
                     warn!("streaming result read failed: {error}");
-                    return None;
+                    break;
                 }
             }
             std::thread::sleep(Duration::from_millis(25));
         }
-        match self.result.lock() {
-            Ok(result) => result
-                .latest_partial
-                .clone()
-                .filter(|text| !text.is_empty()),
-            Err(error) => {
-                warn!("streaming result read failed: {error}");
-                None
-            }
+        if best.is_empty() {
+            None
+        } else {
+            info!(
+                "[stt] streaming_result {}",
+                serde_json::json!({
+                    "chars": best.chars().count(),
+                    "drain_ms": started.elapsed().as_millis(),
+                    "source": "best_available",
+                })
+            );
+            Some(best)
         }
+    }
+}
+
+fn best_streaming_text(result: &StreamingTranscript) -> Option<String> {
+    let final_text = result.latest_final.as_deref().unwrap_or_default().trim();
+    let partial_text = result.latest_partial.as_deref().unwrap_or_default().trim();
+    match (final_text.is_empty(), partial_text.is_empty()) {
+        (true, true) => None,
+        (false, true) => Some(final_text.to_owned()),
+        (true, false) => Some(partial_text.to_owned()),
+        (false, false) if partial_text.chars().count() > final_text.chars().count() => {
+            Some(partial_text.to_owned())
+        }
+        (false, false) => Some(final_text.to_owned()),
     }
 }
 
@@ -471,6 +509,18 @@ async fn run_telnyx_stream(
                     input_closed = true;
                     close_deadline = Some(Instant::now() + Duration::from_millis(1_500));
                     if provider == StreamingProvider::Deepgram {
+                        let silence_samples = usize::try_from(STREAMING_SAMPLE_RATE)
+                            .unwrap_or(48_000)
+                            .saturating_mul(STREAMING_TRAILING_SILENCE_MS)
+                            / 1_000;
+                        if let Err(error) = write
+                            .send(Message::Binary(
+                                pcm_bytes(&vec![0_i16; silence_samples]).into(),
+                            ))
+                            .await
+                        {
+                            warn!("streaming trailing silence failed: {error}");
+                        }
                         if let Err(error) = write
                             .send(Message::Text(
                                 String::from(r#"{"type":"CloseStream"}"#).into(),
@@ -516,13 +566,13 @@ fn telnyx_stream_query(
             String::from("transcription_engine=AssemblyAI"),
             String::from("model=assemblyai%2Funiversal-streaming"),
             String::from("input_format=linear16"),
-            String::from("sample_rate=48000"),
+            format!("sample_rate={STREAMING_SAMPLE_RATE}"),
         ],
         StreamingProvider::Deepgram => vec![
             String::from("transcription_engine=Deepgram"),
             String::from("model=nova-3"),
             String::from("input_format=linear16"),
-            String::from("sample_rate=48000"),
+            format!("sample_rate={STREAMING_SAMPLE_RATE}"),
             String::from("interim_results=true"),
             String::from("endpointing=300"),
         ],
@@ -3052,7 +3102,7 @@ where
     T: Sample + SizedSample,
     i16: FromSample<T>,
 {
-    let chunk_samples = usize::try_from(config.sample_rate / 10)
+    let chunk_samples = usize::try_from(config.sample_rate / 50)
         .map_err(|error| AppError::AudioStream(error.to_string()))?
         .max(1);
     let mut streaming_chunk = Vec::with_capacity(chunk_samples);
@@ -4189,7 +4239,7 @@ fn app_root_dir() -> Result<PathBuf, AppError> {
 mod tests {
     use super::{
         AccessibilityContext, App, AppError, AppState, CleanupMode, CleanupProfile, Config,
-        DictationCommandKind, DictationWarmup, StreamingProvider, SttFallback,
+        DictationCommandKind, DictationWarmup, StreamingProvider, StreamingTranscript, SttFallback,
         TRANSCRIPT_HISTORY_LIMIT, TextReplacement, TranscriptHistoryEntry, apply_text_replacements,
         build_cleanup_user_content, build_stt_prompt, canonicalize_known_terms, cleanup_decision,
         cleanup_max_tokens, cleanup_profile, is_known_no_speech_transcript, parse_command,
@@ -4371,6 +4421,21 @@ mod tests {
         assert!(assembly.contains("model=assemblyai%2Funiversal-streaming"));
         assert!(assembly.contains("input_format=linear16"));
         assert!(!assembly.contains("keyterm="));
+    }
+
+    #[test]
+    fn streaming_text_prefers_longer_partial_tail() {
+        let transcript = StreamingTranscript {
+            latest_final: Some(String::from("Investigate why this is")),
+            latest_partial: Some(String::from(
+                "Investigate why this is like a streaming issue or some config that we tweaked",
+            )),
+            ..StreamingTranscript::default()
+        };
+        assert_eq!(
+            super::best_streaming_text(&transcript).as_deref(),
+            Some("Investigate why this is like a streaming issue or some config that we tweaked")
+        );
     }
 
     #[test]
