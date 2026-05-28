@@ -83,6 +83,7 @@ struct Config {
     litellm_base: Option<String>,
     litellm_key: Option<String>,
     stt_model: String,
+    stt_language: String,
     stt_fallbacks: Vec<SttFallback>,
     microphone: Option<String>,
     root_dir: PathBuf,
@@ -142,6 +143,7 @@ struct AppState {
     correction_until: Option<Instant>,
     history: VecDeque<String>,
     selected_microphone: Option<String>,
+    selected_language: Option<String>,
     cleanup_status: Option<String>,
 }
 
@@ -209,16 +211,16 @@ struct SttRequestParts {
     primary_model: String,
     model_config: Option<serde_json::Value>,
     prompt: Option<String>,
-    include_language: bool,
+    language: Option<String>,
 }
 
 impl SttRequestParts {
-    fn new(primary_model: &str, vocabulary: &[String]) -> Self {
+    fn new(primary_model: &str, configured_language: &str, vocabulary: &[String]) -> Self {
         Self {
             primary_model: primary_model.to_owned(),
             model_config: stt_model_config(primary_model, vocabulary),
             prompt: build_stt_prompt(vocabulary),
-            include_language: stt_include_language(primary_model),
+            language: stt_language_for_model(primary_model, configured_language),
         }
     }
 }
@@ -300,7 +302,7 @@ impl std::fmt::Debug for ActiveRecording {
 struct App {
     config: Config,
     http: Client,
-    vocabulary: Vec<String>,
+    vocabulary: Mutex<Vec<String>>,
     state: Mutex<AppState>,
     event_proxy: Mutex<Option<EventLoopProxy<UserEvent>>>,
 }
@@ -310,7 +312,10 @@ impl std::fmt::Debug for App {
         formatter
             .debug_struct("App")
             .field("config", &self.config)
-            .field("vocabulary_count", &self.vocabulary.len())
+            .field(
+                "vocabulary_count",
+                &self.vocabulary_snapshot().map_or(0, |items| items.len()),
+            )
             .field("replacement_count", &self.config.replacements.len())
             .finish_non_exhaustive()
     }
@@ -365,6 +370,8 @@ struct TrayUi {
     cleanup_status_item: MenuItem,
     history_menu: Submenu,
     history_items: Vec<MenuItem>,
+    language_items: Vec<(String, CheckMenuItem)>,
+    add_vocabulary_item: MenuItem,
     quit_item: MenuItem,
 }
 
@@ -795,16 +802,18 @@ impl App {
         let root_dir = app_root_dir()?;
         let config = Config::load(root_dir)?;
         let selected_microphone = config.microphone.clone();
+        let selected_language = Some(config.stt_language.clone());
         let vocabulary = load_vocabulary(&config.root_dir);
         let history = load_transcript_history();
         let http = Client::builder().timeout(Duration::from_secs(12)).build()?;
         Ok(Self {
             config,
             http,
-            vocabulary,
+            vocabulary: Mutex::new(vocabulary),
             state: Mutex::new(AppState {
                 history,
                 selected_microphone,
+                selected_language,
                 ..AppState::default()
             }),
             event_proxy: Mutex::new(None),
@@ -1006,14 +1015,17 @@ impl App {
         let warmup = DictationWarmup::default();
         let root_dir = self.config.root_dir.clone();
         let primary_model = self.config.stt_model.clone();
-        let vocabulary = self.vocabulary.clone();
+        let vocabulary = self.vocabulary_snapshot().unwrap_or_default();
+        let stt_language = self
+            .stt_language()
+            .unwrap_or_else(|_| self.config.stt_language.clone());
         let accessibility_context = Arc::clone(&warmup.accessibility_context);
         let stt_request = Arc::clone(&warmup.stt_request);
         if let Err(error) = std::thread::Builder::new()
             .name(String::from("bolo-warmup"))
             .spawn(move || {
                 let started = Instant::now();
-                let request = SttRequestParts::new(&primary_model, &vocabulary);
+                let request = SttRequestParts::new(&primary_model, &stt_language, &vocabulary);
                 match stt_request.lock() {
                     Ok(mut slot) => *slot = WarmupValue::Ready(Some(request)),
                     Err(error) => warn!("STT warmup mutex was poisoned: {error}"),
@@ -1045,7 +1057,11 @@ impl App {
             return request;
         }
         info!("[warmup] stt_request_not_ready");
-        SttRequestParts::new(&self.config.stt_model, &self.vocabulary)
+        let vocabulary = self.vocabulary_snapshot().unwrap_or_default();
+        let language = self
+            .stt_language()
+            .unwrap_or_else(|_| self.config.stt_language.clone());
+        SttRequestParts::new(&self.config.stt_model, &language, &vocabulary)
     }
 
     fn accessibility_context_for_cleanup(
@@ -1077,7 +1093,7 @@ impl App {
             &request.primary_model,
             request.model_config.as_ref(),
             request.prompt.as_deref(),
-            request.include_language,
+            request.language.as_deref(),
         ) {
             Ok(transcript) => Ok(transcript),
             Err(AppError::RateLimited) => {
@@ -1092,7 +1108,7 @@ impl App {
                     &request.primary_model,
                     request.model_config.as_ref(),
                     request.prompt.as_deref(),
-                    request.include_language,
+                    request.language.as_deref(),
                 )
             }
             Err(error) => Err(error),
@@ -1132,9 +1148,15 @@ impl App {
             SttFallback::Telnyx(model) => self.transcribe_with_model(
                 wav,
                 model,
-                stt_model_config(model, &self.vocabulary).as_ref(),
+                stt_model_config(model, &self.vocabulary_snapshot().unwrap_or_default()).as_ref(),
                 prompt,
-                stt_include_language(model),
+                stt_language_for_model(
+                    model,
+                    &self
+                        .stt_language()
+                        .unwrap_or_else(|_| self.config.stt_language.clone()),
+                )
+                .as_deref(),
             ),
             SttFallback::Xai => self.transcribe_with_xai(wav),
             SttFallback::AssemblyAi(model) => {
@@ -1149,14 +1171,14 @@ impl App {
         model: &str,
         model_config: Option<&serde_json::Value>,
         prompt: Option<&str>,
-        include_language: bool,
+        language: Option<&str>,
     ) -> Result<String, AppError> {
         info!(
             "[stt] request {}",
             serde_json::json!({
                 "endpoint": TELNYX_STT_ENDPOINT,
                 "model": model,
-                "language": if include_language { Some("en") } else { None },
+                "language": language,
                 "audio_mime": "audio/wav",
                 "audio_bytes": wav.len(),
                 "model_config": model_config,
@@ -1169,8 +1191,8 @@ impl App {
         let mut form = multipart::Form::new()
             .text("model", model.to_owned())
             .part("file", part);
-        if include_language {
-            form = form.text("language", String::from("en"));
+        if let Some(language) = language {
+            form = form.text("language", language.to_owned());
         }
         if let Some(model_config) = model_config {
             form = form.text("model_config", serde_json::to_string(model_config)?);
@@ -1224,21 +1246,25 @@ impl App {
     fn transcribe_with_xai(&self, wav: &[u8]) -> Result<String, AppError> {
         let api_key =
             load_env_value("XAI_API_KEY").ok_or(AppError::MissingConfig("XAI_API_KEY"))?;
+        let language = self
+            .stt_language()
+            .unwrap_or_else(|_| self.config.stt_language.clone());
+        let keyterms = self.vocabulary_snapshot().unwrap_or_default();
         info!(
             "[stt] request {}",
             serde_json::json!({
                 "endpoint": XAI_STT_ENDPOINT,
                 "provider": "xai",
-                "language": "en",
+                "language": &language,
                 "audio_mime": "audio/wav",
                 "audio_bytes": wav.len(),
-                "keyterms": self.vocabulary.iter().take(100).collect::<Vec<_>>()
+                "keyterms": keyterms.iter().take(100).collect::<Vec<_>>()
             })
         );
         let mut form = multipart::Form::new()
             .text("format", String::from("true"))
-            .text("language", String::from("en"));
-        for term in self.vocabulary.iter().take(100) {
+            .text("language", language);
+        for term in keyterms.iter().take(100) {
             form = form.text("keyterm", term.clone());
         }
         let part = multipart::Part::bytes(wav.to_vec())
@@ -1811,12 +1837,62 @@ impl App {
         Ok(state.selected_microphone.clone())
     }
 
+    fn stt_language(&self) -> Result<String, AppError> {
+        let state = self.lock_state()?;
+        Ok(state
+            .selected_language
+            .clone()
+            .unwrap_or_else(|| self.config.stt_language.clone()))
+    }
+
+    fn vocabulary_snapshot(&self) -> Result<Vec<String>, AppError> {
+        self.vocabulary
+            .lock()
+            .map(|terms| terms.clone())
+            .map_err(|error| AppError::PoisonedMutex(error.to_string()))
+    }
+
     fn set_microphone(&self, microphone: &str) -> Result<(), AppError> {
         let mut state = self.lock_state()?;
         state.selected_microphone = Some(microphone.to_owned());
         drop(state);
         info!("selected microphone: {microphone}");
         Ok(())
+    }
+
+    fn set_stt_language(&self, language: &str) -> Result<(), AppError> {
+        let language = language.trim();
+        if language.is_empty() {
+            return Ok(());
+        }
+        write_bolo_env_value("BOLO_STT_LANGUAGE", language)?;
+        let mut state = self.lock_state()?;
+        state.selected_language = Some(language.to_owned());
+        drop(state);
+        info!("selected STT language: {language}");
+        Ok(())
+    }
+
+    fn add_vocabulary_term(&self, term: &str) -> Result<bool, AppError> {
+        let term = term.trim();
+        if term.is_empty() {
+            return Ok(false);
+        }
+        let added = add_personal_vocabulary_term(term)?;
+        if added {
+            let mut vocabulary = self
+                .vocabulary
+                .lock()
+                .map_err(|error| AppError::PoisonedMutex(error.to_string()))?;
+            let key = term.to_ascii_lowercase();
+            if !vocabulary
+                .iter()
+                .any(|existing| existing.to_ascii_lowercase() == key)
+            {
+                vocabulary.push(term.to_owned());
+            }
+        }
+        Ok(added)
     }
 }
 
@@ -1840,6 +1916,8 @@ impl Config {
             litellm_key: load_env_value("LITELLM_KEY"),
             stt_model: load_env_value("BOLO_STT_MODEL")
                 .unwrap_or_else(|| String::from("deepgram/nova-3")),
+            stt_language: load_env_value("BOLO_STT_LANGUAGE")
+                .unwrap_or_else(|| String::from("en-US")),
             stt_fallbacks: load_stt_fallbacks(),
             microphone: load_env_value("BOLO_MICROPHONE"),
             replacements: load_replacements(),
@@ -2044,6 +2122,37 @@ fn create_tray_ui(app: &App) -> Result<TrayUi, AppError> {
         .append(&history_menu)
         .map_err(|error| AppError::MenuBar(error.to_string()))?;
 
+    let language_menu = Submenu::new("Language", true);
+    let selected_language = app.stt_language()?;
+    let mut language_items = Vec::new();
+    for (language, label) in [
+        ("en-IN", "English, India"),
+        ("en-US", "English, US"),
+        ("en-GB", "English, UK"),
+        ("auto", "Auto detect"),
+    ] {
+        let item = CheckMenuItem::with_id(
+            MenuId::new(format!("language:{language}")),
+            label,
+            true,
+            selected_language.eq_ignore_ascii_case(language),
+            None,
+        );
+        language_menu
+            .append(&item)
+            .map_err(|error| AppError::MenuBar(error.to_string()))?;
+        language_items.push((language.to_owned(), item));
+    }
+    tray_menu
+        .append(&language_menu)
+        .map_err(|error| AppError::MenuBar(error.to_string()))?;
+
+    let add_vocabulary_item =
+        MenuItem::with_id("add-vocabulary-term", "Add Vocabulary Term...", true, None);
+    tray_menu
+        .append(&add_vocabulary_item)
+        .map_err(|error| AppError::MenuBar(error.to_string()))?;
+
     let microphone_menu = Submenu::new("Microphone", true);
     let selected_microphone = app.selected_microphone()?;
     let devices = input_device_names()?;
@@ -2097,6 +2206,8 @@ fn create_tray_ui(app: &App) -> Result<TrayUi, AppError> {
         cleanup_status_item,
         history_menu,
         history_items: Vec::new(),
+        language_items,
+        add_vocabulary_item,
         quit_item,
     };
     update_history_menu(app, &mut ui)?;
@@ -2118,11 +2229,29 @@ fn handle_menu_event(
         copy_history_item(app, 0);
         return;
     }
+    if event_id == tray_ui.add_vocabulary_item.id().as_ref() {
+        add_vocabulary_from_menu(app);
+        return;
+    }
     if let Some(index) = event_id
         .strip_prefix("transcript-history:")
         .and_then(|value| value.parse::<usize>().ok())
     {
         copy_history_item(app, index);
+        return;
+    }
+    if let Some((language, _)) = tray_ui
+        .language_items
+        .iter()
+        .find(|(_, item)| event_id == item.id().as_ref())
+    {
+        if let Err(error) = app.set_stt_language(language) {
+            error!("{error}");
+            return;
+        }
+        for (candidate, item) in &tray_ui.language_items {
+            item.set_checked(candidate == language);
+        }
         return;
     }
     if let Some((selected_name, _)) = tray_ui
@@ -2195,6 +2324,28 @@ fn copy_history_item(app: &App, index: usize) {
         return;
     }
     info!("copied transcript history item {index}");
+}
+
+fn add_vocabulary_from_menu(app: &App) {
+    let term = match prompt_for_text(
+        "Add Vocabulary Term",
+        "Enter a name, acronym, product, or phrase Bolo should preserve.",
+    ) {
+        Ok(Some(term)) => term,
+        Ok(None) => return,
+        Err(error) => {
+            warn!("vocabulary prompt failed: {error}");
+            return;
+        }
+    };
+    match app.add_vocabulary_term(&term) {
+        Ok(true) => {
+            info!("added vocabulary term");
+            show_notification("Bolo", "Vocabulary term added.");
+        }
+        Ok(false) => show_notification("Bolo", "That vocabulary term is already saved."),
+        Err(error) => warn!("vocabulary term save failed: {error}"),
+    }
 }
 
 fn show_native_overlay(
@@ -2756,8 +2907,23 @@ fn stt_model_config(model: &str, vocabulary: &[String]) -> Option<serde_json::Va
     }))
 }
 
-fn stt_include_language(model: &str) -> bool {
-    model == "deepgram/nova-3"
+fn stt_language_for_model(model: &str, configured_language: &str) -> Option<String> {
+    let language = configured_language.trim();
+    if language.is_empty()
+        || language.eq_ignore_ascii_case("off")
+        || language.eq_ignore_ascii_case("none")
+        || language.eq_ignore_ascii_case("false")
+    {
+        return None;
+    }
+    if language.eq_ignore_ascii_case("auto") || language.eq_ignore_ascii_case("auto_detect") {
+        return if model == "deepgram/nova-3" {
+            Some(String::from("multi"))
+        } else {
+            None
+        };
+    }
+    Some(language.to_owned())
 }
 
 fn load_stt_fallbacks() -> Vec<SttFallback> {
@@ -2856,25 +3022,25 @@ fn build_cleanup_user_content(transcript: &str, context: Option<&AccessibilityCo
         return transcript.to_owned();
     }
 
-    let mut content = String::new();
+    let mut prompt_text = String::new();
     if !app_name.is_empty() {
-        content.push_str("Frontmost app: ");
-        content.push_str(app_name);
-        content.push('\n');
+        prompt_text.push_str("Frontmost app: ");
+        prompt_text.push_str(app_name);
+        prompt_text.push('\n');
     }
     if !bundle_id.is_empty() {
-        content.push_str("Frontmost bundle id: ");
-        content.push_str(bundle_id);
-        content.push('\n');
+        prompt_text.push_str("Frontmost bundle id: ");
+        prompt_text.push_str(bundle_id);
+        prompt_text.push('\n');
     }
     if !text_before_cursor.is_empty() {
-        content.push_str("Text before cursor, last 500 chars:\n");
-        content.push_str(text_before_cursor);
-        content.push_str("\n\nUse this cursor context only to choose capitalization, punctuation, and natural continuation. Do not repeat text that is already before the cursor.\n");
+        prompt_text.push_str("Text before cursor, last 500 chars:\n");
+        prompt_text.push_str(text_before_cursor);
+        prompt_text.push_str("\n\nUse this cursor context only to choose capitalization, punctuation, and natural continuation. Do not repeat text that is already before the cursor.\n");
     }
-    content.push_str("Transcript:\n");
-    content.push_str(transcript);
-    content
+    prompt_text.push_str("Transcript:\n");
+    prompt_text.push_str(transcript);
+    prompt_text
 }
 
 fn read_accessibility_context(root_dir: &Path) -> Option<AccessibilityContext> {
@@ -2957,6 +3123,38 @@ fn read_vocabulary_file(path: &Path) -> Option<Vec<String>> {
             .filter(|term| !term.is_empty())
             .collect(),
     )
+}
+
+fn add_personal_vocabulary_term(term: &str) -> Result<bool, AppError> {
+    let term = term.trim();
+    if term.is_empty() {
+        return Ok(false);
+    }
+    let path = home_path(".bolo_vocabulary.json");
+    let mut terms = read_vocabulary_file(&path).unwrap_or_default();
+    let key = term.to_ascii_lowercase();
+    if terms
+        .iter()
+        .any(|existing| existing.to_ascii_lowercase() == key)
+    {
+        return Ok(false);
+    }
+    terms.push(term.to_owned());
+    save_vocabulary_file(&path, &terms)?;
+    Ok(true)
+}
+
+fn save_vocabulary_file(path: &Path, terms: &[String]) -> Result<(), AppError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    let text = serde_json::to_string_pretty(terms)?;
+    fs::write(&tmp, format!("{text}\n"))?;
+    #[cfg(unix)]
+    fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))?;
+    fs::rename(tmp, path)?;
+    Ok(())
 }
 
 fn load_replacements() -> Vec<TextReplacement> {
@@ -3112,6 +3310,39 @@ fn read_shell_export(path: &Path, name: &str) -> Option<String> {
     None
 }
 
+fn write_bolo_env_value(name: &str, value: &str) -> Result<(), AppError> {
+    let path = home_path(".bolo/env");
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut lines = fs::read_to_string(&path)
+        .map(|text| text.lines().map(str::to_owned).collect::<Vec<_>>())
+        .unwrap_or_default();
+    let prefix = format!("{name}=");
+    let replacement = format!("{name}=\"{}\"", shell_double_quote(value));
+    let mut updated = false;
+    for line in &mut lines {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with(&prefix) {
+            *line = replacement.clone();
+            updated = true;
+        }
+    }
+    if !updated {
+        lines.push(replacement);
+    }
+    let tmp = path.with_extension("env.tmp");
+    fs::write(&tmp, format!("{}\n", lines.join("\n")))?;
+    #[cfg(unix)]
+    fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))?;
+    fs::rename(tmp, path)?;
+    Ok(())
+}
+
+fn shell_double_quote(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
 fn load_bool_env(name: &'static str, default: bool) -> bool {
     match load_env_value(name).as_deref().map(str::to_ascii_lowercase) {
         Some(value) if matches!(value.as_str(), "1" | "true" | "yes" | "on") => true,
@@ -3164,6 +3395,39 @@ fn run_osascript(script: &str) -> Result<(), AppError> {
     } else {
         Err(AppError::Io(std::io::Error::other("osascript failed")))
     }
+}
+
+fn prompt_for_text(title: &str, message: &str) -> Result<Option<String>, AppError> {
+    let script = format!(
+        "text returned of (display dialog {} with title {} default answer \"\" buttons {{\"Cancel\", \"Save\"}} default button \"Save\" cancel button \"Cancel\")",
+        applescript_string(message),
+        applescript_string(title)
+    );
+    let output = Command::new("osascript").arg("-e").arg(script).output()?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if value.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(value))
+    }
+}
+
+fn show_notification(title: &str, message: &str) {
+    let script = format!(
+        "display notification {} with title {}",
+        applescript_string(message),
+        applescript_string(title)
+    );
+    if let Err(error) = run_osascript(&script) {
+        warn!("notification failed: {error}");
+    }
+}
+
+fn applescript_string(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 fn play_sound(name: &str) {
@@ -3241,7 +3505,7 @@ mod tests {
         TextReplacement, apply_text_replacements, build_cleanup_user_content, build_stt_prompt,
         canonicalize_known_terms, cleanup_decision, cleanup_max_tokens, cleanup_profile,
         is_known_no_speech_transcript, parse_command, parse_stt_fallbacks, remove_fillers,
-        sanitize_transcript_history, speech_stats, strip_reasoning_tags, stt_include_language,
+        sanitize_transcript_history, speech_stats, strip_reasoning_tags, stt_language_for_model,
         stt_model_config, transcript_menu_preview, wav_bytes,
     };
     use std::collections::VecDeque;
@@ -3328,12 +3592,12 @@ mod tests {
             bundle_id: String::from("com.tinyspeck.slackmacgap"),
             text_before_cursor: String::from("Can you send me"),
         };
-        let content = build_cleanup_user_content("the notes", Some(&context));
+        let user_content = build_cleanup_user_content("the notes", Some(&context));
 
-        assert!(content.contains("Frontmost app: Slack"));
-        assert!(content.contains("Text before cursor, last 500 chars:"));
-        assert!(content.contains("Can you send me"));
-        assert!(content.ends_with("Transcript:\nthe notes"));
+        assert!(user_content.contains("Frontmost app: Slack"));
+        assert!(user_content.contains("Text before cursor, last 500 chars:"));
+        assert!(user_content.contains("Can you send me"));
+        assert!(user_content.ends_with("Transcript:\nthe notes"));
     }
 
     #[test]
@@ -3344,6 +3608,7 @@ mod tests {
             litellm_base: Some(String::from("http://localhost:4000")),
             litellm_key: None,
             stt_model: String::from("deepgram/nova-3"),
+            stt_language: String::from("en-US"),
             stt_fallbacks: vec![SttFallback::Telnyx(String::from(
                 "openai/whisper-large-v3-turbo",
             ))],
@@ -3366,6 +3631,7 @@ mod tests {
             litellm_base: None,
             litellm_key: None,
             stt_model: String::from("deepgram/nova-3"),
+            stt_language: String::from("en-US"),
             stt_fallbacks: Vec::new(),
             microphone: None,
             replacements: Vec::new(),
@@ -3429,6 +3695,7 @@ mod tests {
                 litellm_base: None,
                 litellm_key: None,
                 stt_model: String::from("deepgram/nova-3"),
+                stt_language: String::from("en-US"),
                 stt_fallbacks: Vec::new(),
                 microphone: None,
                 replacements: Vec::new(),
@@ -3438,7 +3705,7 @@ mod tests {
                 preserve_clipboard: true,
             },
             http: reqwest::blocking::Client::new(),
-            vocabulary: Vec::new(),
+            vocabulary: Mutex::new(Vec::new()),
             state: Mutex::new(AppState::default()),
             event_proxy: Mutex::new(None),
         };
@@ -3460,6 +3727,7 @@ mod tests {
                 litellm_base: None,
                 litellm_key: None,
                 stt_model: String::from("deepgram/nova-3"),
+                stt_language: String::from("en-US"),
                 stt_fallbacks: Vec::new(),
                 microphone: None,
                 replacements: Vec::new(),
@@ -3469,7 +3737,7 @@ mod tests {
                 preserve_clipboard: true,
             },
             http: reqwest::blocking::Client::new(),
-            vocabulary: Vec::new(),
+            vocabulary: Mutex::new(Vec::new()),
             state: Mutex::new(AppState::default()),
             event_proxy: Mutex::new(None),
         };
@@ -3503,6 +3771,7 @@ mod tests {
                 litellm_base: None,
                 litellm_key: None,
                 stt_model: String::from("deepgram/nova-3"),
+                stt_language: String::from("en-US"),
                 stt_fallbacks: Vec::new(),
                 microphone: None,
                 replacements: Vec::new(),
@@ -3512,7 +3781,7 @@ mod tests {
                 preserve_clipboard: true,
             },
             http: reqwest::blocking::Client::new(),
-            vocabulary: Vec::new(),
+            vocabulary: Mutex::new(Vec::new()),
             state: Mutex::new(AppState::default()),
             event_proxy: Mutex::new(None),
         };
@@ -3537,6 +3806,7 @@ mod tests {
                 litellm_base: None,
                 litellm_key: None,
                 stt_model: String::from("deepgram/nova-3"),
+                stt_language: String::from("en-US"),
                 stt_fallbacks: Vec::new(),
                 microphone: None,
                 replacements: Vec::new(),
@@ -3546,7 +3816,7 @@ mod tests {
                 preserve_clipboard: true,
             },
             http: reqwest::blocking::Client::new(),
-            vocabulary: Vec::new(),
+            vocabulary: Mutex::new(Vec::new()),
             state: Mutex::new(AppState {
                 last_result: Some(String::from("current transcript")),
                 history: VecDeque::from([String::from("history transcript")]),
@@ -3565,6 +3835,7 @@ mod tests {
                 litellm_base: None,
                 litellm_key: None,
                 stt_model: String::from("deepgram/nova-3"),
+                stt_language: String::from("en-US"),
                 stt_fallbacks: Vec::new(),
                 microphone: None,
                 replacements: Vec::new(),
@@ -3574,7 +3845,7 @@ mod tests {
                 preserve_clipboard: true,
             },
             http: reqwest::blocking::Client::new(),
-            vocabulary: Vec::new(),
+            vocabulary: Mutex::new(Vec::new()),
             state: Mutex::new(AppState {
                 history: VecDeque::from([String::from("history transcript")]),
                 ..AppState::default()
@@ -3661,9 +3932,19 @@ mod tests {
 
     #[test]
     fn deepgram_stt_gets_model_config() {
-        assert!(stt_include_language("deepgram/nova-3"));
+        assert_eq!(
+            stt_language_for_model("deepgram/nova-3", "auto"),
+            Some(String::from("multi"))
+        );
+        assert_eq!(
+            stt_language_for_model("deepgram/nova-3", "en-IN"),
+            Some(String::from("en-IN"))
+        );
         assert!(stt_model_config("deepgram/nova-3", &[String::from("Telnyx")]).is_some());
-        assert!(!stt_include_language("openai/whisper-large-v3-turbo"));
+        assert_eq!(
+            stt_language_for_model("openai/whisper-large-v3-turbo", "auto"),
+            None
+        );
         assert!(stt_model_config("openai/whisper-large-v3-turbo", &[]).is_none());
     }
 

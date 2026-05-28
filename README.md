@@ -110,6 +110,14 @@ export BOLO_STT_MODEL="deepgram/nova-3"
 export BOLO_STT_FALLBACK_MODEL="openai/whisper-large-v3-turbo"
 ```
 
+For accent or language hints, set:
+
+```bash
+export BOLO_STT_LANGUAGE="en-IN"
+```
+
+Bolo also exposes this from the menu bar under **Language**. `auto` maps to Deepgram multi-language mode and disables the hint for Whisper-style fallback models.
+
 For provider fallback, set a comma-separated chain:
 
 ```bash
@@ -155,6 +163,8 @@ You can also add personal vocabulary in `~/.bolo_vocabulary.json` as a JSON stri
 ```
 
 Bolo merges that with its built-in vocabulary and uses it to preserve known terms more reliably.
+
+You can add vocabulary from the menu bar with **Add Vocabulary Term...**. New terms are saved to `~/.bolo_vocabulary.json` and start applying immediately.
 
 For deterministic phrase fixes after transcription, add replacements in `~/.bolo/replacements.json`:
 
