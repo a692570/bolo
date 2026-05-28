@@ -395,6 +395,7 @@ struct TrayUi {
     history_items: Vec<MenuItem>,
     language_items: Vec<(String, CheckMenuItem)>,
     add_vocabulary_item: MenuItem,
+    add_replacement_item: MenuItem,
     quit_item: MenuItem,
 }
 
@@ -1493,12 +1494,13 @@ impl App {
             })
         );
         if !should_cleanup {
-            let final_text = apply_text_replacements(&stripped, &self.config.replacements);
+            let replacements = self.replacements_snapshot();
+            let final_text = apply_text_replacements(&stripped, &replacements);
             info!(
                 "[cleanup] final_without_llm {}",
                 serde_json::json!({
                     "text": &final_text,
-                    "replacement_count": self.config.replacements.len(),
+                    "replacement_count": replacements.len(),
                 })
             );
             return Ok(PreparedText {
@@ -1508,13 +1510,14 @@ impl App {
                 cleanup_input: None,
             });
         }
-        let fallback_text = apply_text_replacements(&stripped, &self.config.replacements);
+        let replacements = self.replacements_snapshot();
+        let fallback_text = apply_text_replacements(&stripped, &replacements);
         info!(
             "[cleanup] deferred_llm_cleanup {}",
             serde_json::json!({
                 "fallback_text": &fallback_text,
                 "reason": cleanup_reason,
-                "replacement_count": self.config.replacements.len(),
+                "replacement_count": replacements.len(),
             })
         );
         Ok(PreparedText {
@@ -1673,9 +1676,10 @@ impl App {
             return Ok(DeferredCleanupOutcome::Skipped("empty_llm_output"));
         }
         let normalized_cleaned = normalize_transcript(cleaned.trim());
+        let replacements = self.replacements_snapshot();
         let final_text = apply_text_replacements(
             &canonicalize_known_terms(&normalized_cleaned),
-            &self.config.replacements,
+            &replacements,
         );
         if final_text.is_empty() || is_known_no_speech_transcript(&final_text) {
             return Ok(DeferredCleanupOutcome::Skipped("empty_final_text"));
@@ -1958,6 +1962,15 @@ impl App {
         }
         Ok(added)
     }
+
+    fn replacements_snapshot(&self) -> Vec<TextReplacement> {
+        let mut replacements = self.config.replacements.clone();
+        for replacement in load_replacements() {
+            upsert_replacement(&mut replacements, replacement);
+        }
+        sort_replacements(&mut replacements);
+        replacements
+    }
 }
 
 impl Config {
@@ -2217,6 +2230,12 @@ fn create_tray_ui(app: &App) -> Result<TrayUi, AppError> {
         .append(&add_vocabulary_item)
         .map_err(|error| AppError::MenuBar(error.to_string()))?;
 
+    let add_replacement_item =
+        MenuItem::with_id("add-replacement-rule", "Add Correction Rule...", true, None);
+    tray_menu
+        .append(&add_replacement_item)
+        .map_err(|error| AppError::MenuBar(error.to_string()))?;
+
     let microphone_menu = Submenu::new("Microphone", true);
     let selected_microphone = app.selected_microphone()?;
     let devices = input_device_names()?;
@@ -2272,6 +2291,7 @@ fn create_tray_ui(app: &App) -> Result<TrayUi, AppError> {
         history_items: Vec::new(),
         language_items,
         add_vocabulary_item,
+        add_replacement_item,
         quit_item,
     };
     update_history_menu(app, &mut ui)?;
@@ -2295,6 +2315,10 @@ fn handle_menu_event(
     }
     if event_id == tray_ui.add_vocabulary_item.id().as_ref() {
         add_vocabulary_from_menu(app);
+        return;
+    }
+    if event_id == tray_ui.add_replacement_item.id().as_ref() {
+        add_replacement_from_menu();
         return;
     }
     if let Some(index) = event_id
@@ -2442,6 +2466,36 @@ fn add_vocabulary_from_menu(app: &App) {
         }
         Ok(false) => show_notification("Bolo", "That vocabulary term is already saved."),
         Err(error) => warn!("vocabulary term save failed: {error}"),
+    }
+}
+
+fn add_replacement_from_menu() {
+    let spoken = match prompt_for_text(
+        "Add Correction Rule",
+        "Enter the words Bolo hears, for example cloud doc.",
+    ) {
+        Ok(Some(value)) => value,
+        Ok(None) => return,
+        Err(error) => {
+            warn!("replacement prompt failed: {error}");
+            return;
+        }
+    };
+    let replacement = match prompt_for_text(
+        "Add Correction Rule",
+        "Enter what Bolo should paste instead.",
+    ) {
+        Ok(Some(value)) => value,
+        Ok(None) => return,
+        Err(error) => {
+            warn!("replacement prompt failed: {error}");
+            return;
+        }
+    };
+    match add_text_replacement(&spoken, &replacement) {
+        Ok(true) => show_notification("Bolo", "Correction rule added."),
+        Ok(false) => show_notification("Bolo", "Correction rule was empty."),
+        Err(error) => warn!("replacement save failed: {error}"),
     }
 }
 
@@ -3277,6 +3331,46 @@ fn load_replacements() -> Vec<TextReplacement> {
 fn read_replacements_file(path: &Path) -> Result<Vec<TextReplacement>, AppError> {
     let text = fs::read_to_string(path)?;
     Ok(parse_replacements_json(&text)?)
+}
+
+fn add_text_replacement(spoken: &str, replacement: &str) -> Result<bool, AppError> {
+    let spoken = spoken.trim();
+    let replacement = replacement.trim();
+    if spoken.is_empty() || replacement.is_empty() {
+        return Ok(false);
+    }
+    let path = home_path(".bolo/replacements.json");
+    let mut replacements = match read_replacements_file(&path) {
+        Ok(values) => values,
+        Err(AppError::Io(error)) if error.kind() == ErrorKind::NotFound => Vec::new(),
+        Err(error) => return Err(error),
+    };
+    upsert_replacement(
+        &mut replacements,
+        TextReplacement {
+            spoken: spoken.to_owned(),
+            replacement: replacement.to_owned(),
+        },
+    );
+    save_replacements_file(&path, &replacements)?;
+    Ok(true)
+}
+
+fn save_replacements_file(path: &Path, replacements: &[TextReplacement]) -> Result<(), AppError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut values = BTreeMap::new();
+    for replacement in replacements {
+        drop(values.insert(replacement.spoken.clone(), replacement.replacement.clone()));
+    }
+    let tmp = path.with_extension("json.tmp");
+    let text = serde_json::to_string_pretty(&values)?;
+    fs::write(&tmp, format!("{text}\n"))?;
+    #[cfg(unix)]
+    fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))?;
+    fs::rename(tmp, path)?;
+    Ok(())
 }
 
 fn load_transcript_history() -> VecDeque<TranscriptHistoryEntry> {

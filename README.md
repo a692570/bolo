@@ -179,6 +179,8 @@ For deterministic phrase fixes after transcription, add replacements in `~/.bolo
 
 Replacements are applied after local cleanup and before text insertion. Longer replacement triggers win before shorter ones.
 
+You can add these from the menu bar with **Add Correction Rule...**. Rules are saved to `~/.bolo/replacements.json` and apply to the next dictation.
+
 ## Current Limitations
 
 - Bolo is under active development and improving quickly.
