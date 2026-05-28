@@ -118,6 +118,8 @@ export BOLO_STT_LANGUAGE="en-IN"
 
 Bolo also exposes this from the menu bar under **Language**. `auto` maps to Deepgram multi-language mode and disables the hint for Whisper-style fallback models.
 
+If a non-US language hint makes recognition slow, Bolo automatically switches back to English, US after that dictation and shows a notification. This keeps accent experiments from making the app feel stuck.
+
 For provider fallback, set a comma-separated chain:
 
 ```bash
@@ -140,7 +142,7 @@ export BOLO_PRESERVE_CLIPBOARD="off"
 
 By default, Bolo restores whatever was on your clipboard before dictation. The dictated text is still kept in Bolo's correction state for commands like `scratch that` and `actually ...`.
 
-Bolo also stores your 10 most recent transcripts locally at `~/.bolo/transcripts.json`. Use the menu bar icon to copy the latest transcript or a recent transcript into the clipboard on demand.
+Bolo also stores your 10 most recent transcripts locally at `~/.bolo/transcripts.json`. Use the menu bar icon to copy the latest transcript or a recent transcript into the clipboard on demand. When cleanup changes the text, Bolo keeps both the raw STT transcript and the cleaned transcript so you can copy either one from history.
 
 LLM cleanup defaults to `auto`: short clean dictations skip the LLM, while longer or messy dictations use the LLM for grammar, punctuation, contractions, and missing articles.
 

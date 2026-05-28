@@ -11,7 +11,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arboard::Clipboard;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -128,11 +128,34 @@ enum DictationCommandKind {
     Replace,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HistoryCopyMode {
+    Cleaned,
+    Raw,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct DictationCommand {
     kind: DictationCommandKind,
     text: String,
     display: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct TranscriptHistoryEntry {
+    text: String,
+    raw: String,
+    created_at_ms: u64,
+}
+
+impl TranscriptHistoryEntry {
+    fn new(raw: &str, text: &str) -> Self {
+        Self {
+            text: text.trim().to_owned(),
+            raw: raw.trim().to_owned(),
+            created_at_ms: unix_time_ms(),
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -141,7 +164,7 @@ struct AppState {
     recording_fsm: RecordingFsm,
     last_result: Option<String>,
     correction_until: Option<Instant>,
-    history: VecDeque<String>,
+    history: VecDeque<TranscriptHistoryEntry>,
     selected_microphone: Option<String>,
     selected_language: Option<String>,
     cleanup_status: Option<String>,
@@ -951,6 +974,7 @@ impl App {
         let stt_started = Instant::now();
         let raw = self.transcribe(&wav, &recording.warmup)?;
         metrics.stt_duration = Some(stt_started.elapsed());
+        self.check_stt_language_latency(metrics.stt_duration);
         info!(
             "[pipeline] stt_understanding {}",
             serde_json::json!({
@@ -998,7 +1022,7 @@ impl App {
             );
             let pasted_text = prepared.text.clone();
             paste_text(&prepared.text)?;
-            self.remember_result(prepared.text)?;
+            self.remember_result(&raw, &prepared.text)?;
             if let Some(cleanup_input) = prepared.cleanup_input {
                 self.start_deferred_cleanup(cleanup_input, pasted_text, &recording.warmup)?;
             }
@@ -1680,7 +1704,7 @@ impl App {
             }
             DictationCommandKind::Insert => {
                 paste_text(&command.text)?;
-                self.remember_result(command.text)?;
+                self.remember_result(&command.text, &command.text)?;
                 play_sound("Pop");
             }
             DictationCommandKind::Replace => {
@@ -1692,19 +1716,23 @@ impl App {
                     delete_chars(text.chars().count())?;
                 }
                 paste_text(&command.text)?;
-                self.remember_result(command.text)?;
+                self.remember_result(&command.text, &command.text)?;
                 play_sound("Pop");
             }
         }
         Ok(())
     }
 
-    fn remember_result(&self, text: String) -> Result<(), AppError> {
+    fn remember_result(&self, raw: &str, text: &str) -> Result<(), AppError> {
+        let entry = TranscriptHistoryEntry::new(raw, text);
+        if entry.text.is_empty() {
+            return Ok(());
+        }
         let history = {
             let mut state = self.lock_state()?;
-            state.last_result = Some(text.clone());
+            state.last_result = Some(entry.text.clone());
             state.correction_until = Some(Instant::now() + CORRECTION_WINDOW);
-            state.history.push_front(text.clone());
+            state.history.push_front(entry.clone());
             state.history.truncate(TRANSCRIPT_HISTORY_LIMIT);
             state.history.iter().cloned().collect::<Vec<_>>()
         };
@@ -1718,7 +1746,7 @@ impl App {
         drop(history);
         self.send_user_event(UserEvent::HistoryChanged);
         if !self.config.preserve_clipboard {
-            if let Err(error) = copy_to_clipboard(&text) {
+            if let Err(error) = copy_to_clipboard(&entry.text) {
                 warn!("clipboard backup failed: {error}");
             }
         }
@@ -1735,10 +1763,10 @@ impl App {
             let Some(first) = state.history.front_mut() else {
                 return Ok(false);
             };
-            if first != original {
+            if first.text != original {
                 return Ok(false);
             }
-            *first = replacement;
+            first.text = replacement;
             state.history.iter().cloned().collect::<Vec<_>>()
         };
         #[cfg(not(test))]
@@ -1779,7 +1807,43 @@ impl App {
         }
     }
 
-    fn history_snapshot(&self) -> Result<Vec<String>, AppError> {
+    fn check_stt_language_latency(&self, stt_duration: Option<Duration>) {
+        const SLOW_STT_LANGUAGE_THRESHOLD: Duration = Duration::from_secs(2);
+        let Some(duration) = stt_duration else {
+            return;
+        };
+        if duration < SLOW_STT_LANGUAGE_THRESHOLD {
+            return;
+        }
+        let language = match self.stt_language() {
+            Ok(language) => language,
+            Err(error) => {
+                warn!("STT language latency check failed: {error}");
+                return;
+            }
+        };
+        if language.eq_ignore_ascii_case("en-US") || language.eq_ignore_ascii_case("en") {
+            return;
+        }
+        warn!(
+            "[stt] slow_language_fallback {}",
+            serde_json::json!({
+                "language": language,
+                "duration_ms": duration.as_millis(),
+                "fallback_language": "en-US",
+            })
+        );
+        if let Err(error) = self.set_stt_language("en-US") {
+            warn!("STT language fallback failed: {error}");
+            return;
+        }
+        show_notification(
+            "Bolo",
+            "Speech recognition was slow, so Bolo switched back to English, US.",
+        );
+    }
+
+    fn history_entries(&self) -> Result<Vec<TranscriptHistoryEntry>, AppError> {
         let state = self.lock_state()?;
         Ok(state.history.iter().cloned().collect())
     }
@@ -1789,7 +1853,7 @@ impl App {
         Ok(state
             .history
             .front()
-            .cloned()
+            .map(|entry| entry.text.clone())
             .or_else(|| state.last_result.clone()))
     }
 
@@ -2226,7 +2290,7 @@ fn handle_menu_event(
         return;
     }
     if event_id == tray_ui.copy_last_item.id().as_ref() {
-        copy_history_item(app, 0);
+        copy_history_item(app, 0, HistoryCopyMode::Cleaned);
         return;
     }
     if event_id == tray_ui.add_vocabulary_item.id().as_ref() {
@@ -2237,7 +2301,14 @@ fn handle_menu_event(
         .strip_prefix("transcript-history:")
         .and_then(|value| value.parse::<usize>().ok())
     {
-        copy_history_item(app, index);
+        copy_history_item(app, index, HistoryCopyMode::Cleaned);
+        return;
+    }
+    if let Some(index) = event_id
+        .strip_prefix("transcript-history-raw:")
+        .and_then(|value| value.parse::<usize>().ok())
+    {
+        copy_history_item(app, index, HistoryCopyMode::Raw);
         return;
     }
     if let Some((language, _)) = tray_ui
@@ -2276,7 +2347,7 @@ fn update_history_menu(app: &App, tray_ui: &mut TrayUi) -> Result<(), AppError> 
             .remove(&item)
             .map_err(|error| AppError::MenuBar(error.to_string()))?;
     }
-    let history = app.history_snapshot()?;
+    let history = app.history_entries()?;
     tray_ui.copy_last_item.set_enabled(!history.is_empty());
     if history.is_empty() {
         let item = MenuItem::with_id(
@@ -2292,14 +2363,36 @@ fn update_history_menu(app: &App, tray_ui: &mut TrayUi) -> Result<(), AppError> 
         tray_ui.history_items.push(item);
         return Ok(());
     }
-    for (index, text) in history.iter().enumerate() {
-        let label = format!("Copy {}: {}", index + 1, transcript_menu_preview(text));
+    for (index, entry) in history.iter().enumerate() {
+        let label = format!(
+            "Copy {}: {}",
+            index + 1,
+            transcript_menu_preview(&entry.text)
+        );
         let item = MenuItem::with_id(format!("transcript-history:{index}"), label, true, None);
         tray_ui
             .history_menu
             .append(&item)
             .map_err(|error| AppError::MenuBar(error.to_string()))?;
         tray_ui.history_items.push(item);
+        if entry.raw != entry.text {
+            let raw_label = format!(
+                "Copy Raw {}: {}",
+                index + 1,
+                transcript_menu_preview(&entry.raw)
+            );
+            let raw_item = MenuItem::with_id(
+                format!("transcript-history-raw:{index}"),
+                raw_label,
+                true,
+                None,
+            );
+            tray_ui
+                .history_menu
+                .append(&raw_item)
+                .map_err(|error| AppError::MenuBar(error.to_string()))?;
+            tray_ui.history_items.push(raw_item);
+        }
     }
     Ok(())
 }
@@ -2308,22 +2401,26 @@ fn update_cleanup_status_item(app: &App, tray_ui: &TrayUi) {
     tray_ui.cleanup_status_item.set_text(app.cleanup_status());
 }
 
-fn copy_history_item(app: &App, index: usize) {
-    let history = match app.history_snapshot() {
+fn copy_history_item(app: &App, index: usize, mode: HistoryCopyMode) {
+    let history = match app.history_entries() {
         Ok(history) => history,
         Err(error) => {
             error!("{error}");
             return;
         }
     };
-    let Some(text) = history.get(index) else {
+    let Some(entry) = history.get(index) else {
         return;
+    };
+    let text = match mode {
+        HistoryCopyMode::Cleaned => &entry.text,
+        HistoryCopyMode::Raw => &entry.raw,
     };
     if let Err(error) = copy_to_clipboard(text) {
         warn!("transcript history copy failed: {error}");
         return;
     }
-    info!("copied transcript history item {index}");
+    info!("copied transcript history item {index} as {mode:?}");
 }
 
 fn add_vocabulary_from_menu(app: &App) {
@@ -3182,7 +3279,7 @@ fn read_replacements_file(path: &Path) -> Result<Vec<TextReplacement>, AppError>
     Ok(parse_replacements_json(&text)?)
 }
 
-fn load_transcript_history() -> VecDeque<String> {
+fn load_transcript_history() -> VecDeque<TranscriptHistoryEntry> {
     let path = transcript_history_path();
     match read_transcript_history_file(&path) {
         Ok(history) => history.into(),
@@ -3194,15 +3291,23 @@ fn load_transcript_history() -> VecDeque<String> {
     }
 }
 
-fn read_transcript_history_file(path: &Path) -> Result<Vec<String>, AppError> {
+fn read_transcript_history_file(path: &Path) -> Result<Vec<TranscriptHistoryEntry>, AppError> {
     let text = fs::read_to_string(path)?;
-    Ok(sanitize_transcript_history(serde_json::from_str::<
-        Vec<String>,
-    >(&text)?))
+    let value = serde_json::from_str::<serde_json::Value>(&text)?;
+    if let Ok(entries) = serde_json::from_value::<Vec<TranscriptHistoryEntry>>(value.clone()) {
+        return Ok(sanitize_transcript_history(entries));
+    }
+    let legacy = serde_json::from_value::<Vec<String>>(value)?;
+    Ok(sanitize_transcript_history(
+        legacy
+            .into_iter()
+            .map(|text| TranscriptHistoryEntry::new(&text, &text))
+            .collect(),
+    ))
 }
 
 #[cfg_attr(test, allow(dead_code))]
-fn save_transcript_history(history: &[String]) -> Result<(), AppError> {
+fn save_transcript_history(history: &[TranscriptHistoryEntry]) -> Result<(), AppError> {
     let path = transcript_history_path();
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -3216,11 +3321,17 @@ fn save_transcript_history(history: &[String]) -> Result<(), AppError> {
     Ok(())
 }
 
-fn sanitize_transcript_history(history: Vec<String>) -> Vec<String> {
+fn sanitize_transcript_history(
+    history: Vec<TranscriptHistoryEntry>,
+) -> Vec<TranscriptHistoryEntry> {
     history
         .into_iter()
-        .map(|text| text.trim().to_owned())
-        .filter(|text| !text.is_empty())
+        .map(|entry| TranscriptHistoryEntry {
+            text: entry.text.trim().to_owned(),
+            raw: entry.raw.trim().to_owned(),
+            created_at_ms: entry.created_at_ms,
+        })
+        .filter(|entry| !entry.text.is_empty())
         .take(TRANSCRIPT_HISTORY_LIMIT)
         .collect()
 }
@@ -3449,6 +3560,13 @@ fn home_path(relative: &str) -> PathBuf {
     )
 }
 
+fn unix_time_ms() -> u64 {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_millis());
+    u64::try_from(millis).unwrap_or(u64::MAX)
+}
+
 fn run_onboarding_if_needed() {
     if env::var("BOLO_HOTKEY").is_ok() {
         return;
@@ -3502,11 +3620,12 @@ mod tests {
     use super::{
         AccessibilityContext, App, AppError, AppState, CleanupMode, CleanupProfile, Config,
         DictationCommandKind, DictationWarmup, SttFallback, TRANSCRIPT_HISTORY_LIMIT,
-        TextReplacement, apply_text_replacements, build_cleanup_user_content, build_stt_prompt,
-        canonicalize_known_terms, cleanup_decision, cleanup_max_tokens, cleanup_profile,
-        is_known_no_speech_transcript, parse_command, parse_stt_fallbacks, remove_fillers,
-        sanitize_transcript_history, speech_stats, strip_reasoning_tags, stt_language_for_model,
-        stt_model_config, transcript_menu_preview, wav_bytes,
+        TextReplacement, TranscriptHistoryEntry, apply_text_replacements,
+        build_cleanup_user_content, build_stt_prompt, canonicalize_known_terms, cleanup_decision,
+        cleanup_max_tokens, cleanup_profile, is_known_no_speech_transcript, parse_command,
+        parse_stt_fallbacks, remove_fillers, sanitize_transcript_history, speech_stats,
+        strip_reasoning_tags, stt_language_for_model, stt_model_config, transcript_menu_preview,
+        wav_bytes,
     };
     use std::collections::VecDeque;
     use std::path::PathBuf;
@@ -3786,13 +3905,17 @@ mod tests {
             event_proxy: Mutex::new(None),
         };
 
-        app.remember_result(String::from("dictated text"))?;
+        app.remember_result("raw dictated text", "dictated text")?;
 
         let state = app.lock_state()?;
         assert_eq!(state.last_result.as_deref(), Some("dictated text"));
         assert_eq!(
-            state.history.front().map(String::as_str),
+            state.history.front().map(|entry| entry.text.as_str()),
             Some("dictated text")
+        );
+        assert_eq!(
+            state.history.front().map(|entry| entry.raw.as_str()),
+            Some("raw dictated text")
         );
         Ok(())
     }
@@ -3819,7 +3942,10 @@ mod tests {
             vocabulary: Mutex::new(Vec::new()),
             state: Mutex::new(AppState {
                 last_result: Some(String::from("current transcript")),
-                history: VecDeque::from([String::from("history transcript")]),
+                history: VecDeque::from([TranscriptHistoryEntry::new(
+                    "raw history transcript",
+                    "history transcript",
+                )]),
                 ..AppState::default()
             }),
             event_proxy: Mutex::new(None),
@@ -3847,7 +3973,10 @@ mod tests {
             http: reqwest::blocking::Client::new(),
             vocabulary: Mutex::new(Vec::new()),
             state: Mutex::new(AppState {
-                history: VecDeque::from([String::from("history transcript")]),
+                history: VecDeque::from([TranscriptHistoryEntry::new(
+                    "raw history transcript",
+                    "history transcript",
+                )]),
                 ..AppState::default()
             }),
             event_proxy: Mutex::new(None),
@@ -3859,23 +3988,33 @@ mod tests {
     #[test]
     fn transcript_history_is_trimmed_and_limited() {
         let history = sanitize_transcript_history(vec![
-            String::from(" first "),
-            String::new(),
-            String::from("second"),
-            String::from("third"),
-            String::from("fourth"),
-            String::from("fifth"),
-            String::from("sixth"),
-            String::from("seventh"),
-            String::from("eighth"),
-            String::from("ninth"),
-            String::from("tenth"),
-            String::from("eleventh"),
+            TranscriptHistoryEntry::new(" first raw ", " first "),
+            TranscriptHistoryEntry::new("", ""),
+            TranscriptHistoryEntry::new("second", "second"),
+            TranscriptHistoryEntry::new("third", "third"),
+            TranscriptHistoryEntry::new("fourth", "fourth"),
+            TranscriptHistoryEntry::new("fifth", "fifth"),
+            TranscriptHistoryEntry::new("sixth", "sixth"),
+            TranscriptHistoryEntry::new("seventh", "seventh"),
+            TranscriptHistoryEntry::new("eighth", "eighth"),
+            TranscriptHistoryEntry::new("ninth", "ninth"),
+            TranscriptHistoryEntry::new("tenth", "tenth"),
+            TranscriptHistoryEntry::new("eleventh", "eleventh"),
         ]);
 
         assert_eq!(history.len(), TRANSCRIPT_HISTORY_LIMIT);
-        assert_eq!(history.first().map(String::as_str), Some("first"));
-        assert_eq!(history.last().map(String::as_str), Some("tenth"));
+        assert_eq!(
+            history.first().map(|entry| entry.text.as_str()),
+            Some("first")
+        );
+        assert_eq!(
+            history.first().map(|entry| entry.raw.as_str()),
+            Some("first raw")
+        );
+        assert_eq!(
+            history.last().map(|entry| entry.text.as_str()),
+            Some("tenth")
+        );
     }
 
     #[test]
