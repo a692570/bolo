@@ -3280,6 +3280,9 @@ fn canonicalize_known_terms(text: &str) -> String {
         ),
         (r"(?i)\bchrome\b|\bcrone\b|\bcrohn\b", "cron"),
         (r"(?i)\bspending for us\b", "pending for us"),
+        (r"(?i)\blinear ticket\b", "Linear ticket"),
+        (r"(?i)\bdo 1 thing\b", "do one thing"),
+        (r"(?i)\bokay ish\b", "okay-ish"),
         (r"(?i)\bremotion\b|\bemotion\b|\bemotions\b", "Remotion"),
         (r"(?i)\bnova[ -]three\b|\bnova 3\b", "nova-3"),
         (r"(?i)\bquen\b|\bqueue when\b|\bkyuen\b|\bkwan\b", "Qwen"),
@@ -3287,6 +3290,8 @@ fn canonicalize_known_terms(text: &str) -> String {
             r"(?i)\bbrave search api\b|\bbrief search api\b",
             "Brave Search API",
         ),
+        (r"(?i)\btavoli\b|\btavily\b", "Tavily"),
+        (r"(?i)\bkimmy\b|\bkimmi\b|\bkimi\b", "Kimi"),
     ];
     let mut result = text.to_owned();
     for (pattern, replacement) in replacements {
@@ -4297,6 +4302,14 @@ mod tests {
         assert_eq!(
             canonicalize_known_terms("telenex has spending for us"),
             "Telnyx has pending for us"
+        );
+        assert_eq!(
+            canonicalize_known_terms("do 1 thing with the linear ticket, it was okay ish"),
+            "do one thing with the Linear ticket, it was okay-ish"
+        );
+        assert_eq!(
+            canonicalize_known_terms("ask kimmy about that tavoli cron thing"),
+            "ask Kimi about that Tavily cron thing"
         );
 
         assert_eq!(
