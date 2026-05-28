@@ -2469,10 +2469,24 @@ fn canonicalize_known_terms(text: &str) -> String {
             r"(?i)\btelnyx\b|\btelenix\b|\btennix\b|\btenlex\b|\btenlix\b|\btelx\b",
             "Telnyx",
         ),
-        (r"(?i)\bbolo\b|\bbollo\b", "Bolo"),
+        (r"(?i)\bbolo\b|\bbollo\b|\bboro\b", "Bolo"),
+        (
+            r"(?i)\bclock talk\b|\bcloud talk\b|\bclaud talk\b|\bclawed talk\b",
+            "ClawdTalk",
+        ),
+        (r"(?i)\bclaud\b", "Claude"),
+        (
+            r"(?i)\bcloud\s+(code|doc|docs|topic|agent|web|brave)\b",
+            "Claude $1",
+        ),
+        (r"(?i)\bchrome\b|\bcrone\b|\bcrohn\b", "cron"),
         (r"(?i)\bremotion\b|\bemotion\b|\bemotions\b", "Remotion"),
         (r"(?i)\bnova[ -]three\b|\bnova 3\b", "nova-3"),
         (r"(?i)\bquen\b|\bqueue when\b|\bkyuen\b|\bkwan\b", "Qwen"),
+        (
+            r"(?i)\bbrave search api\b|\bbrief search api\b",
+            "Brave Search API",
+        ),
     ];
     let mut result = text.to_owned();
     for (pattern, replacement) in replacements {
@@ -3270,6 +3284,13 @@ mod tests {
 
         let possessive = canonicalize_known_terms("tenley's brand standards");
         assert_eq!(possessive, "Telnyx's brand standards");
+
+        let accent_terms =
+            canonicalize_known_terms("boro heard cloud doc chrome and clock talk as crohn");
+        assert_eq!(
+            accent_terms,
+            "Bolo heard Claude doc cron and ClawdTalk as cron"
+        );
 
         assert_eq!(
             remove_fillers("um, you know, ship it.Thanks, right?")
