@@ -45,7 +45,7 @@ const CHANNELS: u16 = 1;
 const LOCK_DIR: &str = "/tmp/bolo-instance.lock";
 const TRANSCRIPT_HISTORY_LIMIT: usize = 10;
 const TELNYX_STT_ENDPOINT: &str = "https://api.telnyx.com/v2/ai/audio/transcriptions";
-const ASSEMBLYAI_STREAMING_ENDPOINT: &str = "wss://streaming.assemblyai.com/v3/ws";
+const TELNYX_STT_STREAMING_ENDPOINT: &str = "wss://api.telnyx.com/v2/speech-to-text/transcription";
 const TELNYX_LLM_ENDPOINT: &str = "https://api.telnyx.com/v2/ai/chat/completions";
 const XAI_STT_ENDPOINT: &str = "https://api.x.ai/v1/stt";
 const ASSEMBLYAI_UPLOAD_ENDPOINT: &str = "https://api.assemblyai.com/v2/upload";
@@ -365,7 +365,7 @@ impl StreamingRecording {
                     .build()
                 {
                     Ok(runtime) => runtime.block_on(async move {
-                        if let Err(error) = run_assemblyai_stream(
+                        if let Err(error) = run_telnyx_assemblyai_stream(
                             api_key,
                             language,
                             vocabulary,
@@ -426,15 +426,15 @@ impl StreamingRecording {
     }
 }
 
-async fn run_assemblyai_stream(
+async fn run_telnyx_assemblyai_stream(
     api_key: String,
     language: String,
     vocabulary: Vec<String>,
     receiver: Receiver<Vec<i16>>,
     result: Arc<Mutex<StreamingTranscript>>,
 ) -> Result<(), String> {
-    let query = assemblyai_stream_query(&language, &vocabulary);
-    let url = format!("{ASSEMBLYAI_STREAMING_ENDPOINT}?{query}");
+    let query = telnyx_assemblyai_stream_query(&language, &vocabulary);
+    let url = format!("{TELNYX_STT_STREAMING_ENDPOINT}?{query}");
     let mut request = url
         .into_client_request()
         .map_err(|error| error.to_string())?;
@@ -444,8 +444,12 @@ async fn run_assemblyai_stream(
     let (socket, _response) = connect_async(request)
         .await
         .map_err(|error| error.to_string())?;
-    info!("[stt] streaming_connected assemblyai");
+    info!("[stt] streaming_connected telnyx_assemblyai");
     let (mut write, mut read) = socket.split();
+    write
+        .send(Message::Binary(streaming_wav_header(48_000).into()))
+        .await
+        .map_err(|error| error.to_string())?;
     let mut input_closed = false;
     let mut close_deadline = None;
     loop {
@@ -461,14 +465,6 @@ async fn run_assemblyai_stream(
                 Err(mpsc::TryRecvError::Disconnected) => {
                     input_closed = true;
                     close_deadline = Some(Instant::now() + Duration::from_millis(1_000));
-                    if let Err(error) = write
-                        .send(Message::Text(
-                            String::from(r#"{"type":"Terminate"}"#).into(),
-                        ))
-                        .await
-                    {
-                        warn!("streaming terminate failed: {error}");
-                    }
                     break;
                 }
             }
@@ -495,18 +491,14 @@ async fn run_assemblyai_stream(
     }
 }
 
-fn assemblyai_stream_query(language: &str, vocabulary: &[String]) -> String {
+fn telnyx_assemblyai_stream_query(language: &str, _vocabulary: &[String]) -> String {
     let mut params = vec![
-        String::from("speech_model=universal-streaming"),
-        String::from("sample_rate=48000"),
-        String::from("encoding=pcm_s16le"),
-        String::from("format_turns=true"),
+        String::from("transcription_engine=AssemblyAI"),
+        String::from("model=assemblyai%2Funiversal-streaming"),
+        String::from("input_format=wav"),
     ];
     if !language.is_empty() && !language.eq_ignore_ascii_case("auto") {
-        params.push(format!("language_code={}", query_escape(language)));
-    }
-    for term in vocabulary.iter().take(50) {
-        params.push(format!("keyterms_prompt={}", query_escape(term)));
+        params.push(format!("language={}", query_escape(language)));
     }
     params.join("&")
 }
@@ -562,6 +554,26 @@ fn pcm_bytes(samples: &[i16]) -> Vec<u8> {
     for sample in samples {
         bytes.extend_from_slice(&sample.to_le_bytes());
     }
+    bytes
+}
+
+fn streaming_wav_header(sample_rate: u32) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(44);
+    bytes.extend_from_slice(b"RIFF");
+    bytes.extend_from_slice(&u32::MAX.to_le_bytes());
+    bytes.extend_from_slice(b"WAVEfmt ");
+    bytes.extend_from_slice(&16_u32.to_le_bytes());
+    bytes.extend_from_slice(&1_u16.to_le_bytes());
+    bytes.extend_from_slice(&CHANNELS.to_le_bytes());
+    bytes.extend_from_slice(&sample_rate.to_le_bytes());
+    let byte_rate = sample_rate
+        .saturating_mul(u32::from(CHANNELS))
+        .saturating_mul(2);
+    bytes.extend_from_slice(&byte_rate.to_le_bytes());
+    bytes.extend_from_slice(&(CHANNELS.saturating_mul(2)).to_le_bytes());
+    bytes.extend_from_slice(&16_u16.to_le_bytes());
+    bytes.extend_from_slice(b"data");
+    bytes.extend_from_slice(&(u32::MAX - 36).to_le_bytes());
     bytes
 }
 
@@ -1358,13 +1370,7 @@ impl App {
 
     fn start_streaming_recording(&self) -> Option<StreamingRecording> {
         let StreamingProvider::AssemblyAi = self.config.streaming_stt?;
-        let api_key = match load_env_value("ASSEMBLYAI_API_KEY") {
-            Some(key) => key,
-            None => {
-                warn!("[stt] streaming disabled because ASSEMBLYAI_API_KEY is missing");
-                return None;
-            }
-        };
+        let api_key = self.config.telnyx_api_key.clone();
         let language = self
             .stt_language()
             .unwrap_or_else(|_| self.config.stt_language.clone());
@@ -2176,12 +2182,7 @@ impl App {
             .unwrap_or_else(|_| self.config.stt_language.clone());
         let history_count = self.history_entries().map_or(0, |history| history.len());
         let streaming_status = match self.config.streaming_stt {
-            Some(StreamingProvider::AssemblyAi)
-                if load_env_value("ASSEMBLYAI_API_KEY").is_some() =>
-            {
-                "AssemblyAI streaming ready"
-            }
-            Some(StreamingProvider::AssemblyAi) => "AssemblyAI streaming missing key",
+            Some(StreamingProvider::AssemblyAi) => "AssemblyAI streaming via Telnyx",
             None => "Batch STT",
         };
         let message = format!(

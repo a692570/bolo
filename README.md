@@ -137,11 +137,10 @@ Set `BOLO_STT_FALLBACKS=off` to fail fast instead of retrying when the primary m
 To try AssemblyAI streaming STT, set:
 
 ```bash
-export ASSEMBLYAI_API_KEY="..."
 export BOLO_STT_STREAMING="assemblyai"
 ```
 
-Streaming starts sending audio while you speak and falls back to the normal batch path if it does not produce a transcript quickly enough after release.
+Streaming uses the existing Telnyx API key, starts sending audio while you speak, and falls back to the normal batch path if it does not produce a transcript quickly enough after release.
 
 To keep dictated text on the clipboard after insertion, set:
 
