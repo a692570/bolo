@@ -29,6 +29,11 @@ from overlay_controller import RecordingOverlay
 from stt import SilenceDetector, TelnyxStreamingSTT
 from transcript_state import TranscriptState, longest_common_prefix, merge_transcript
 from vocabulary import VocabularyStore
+# ── Bolo Session & UI modules ────────────────────────────────────────────────
+from config import __version__                                                       # noqa: E402
+from config import validate as config_validate, get as config_get, config as _config  # noqa: E402
+from session_store import SessionStore                                              # noqa: E402
+
 
 from AppKit import (
     NSEvent,
@@ -341,6 +346,13 @@ class BoloApp(rumps.App):
             rumps.MenuItem("Auto-stop on silence", callback=self._toggle_auto_silence),
             rumps.MenuItem("Clipboard paste mode", callback=self._toggle_clipboard_mode),
             None,
+            
+            None,  # separator
+            rumps.MenuItem("Show Last Transcript", callback=self.show_last_transcript),
+            rumps.MenuItem("Settings...", callback=self.open_settings),
+            rumps.MenuItem("Check for Updates", callback=self.check_updates),
+            None,  # separator
+
             rumps.MenuItem("Quit Bolo", callback=self.quit_app),
         ]
         self.menu["Bolo - Voice Dictation"].set_callback(None)
@@ -929,7 +941,6 @@ class BoloApp(rumps.App):
         self._silence_event.clear()
         self._chunk_time = time.time()
         self._transcript_state = TranscriptState()
-
         # IMMEDIATELY give user feedback - don't wait for stream/context
         self._play("Tink")
         self.overlay.show()
@@ -2134,6 +2145,21 @@ class BoloApp(rumps.App):
         self.session_history.appendleft(text)
         self.menu["History"].title = f"History ({len(self.session_history)})"
 
+        # ── Save to session history (SQLite) ────────────────────────────────
+        try:
+            source_app = self._frontmost_app_name() if hasattr(self, "_frontmost_app_name") else ""
+            self._last_transcript = text
+            preview = text[:60] + "..." if len(text) > 60 else text
+            self._session_store.persist(
+                raw_text=getattr(self, "_last_raw_transcript", text),
+                final_text=text,
+                source_app=source_app,
+                word_count=len(text.split()),
+            )
+            logger.info("session: saved [%s]", preview)
+        except Exception as e:
+            logger.warning("session: failed to save %s", e)
+
     def _copy_last(self, _):
         if self.last_result:
             pasteboard = NSPasteboard.generalPasteboard()
@@ -2151,6 +2177,76 @@ class BoloApp(rumps.App):
         self._hide_overlay_after_delay(1.0, session_id=session_id)
 
     # ── Quit ──────────────────────────────────────────────────────────────────
+
+
+    def open_settings(self, _):
+        """Open settings/preferences window."""
+        try:
+            from settings import SettingsWindow
+            if self._settings_window is None:
+                self._settings_window = SettingsWindow()
+            self._settings_window.show()
+        except Exception as e:
+            logger.error("settings: failed to open - %s", e)
+            rumps.alert(
+                title="Bolo Settings",
+                message="Could not open settings: " + str(e),
+            )
+
+    def show_last_transcript(self, _):
+        """Show the most recent transcript in a review window."""
+        try:
+            if self._last_transcript:
+                from transcript_review import TranscriptReviewWindow
+                win = TranscriptReviewWindow()
+                win.show(
+                    text=self._last_transcript,
+                    raw_text=self._last_raw_transcript,
+                    metadata=self._last_metadata,
+                )
+            else:
+                rumps.alert(
+                    title="No Transcripts Yet",
+                    message="Start speaking after pressing the hotkey.",
+                )
+        except Exception as e:
+            logger.error("transcript_review: failed - %s", e)
+
+    def check_updates(self, _):
+        """Check for updates via GitHub releases."""
+        try:
+            import json, urllib.request, threading
+
+            def _check():
+                try:
+                    url = "https://api.github.com/repos/a692570/bolo/releases/latest"
+                    req = urllib.request.Request(
+                        url, headers={"Accept": "application/vnd.github.v3+json"})
+                    with urllib.request.urlopen(req, timeout=10) as resp:
+                        data = json.loads(resp.read())
+                        latest = data.get("tag_name", "").lstrip("v")
+                        current = __version__.lstrip("v")
+                        if latest and latest != current:
+                            body = (data.get("body", "") or "")[:200]
+                            msg = "Bolo " + latest + " is available (you have " + current + ")."
+                            if body:
+                                msg += "\n\n" + body
+                            msg += "\n\n" + (data.get("html_url", "") or "")
+                            rumps.alert(title="Update Available", message=msg)
+                        else:
+                            rumps.notification(
+                                title="Bolo",
+                                subtitle="Up to date",
+                                message="Bolo " + current + " is the latest version.",
+                            )
+                except Exception as e:
+                    rumps.alert(title="Update Check Failed", message=str(e))
+
+            t = threading.Thread(target=_check, daemon=True)
+            t.start()
+        except Exception as e:
+            logger.error("update_check: failed - %s", e)
+
 
     def quit_app(self, _):
         # Cancel any pending overlay hide timer and force hide overlay before
