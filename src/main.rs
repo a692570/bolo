@@ -146,6 +146,7 @@ enum DictationCommandKind {
     Scratch,
     Insert,
     Replace,
+    AddCorrection,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -159,6 +160,7 @@ struct DictationCommand {
     kind: DictationCommandKind,
     text: String,
     display: String,
+    replacement: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -2105,6 +2107,18 @@ impl App {
                 self.remember_result(&command.text, &command.text)?;
                 play_sound("Pop");
             }
+            DictationCommandKind::AddCorrection => {
+                let Some(replacement) = command.replacement.as_ref() else {
+                    return Ok(());
+                };
+                if add_text_replacement(&command.text, replacement)? {
+                    show_notification(
+                        "Bolo Correction Added",
+                        &format!("{} -> {}", command.text, replacement),
+                    );
+                    play_sound("Pop");
+                }
+            }
         }
         Ok(())
     }
@@ -3213,6 +3227,7 @@ fn parse_command(text: &str, correction_active: bool) -> Option<DictationCommand
             kind: DictationCommandKind::Scratch,
             text: String::new(),
             display: String::new(),
+            replacement: None,
         },
         "new paragraph" => insert_command("\n\n", "\\n\\n"),
         "new line" => insert_command("\n", "\\n"),
@@ -3226,17 +3241,105 @@ fn parse_command(text: &str, correction_active: bool) -> Option<DictationCommand
         "colon" => insert_command(": ", ":"),
         "semicolon" => insert_command("; ", ";"),
         _ if lowered.starts_with("bullet ") => {
-            let bullet_text = stripped.trim_start_matches("bullet ").trim();
+            let bullet_text = stripped["bullet ".len()..].trim();
             insert_command(&format!("\n- {bullet_text}"), &format!("- {bullet_text}"))
         }
         _ if lowered.starts_with("actually ") && correction_active => DictationCommand {
             kind: DictationCommandKind::Replace,
-            text: stripped.trim_start_matches("actually ").trim().to_owned(),
-            display: stripped.trim_start_matches("actually ").trim().to_owned(),
+            text: stripped["actually ".len()..].trim().to_owned(),
+            display: stripped["actually ".len()..].trim().to_owned(),
+            replacement: None,
         },
-        _ => return None,
+        _ => parse_correction_command(stripped)?,
     };
     Some(command)
+}
+
+fn parse_correction_command(text: &str) -> Option<DictationCommand> {
+    let normalized = normalize_transcript(text);
+    for word in ["correct", "correction"] {
+        let Some(rest) = strip_command_word_ignore_ascii_case(&normalized, word) else {
+            continue;
+        };
+        if let Some((spoken, replacement)) = split_correction_pair(rest, "to") {
+            return Some(correction_command(spoken, replacement));
+        }
+        if let Some((spoken, replacement)) = split_correction_pair(rest, "as") {
+            return Some(correction_command(spoken, replacement));
+        }
+    }
+    let Some(rest) = strip_phrase_ignore_ascii_case(&normalized, "bolo heard") else {
+        return None;
+    };
+    if let Some((spoken, replacement)) = split_correction_pair(rest, "i meant") {
+        return Some(correction_command(spoken, replacement));
+    }
+    None
+}
+
+fn strip_command_word_ignore_ascii_case<'a>(text: &'a str, word: &str) -> Option<&'a str> {
+    if text.len() < word.len() || !text[..word.len()].eq_ignore_ascii_case(word) {
+        return None;
+    }
+    let rest = &text[word.len()..];
+    if rest
+        .chars()
+        .next()
+        .is_some_and(|character| !is_correction_delimiter(character))
+    {
+        return None;
+    }
+    Some(trim_correction_delimiters(rest))
+}
+
+fn strip_phrase_ignore_ascii_case<'a>(text: &'a str, phrase: &str) -> Option<&'a str> {
+    if text.len() < phrase.len() || !text[..phrase.len()].eq_ignore_ascii_case(phrase) {
+        return None;
+    }
+    Some(trim_correction_delimiters(&text[phrase.len()..]))
+}
+
+fn trim_correction_delimiters(text: &str) -> &str {
+    text.trim_matches(|character: char| is_correction_delimiter(character))
+}
+
+fn is_correction_delimiter(character: char) -> bool {
+    character.is_whitespace() || ",.:;".contains(character)
+}
+
+fn split_correction_pair<'a>(text: &'a str, separator: &str) -> Option<(&'a str, &'a str)> {
+    let separator_index = find_correction_separator(text, separator)?;
+    let separator_len = separator.len();
+    let spoken = trim_correction_delimiters(&text[..separator_index]);
+    let replacement = trim_correction_delimiters(&text[separator_index + separator_len..]);
+    if spoken.is_empty() || replacement.is_empty() {
+        return None;
+    }
+    Some((spoken, replacement))
+}
+
+fn find_correction_separator(text: &str, separator: &str) -> Option<usize> {
+    let lower_text = text.to_ascii_lowercase();
+    let lower_separator = separator.to_ascii_lowercase();
+    for (index, _) in lower_text.match_indices(&lower_separator) {
+        let before = text[..index].chars().next_back();
+        let after = text[index + separator.len()..].chars().next();
+        if before.is_some_and(is_correction_delimiter) && after.is_some_and(is_correction_delimiter)
+        {
+            return Some(index);
+        }
+    }
+    None
+}
+
+fn correction_command(spoken: &str, replacement: &str) -> DictationCommand {
+    let replacement = canonicalize_known_terms(replacement);
+    DictationCommand {
+        kind: DictationCommandKind::AddCorrection,
+        text: spoken.to_owned(),
+        display: format!("{spoken} -> {replacement}"),
+        replacement: Some(replacement),
+    }
 }
 
 fn insert_command(text: &str, display: &str) -> DictationCommand {
@@ -3244,13 +3347,14 @@ fn insert_command(text: &str, display: &str) -> DictationCommand {
         kind: DictationCommandKind::Insert,
         text: text.to_owned(),
         display: display.to_owned(),
+        replacement: None,
     }
 }
 
 fn correction_active(state: &AppState) -> bool {
     state
         .correction_until
-        .is_some_and(|deadline| Instant::now() < deadline)
+        .is_some_and(|until| Instant::now() < until)
 }
 
 fn normalize_transcript(text: &str) -> String {
@@ -3290,7 +3394,7 @@ fn canonicalize_known_terms(text: &str) -> String {
             r"(?i)\bbrave search api\b|\bbrief search api\b",
             "Brave Search API",
         ),
-        (r"(?i)\btavoli\b|\btavily\b", "Tavily"),
+        (r"(?i)\btabily\b|\btabby\b|\btavoli\b|\btavily\b", "Tavily"),
         (r"(?i)\bkimmy\b|\bkimmi\b|\bkimi\b", "Kimi"),
     ];
     let mut result = text.to_owned();
@@ -4282,6 +4386,38 @@ mod tests {
         assert_eq!(
             replace.as_ref().map(|command| command.text.as_str()),
             Some("corrected text")
+        );
+
+        let correction = parse_command("Correct. tab only to tabily", false);
+        assert_eq!(
+            correction.as_ref().map(|command| command.kind),
+            Some(DictationCommandKind::AddCorrection)
+        );
+        assert_eq!(
+            correction.as_ref().map(|command| command.text.as_str()),
+            Some("tab only")
+        );
+        assert_eq!(
+            correction
+                .as_ref()
+                .and_then(|command| command.replacement.as_deref()),
+            Some("Tavily")
+        );
+
+        let heard = parse_command("Bolo heard tavoli I meant Tavily", false);
+        assert_eq!(
+            heard.as_ref().map(|command| command.kind),
+            Some(DictationCommandKind::AddCorrection)
+        );
+        assert_eq!(
+            heard.as_ref().map(|command| command.text.as_str()),
+            Some("tavoli")
+        );
+        assert_eq!(
+            heard
+                .as_ref()
+                .and_then(|command| command.replacement.as_deref()),
+            Some("Tavily")
         );
     }
 
