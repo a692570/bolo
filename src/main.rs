@@ -60,6 +60,7 @@ const STREAMING_DRAIN_MIN: Duration = Duration::from_millis(450);
 const STREAMING_DRAIN_MAX: Duration = Duration::from_millis(1_600);
 const STREAMING_TRAILING_SILENCE_MS: usize = 350;
 const STREAMING_SAMPLE_RATE: u32 = 48_000;
+const UPDATE_RESTART_EXIT_CODE: i32 = 42;
 
 #[derive(Debug, Error)]
 enum AppError {
@@ -153,6 +154,13 @@ enum DictationCommandKind {
 enum HistoryCopyMode {
     Cleaned,
     Raw,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum UpdateOutcome {
+    Updated,
+    Current,
+    Skipped(String),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -741,6 +749,7 @@ struct TrayUi {
     clear_history_item: MenuItem,
     language_items: Vec<(String, CheckMenuItem)>,
     health_check_item: MenuItem,
+    update_item: MenuItem,
     add_vocabulary_item: MenuItem,
     add_replacement_item: MenuItem,
     quit_item: MenuItem,
@@ -2678,6 +2687,11 @@ fn create_tray_ui(app: &App) -> Result<TrayUi, AppError> {
         .append(&health_check_item)
         .map_err(|error| AppError::MenuBar(error.to_string()))?;
 
+    let update_item = MenuItem::with_id("check-for-updates", "Check for Updates", true, None);
+    tray_menu
+        .append(&update_item)
+        .map_err(|error| AppError::MenuBar(error.to_string()))?;
+
     let language_menu = Submenu::new("Language", true);
     let selected_language = app.stt_language()?;
     let mut language_items = Vec::new();
@@ -2771,6 +2785,7 @@ fn create_tray_ui(app: &App) -> Result<TrayUi, AppError> {
         clear_history_item,
         language_items,
         health_check_item,
+        update_item,
         add_vocabulary_item,
         add_replacement_item,
         quit_item,
@@ -2802,6 +2817,10 @@ fn handle_menu_event(
     }
     if event_id == tray_ui.health_check_item.id().as_ref() {
         app.run_health_check();
+        return;
+    }
+    if event_id == tray_ui.update_item.id().as_ref() {
+        check_for_updates_from_menu(app);
         return;
     }
     if event_id == tray_ui.add_vocabulary_item.id().as_ref() {
@@ -2936,6 +2955,102 @@ fn copy_history_item(app: &App, index: usize, mode: HistoryCopyMode) {
         return;
     }
     info!("copied transcript history item {index} as {mode:?}");
+}
+
+fn check_for_updates_from_menu(app: &App) {
+    let root_dir = app.config.root_dir.clone();
+    show_notification("Bolo Update", "Checking for updates.");
+    let join_handle = std::thread::Builder::new()
+        .name(String::from("bolo-updater"))
+        .spawn(move || match run_bolo_update(&root_dir) {
+            Ok(UpdateOutcome::Updated) => {
+                info!("Bolo update installed, restarting runtime");
+                show_notification("Bolo Updated", "Restarting Bolo now.");
+                std::thread::sleep(Duration::from_millis(300));
+                std::process::exit(UPDATE_RESTART_EXIT_CODE);
+            }
+            Ok(UpdateOutcome::Current) => {
+                info!("Bolo update check: already current");
+                show_notification("Bolo Update", "Bolo is already up to date.");
+            }
+            Ok(UpdateOutcome::Skipped(reason)) => {
+                warn!("Bolo update skipped: {reason}");
+                show_notification("Bolo Update Skipped", &reason);
+            }
+            Err(error) => {
+                warn!("Bolo update failed: {error}");
+                show_notification(
+                    "Bolo Update Failed",
+                    &short_menu_message(&error.to_string()),
+                );
+            }
+        });
+    if let Err(error) = join_handle {
+        warn!("failed to start updater thread: {error}");
+    }
+}
+
+fn run_bolo_update(root_dir: &Path) -> Result<UpdateOutcome, AppError> {
+    let script = root_dir.join("update.sh");
+    let output = Command::new(&script).current_dir(root_dir).output()?;
+    let text = command_output_text(&output);
+    info!(
+        "[update] script_finished {}",
+        serde_json::json!({
+            "status": output.status.code(),
+            "output": &text,
+        })
+    );
+    if !output.status.success() {
+        return Err(AppError::MenuBar(short_menu_message(&text)));
+    }
+    Ok(parse_update_outcome(&text))
+}
+
+fn parse_update_outcome(output: &str) -> UpdateOutcome {
+    for line in output.lines() {
+        match line.trim() {
+            "BOLO_UPDATE_RESULT=updated" => return UpdateOutcome::Updated,
+            "BOLO_UPDATE_RESULT=current" => return UpdateOutcome::Current,
+            "BOLO_UPDATE_RESULT=skipped" => {
+                return UpdateOutcome::Skipped(update_reason(output));
+            }
+            _ => {}
+        }
+    }
+    UpdateOutcome::Current
+}
+
+fn update_reason(output: &str) -> String {
+    output
+        .lines()
+        .find_map(|line| line.strip_prefix("BOLO_UPDATE_REASON="))
+        .filter(|reason| !reason.trim().is_empty())
+        .map_or_else(
+            || String::from("Update was skipped."),
+            |reason| short_menu_message(reason),
+        )
+}
+
+fn command_output_text(output: &std::process::Output) -> String {
+    let mut text = String::new();
+    text.push_str(&String::from_utf8_lossy(&output.stdout));
+    text.push_str(&String::from_utf8_lossy(&output.stderr));
+    text
+}
+
+fn short_menu_message(message: &str) -> String {
+    const MAX_CHARS: usize = 160;
+    let single_line = message.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut short = single_line.chars().take(MAX_CHARS).collect::<String>();
+    if single_line.chars().count() > MAX_CHARS {
+        short.push_str("...");
+    }
+    if short.is_empty() {
+        String::from("Unknown error.")
+    } else {
+        short
+    }
 }
 
 fn add_vocabulary_from_menu(app: &App) {
@@ -4349,12 +4464,13 @@ mod tests {
     use super::{
         AccessibilityContext, App, AppError, AppState, CleanupMode, CleanupProfile, Config,
         DictationCommandKind, DictationWarmup, StreamingProvider, StreamingTranscript, SttFallback,
-        TRANSCRIPT_HISTORY_LIMIT, TextReplacement, TranscriptHistoryEntry, apply_text_replacements,
-        build_cleanup_user_content, build_stt_prompt, canonicalize_known_terms, cleanup_decision,
-        cleanup_max_tokens, cleanup_profile, is_known_no_speech_transcript, parse_command,
-        parse_stt_fallbacks, remove_fillers, sanitize_transcript_history, speech_stats,
-        strip_reasoning_tags, stt_language_for_model, stt_model_config, telnyx_stream_query,
-        transcript_menu_preview, valid_deferred_cleanup, wav_bytes,
+        TRANSCRIPT_HISTORY_LIMIT, TextReplacement, TranscriptHistoryEntry, UpdateOutcome,
+        apply_text_replacements, build_cleanup_user_content, build_stt_prompt,
+        canonicalize_known_terms, cleanup_decision, cleanup_max_tokens, cleanup_profile,
+        is_known_no_speech_transcript, parse_command, parse_stt_fallbacks, parse_update_outcome,
+        remove_fillers, sanitize_transcript_history, speech_stats, strip_reasoning_tags,
+        stt_language_for_model, stt_model_config, telnyx_stream_query, transcript_menu_preview,
+        valid_deferred_cleanup, wav_bytes,
     };
     use std::collections::VecDeque;
     use std::path::PathBuf;
@@ -4847,6 +4963,24 @@ mod tests {
             "line one line two"
         );
         assert!(transcript_menu_preview(&"a".repeat(80)).ends_with("..."));
+    }
+
+    #[test]
+    fn parses_update_outcomes() {
+        assert_eq!(
+            parse_update_outcome("BOLO_UPDATE_RESULT=updated\n"),
+            UpdateOutcome::Updated
+        );
+        assert_eq!(
+            parse_update_outcome("BOLO_UPDATE_RESULT=current\n"),
+            UpdateOutcome::Current
+        );
+        assert_eq!(
+            parse_update_outcome(
+                "BOLO_UPDATE_RESULT=skipped\nBOLO_UPDATE_REASON=Local files changed.\n"
+            ),
+            UpdateOutcome::Skipped(String::from("Local files changed."))
+        );
     }
 
     #[test]

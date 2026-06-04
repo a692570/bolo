@@ -53,7 +53,7 @@ fi
 
 BOLO_DIR="$(cd "$(dirname "$0")" && pwd)"
 COMMAND_FILE="$BOLO_DIR/start-bolo.command"
-chmod +x "$COMMAND_FILE" "$BOLO_DIR/start-bolo.sh" "$BOLO_DIR/restart.sh"
+chmod +x "$COMMAND_FILE" "$BOLO_DIR/start-bolo.sh" "$BOLO_DIR/restart.sh" "$BOLO_DIR/update.sh"
 
 osascript -e "tell application \"System Events\" to delete (every login item whose name contains \"bolo\")" 2>/dev/null || true
 osascript -e "tell application \"System Events\" to make new login item at end of login items with properties {path:\"$COMMAND_FILE\", hidden:false}"

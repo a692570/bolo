@@ -16,6 +16,11 @@ fi
 
 cd "$BOLO_DIR" || exit 1
 
+if [ "${BOLO_AUTO_UPDATE:-on}" != "off" ] && [ -x "$BOLO_DIR/update.sh" ]; then
+    echo "[bolo] checking for updates" >> "$LOG"
+    "$BOLO_DIR/update.sh" >> "$LOG" 2>&1 || echo "[bolo] update check failed" >> "$LOG"
+fi
+
 if [ ! -x "$BIN" ] || [ "$BOLO_DIR/src/main.rs" -nt "$BIN" ] || [ "$BOLO_DIR/Cargo.toml" -nt "$BIN" ]; then
     if ! command -v cargo >/dev/null 2>&1; then
         echo "[bolo] ERROR: cargo not found. Run ./install.sh first." >> "$LOG"

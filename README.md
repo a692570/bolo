@@ -63,6 +63,21 @@ Place your cursor in any text field, hold your hotkey, speak, and release. Text 
 ./restart.sh
 ```
 
+## Updates
+
+Bolo checks for updates when it starts from the login item or `./restart.sh`.
+If the local checkout can fast-forward to GitHub, Bolo pulls the latest code and rebuilds the release binary before launching.
+
+You can also use **Check for Updates** from the Bolo menu bar icon.
+
+Updates are skipped if local files have uncommitted changes, GitHub is unreachable, Rust is missing, or the checkout cannot fast-forward cleanly.
+
+To disable launch-time update checks, set:
+
+```bash
+export BOLO_AUTO_UPDATE="off"
+```
+
 ## Configuration
 
 Set your Telnyx API key as an environment variable:
@@ -191,13 +206,20 @@ Replacements are applied after local cleanup and before text insertion. Longer r
 
 You can add these from the menu bar with **Add Correction Rule...**. Rules are saved to `~/.bolo/replacements.json` and apply to the next dictation.
 
+You can also add a correction by voice:
+
+```text
+Correct tab only to Tavily
+```
+
+Bolo saves that as a local replacement rule and does not paste the command text.
+
 ## Current Limitations
 
 - Bolo is under active development and improving quickly.
 - Short dictation works well today. Longer dictation and latency are still improving.
 - Long dictation still needs more real-world validation than short phrases.
 - Cleanup is intentionally conservative to preserve literal meaning.
-- Streaming preview and learned correction memory are not part of the Rust runtime.
 - A first-run onboarding dialog asks for your preferred hotkey so you never start with the wrong key.
 - Bolo rechecks OS key state while running so missed hotkey press or release events are corrected quickly.
 - A recording lifecycle state machine ignores duplicate press and release events and keeps stale-recording recovery predictable.
@@ -250,7 +272,7 @@ Rust gives Bolo a single compiled runtime with strict linting, safe audio captur
 
 - How do I correct a mistake?
 
-Re-dictate the corrected text. Bolo no longer uses the old learned correction memory because it was too error-prone.
+Say `Correct heard phrase to desired phrase`, or use **Add Correction Rule...** from the menu bar. Bolo stores the rule locally in `~/.bolo/replacements.json`.
 
 ## Troubleshooting
 
