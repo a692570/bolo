@@ -4646,6 +4646,24 @@ mod tests {
         // A submit phrase with nothing before it stays a standalone press, and
         // ordinary prose without a trailing submit phrase is not a command.
         assert!(parse_command("the package will ship eventually", false).is_none());
+
+        // A submit phrase mid-sentence (not trailing) is not a command.
+        assert!(
+            parse_command("send it to john and call me later", false).is_none(),
+            "mid-sentence submit phrase should not trigger"
+        );
+
+        // Multiple trailing submit phrases: strip only the last one; the earlier
+        // phrase stays as literal text.
+        let multi = parse_command("do the thing send it run it", false);
+        assert_eq!(
+            multi.as_ref().map(|command| command.kind),
+            Some(DictationCommandKind::InsertReturn)
+        );
+        assert_eq!(
+            multi.as_ref().map(|command| command.text.as_str()),
+            Some("do the thing send it")
+        );
     }
 
     #[test]
