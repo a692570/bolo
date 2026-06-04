@@ -148,6 +148,8 @@ enum DictationCommandKind {
     Insert,
     Replace,
     AddCorrection,
+    PressReturn,
+    InsertReturn,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2116,6 +2118,16 @@ impl App {
                 self.remember_result(&command.text, &command.text)?;
                 play_sound("Pop");
             }
+            DictationCommandKind::PressReturn => {
+                press_return()?;
+                info!("applied press-return command");
+            }
+            DictationCommandKind::InsertReturn => {
+                paste_text(&command.text)?;
+                self.remember_result(&command.text, &command.text)?;
+                press_return()?;
+                play_sound("Pop");
+            }
             DictationCommandKind::AddCorrection => {
                 let Some(replacement) = command.replacement.as_ref() else {
                     return Ok(());
@@ -3336,8 +3348,11 @@ fn frame_rms(samples: &[i16]) -> f32 {
 
 fn parse_command(text: &str, correction_active: bool) -> Option<DictationCommand> {
     let stripped = text.trim();
-    let lowered = stripped.to_ascii_lowercase();
-    let command = match lowered.as_str() {
+    let lowered_full = stripped.to_ascii_lowercase();
+    let lowered = lowered_full
+        .trim_end_matches(|character: char| ".!?,".contains(character))
+        .trim();
+    let command = match lowered {
         "scratch that" => DictationCommand {
             kind: DictationCommandKind::Scratch,
             text: String::new(),
@@ -3355,6 +3370,12 @@ fn parse_command(text: &str, correction_active: bool) -> Option<DictationCommand
         "dash" => insert_command(" -- ", "--"),
         "colon" => insert_command(": ", ":"),
         "semicolon" => insert_command("; ", ";"),
+        "enter" | "submit" | "press enter" | "hit enter" => DictationCommand {
+            kind: DictationCommandKind::PressReturn,
+            text: String::new(),
+            display: "\u{21A9}".to_owned(),
+            replacement: None,
+        },
         _ if lowered.starts_with("bullet ") => {
             let bullet_text = stripped["bullet ".len()..].trim();
             insert_command(&format!("\n- {bullet_text}"), &format!("- {bullet_text}"))
@@ -3365,9 +3386,56 @@ fn parse_command(text: &str, correction_active: bool) -> Option<DictationCommand
             display: stripped["actually ".len()..].trim().to_owned(),
             replacement: None,
         },
-        _ => parse_correction_command(stripped)?,
+        _ => {
+            if let Some(prefix) = strip_trailing_submit(stripped) {
+                DictationCommand {
+                    kind: DictationCommandKind::InsertReturn,
+                    text: prefix.clone(),
+                    display: format!("{prefix} \u{21A9}"),
+                    replacement: None,
+                }
+            } else {
+                parse_correction_command(stripped)?
+            }
+        }
     };
     Some(command)
+}
+
+/// If the transcript ends with a spoken submit phrase ("send it" / "run it"),
+/// return the text with that trailing phrase removed. The text before the phrase
+/// is typed, then Return is pressed. Returns None when no trailing phrase is
+/// present or nothing remains before it.
+fn strip_trailing_submit(text: &str) -> Option<String> {
+    let lowered = text.to_ascii_lowercase();
+    for phrase in [
+        " send it",
+        " run it",
+        " ship it",
+        " submit it",
+        " send that",
+        " run that",
+        " press enter",
+        " hit enter",
+        " and enter",
+        " then enter",
+    ] {
+        let Some(index) = lowered.rfind(phrase) else {
+            continue;
+        };
+        let after = lowered[index + phrase.len()..]
+            .trim_matches(|character: char| character.is_whitespace() || ".,!?".contains(character));
+        if !after.is_empty() {
+            continue;
+        }
+        let prefix = text[..index]
+            .trim_end_matches(|character: char| character.is_whitespace() || character == ',')
+            .to_owned();
+        if !prefix.is_empty() {
+            return Some(prefix);
+        }
+    }
+    None
 }
 
 fn parse_correction_command(text: &str) -> Option<DictationCommand> {
@@ -4343,6 +4411,10 @@ fn delete_chars(count: usize) -> Result<(), AppError> {
     Ok(())
 }
 
+fn press_return() -> Result<(), AppError> {
+    run_osascript("tell application \"System Events\" to key code 36")
+}
+
 fn run_osascript(script: &str) -> Result<(), AppError> {
     let status = Command::new("osascript").arg("-e").arg(script).status()?;
     if status.success() {
@@ -4535,6 +4607,45 @@ mod tests {
                 .and_then(|command| command.replacement.as_deref()),
             Some("Tavily")
         );
+    }
+
+    #[test]
+    fn parses_return_commands() {
+        for phrase in ["enter", "submit", "press enter", "hit enter", "Submit."] {
+            assert_eq!(
+                parse_command(phrase, false).map(|command| command.kind),
+                Some(DictationCommandKind::PressReturn),
+                "standalone phrase did not press return: {phrase}"
+            );
+        }
+
+        let one_shot = parse_command("git status send it", false);
+        assert_eq!(
+            one_shot.as_ref().map(|command| command.kind),
+            Some(DictationCommandKind::InsertReturn)
+        );
+        assert_eq!(
+            one_shot.as_ref().map(|command| command.text.as_str()),
+            Some("git status")
+        );
+
+        for phrase in [
+            "list the files run it",
+            "deploy the build ship it",
+            "save the draft submit it",
+            "open the menu press enter",
+            "go to the end then enter",
+        ] {
+            assert_eq!(
+                parse_command(phrase, false).map(|command| command.kind),
+                Some(DictationCommandKind::InsertReturn),
+                "one-shot phrase did not insert and return: {phrase}"
+            );
+        }
+
+        // A submit phrase with nothing before it stays a standalone press, and
+        // ordinary prose without a trailing submit phrase is not a command.
+        assert!(parse_command("the package will ship eventually", false).is_none());
     }
 
     #[test]

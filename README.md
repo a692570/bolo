@@ -63,6 +63,19 @@ Place your cursor in any text field, hold your hotkey, speak, and release. Text 
 ./restart.sh
 ```
 
+## Voice commands
+
+Some spoken phrases act as commands instead of dictated text.
+
+Press Enter without touching the keyboard:
+
+- End a dictation with a submit phrase to type the text and press Return in one step. Supported phrases: `send it`, `run it`, `ship it`, `submit it`, `send that`, `run that`, `press enter`, `hit enter`, `and enter`, `then enter`. For example, saying "git status run it" types `git status` and presses Return.
+- Say a submit phrase on its own (`enter`, `submit`, `press enter`, `hit enter`) to press Return only, when text is already in the field.
+
+This keeps the loop hands-free in REPLs, CLI agents, and chat boxes that send on Enter. Return is sent through the same macOS path Bolo uses for paste, so no extra permission is needed.
+
+Other voice commands include `scratch that`, `new line`, `new paragraph`, `bullet ...`, punctuation words such as `comma` and `period`, and corrections like `Correct heard phrase to desired phrase`.
+
 ## Updates
 
 Bolo checks for updates when it starts from the login item or `./restart.sh`.
