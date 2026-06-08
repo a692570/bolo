@@ -53,7 +53,7 @@ const ASSEMBLYAI_TRANSCRIPT_ENDPOINT: &str = "https://api.assemblyai.com/v2/tran
 const CORRECTION_WINDOW: Duration = Duration::from_secs(3);
 const MIN_RECORDING: Duration = Duration::from_secs(1);
 const RECORDING_WATCHDOG_INTERVAL: Duration = Duration::from_secs(5);
-const RECORDING_STALE_SECONDS: u64 = 30;
+const DEFAULT_MAX_RECORDING_SECONDS: u64 = 30;
 const SPEECH_RMS_THRESHOLD: f32 = 0.006;
 const SPEECH_FRAME_MS: usize = 20;
 const AUDIO_RELEASE_DRAIN: Duration = Duration::from_millis(120);
@@ -107,6 +107,7 @@ struct Config {
     paste_last_hotkey: Option<String>,
     preserve_clipboard: bool,
     log_transcripts: bool,
+    max_recording_seconds: u64,
     replacements: Vec<TextReplacement>,
 }
 
@@ -1152,12 +1153,13 @@ fn run_app_event_loop(app: Arc<App>) -> Result<(), AppError> {
                 }
             }
             TaoEvent::UserEvent(UserEvent::RecordingWatchdog) => {
+                let max_seconds = app.config.max_recording_seconds;
                 let stale = {
                     let Ok(state) = app.state.lock() else {
                         return;
                     };
                     state.active.as_ref().is_some_and(|recording| {
-                        recording.started_at.elapsed().as_secs() > RECORDING_STALE_SECONDS
+                        recording.started_at.elapsed().as_secs() > max_seconds
                     })
                 };
                 if stale {
@@ -2472,6 +2474,10 @@ impl Config {
             paste_last_hotkey: load_env_value("BOLO_PASTE_LAST_HOTKEY"),
             preserve_clipboard: load_bool_env("BOLO_PRESERVE_CLIPBOARD", true),
             log_transcripts: load_bool_env("BOLO_LOG_TRANSCRIPTS", false),
+            max_recording_seconds: load_u64_env(
+                "BOLO_MAX_RECORDING_SECONDS",
+                DEFAULT_MAX_RECORDING_SECONDS,
+            ),
         })
     }
 
@@ -4650,6 +4656,20 @@ fn load_bool_env(name: &'static str, default: bool) -> bool {
     }
 }
 
+fn load_u64_env(name: &'static str, default: u64) -> u64 {
+    parse_u64_env_value(load_env_value(name).as_deref(), default)
+}
+
+/// Parse a positive integer env value, falling back to `default`. A missing,
+/// unparseable, or zero value yields the default (zero would make the watchdog
+/// cut every recording off instantly).
+fn parse_u64_env_value(value: Option<&str>, default: u64) -> u64 {
+    match value.and_then(|value| value.trim().parse::<u64>().ok()) {
+        Some(value) if value > 0 => value,
+        _ => default,
+    }
+}
+
 fn copy_to_clipboard(text: &str) -> Result<(), AppError> {
     let mut clipboard = Clipboard::new().map_err(|error| AppError::Clipboard(error.to_string()))?;
     clipboard
@@ -4818,7 +4838,8 @@ mod tests {
         apply_text_replacements, apply_vocabulary_corrections, build_cleanup_user_content,
         build_stt_prompt, canonicalize_known_terms, cleanup_decision, cleanup_max_tokens,
         cleanup_profile, is_known_no_speech_transcript, parse_command, parse_replacements_json,
-        parse_stt_fallbacks, parse_update_outcome, read_vocabulary_file, remove_fillers,
+        parse_stt_fallbacks, parse_u64_env_value, parse_update_outcome, read_vocabulary_file,
+        remove_fillers,
         sanitize_transcript_history, speech_stats, strip_reasoning_tags, stt_language_for_model,
         stt_model_config, telnyx_stream_query, transcript_log_value, transcript_menu_preview,
         valid_deferred_cleanup, wav_bytes,
@@ -4827,6 +4848,19 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Mutex;
     use std::{env, fs, process};
+
+    #[test]
+    fn parses_max_recording_seconds_env_value() {
+        // Valid positive values are used as-is.
+        assert_eq!(parse_u64_env_value(Some("180"), 30), 180);
+        assert_eq!(parse_u64_env_value(Some("  240 "), 30), 240);
+        // Missing, zero, negative, or unparseable values fall back to the default.
+        assert_eq!(parse_u64_env_value(None, 30), 30);
+        assert_eq!(parse_u64_env_value(Some("0"), 30), 30);
+        assert_eq!(parse_u64_env_value(Some("-5"), 30), 30);
+        assert_eq!(parse_u64_env_value(Some("abc"), 30), 30);
+        assert_eq!(parse_u64_env_value(Some(""), 30), 30);
+    }
 
     #[test]
     fn parses_dictation_commands() {
@@ -5056,6 +5090,7 @@ mod tests {
             paste_last_hotkey: None,
             preserve_clipboard: true,
             log_transcripts: false,
+            max_recording_seconds: 30,
         };
 
         assert_eq!(config.llm_model(), "Kimi-K2.5");
@@ -5079,6 +5114,7 @@ mod tests {
             paste_last_hotkey: None,
             preserve_clipboard: true,
             log_transcripts: false,
+            max_recording_seconds: 30,
         };
 
         assert!(!cleanup_decision(&config, "got it thanks").0);
@@ -5110,6 +5146,7 @@ mod tests {
             paste_last_hotkey: None,
             preserve_clipboard: true,
             log_transcripts: false,
+            max_recording_seconds: 30,
         };
 
         assert!(cleanup_decision(&config, "got it thanks let me know").0);
@@ -5223,6 +5260,7 @@ mod tests {
                 paste_last_hotkey: None,
                 preserve_clipboard: true,
                 log_transcripts: false,
+                max_recording_seconds: 30,
             },
             http: reqwest::blocking::Client::new(),
             vocabulary: Mutex::new(Vec::new()),
@@ -5260,6 +5298,7 @@ mod tests {
                 paste_last_hotkey: None,
                 preserve_clipboard: true,
                 log_transcripts: false,
+                max_recording_seconds: 30,
             },
             http: reqwest::blocking::Client::new(),
             vocabulary: Mutex::new(Vec::new()),
@@ -5296,6 +5335,7 @@ mod tests {
                 paste_last_hotkey: None,
                 preserve_clipboard: true,
                 log_transcripts: false,
+                max_recording_seconds: 30,
             },
             http: reqwest::blocking::Client::new(),
             vocabulary: Mutex::new(Vec::new()),
@@ -5342,6 +5382,7 @@ mod tests {
                 paste_last_hotkey: None,
                 preserve_clipboard: true,
                 log_transcripts: false,
+                max_recording_seconds: 30,
             },
             http: reqwest::blocking::Client::new(),
             vocabulary: Mutex::new(Vec::new()),
@@ -5383,6 +5424,7 @@ mod tests {
                 paste_last_hotkey: Some(String::from("f19")),
                 preserve_clipboard: true,
                 log_transcripts: false,
+                max_recording_seconds: 30,
             },
             http: reqwest::blocking::Client::new(),
             vocabulary: Mutex::new(Vec::new()),
@@ -5417,6 +5459,7 @@ mod tests {
                 paste_last_hotkey: Some(String::from("f19")),
                 preserve_clipboard: true,
                 log_transcripts: false,
+                max_recording_seconds: 30,
             },
             http: reqwest::blocking::Client::new(),
             vocabulary: Mutex::new(Vec::new()),
