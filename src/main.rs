@@ -56,8 +56,9 @@ const RECORDING_WATCHDOG_INTERVAL: Duration = Duration::from_secs(5);
 const RECORDING_STALE_SECONDS: u64 = 30;
 const SPEECH_RMS_THRESHOLD: f32 = 0.006;
 const SPEECH_FRAME_MS: usize = 20;
+const AUDIO_RELEASE_DRAIN: Duration = Duration::from_millis(120);
 const STREAMING_DRAIN_MIN: Duration = Duration::from_millis(450);
-const STREAMING_DRAIN_MAX: Duration = Duration::from_millis(1_600);
+const STREAMING_DRAIN_MAX: Duration = Duration::from_millis(2_500);
 const STREAMING_TRAILING_SILENCE_MS: usize = 350;
 const STREAMING_SAMPLE_RATE: u32 = 48_000;
 const UPDATE_RESTART_EXIT_CODE: i32 = 42;
@@ -147,6 +148,8 @@ enum CleanupProfile {
 enum DictationCommandKind {
     Scratch,
     Insert,
+    InsertReturn,
+    PressReturn,
     Replace,
     AddCorrection,
 }
@@ -1296,6 +1299,7 @@ impl App {
         recording: ActiveRecording,
         released_at: Instant,
     ) -> Result<(), AppError> {
+        std::thread::sleep(AUDIO_RELEASE_DRAIN);
         let elapsed = recording.started_at.elapsed();
         drop(recording.stream);
         let mut metrics = DictationLatencyMetrics::new(elapsed, released_at);
@@ -1866,14 +1870,17 @@ impl App {
             })
         );
         let normalized = canonicalize_known_terms(&whitespace_normalized);
+        let vocabulary = self.vocabulary_snapshot().unwrap_or_default();
+        let vocabulary_normalized = apply_vocabulary_corrections(&normalized, &vocabulary);
         info!(
             "[cleanup] canonicalize_terms {}",
             serde_json::json!({
                 "before": self.log_text(&whitespace_normalized),
-                "after": self.log_text(&normalized),
+                "after": self.log_text(&vocabulary_normalized),
+                "vocabulary_count": vocabulary.len(),
             })
         );
-        let stripped = remove_fillers(&normalized)?;
+        let stripped = remove_fillers(&vocabulary_normalized)?;
         info!(
             "[cleanup] remove_fillers {}",
             serde_json::json!({
@@ -2124,6 +2131,16 @@ impl App {
                 paste_text(&command.text)?;
                 self.remember_result(&command.text, &command.text)?;
                 play_sound("Pop");
+            }
+            DictationCommandKind::InsertReturn => {
+                paste_text(&command.text)?;
+                self.remember_result(&command.text, &command.text)?;
+                press_return()?;
+                play_sound("Pop");
+            }
+            DictationCommandKind::PressReturn => {
+                press_return()?;
+                info!("applied return command");
             }
             DictationCommandKind::Replace => {
                 let previous = {
@@ -3246,7 +3263,8 @@ where
     let chunk_samples = usize::try_from(config.sample_rate / 50)
         .map_err(|error| AppError::AudioStream(error.to_string()))?
         .max(1);
-    let mut streaming_chunk = Vec::with_capacity(chunk_samples);
+    let mut streaming_chunker =
+        streaming_sender.map(|sender| StreamingAudioChunker::new(sender, chunk_samples));
     device
         .build_input_stream(
             config,
@@ -3260,14 +3278,8 @@ where
                 if let Ok(mut guard) = samples.try_lock() {
                     guard.extend(mono.iter().copied());
                 }
-                if let Some(sender) = streaming_sender.as_ref() {
-                    streaming_chunk.extend(mono);
-                    if streaming_chunk.len() >= chunk_samples {
-                        let chunk = std::mem::take(&mut streaming_chunk);
-                        if sender.send(chunk).is_err() {
-                            streaming_chunk.clear();
-                        }
-                    }
+                if let Some(chunker) = streaming_chunker.as_mut() {
+                    chunker.push(mono);
                 }
             },
             |error| {
@@ -3276,6 +3288,43 @@ where
             None,
         )
         .map_err(|error| AppError::AudioStream(error.to_string()))
+}
+
+struct StreamingAudioChunker {
+    sender: mpsc::Sender<Vec<i16>>,
+    buffer: Vec<i16>,
+    chunk_samples: usize,
+}
+
+impl StreamingAudioChunker {
+    fn new(sender: mpsc::Sender<Vec<i16>>, chunk_samples: usize) -> Self {
+        Self {
+            sender,
+            buffer: Vec::with_capacity(chunk_samples),
+            chunk_samples,
+        }
+    }
+
+    fn push(&mut self, samples: Vec<i16>) {
+        self.buffer.extend(samples);
+        while self.buffer.len() >= self.chunk_samples {
+            let remainder = self.buffer.split_off(self.chunk_samples);
+            let chunk = std::mem::replace(&mut self.buffer, remainder);
+            if self.sender.send(chunk).is_err() {
+                self.buffer.clear();
+                break;
+            }
+        }
+    }
+}
+
+impl Drop for StreamingAudioChunker {
+    fn drop(&mut self) {
+        if !self.buffer.is_empty() {
+            let chunk = std::mem::take(&mut self.buffer);
+            drop(self.sender.send(chunk));
+        }
+    }
 }
 
 fn wav_bytes(samples: &[i16], sample_rate: u32) -> Result<Vec<u8>, AppError> {
@@ -3348,12 +3397,19 @@ fn frame_rms(samples: &[i16]) -> f32 {
 
 fn parse_command(text: &str, correction_active: bool) -> Option<DictationCommand> {
     let stripped = text.trim();
-    let lowered = stripped.to_ascii_lowercase();
+    let command_text = stripped.trim_end_matches(is_command_trailing_punctuation);
+    let lowered = command_text.to_ascii_lowercase();
     let command = match lowered.as_str() {
         "scratch that" => DictationCommand {
             kind: DictationCommandKind::Scratch,
             text: String::new(),
             display: String::new(),
+            replacement: None,
+        },
+        "enter" | "return" | "press enter" | "hit enter" | "submit" => DictationCommand {
+            kind: DictationCommandKind::PressReturn,
+            text: String::new(),
+            display: String::from("enter"),
             replacement: None,
         },
         "new paragraph" => insert_command("\n\n", "\\n\\n"),
@@ -3368,18 +3424,62 @@ fn parse_command(text: &str, correction_active: bool) -> Option<DictationCommand
         "colon" => insert_command(": ", ":"),
         "semicolon" => insert_command("; ", ";"),
         _ if lowered.starts_with("bullet ") => {
-            let bullet_text = stripped["bullet ".len()..].trim();
+            let bullet_text = command_text["bullet ".len()..].trim();
             insert_command(&format!("\n- {bullet_text}"), &format!("- {bullet_text}"))
         }
         _ if lowered.starts_with("actually ") && correction_active => DictationCommand {
             kind: DictationCommandKind::Replace,
-            text: stripped["actually ".len()..].trim().to_owned(),
-            display: stripped["actually ".len()..].trim().to_owned(),
+            text: command_text["actually ".len()..].trim().to_owned(),
+            display: command_text["actually ".len()..].trim().to_owned(),
             replacement: None,
         },
+        _ if strip_trailing_submit(command_text).is_some() => {
+            let submitted_text = strip_trailing_submit(command_text)?.to_owned();
+            DictationCommand {
+                kind: DictationCommandKind::InsertReturn,
+                display: format!("{submitted_text} + enter"),
+                text: submitted_text,
+                replacement: None,
+            }
+        }
         _ => parse_correction_command(stripped)?,
     };
     Some(command)
+}
+
+fn is_command_trailing_punctuation(character: char) -> bool {
+    character.is_whitespace() || ".!?,".contains(character)
+}
+
+fn strip_trailing_submit(text: &str) -> Option<&str> {
+    for suffix in [
+        " and press enter",
+        " then press enter",
+        " and hit enter",
+        " then hit enter",
+        " and enter",
+        " then enter",
+        " and submit",
+        " then submit",
+    ] {
+        if let Some(prefix) = strip_suffix_ignore_ascii_case(text, suffix) {
+            let prefix = prefix.trim();
+            if !prefix.is_empty() {
+                return Some(prefix);
+            }
+        }
+    }
+    None
+}
+
+fn strip_suffix_ignore_ascii_case<'a>(text: &'a str, suffix: &str) -> Option<&'a str> {
+    if text.len() < suffix.len() {
+        return None;
+    }
+    let start = text.len() - suffix.len();
+    text[start..]
+        .eq_ignore_ascii_case(suffix)
+        .then_some(&text[..start])
 }
 
 fn parse_correction_command(text: &str) -> Option<DictationCommand> {
@@ -3529,6 +3629,229 @@ fn canonicalize_known_terms(text: &str) -> String {
         }
     }
     result.trim().to_owned()
+}
+
+fn apply_vocabulary_corrections(text: &str, vocabulary: &[String]) -> String {
+    if text.is_empty() || vocabulary.is_empty() {
+        return text.to_owned();
+    }
+    let terms = vocabulary_terms(vocabulary);
+    if terms.is_empty() {
+        return text.to_owned();
+    }
+    let pieces = word_pieces(text);
+    if pieces.is_empty() {
+        return text.to_owned();
+    }
+
+    let mut result = String::with_capacity(text.len());
+    let mut cursor = 0;
+    let mut index = 0;
+    while index < pieces.len() {
+        if let Some(match_) = best_vocabulary_match(text, &pieces, index, &terms) {
+            result.push_str(&text[cursor..match_.start]);
+            result.push_str(match_.term);
+            cursor = match_.end;
+            index += match_.word_count;
+        } else {
+            index += 1;
+        }
+    }
+    result.push_str(&text[cursor..]);
+    result.trim().to_owned()
+}
+
+#[derive(Clone, Debug)]
+struct VocabularyTerm<'a> {
+    term: &'a str,
+    normalized: String,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct WordPiece {
+    start: usize,
+    end: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct VocabularyMatch<'a> {
+    term: &'a str,
+    start: usize,
+    end: usize,
+    word_count: usize,
+    score: usize,
+}
+
+fn vocabulary_terms(vocabulary: &[String]) -> Vec<VocabularyTerm<'_>> {
+    vocabulary
+        .iter()
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|term| !term.is_empty())
+        .filter_map(|term| {
+            let normalized = normalize_for_matching(term);
+            (normalized.chars().count() >= 4).then_some(VocabularyTerm { term, normalized })
+        })
+        .collect()
+}
+
+fn word_pieces(text: &str) -> Vec<WordPiece> {
+    let mut pieces = Vec::new();
+    let mut start = None;
+    for (index, character) in text.char_indices() {
+        if character.is_alphanumeric() || character == '\'' {
+            if start.is_none() {
+                start = Some(index);
+            }
+        } else if let Some(piece_start) = start.take() {
+            pieces.push(WordPiece {
+                start: piece_start,
+                end: index,
+            });
+        }
+    }
+    if let Some(piece_start) = start {
+        pieces.push(WordPiece {
+            start: piece_start,
+            end: text.len(),
+        });
+    }
+    pieces
+}
+
+fn best_vocabulary_match<'a>(
+    text: &str,
+    pieces: &[WordPiece],
+    index: usize,
+    terms: &'a [VocabularyTerm<'a>],
+) -> Option<VocabularyMatch<'a>> {
+    let max_words = pieces.len().saturating_sub(index).min(3);
+    let mut best = None;
+    for word_count in 1..=max_words {
+        let start = pieces[index].start;
+        let end = pieces[index + word_count - 1].end;
+        let spoken = &text[start..end];
+        let normalized = normalize_for_matching(spoken);
+        if normalized.is_empty() {
+            continue;
+        }
+        for term in terms {
+            let Some(score) = vocabulary_match_score(&normalized, &term.normalized) else {
+                continue;
+            };
+            if spoken == term.term {
+                continue;
+            }
+            let candidate = VocabularyMatch {
+                term: term.term,
+                start,
+                end,
+                word_count,
+                score,
+            };
+            if best.is_none_or(|current: VocabularyMatch<'_>| {
+                candidate.score < current.score
+                    || (candidate.score == current.score
+                        && candidate.word_count > current.word_count)
+            }) {
+                best = Some(candidate);
+            }
+        }
+    }
+    best
+}
+
+fn vocabulary_match_score(spoken: &str, term: &str) -> Option<usize> {
+    if spoken == term {
+        return Some(0);
+    }
+    let spoken_len = spoken.chars().count();
+    let term_len = term.chars().count();
+    let max_len = spoken_len.max(term_len);
+    let min_len = spoken_len.min(term_len);
+    if min_len < 4 {
+        return None;
+    }
+    let length_gap = max_len - min_len;
+    if length_gap > 3 && length_gap * 3 > max_len {
+        return None;
+    }
+    let allowed = match max_len {
+        0..=5 => 1,
+        6..=9 => 2,
+        _ => 3,
+    };
+    let phonetic = soundex_key(spoken) == soundex_key(term);
+    let max_distance = if phonetic { allowed + 1 } else { allowed };
+    let distance = bounded_levenshtein(spoken, term, max_distance)?;
+    if distance <= allowed || phonetic {
+        Some(distance.saturating_mul(10).saturating_add(length_gap))
+    } else {
+        None
+    }
+}
+
+fn bounded_levenshtein(left: &str, right: &str, max_distance: usize) -> Option<usize> {
+    let left = left.chars().collect::<Vec<_>>();
+    let right = right.chars().collect::<Vec<_>>();
+    if left.len().abs_diff(right.len()) > max_distance {
+        return None;
+    }
+    let mut previous = (0..=right.len()).collect::<Vec<_>>();
+    let mut current = vec![0; right.len() + 1];
+    for (left_index, left_char) in left.iter().enumerate() {
+        current[0] = left_index + 1;
+        let mut row_min = current[0];
+        for (right_index, right_char) in right.iter().enumerate() {
+            let substitution = usize::from(left_char != right_char);
+            current[right_index + 1] = (previous[right_index + 1] + 1)
+                .min(current[right_index] + 1)
+                .min(previous[right_index] + substitution);
+            row_min = row_min.min(current[right_index + 1]);
+        }
+        if row_min > max_distance {
+            return None;
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    (previous[right.len()] <= max_distance).then_some(previous[right.len()])
+}
+
+fn soundex_key(text: &str) -> String {
+    let mut chars = text.chars().filter(char::is_ascii_alphabetic);
+    let Some(first) = chars.next() else {
+        return String::new();
+    };
+    let mut key = String::with_capacity(4);
+    key.push(first.to_ascii_uppercase());
+    let mut previous = soundex_digit(first);
+    for character in chars {
+        let digit = soundex_digit(character);
+        if digit != '0' && digit != previous {
+            key.push(digit);
+            if key.len() == 4 {
+                break;
+            }
+        }
+        previous = digit;
+    }
+    while key.len() < 4 {
+        key.push('0');
+    }
+    key
+}
+
+const fn soundex_digit(character: char) -> char {
+    match character {
+        'b' | 'f' | 'p' | 'v' | 'B' | 'F' | 'P' | 'V' => '1',
+        'c' | 'g' | 'j' | 'k' | 'q' | 's' | 'x' | 'z' | 'C' | 'G' | 'J' | 'K' | 'Q' | 'S' | 'X'
+        | 'Z' => '2',
+        'd' | 't' | 'D' | 'T' => '3',
+        'l' | 'L' => '4',
+        'm' | 'n' | 'M' | 'N' => '5',
+        'r' | 'R' => '6',
+        _ => '0',
+    }
 }
 
 fn remove_fillers(text: &str) -> Result<String, AppError> {
@@ -4364,6 +4687,10 @@ fn delete_chars(count: usize) -> Result<(), AppError> {
     Ok(())
 }
 
+fn press_return() -> Result<(), AppError> {
+    run_osascript("tell application \"System Events\" to key code 36")
+}
+
 fn run_osascript(script: &str) -> Result<(), AppError> {
     let status = Command::new("osascript").arg("-e").arg(script).status()?;
     if status.success() {
@@ -4488,16 +4815,18 @@ mod tests {
         AccessibilityContext, App, AppError, AppState, CleanupMode, CleanupProfile, Config,
         DictationCommandKind, DictationWarmup, StreamingProvider, StreamingTranscript, SttFallback,
         TRANSCRIPT_HISTORY_LIMIT, TextReplacement, TranscriptHistoryEntry, UpdateOutcome,
-        apply_text_replacements, build_cleanup_user_content, build_stt_prompt,
-        canonicalize_known_terms, cleanup_decision, cleanup_max_tokens, cleanup_profile,
-        is_known_no_speech_transcript, parse_command, parse_stt_fallbacks, parse_update_outcome,
-        remove_fillers, sanitize_transcript_history, speech_stats, strip_reasoning_tags,
-        stt_language_for_model, stt_model_config, telnyx_stream_query, transcript_log_value,
-        transcript_menu_preview, valid_deferred_cleanup, wav_bytes,
+        apply_text_replacements, apply_vocabulary_corrections, build_cleanup_user_content,
+        build_stt_prompt, canonicalize_known_terms, cleanup_decision, cleanup_max_tokens,
+        cleanup_profile, is_known_no_speech_transcript, parse_command, parse_replacements_json,
+        parse_stt_fallbacks, parse_update_outcome, read_vocabulary_file, remove_fillers,
+        sanitize_transcript_history, speech_stats, strip_reasoning_tags, stt_language_for_model,
+        stt_model_config, telnyx_stream_query, transcript_log_value, transcript_menu_preview,
+        valid_deferred_cleanup, wav_bytes,
     };
     use std::collections::VecDeque;
     use std::path::PathBuf;
     use std::sync::Mutex;
+    use std::{env, fs, process};
 
     #[test]
     fn parses_dictation_commands() {
@@ -4558,6 +4887,22 @@ mod tests {
                 .and_then(|command| command.replacement.as_deref()),
             Some("Tavily")
         );
+
+        let enter = parse_command("press enter.", false);
+        assert_eq!(
+            enter.as_ref().map(|command| command.kind),
+            Some(DictationCommandKind::PressReturn)
+        );
+
+        let submit = parse_command("ship the message and submit", false);
+        assert_eq!(
+            submit.as_ref().map(|command| command.kind),
+            Some(DictationCommandKind::InsertReturn)
+        );
+        assert_eq!(
+            submit.as_ref().map(|command| command.text.as_str()),
+            Some("ship the message")
+        );
     }
 
     #[test]
@@ -4593,6 +4938,49 @@ mod tests {
                 .as_deref(),
             Some("ship it. Thanks")
         );
+        assert_eq!(
+            canonicalize_known_terms(
+                "I said TELNYX, tenlex, and telenix with voisei and clock talk."
+            ),
+            "I said Telnyx, Telnyx, and Telnyx with Wispr Flow and ClawdTalk."
+        );
+        assert_eq!(
+            canonicalize_known_terms("notelnyx should stay as is"),
+            "notelnyx should stay as is"
+        );
+    }
+
+    #[test]
+    fn canonicalize_known_terms_is_case_insensitive_and_word_safe() {
+        assert_eq!(
+            canonicalize_known_terms("telnyx tenlex telenyx telx"),
+            "Telnyx Telnyx Telnyx Telnyx"
+        );
+        assert_eq!(
+            canonicalize_known_terms("borO and cloud doc doc"),
+            "Bolo and Claude doc doc"
+        );
+    }
+
+    #[test]
+    fn applies_personal_vocabulary_corrections_with_punctuation() {
+        let vocabulary = vec![
+            String::from("Claude Code"),
+            String::from("cron"),
+            String::from("Chargebee"),
+        ];
+
+        assert_eq!(
+            apply_vocabulary_corrections(
+                "open cloud code, then check chrome and charge b",
+                &vocabulary,
+            ),
+            "open Claude Code, then check cron and Chargebee"
+        );
+        assert_eq!(
+            apply_vocabulary_corrections("cloud storage is different", &vocabulary),
+            "cloud storage is different"
+        );
     }
 
     #[test]
@@ -4608,6 +4996,23 @@ mod tests {
             build_stt_prompt(&long).map(|prompt| prompt.len()),
             Some(896)
         );
+    }
+
+    #[test]
+    fn reads_vocabulary_file_trims_whitespace_and_filters_empty() -> Result<(), AppError> {
+        let mut path = env::temp_dir();
+        path.push(format!("bolo-vocab-test-{}.json", process::id()));
+        fs::write(&path, "[\" Telnyx \",\"\", \"  Bolo  \",\"\", \" wispr \"]")?;
+
+        let Some(loaded) = read_vocabulary_file(&path) else {
+            return Err(AppError::Transcription(String::from(
+                "vocabulary file read failed",
+            )));
+        };
+        assert_eq!(loaded, vec!["Telnyx", "Bolo", "wispr"]);
+
+        fs::remove_file(&path)?;
+        Ok(())
     }
 
     #[test]
@@ -4685,6 +5090,30 @@ mod tests {
             )
             .0
         );
+    }
+
+    #[test]
+    fn auto_cleanup_runs_for_short_text_without_terminal_punctuation() {
+        let config = Config {
+            telnyx_api_key: String::from("test"),
+            llm_cleanup: CleanupMode::Auto,
+            litellm_base: None,
+            litellm_key: None,
+            stt_model: String::from("deepgram/nova-3"),
+            stt_language: String::from("en-US"),
+            streaming_stt: None,
+            stt_fallbacks: Vec::new(),
+            microphone: None,
+            replacements: Vec::new(),
+            root_dir: PathBuf::new(),
+            hotkey: String::from("right_option"),
+            paste_last_hotkey: None,
+            preserve_clipboard: true,
+            log_transcripts: false,
+        };
+
+        assert!(cleanup_decision(&config, "got it thanks let me know").0);
+        assert!(!cleanup_decision(&config, "got it thanks!").0);
     }
 
     #[test]
@@ -4806,6 +5235,45 @@ mod tests {
         assert_eq!(prepared.text, "Telnyx ships");
         assert!(!prepared.llm_cleanup_ran);
         assert!(!prepared.llm_cleanup_deferred);
+        Ok(())
+    }
+
+    #[test]
+    fn prepare_text_applies_local_corrections_on_short_text_without_llm() -> Result<(), AppError> {
+        let app = App {
+            config: Config {
+                telnyx_api_key: String::from("test"),
+                llm_cleanup: CleanupMode::Auto,
+                litellm_base: None,
+                litellm_key: None,
+                stt_model: String::from("deepgram/nova-3"),
+                stt_language: String::from("en-US"),
+                streaming_stt: None,
+                stt_fallbacks: Vec::new(),
+                microphone: None,
+                replacements: vec![TextReplacement {
+                    spoken: String::from("ship"),
+                    replacement: String::from("send"),
+                }],
+                root_dir: PathBuf::new(),
+                hotkey: String::from("right_option"),
+                paste_last_hotkey: None,
+                preserve_clipboard: true,
+                log_transcripts: false,
+            },
+            http: reqwest::blocking::Client::new(),
+            vocabulary: Mutex::new(Vec::new()),
+            state: Mutex::new(AppState::default()),
+            event_proxy: Mutex::new(None),
+        };
+
+        let prepared =
+            app.prepare_text("tenlex can ship this quickly", &DictationWarmup::default())?;
+
+        assert_eq!(prepared.text, "Telnyx can send this quickly");
+        assert!(!prepared.llm_cleanup_ran);
+        assert!(!prepared.llm_cleanup_deferred);
+        assert_eq!(prepared.cleanup_input, None);
         Ok(())
     }
 
@@ -5081,6 +5549,36 @@ mod tests {
             apply_text_replacements("ship the voice ai demo", &replacements),
             "ship the Voice AI demo"
         );
+    }
+
+    #[test]
+    fn applies_replacements_longest_match_and_boundaries() {
+        let replacements = vec![
+            TextReplacement {
+                spoken: String::from("open ai"),
+                replacement: String::from("OpenAI"),
+            },
+            TextReplacement {
+                spoken: String::from("open"),
+                replacement: String::from("Open"),
+            },
+        ];
+
+        assert_eq!(
+            apply_text_replacements("OpEn AI model", &replacements),
+            "OpenAI model"
+        );
+        assert_eq!(
+            apply_text_replacements("prefix_open ai should stay", &replacements),
+            "prefix_open ai should stay"
+        );
+    }
+
+    #[test]
+    fn parses_replacements_json_and_applies_longest_match() -> Result<(), AppError> {
+        let parsed = parse_replacements_json(r#"{"Open AI":"OpenAI","open":"Open"}"#)?;
+        assert_eq!(apply_text_replacements("Open AI", &parsed), "OpenAI");
+        Ok(())
     }
 
     #[test]
