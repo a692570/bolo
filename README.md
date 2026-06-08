@@ -118,6 +118,14 @@ export BOLO_PASTE_LAST_HOTKEY="f19"
 
 This is off unless configured. It accepts the same key names as `BOLO_HOTKEY` where supported, and uses the clipboard only long enough to paste before restoring the previous clipboard text.
 
+A watchdog auto-releases a recording that runs longer than 30 seconds, which protects against a stuck recording but also caps a single dictation. To raise (or lower) that ceiling, set:
+
+```bash
+export BOLO_MAX_RECORDING_SECONDS="180"
+```
+
+The value is in seconds and defaults to 30. A missing, zero, or unparseable value keeps the 30-second default.
+
 To preselect a microphone without using the menu, set:
 
 ```bash
