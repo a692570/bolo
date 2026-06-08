@@ -105,6 +105,7 @@ struct Config {
     hotkey: String,
     paste_last_hotkey: Option<String>,
     preserve_clipboard: bool,
+    log_transcripts: bool,
     replacements: Vec<TextReplacement>,
 }
 
@@ -1078,8 +1079,9 @@ fn run_app_event_loop(app: Arc<App>) -> Result<(), AppError> {
         *control_flow = deadline.map_or(ControlFlow::Wait, ControlFlow::WaitUntil);
         match event {
             TaoEvent::NewEvents(StartCause::Init) => {
-                recording_check_at = Some(Instant::now() + RECORDING_WATCHDOG_INTERVAL);
-                *control_flow = ControlFlow::WaitUntil(recording_check_at.unwrap());
+                let next_recording_check = Instant::now() + RECORDING_WATCHDOG_INTERVAL;
+                recording_check_at = Some(next_recording_check);
+                *control_flow = ControlFlow::WaitUntil(next_recording_check);
                 match create_tray_ui(&app) {
                     Ok(ui) => {
                         tray_ui = Some(ui);
@@ -1357,7 +1359,7 @@ impl App {
         info!(
             "[pipeline] stt_understanding {}",
             serde_json::json!({
-                    "transcript": &raw,
+                "transcript": self.log_text(&raw),
                 "chars": raw.chars().count(),
                 "words": raw.split_whitespace().count(),
             })
@@ -1386,8 +1388,8 @@ impl App {
                 "[pipeline] command_detected {}",
                 serde_json::json!({
                     "kind": format!("{:?}", command.kind),
-                    "text": &command.text,
-                    "display": &command.display,
+                    "text": self.log_text(&command.text),
+                    "display": self.log_text(&command.display),
                 })
             );
             self.apply_command(command)?;
@@ -1395,7 +1397,7 @@ impl App {
             info!(
                 "[pipeline] injecting_text {}",
                 serde_json::json!({
-                    "text": &prepared.text,
+                    "text": self.log_text(&prepared.text),
                     "chars": prepared.text.chars().count(),
                 })
             );
@@ -1652,7 +1654,7 @@ impl App {
             serde_json::json!({
                 "endpoint": TELNYX_STT_ENDPOINT,
                 "model": model,
-                "transcript": &transcript,
+                "transcript": self.log_text(&transcript),
             })
         );
         Ok(transcript)
@@ -1828,7 +1830,7 @@ impl App {
         info!(
             "[cleanup] input {}",
             serde_json::json!({
-                "raw_stt": raw,
+                "raw_stt": self.log_text(raw),
             })
         );
         let whitespace_normalized = normalize_transcript(raw);
@@ -1844,24 +1846,24 @@ impl App {
         info!(
             "[cleanup] normalize_whitespace {}",
             serde_json::json!({
-                "before": raw,
-                "after": &whitespace_normalized,
+                "before": self.log_text(raw),
+                "after": self.log_text(&whitespace_normalized),
             })
         );
         let normalized = canonicalize_known_terms(&whitespace_normalized);
         info!(
             "[cleanup] canonicalize_terms {}",
             serde_json::json!({
-                "before": &whitespace_normalized,
-                "after": &normalized,
+                "before": self.log_text(&whitespace_normalized),
+                "after": self.log_text(&normalized),
             })
         );
         let stripped = remove_fillers(&normalized)?;
         info!(
             "[cleanup] remove_fillers {}",
             serde_json::json!({
-                "before": &normalized,
-                "after": &stripped,
+                "before": self.log_text(&normalized),
+                "after": self.log_text(&stripped),
             })
         );
         if is_known_no_speech_transcript(&stripped) {
@@ -1889,7 +1891,7 @@ impl App {
             info!(
                 "[cleanup] final_without_llm {}",
                 serde_json::json!({
-                    "text": &final_text,
+                    "text": self.log_text(&final_text),
                     "replacement_count": replacements.len(),
                 })
             );
@@ -1905,7 +1907,7 @@ impl App {
         info!(
             "[cleanup] deferred_llm_cleanup {}",
             serde_json::json!({
-                "fallback_text": &fallback_text,
+                "fallback_text": self.log_text(&fallback_text),
                 "reason": cleanup_reason,
                 "replacement_count": replacements.len(),
             })
@@ -1958,7 +1960,7 @@ impl App {
                 "endpoint": &endpoint,
                 "model": &model,
                 "system_prompt": system_prompt,
-                "user_transcript": transcript,
+                "user_transcript": self.log_text(transcript),
                 "context_app": context_app,
                 "cleanup_profile": format!("{:?}", cleanup_profile),
                 "context_text_chars": context_text_chars,
@@ -1967,7 +1969,11 @@ impl App {
                 "enable_thinking": request.enable_thinking,
             })
         );
-        let mut builder = self.http.post(&endpoint).json(&request);
+        let mut builder = self
+            .http
+            .post(&endpoint)
+            .timeout(Duration::from_secs(30))
+            .json(&request);
         if let Some(key) = self.config.llm_key() {
             builder = builder.bearer_auth(key);
         }
@@ -1996,8 +2002,8 @@ impl App {
                 "model": &model,
                 "finish_reason": parsed.choices.first().and_then(|choice| choice.finish_reason.as_deref()),
                 "reasoning_chars": parsed.choices.first().and_then(|choice| choice.message.reasoning_content.as_ref()).map_or(0, |reasoning| reasoning.chars().count()),
-                "output": &output,
-                "sanitized_output": &sanitized,
+                "output": self.log_text(&output),
+                "sanitized_output": self.log_text(&sanitized),
             })
         );
         Ok(sanitized)
@@ -2231,24 +2237,12 @@ impl App {
                 return;
             }
         };
-        if language.eq_ignore_ascii_case("en-US") || language.eq_ignore_ascii_case("en") {
-            return;
-        }
         warn!(
-            "[stt] slow_language_fallback {}",
+            "[stt] slow_language_request {}",
             serde_json::json!({
                 "language": language,
                 "duration_ms": duration.as_millis(),
-                "fallback_language": "en-US",
             })
-        );
-        if let Err(error) = self.set_stt_language("en-US") {
-            warn!("STT language fallback failed: {error}");
-            return;
-        }
-        show_notification(
-            "Bolo",
-            "Speech recognition was slow, so Bolo switched back to English, US.",
         );
     }
 
@@ -2409,6 +2403,10 @@ impl App {
         sort_replacements(&mut replacements);
         replacements
     }
+
+    fn log_text(&self, text: &str) -> serde_json::Value {
+        transcript_log_value(self.config.log_transcripts, text)
+    }
 }
 
 impl Config {
@@ -2441,6 +2439,7 @@ impl Config {
             hotkey: load_env_value("BOLO_HOTKEY").unwrap_or_else(|| String::from("right_option")),
             paste_last_hotkey: load_env_value("BOLO_PASTE_LAST_HOTKEY"),
             preserve_clipboard: load_bool_env("BOLO_PRESERVE_CLIPBOARD", true),
+            log_transcripts: load_bool_env("BOLO_LOG_TRANSCRIPTS", false),
         })
     }
 
@@ -3665,6 +3664,17 @@ fn transcript_menu_preview(text: &str) -> String {
     preview
 }
 
+fn transcript_log_value(enabled: bool, text: &str) -> serde_json::Value {
+    if enabled {
+        return serde_json::Value::String(text.to_owned());
+    }
+    serde_json::json!({
+        "redacted": true,
+        "chars": text.chars().count(),
+        "words": text.split_whitespace().count(),
+    })
+}
+
 fn cleanup_decision(config: &Config, transcript: &str) -> (bool, &'static str) {
     match config.llm_cleanup {
         CleanupMode::Off => (false, "mode_off"),
@@ -4469,8 +4479,8 @@ mod tests {
         canonicalize_known_terms, cleanup_decision, cleanup_max_tokens, cleanup_profile,
         is_known_no_speech_transcript, parse_command, parse_stt_fallbacks, parse_update_outcome,
         remove_fillers, sanitize_transcript_history, speech_stats, strip_reasoning_tags,
-        stt_language_for_model, stt_model_config, telnyx_stream_query, transcript_menu_preview,
-        valid_deferred_cleanup, wav_bytes,
+        stt_language_for_model, stt_model_config, telnyx_stream_query, transcript_log_value,
+        transcript_menu_preview, valid_deferred_cleanup, wav_bytes,
     };
     use std::collections::VecDeque;
     use std::path::PathBuf;
@@ -4627,6 +4637,7 @@ mod tests {
             hotkey: String::from("right_option"),
             paste_last_hotkey: None,
             preserve_clipboard: true,
+            log_transcripts: false,
         };
 
         assert_eq!(config.llm_model(), "Kimi-K2.5");
@@ -4649,6 +4660,7 @@ mod tests {
             hotkey: String::from("right_option"),
             paste_last_hotkey: None,
             preserve_clipboard: true,
+            log_transcripts: false,
         };
 
         assert_eq!(cleanup_decision(&config, "got it thanks").0, false);
@@ -4757,6 +4769,7 @@ mod tests {
                 hotkey: String::from("right_option"),
                 paste_last_hotkey: None,
                 preserve_clipboard: true,
+                log_transcripts: false,
             },
             http: reqwest::blocking::Client::new(),
             vocabulary: Mutex::new(Vec::new()),
@@ -4790,6 +4803,7 @@ mod tests {
                 hotkey: String::from("right_option"),
                 paste_last_hotkey: None,
                 preserve_clipboard: true,
+                log_transcripts: false,
             },
             http: reqwest::blocking::Client::new(),
             vocabulary: Mutex::new(Vec::new()),
@@ -4835,6 +4849,7 @@ mod tests {
                 hotkey: String::from("right_option"),
                 paste_last_hotkey: None,
                 preserve_clipboard: true,
+                log_transcripts: false,
             },
             http: reqwest::blocking::Client::new(),
             vocabulary: Mutex::new(Vec::new()),
@@ -4875,6 +4890,7 @@ mod tests {
                 hotkey: String::from("right_option"),
                 paste_last_hotkey: Some(String::from("f19")),
                 preserve_clipboard: true,
+                log_transcripts: false,
             },
             http: reqwest::blocking::Client::new(),
             vocabulary: Mutex::new(Vec::new()),
@@ -4908,6 +4924,7 @@ mod tests {
                 hotkey: String::from("right_option"),
                 paste_last_hotkey: Some(String::from("f19")),
                 preserve_clipboard: true,
+                log_transcripts: false,
             },
             http: reqwest::blocking::Client::new(),
             vocabulary: Mutex::new(Vec::new()),
@@ -4963,6 +4980,22 @@ mod tests {
             "line one line two"
         );
         assert!(transcript_menu_preview(&"a".repeat(80)).ends_with("..."));
+    }
+
+    #[test]
+    fn transcript_log_value_redacts_by_default() {
+        assert_eq!(
+            transcript_log_value(false, "secret dictated words"),
+            serde_json::json!({
+                "redacted": true,
+                "chars": 21,
+                "words": 3,
+            })
+        );
+        assert_eq!(
+            transcript_log_value(true, "secret dictated words"),
+            serde_json::Value::String(String::from("secret dictated words"))
+        );
     }
 
     #[test]

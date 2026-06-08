@@ -89,6 +89,12 @@ export TELNYX_API_KEY="your_key_here"
 Add it to your shell profile to persist it, or put it in `~/.bolo/env`. The install script writes prompted keys to `~/.bolo/env`.
 Bolo reads `TELNYX_API_KEY` from the process environment first, then falls back to `~/.bolo/env`, `~/.codex/.env`, and `~/.zshrc`.
 
+Bolo redacts dictated text from `/tmp/bolo.log` by default. To temporarily log transcript text while debugging, set:
+
+```bash
+export BOLO_LOG_TRANSCRIPTS="on"
+```
+
 To change the push-to-talk hotkey, set:
 
 ```bash

@@ -101,10 +101,16 @@ if ! git merge --ff-only "$upstream"; then
     exit 0
 fi
 
-if ! cp "$target_dir/release/bolo" "$BOLO_DIR/target/release/bolo"; then
+new_binary="$BOLO_DIR/target/release/bolo.new"
+if ! cp "$target_dir/release/bolo" "$new_binary"; then
     result skipped "Bolo updated, but the new binary could not be installed."
     exit 0
 fi
-chmod +x "$BOLO_DIR/target/release/bolo"
+chmod +x "$new_binary"
+if ! mv "$new_binary" "$BOLO_DIR/target/release/bolo"; then
+    rm -f "$new_binary"
+    result skipped "Bolo updated, but the new binary could not be activated."
+    exit 0
+fi
 
 result updated
