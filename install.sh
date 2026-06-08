@@ -10,12 +10,15 @@ if ! command -v cargo &>/dev/null; then
 fi
 
 if ! python3 - <<'PY' >/dev/null 2>&1
+import objc
 import AppKit
+import Foundation
 import Quartz
 PY
 then
   echo "Installing native macOS helper dependencies..."
-  python3 -m pip install --user pyobjc-framework-AppKit pyobjc-framework-Quartz
+  python3 -m pip install --user --upgrade pip
+  python3 -m pip install --user pyobjc-framework-Cocoa pyobjc-framework-Quartz
 fi
 
 echo "Building Rust binary..."
