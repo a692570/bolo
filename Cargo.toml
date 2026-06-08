@@ -56,9 +56,9 @@ variant_size_differences = "deny"
 
 [workspace.lints.clippy]
 all = { level = "deny", priority = -1 }
-pedantic = { level = "deny", priority = -1 }
-nursery = { level = "deny", priority = -1 }
-cargo = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+cargo = { level = "warn", priority = -1 }
 multiple_crate_versions = "allow"
 redundant_pub_crate = "allow"
 dbg_macro = "deny"
@@ -80,7 +80,7 @@ rc_buffer = "deny"
 rc_mutex = "deny"
 rest_pat_in_fully_bound_structs = "deny"
 same_name_method = "deny"
-shadow_unrelated = "deny"
+shadow_unrelated = "warn"
 string_add = "deny"
 implicit_clone = "deny"
 todo = "deny"

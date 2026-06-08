@@ -559,7 +559,14 @@ async fn run_telnyx_stream(
                     update_streaming_transcript(&result, &text);
                 }
             }
-            Ok(Some(Err(error))) => return Err(error.to_string()),
+            Ok(Some(Err(error))) => {
+                let message = error.to_string();
+                if input_closed && benign_stream_close_error(&message) {
+                    warn!("streaming close read ignored: {message}");
+                    return Ok(());
+                }
+                return Err(message);
+            }
             Ok(None) => return Ok(()),
             Err(_) if input_closed => {}
             Err(_) => {}
@@ -601,6 +608,14 @@ fn telnyx_stream_query(
         params.push(format!("keyterm={keyterms}"));
     }
     params.join("&")
+}
+
+fn benign_stream_close_error(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("badrecordmac")
+        || error.contains("close notify")
+        || error.contains("connection reset")
+        || error.contains("unexpected eof")
 }
 
 fn query_escape(value: &str) -> String {
@@ -2160,10 +2175,10 @@ impl App {
         #[cfg(test)]
         drop(history);
         self.send_user_event(UserEvent::HistoryChanged);
-        if !self.config.preserve_clipboard {
-            if let Err(error) = copy_to_clipboard(&entry.text) {
-                warn!("clipboard backup failed: {error}");
-            }
+        if !self.config.preserve_clipboard
+            && let Err(error) = copy_to_clipboard(&entry.text)
+        {
+            warn!("clipboard backup failed: {error}");
         }
         Ok(())
     }
@@ -2646,7 +2661,7 @@ fn human_readable_hotkey(hotkey: &str) -> String {
 fn create_tray_ui(app: &App) -> Result<TrayUi, AppError> {
     let tray_menu = Menu::new();
     let title = MenuItem::new(
-        &format!("Bolo - Hold {}", human_readable_hotkey(&app.config.hotkey)),
+        format!("Bolo - Hold {}", human_readable_hotkey(&app.config.hotkey)),
         false,
         None,
     );
@@ -2956,6 +2971,7 @@ fn copy_history_item(app: &App, index: usize, mode: HistoryCopyMode) {
     info!("copied transcript history item {index} as {mode:?}");
 }
 
+#[allow(clippy::exit)]
 fn check_for_updates_from_menu(app: &App) {
     let root_dir = app.config.root_dir.clone();
     show_notification("Bolo Update", "Checking for updates.");
@@ -3025,10 +3041,7 @@ fn update_reason(output: &str) -> String {
         .lines()
         .find_map(|line| line.strip_prefix("BOLO_UPDATE_REASON="))
         .filter(|reason| !reason.trim().is_empty())
-        .map_or_else(
-            || String::from("Update was skipped."),
-            |reason| short_menu_message(reason),
-        )
+        .map_or_else(|| String::from("Update was skipped."), short_menu_message)
 }
 
 fn command_output_text(output: &std::process::Output) -> String {
@@ -3382,9 +3395,7 @@ fn parse_correction_command(text: &str) -> Option<DictationCommand> {
             return Some(correction_command(spoken, replacement));
         }
     }
-    let Some(rest) = strip_phrase_ignore_ascii_case(&normalized, "bolo heard") else {
-        return None;
-    };
+    let rest = strip_phrase_ignore_ascii_case(&normalized, "bolo heard")?;
     if let Some((spoken, replacement)) = split_correction_pair(rest, "i meant") {
         return Some(correction_command(spoken, replacement));
     }
@@ -4432,10 +4443,10 @@ fn run_onboarding_if_needed() {
             if trimmed.starts_with('#') || trimmed.is_empty() {
                 continue;
             }
-            if let Some((key, _)) = trimmed.split_once('=') {
-                if key.trim() == "BOLO_HOTKEY" {
-                    return;
-                }
+            if let Some((key, _)) = trimmed.split_once('=')
+                && key.trim() == "BOLO_HOTKEY"
+            {
+                return;
             }
         }
     }
@@ -4471,6 +4482,8 @@ fn app_root_dir() -> Result<PathBuf, AppError> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::panic_in_result_fn)]
+
     use super::{
         AccessibilityContext, App, AppError, AppState, CleanupMode, CleanupProfile, Config,
         DictationCommandKind, DictationWarmup, StreamingProvider, StreamingTranscript, SttFallback,
@@ -4663,18 +4676,14 @@ mod tests {
             log_transcripts: false,
         };
 
-        assert_eq!(cleanup_decision(&config, "got it thanks").0, false);
-        assert_eq!(
-            cleanup_decision(&config, "got it thanks ill take look and get back to you").0,
-            true
-        );
-        assert_eq!(
+        assert!(!cleanup_decision(&config, "got it thanks").0);
+        assert!(cleanup_decision(&config, "got it thanks ill take look and get back to you").0);
+        assert!(
             cleanup_decision(
                 &config,
                 "This is a longer dictated sentence that should probably get grammar cleanup before insertion."
             )
-            .0,
-            true
+            .0
         );
     }
 
@@ -4713,6 +4722,21 @@ mod tests {
             super::best_streaming_text(&transcript).as_deref(),
             Some("Investigate why this is like a streaming issue or some config that we tweaked")
         );
+    }
+
+    #[test]
+    fn treats_post_close_stream_errors_as_benign() {
+        assert!(super::benign_stream_close_error(
+            "IO error: received fatal alert: BadRecordMac"
+        ));
+        assert!(super::benign_stream_close_error(
+            "TLS close notify after stream close"
+        ));
+        assert!(super::benign_stream_close_error("connection reset by peer"));
+        assert!(super::benign_stream_close_error(
+            "unexpected eof while reading"
+        ));
+        assert!(!super::benign_stream_close_error("401 unauthorized"));
     }
 
     #[test]
