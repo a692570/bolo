@@ -58,6 +58,8 @@ const SPEECH_RMS_THRESHOLD: f32 = 0.006;
 const SPEECH_FRAME_MS: usize = 20;
 const AUDIO_RELEASE_DRAIN: Duration = Duration::from_millis(120);
 const STREAMING_DRAIN_MIN: Duration = Duration::from_millis(450);
+const STREAMING_STABLE_RESULT_MAX: Duration = Duration::from_millis(1_200);
+const STREAMING_STABLE_RESULT_IDLE: Duration = Duration::from_millis(250);
 const STREAMING_DRAIN_MAX: Duration = Duration::from_millis(2_500);
 const STREAMING_TRAILING_SILENCE_MS: usize = 350;
 const STREAMING_SAMPLE_RATE: u32 = 48_000;
@@ -423,12 +425,14 @@ impl StreamingRecording {
         let started = Instant::now();
         let deadline = started + STREAMING_DRAIN_MAX;
         let mut best = String::new();
+        let mut last_best_change = started;
         while Instant::now() < deadline {
             match self.result.lock() {
                 Ok(result) => {
                     if let Some(text) = best_streaming_text(&result) {
                         if text.chars().count() > best.chars().count() {
                             best = text;
+                            last_best_change = Instant::now();
                         }
                         if started.elapsed() >= STREAMING_DRAIN_MIN
                             && result.latest_final.is_some()
@@ -440,6 +444,21 @@ impl StreamingRecording {
                                     "chars": best.chars().count(),
                                     "drain_ms": started.elapsed().as_millis(),
                                     "source": "final",
+                                })
+                            );
+                            return Some(best);
+                        }
+                        if stable_streaming_best_is_ready(
+                            started,
+                            last_best_change,
+                            best.is_empty(),
+                        ) {
+                            info!(
+                                "[stt] streaming_result {}",
+                                serde_json::json!({
+                                    "chars": best.chars().count(),
+                                    "drain_ms": started.elapsed().as_millis(),
+                                    "source": "stable_best_available",
                                 })
                             );
                             return Some(best);
@@ -471,6 +490,26 @@ impl StreamingRecording {
             Some(best)
         }
     }
+}
+
+fn stable_streaming_best_is_ready(
+    started: Instant,
+    last_best_change: Instant,
+    best_is_empty: bool,
+) -> bool {
+    stable_streaming_best_is_ready_elapsed(
+        started.elapsed(),
+        last_best_change.elapsed(),
+        best_is_empty,
+    )
+}
+
+fn stable_streaming_best_is_ready_elapsed(
+    total: Duration,
+    idle: Duration,
+    best_is_empty: bool,
+) -> bool {
+    !best_is_empty && total >= STREAMING_STABLE_RESULT_MAX && idle >= STREAMING_STABLE_RESULT_IDLE
 }
 
 fn best_streaming_text(result: &StreamingTranscript) -> Option<String> {
@@ -4839,8 +4878,8 @@ mod tests {
         build_stt_prompt, canonicalize_known_terms, cleanup_decision, cleanup_max_tokens,
         cleanup_profile, is_known_no_speech_transcript, parse_command, parse_replacements_json,
         parse_stt_fallbacks, parse_u64_env_value, parse_update_outcome, read_vocabulary_file,
-        remove_fillers,
-        sanitize_transcript_history, speech_stats, strip_reasoning_tags, stt_language_for_model,
+        remove_fillers, sanitize_transcript_history, speech_stats,
+        stable_streaming_best_is_ready_elapsed, strip_reasoning_tags, stt_language_for_model,
         stt_model_config, telnyx_stream_query, transcript_log_value, transcript_menu_preview,
         valid_deferred_cleanup, wav_bytes,
     };
@@ -5188,6 +5227,30 @@ mod tests {
             super::best_streaming_text(&transcript).as_deref(),
             Some("Investigate why this is like a streaming issue or some config that we tweaked")
         );
+    }
+
+    #[test]
+    fn stable_streaming_best_waits_for_text_time_and_idle() {
+        assert!(!stable_streaming_best_is_ready_elapsed(
+            std::time::Duration::from_millis(1_500),
+            std::time::Duration::from_millis(500),
+            true
+        ));
+        assert!(!stable_streaming_best_is_ready_elapsed(
+            std::time::Duration::from_millis(1_100),
+            std::time::Duration::from_millis(500),
+            false
+        ));
+        assert!(!stable_streaming_best_is_ready_elapsed(
+            std::time::Duration::from_millis(1_500),
+            std::time::Duration::from_millis(200),
+            false
+        ));
+        assert!(stable_streaming_best_is_ready_elapsed(
+            std::time::Duration::from_millis(1_500),
+            std::time::Duration::from_millis(500),
+            false
+        ));
     }
 
     #[test]
