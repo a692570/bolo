@@ -34,7 +34,8 @@ pkill -f "$BOLO_DIR/bolo.py" 2>/dev/null || true
 pkill -f "$BOLO_DIR/hotkey.py" 2>/dev/null || true
 pkill -f "$BOLO_DIR/overlay.py" 2>/dev/null || true
 
-(
+export BIN LOG
+nohup bash -c '
     while true; do
         "$BIN" >> "$LOG" 2>&1
         EXIT_CODE=$?
@@ -59,7 +60,7 @@ pkill -f "$BOLO_DIR/overlay.py" 2>/dev/null || true
                 ;;
         esac
     done
-) &
+' >/dev/null 2>&1 &
 
 SUP_PID=$!
 echo "$SUP_PID" > "$PID_FILE"
