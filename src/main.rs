@@ -232,6 +232,12 @@ struct StreamingTranscript {
     error: Option<String>,
 }
 
+#[derive(Debug)]
+struct StreamingText {
+    text: String,
+    source: &'static str,
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct SpeechStats {
     frame_count: usize,
@@ -421,7 +427,7 @@ impl StreamingRecording {
         }
     }
 
-    fn finish(mut self) -> Option<String> {
+    fn finish(mut self) -> Option<StreamingText> {
         drop(self.sender.take());
         let started = Instant::now();
         let deadline = started + STREAMING_DRAIN_MAX;
@@ -450,7 +456,10 @@ impl StreamingRecording {
                                     "source": "final",
                                 })
                             );
-                            return Some(best);
+                            return Some(StreamingText {
+                                text: best,
+                                source: "final",
+                            });
                         }
                         if stable_streaming_best_is_ready(
                             started,
@@ -465,7 +474,10 @@ impl StreamingRecording {
                                     "source": "stable_best_available",
                                 })
                             );
-                            return Some(best);
+                            return Some(StreamingText {
+                                text: best,
+                                source: "stable_best_available",
+                            });
                         }
                     }
                     if let Some(error) = result.error.as_ref() {
@@ -491,7 +503,10 @@ impl StreamingRecording {
                     "source": "best_available",
                 })
             );
-            Some(best)
+            Some(StreamingText {
+                text: best,
+                source: "best_available",
+            })
         }
     }
 }
@@ -537,6 +552,23 @@ fn stable_streaming_best_is_ready_elapsed(
     best_is_empty: bool,
 ) -> bool {
     !best_is_empty && total >= STREAMING_STABLE_RESULT_MAX && idle >= STREAMING_STABLE_RESULT_IDLE
+}
+
+fn streaming_batch_fallback_reason(
+    text: &str,
+    source: &str,
+    recording_duration: Duration,
+) -> Option<&'static str> {
+    if source != "final" {
+        return Some("non_final_streaming_result");
+    }
+    let words = text.split_whitespace().count();
+    if recording_duration >= Duration::from_secs(6)
+        && words.saturating_mul(1_000) < recording_duration.as_millis() as usize * 3 / 2
+    {
+        return Some("low_streaming_word_rate");
+    }
+    None
 }
 
 fn best_streaming_text(result: &StreamingTranscript) -> Option<String> {
@@ -1425,14 +1457,22 @@ impl App {
         metrics.outcome = "stt_failed";
         let stt_started = Instant::now();
         let raw = if let Some(streaming) = recording.streaming {
-            streaming.finish().unwrap_or_else(|| {
-                warn!("[stt] streaming_empty_fallback");
-                self.transcribe(&wav, &recording.warmup)
-                    .unwrap_or_else(|error| {
-                        warn!("batch fallback after streaming failed: {error}");
-                        String::new()
-                    })
-            })
+            match streaming.finish() {
+                Some(streaming_text) => self.recheck_streaming_transcript(
+                    streaming_text,
+                    &wav,
+                    elapsed,
+                    &recording.warmup,
+                ),
+                None => {
+                    warn!("[stt] streaming_empty_fallback");
+                    self.transcribe(&wav, &recording.warmup)
+                        .unwrap_or_else(|error| {
+                            warn!("batch fallback after streaming failed: {error}");
+                            String::new()
+                        })
+                }
+            }
         } else {
             self.transcribe(&wav, &recording.warmup)?
         };
@@ -1501,6 +1541,60 @@ impl App {
         self.send_user_event(UserEvent::Overlay(OverlayPhase::Copied));
         self.send_user_event(UserEvent::HideOverlayAfter(Duration::from_millis(900)));
         Ok(())
+    }
+
+    fn recheck_streaming_transcript(
+        &self,
+        streaming: StreamingText,
+        wav: &[u8],
+        recording_duration: Duration,
+        warmup: &DictationWarmup,
+    ) -> String {
+        let Some(reason) =
+            streaming_batch_fallback_reason(&streaming.text, streaming.source, recording_duration)
+        else {
+            return streaming.text;
+        };
+        warn!(
+            "[stt] streaming_suspicious_batch_fallback {}",
+            serde_json::json!({
+                "reason": reason,
+                "source": streaming.source,
+                "streaming_chars": streaming.text.chars().count(),
+                "streaming_words": streaming.text.split_whitespace().count(),
+                "recording_duration_ms": recording_duration.as_millis(),
+            })
+        );
+        match self.transcribe(wav, warmup) {
+            Ok(batch)
+                if batch.split_whitespace().count() > streaming.text.split_whitespace().count() =>
+            {
+                info!(
+                    "[stt] batch_fallback_selected {}",
+                    serde_json::json!({
+                        "reason": reason,
+                        "streaming_words": streaming.text.split_whitespace().count(),
+                        "batch_words": batch.split_whitespace().count(),
+                    })
+                );
+                batch
+            }
+            Ok(batch) => {
+                info!(
+                    "[stt] batch_fallback_discarded {}",
+                    serde_json::json!({
+                        "reason": reason,
+                        "streaming_words": streaming.text.split_whitespace().count(),
+                        "batch_words": batch.split_whitespace().count(),
+                    })
+                );
+                streaming.text
+            }
+            Err(error) => {
+                warn!("[stt] batch fallback after suspicious streaming failed: {error}");
+                streaming.text
+            }
+        }
     }
 
     fn start_dictation_warmup(&self) -> DictationWarmup {
@@ -4906,9 +5000,9 @@ mod tests {
         cleanup_profile, final_streaming_result_is_ready_elapsed, is_known_no_speech_transcript,
         parse_command, parse_replacements_json, parse_stt_fallbacks, parse_u64_env_value,
         parse_update_outcome, read_vocabulary_file, remove_fillers, sanitize_transcript_history,
-        speech_stats, stable_streaming_best_is_ready_elapsed, strip_reasoning_tags,
-        stt_language_for_model, stt_model_config, telnyx_stream_query, transcript_log_value,
-        transcript_menu_preview, valid_deferred_cleanup, wav_bytes,
+        speech_stats, stable_streaming_best_is_ready_elapsed, streaming_batch_fallback_reason,
+        strip_reasoning_tags, stt_language_for_model, stt_model_config, telnyx_stream_query,
+        transcript_log_value, transcript_menu_preview, valid_deferred_cleanup, wav_bytes,
     };
     use std::collections::VecDeque;
     use std::path::PathBuf;
@@ -5312,6 +5406,34 @@ mod tests {
             std::time::Duration::from_millis(500),
             false
         ));
+    }
+
+    #[test]
+    fn streaming_batch_fallback_catches_short_or_non_final_streams() {
+        assert_eq!(
+            streaming_batch_fallback_reason(
+                "this was only a partial result",
+                "stable_best_available",
+                std::time::Duration::from_secs(3)
+            ),
+            Some("non_final_streaming_result")
+        );
+        assert_eq!(
+            streaming_batch_fallback_reason(
+                "too few words here",
+                "final",
+                std::time::Duration::from_secs(8)
+            ),
+            Some("low_streaming_word_rate")
+        );
+        assert_eq!(
+            streaming_batch_fallback_reason(
+                "this final transcript has enough words for the duration",
+                "final",
+                std::time::Duration::from_secs(4)
+            ),
+            None
+        );
     }
 
     #[test]
