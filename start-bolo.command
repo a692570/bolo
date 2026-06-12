@@ -7,11 +7,17 @@ LOCK_DIR=/tmp/bolo-supervisor.lock
 PID_FILE=/tmp/bolo-supervisor.pid
 BIN="$BOLO_DIR/target/release/bolo"
 
-if mkdir "$LOCK_DIR" 2>/dev/null; then
-    trap "rmdir '$LOCK_DIR' 2>/dev/null; exit" EXIT INT TERM
-else
-    echo "[bolo] supervisor already running"
-    exit 0
+if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+    existing_pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+    if [ "$existing_pid" != "" ] && kill -0 "$existing_pid" 2>/dev/null; then
+        echo "[bolo] supervisor already running"
+        exit 0
+    fi
+    rm -rf "$LOCK_DIR" "$PID_FILE" 2>/dev/null || true
+    if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+        echo "[bolo] supervisor already running"
+        exit 0
+    fi
 fi
 
 cd "$BOLO_DIR" || exit 1
@@ -34,8 +40,12 @@ pkill -f "$BOLO_DIR/bolo.py" 2>/dev/null || true
 pkill -f "$BOLO_DIR/hotkey.py" 2>/dev/null || true
 pkill -f "$BOLO_DIR/overlay.py" 2>/dev/null || true
 
-export BIN LOG
+export BIN LOG LOCK_DIR PID_FILE
 nohup bash -c '
+    cleanup() {
+        rm -rf "$LOCK_DIR" "$PID_FILE" /tmp/bolo-instance.lock 2>/dev/null || true
+    }
+    trap cleanup EXIT INT TERM
     while true; do
         "$BIN" >> "$LOG" 2>&1
         EXIT_CODE=$?

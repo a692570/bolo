@@ -58,10 +58,11 @@ const SPEECH_RMS_THRESHOLD: f32 = 0.006;
 const SPEECH_FRAME_MS: usize = 20;
 const AUDIO_RELEASE_DRAIN: Duration = Duration::from_millis(120);
 const STREAMING_DRAIN_MIN: Duration = Duration::from_millis(450);
+const STREAMING_FINAL_RESULT_IDLE: Duration = Duration::from_millis(250);
 const STREAMING_STABLE_RESULT_MAX: Duration = Duration::from_millis(1_200);
 const STREAMING_STABLE_RESULT_IDLE: Duration = Duration::from_millis(250);
 const STREAMING_DRAIN_MAX: Duration = Duration::from_millis(2_500);
-const STREAMING_TRAILING_SILENCE_MS: usize = 350;
+const STREAMING_TRAILING_SILENCE_MS: usize = 600;
 const STREAMING_SAMPLE_RATE: u32 = 48_000;
 const UPDATE_RESTART_EXIT_CODE: i32 = 42;
 
@@ -434,15 +435,18 @@ impl StreamingRecording {
                             best = text;
                             last_best_change = Instant::now();
                         }
-                        if started.elapsed() >= STREAMING_DRAIN_MIN
-                            && result.latest_final.is_some()
-                            && result.latest_partial.is_none()
-                        {
+                        if final_streaming_result_is_ready(
+                            started,
+                            last_best_change,
+                            result.latest_final.is_some(),
+                            result.latest_partial.is_some(),
+                        ) {
                             info!(
                                 "[stt] streaming_result {}",
                                 serde_json::json!({
                                     "chars": best.chars().count(),
                                     "drain_ms": started.elapsed().as_millis(),
+                                    "idle_ms": last_best_change.elapsed().as_millis(),
                                     "source": "final",
                                 })
                             );
@@ -490,6 +494,29 @@ impl StreamingRecording {
             Some(best)
         }
     }
+}
+
+fn final_streaming_result_is_ready(
+    started: Instant,
+    last_best_change: Instant,
+    has_final: bool,
+    has_partial: bool,
+) -> bool {
+    final_streaming_result_is_ready_elapsed(
+        started.elapsed(),
+        last_best_change.elapsed(),
+        has_final,
+        has_partial,
+    )
+}
+
+fn final_streaming_result_is_ready_elapsed(
+    total: Duration,
+    idle: Duration,
+    has_final: bool,
+    has_partial: bool,
+) -> bool {
+    has_final && !has_partial && total >= STREAMING_DRAIN_MIN && idle >= STREAMING_FINAL_RESULT_IDLE
 }
 
 fn stable_streaming_best_is_ready(
@@ -4876,12 +4903,12 @@ mod tests {
         TRANSCRIPT_HISTORY_LIMIT, TextReplacement, TranscriptHistoryEntry, UpdateOutcome,
         apply_text_replacements, apply_vocabulary_corrections, build_cleanup_user_content,
         build_stt_prompt, canonicalize_known_terms, cleanup_decision, cleanup_max_tokens,
-        cleanup_profile, is_known_no_speech_transcript, parse_command, parse_replacements_json,
-        parse_stt_fallbacks, parse_u64_env_value, parse_update_outcome, read_vocabulary_file,
-        remove_fillers, sanitize_transcript_history, speech_stats,
-        stable_streaming_best_is_ready_elapsed, strip_reasoning_tags, stt_language_for_model,
-        stt_model_config, telnyx_stream_query, transcript_log_value, transcript_menu_preview,
-        valid_deferred_cleanup, wav_bytes,
+        cleanup_profile, final_streaming_result_is_ready_elapsed, is_known_no_speech_transcript,
+        parse_command, parse_replacements_json, parse_stt_fallbacks, parse_u64_env_value,
+        parse_update_outcome, read_vocabulary_file, remove_fillers, sanitize_transcript_history,
+        speech_stats, stable_streaming_best_is_ready_elapsed, strip_reasoning_tags,
+        stt_language_for_model, stt_model_config, telnyx_stream_query, transcript_log_value,
+        transcript_menu_preview, valid_deferred_cleanup, wav_bytes,
     };
     use std::collections::VecDeque;
     use std::path::PathBuf;
@@ -5227,6 +5254,40 @@ mod tests {
             super::best_streaming_text(&transcript).as_deref(),
             Some("Investigate why this is like a streaming issue or some config that we tweaked")
         );
+    }
+
+    #[test]
+    fn final_streaming_result_waits_for_final_time_and_idle() {
+        assert!(!final_streaming_result_is_ready_elapsed(
+            std::time::Duration::from_millis(800),
+            std::time::Duration::from_millis(300),
+            false,
+            false
+        ));
+        assert!(!final_streaming_result_is_ready_elapsed(
+            std::time::Duration::from_millis(400),
+            std::time::Duration::from_millis(300),
+            true,
+            false
+        ));
+        assert!(!final_streaming_result_is_ready_elapsed(
+            std::time::Duration::from_millis(800),
+            std::time::Duration::from_millis(100),
+            true,
+            false
+        ));
+        assert!(!final_streaming_result_is_ready_elapsed(
+            std::time::Duration::from_millis(800),
+            std::time::Duration::from_millis(300),
+            true,
+            true
+        ));
+        assert!(final_streaming_result_is_ready_elapsed(
+            std::time::Duration::from_millis(800),
+            std::time::Duration::from_millis(300),
+            true,
+            false
+        ));
     }
 
     #[test]
