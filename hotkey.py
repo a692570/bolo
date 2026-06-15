@@ -41,6 +41,7 @@ NX_DEVICERSHIFTKEYMASK = 0x00000020
 NX_SECONDARYFNMASK = 0x00004000
 POLL_INTERVAL = 0.02
 RECHECK_INTERVAL = POLL_INTERVAL
+RECHECK_REQUIRED_SAMPLES = int(os.environ.get("BOLO_HOTKEY_RECHECK_SAMPLES") or "4")
 PARENT_PID = int(os.environ.get("BOLO_PARENT_PID") or "0")
 
 HOTKEY = os.environ.get("BOLO_HOTKEY", "right_option")
@@ -75,6 +76,8 @@ USE_KEY_EVENTS = TARGET_KEYCODE is not None and not USE_FLAGS_CHANGED
 
 state = False
 last_recheck_at = 0.0
+pending_recheck_state = None
+pending_recheck_count = 0
 
 
 def emit(event):
@@ -113,10 +116,12 @@ def is_hotkey_down():
 
 
 def set_state(next_state):
-    global state
+    global pending_recheck_count, pending_recheck_state, state
     if next_state == state:
         return
     state = next_state
+    pending_recheck_state = None
+    pending_recheck_count = 0
     if ACTION == "paste_last":
         if state:
             emit("paste_last")
@@ -125,7 +130,7 @@ def set_state(next_state):
 
 
 def recheck_os_state():
-    global last_recheck_at
+    global last_recheck_at, pending_recheck_count, pending_recheck_state
     now = time.monotonic()
     if now - last_recheck_at < RECHECK_INTERVAL:
         return
@@ -133,10 +138,25 @@ def recheck_os_state():
 
     actual = is_hotkey_down()
     if actual == state:
+        pending_recheck_state = None
+        pending_recheck_count = 0
+        return
+
+    if pending_recheck_state != actual:
+        pending_recheck_state = actual
+        pending_recheck_count = 1
+        return
+
+    pending_recheck_count += 1
+    if pending_recheck_count < RECHECK_REQUIRED_SAMPLES:
         return
 
     event = "press" if actual else "release"
-    print(f"[hotkey] OS recheck corrected missed {event}", file=sys.stderr, flush=True)
+    print(
+        f"[hotkey] OS recheck corrected missed {event} after {pending_recheck_count} samples",
+        file=sys.stderr,
+        flush=True,
+    )
     set_state(actual)
 
 
