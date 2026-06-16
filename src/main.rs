@@ -392,6 +392,7 @@ impl StreamingRecording {
         let (sender, receiver) = mpsc::channel::<Vec<i16>>();
         let result = Arc::new(Mutex::new(StreamingTranscript::default()));
         let thread_result = Arc::clone(&result);
+        let error_result = Arc::clone(&result);
         let thread = std::thread::Builder::new()
             .name(String::from("bolo-streaming-stt"))
             .spawn(move || {
@@ -411,9 +412,13 @@ impl StreamingRecording {
                         .await
                         {
                             warn!("streaming STT failed: {error}");
+                            set_streaming_error(&error_result, error);
                         }
                     }),
-                    Err(error) => warn!("streaming runtime failed: {error}"),
+                    Err(error) => {
+                        warn!("streaming runtime failed: {error}");
+                        set_streaming_error(&error_result, error.to_string());
+                    }
                 }
             })
             .unwrap_or_else(|error| {
@@ -508,6 +513,12 @@ impl StreamingRecording {
                 source: "best_available",
             })
         }
+    }
+}
+
+fn set_streaming_error(result: &Arc<Mutex<StreamingTranscript>>, error: String) {
+    if let Ok(mut result) = result.lock() {
+        result.error = Some(error);
     }
 }
 
