@@ -65,6 +65,7 @@ const STREAMING_DRAIN_MAX: Duration = Duration::from_millis(2_500);
 const STREAMING_TRAILING_SILENCE_MS: usize = 600;
 const STREAMING_SAMPLE_RATE: u32 = 48_000;
 const UPDATE_RESTART_EXIT_CODE: i32 = 42;
+const POST_INSERT_EDIT_MAX: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Error)]
 enum AppError {
@@ -184,6 +185,8 @@ struct TranscriptHistoryEntry {
     text: String,
     raw: String,
     created_at_ms: u64,
+    #[serde(default)]
+    edited_after_insert: bool,
 }
 
 impl TranscriptHistoryEntry {
@@ -192,6 +195,24 @@ impl TranscriptHistoryEntry {
             text: text.trim().to_owned(),
             raw: raw.trim().to_owned(),
             created_at_ms: unix_time_ms(),
+            edited_after_insert: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PostInsertWatch {
+    completed_at: Instant,
+    words_bucket: &'static str,
+    cleanup_status: &'static str,
+}
+
+impl PostInsertWatch {
+    fn new(text: &str, prepared: &PreparedText) -> Self {
+        Self {
+            completed_at: Instant::now(),
+            words_bucket: words_bucket(text.split_whitespace().count()),
+            cleanup_status: cleanup_status(prepared),
         }
     }
 }
@@ -206,6 +227,7 @@ struct AppState {
     selected_microphone: Option<String>,
     selected_language: Option<String>,
     cleanup_status: Option<String>,
+    post_insert_watch: Option<PostInsertWatch>,
 }
 
 struct ActiveRecording {
@@ -1150,6 +1172,13 @@ fn run_hotkey_helper(
                     error!("{error}");
                 }
             }
+            Some("post_insert_edit") => {
+                if let Some(action) = message.get("action").and_then(serde_json::Value::as_str)
+                    && let Err(error) = app.handle_post_insert_edit(action)
+                {
+                    error!("{error}");
+                }
+            }
             Some(other) => warn!("unknown hotkey helper event: {other}"),
             None => warn!("missing hotkey helper event"),
         }
@@ -1540,8 +1569,8 @@ impl App {
                 })
             );
             let pasted_text = prepared.text.clone();
-            paste_text(&prepared.text)?;
-            self.remember_result(&raw, &prepared.text)?;
+            paste_text(&self.config.root_dir, &prepared.text)?;
+            self.remember_result(&raw, &prepared.text, Some(&prepared))?;
             if let Some(cleanup_input) = prepared.cleanup_input {
                 self.start_deferred_cleanup(cleanup_input, pasted_text, &recording.warmup)?;
             }
@@ -2301,13 +2330,13 @@ impl App {
                 info!("applied scratch command");
             }
             DictationCommandKind::Insert => {
-                paste_text(&command.text)?;
-                self.remember_result(&command.text, &command.text)?;
+                paste_text(&self.config.root_dir, &command.text)?;
+                self.remember_result(&command.text, &command.text, None)?;
                 play_sound("Pop");
             }
             DictationCommandKind::InsertReturn => {
-                paste_text(&command.text)?;
-                self.remember_result(&command.text, &command.text)?;
+                paste_text(&self.config.root_dir, &command.text)?;
+                self.remember_result(&command.text, &command.text, None)?;
                 press_return()?;
                 play_sound("Pop");
             }
@@ -2323,8 +2352,8 @@ impl App {
                 if let Some(text) = previous {
                     delete_chars(text.chars().count())?;
                 }
-                paste_text(&command.text)?;
-                self.remember_result(&command.text, &command.text)?;
+                paste_text(&self.config.root_dir, &command.text)?;
+                self.remember_result(&command.text, &command.text, None)?;
                 play_sound("Pop");
             }
             DictationCommandKind::AddCorrection => {
@@ -2343,15 +2372,23 @@ impl App {
         Ok(())
     }
 
-    fn remember_result(&self, raw: &str, text: &str) -> Result<(), AppError> {
+    fn remember_result(
+        &self,
+        raw: &str,
+        text: &str,
+        prepared: Option<&PreparedText>,
+    ) -> Result<(), AppError> {
         let entry = TranscriptHistoryEntry::new(raw, text);
         if entry.text.is_empty() {
             return Ok(());
         }
+        let post_insert_watch =
+            prepared.map(|prepared| PostInsertWatch::new(&entry.text, prepared));
         let history = {
             let mut state = self.lock_state()?;
             state.last_result = Some(entry.text.clone());
             state.correction_until = Some(Instant::now() + CORRECTION_WINDOW);
+            state.post_insert_watch = post_insert_watch;
             state.history.push_front(entry.clone());
             state.history.truncate(TRANSCRIPT_HISTORY_LIMIT);
             state.history.iter().cloned().collect::<Vec<_>>()
@@ -2370,6 +2407,46 @@ impl App {
         {
             warn!("clipboard backup failed: {error}");
         }
+        Ok(())
+    }
+
+    fn handle_post_insert_edit(&self, action: &str) -> Result<(), AppError> {
+        let history = {
+            let mut state = self.lock_state()?;
+            let Some(watch) = state.post_insert_watch.clone() else {
+                return Ok(());
+            };
+            let elapsed = watch.completed_at.elapsed();
+            if elapsed > POST_INSERT_EDIT_MAX {
+                state.post_insert_watch = None;
+                return Ok(());
+            }
+            let Some(first) = state.history.front_mut() else {
+                state.post_insert_watch = None;
+                return Ok(());
+            };
+            first.edited_after_insert = true;
+            info!(
+                "[quality] post_insert_edit {}",
+                serde_json::json!({
+                    "action": action,
+                    "elapsed_ms": elapsed.as_millis(),
+                    "words_bucket": watch.words_bucket,
+                    "cleanup_status": watch.cleanup_status,
+                })
+            );
+            state.post_insert_watch = None;
+            state.history.iter().cloned().collect::<Vec<_>>()
+        };
+        #[cfg(not(test))]
+        {
+            if let Err(error) = save_transcript_history(&history) {
+                warn!("transcript history save failed: {error}");
+            }
+        }
+        #[cfg(test)]
+        drop(history);
+        self.send_user_event(UserEvent::HistoryChanged);
         Ok(())
     }
 
@@ -2470,7 +2547,7 @@ impl App {
             info!("paste-last-transcript skipped because history is empty");
             return Ok(());
         };
-        paste_text(&text)?;
+        paste_text(&self.config.root_dir, &text)?;
         info!("pasted last transcript");
         Ok(())
     }
@@ -4175,6 +4252,28 @@ fn transcript_menu_preview(text: &str) -> String {
     preview
 }
 
+const fn words_bucket(words: usize) -> &'static str {
+    match words {
+        0 => "0",
+        1..=5 => "1-5",
+        6..=20 => "6-20",
+        21..=50 => "21-50",
+        51..=100 => "51-100",
+        101..=300 => "101-300",
+        _ => "301+",
+    }
+}
+
+const fn cleanup_status(prepared: &PreparedText) -> &'static str {
+    if prepared.llm_cleanup_ran {
+        "llm"
+    } else if prepared.llm_cleanup_deferred {
+        "deferred"
+    } else {
+        "local"
+    }
+}
+
 fn transcript_log_value(enabled: bool, text: &str) -> serde_json::Value {
     if enabled {
         return serde_json::Value::String(text.to_owned());
@@ -4695,6 +4794,7 @@ fn sanitize_transcript_history(
             text: entry.text.trim().to_owned(),
             raw: entry.raw.trim().to_owned(),
             created_at_ms: entry.created_at_ms,
+            edited_after_insert: entry.edited_after_insert,
         })
         .filter(|entry| !entry.text.is_empty())
         .take(TRANSCRIPT_HISTORY_LIMIT)
@@ -4849,7 +4949,45 @@ fn copy_to_clipboard(text: &str) -> Result<(), AppError> {
     Ok(())
 }
 
-fn paste_text(text: &str) -> Result<(), AppError> {
+fn paste_text(root_dir: &Path, text: &str) -> Result<(), AppError> {
+    if run_insert_text_helper(root_dir, text).is_ok() {
+        info!("pasted {} chars via insert helper", text.chars().count());
+        return Ok(());
+    }
+    warn!("insert helper failed; falling back to plain clipboard paste");
+    paste_text_with_plain_clipboard(text)
+}
+
+fn run_insert_text_helper(root_dir: &Path, text: &str) -> Result<(), AppError> {
+    let script = root_dir.join("insert_text.py");
+    if !script.exists() {
+        return Err(AppError::Io(std::io::Error::new(
+            ErrorKind::NotFound,
+            "insert_text.py missing",
+        )));
+    }
+    let mut child = Command::new("python3")
+        .arg(script)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(AppError::Io)?;
+    if let Some(stdin) = child.stdin.as_mut() {
+        stdin.write_all(text.as_bytes())?;
+    }
+    drop(child.stdin.take());
+    let status = child.wait()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(AppError::Io(std::io::Error::other(format!(
+            "insert helper exited with {status}"
+        ))))
+    }
+}
+
+fn paste_text_with_plain_clipboard(text: &str) -> Result<(), AppError> {
     let mut clipboard = Clipboard::new().map_err(|error| AppError::Clipboard(error.to_string()))?;
     let previous = clipboard.get_text().ok();
     clipboard
@@ -5004,14 +5142,15 @@ mod tests {
 
     use super::{
         AccessibilityContext, App, AppError, AppState, CleanupMode, CleanupProfile, Config,
-        DictationCommandKind, DictationWarmup, StreamingProvider, StreamingTranscript, SttFallback,
-        TRANSCRIPT_HISTORY_LIMIT, TextReplacement, TranscriptHistoryEntry, UpdateOutcome,
-        apply_text_replacements, apply_vocabulary_corrections, build_cleanup_user_content,
-        build_stt_prompt, canonicalize_known_terms, cleanup_decision, cleanup_max_tokens,
-        cleanup_profile, final_streaming_result_is_ready_elapsed, is_known_no_speech_transcript,
-        parse_command, parse_replacements_json, parse_stt_fallbacks, parse_u64_env_value,
-        parse_update_outcome, read_vocabulary_file, remove_fillers, sanitize_transcript_history,
-        speech_stats, stable_streaming_best_is_ready_elapsed, streaming_batch_fallback_reason,
+        DictationCommandKind, DictationWarmup, PreparedText, StreamingProvider,
+        StreamingTranscript, SttFallback, TRANSCRIPT_HISTORY_LIMIT, TextReplacement,
+        TranscriptHistoryEntry, UpdateOutcome, apply_text_replacements,
+        apply_vocabulary_corrections, build_cleanup_user_content, build_stt_prompt,
+        canonicalize_known_terms, cleanup_decision, cleanup_max_tokens, cleanup_profile,
+        final_streaming_result_is_ready_elapsed, is_known_no_speech_transcript, parse_command,
+        parse_replacements_json, parse_stt_fallbacks, parse_u64_env_value, parse_update_outcome,
+        read_vocabulary_file, remove_fillers, sanitize_transcript_history, speech_stats,
+        stable_streaming_best_is_ready_elapsed, streaming_batch_fallback_reason,
         strip_reasoning_tags, stt_language_for_model, stt_model_config, telnyx_stream_query,
         transcript_log_value, transcript_menu_preview, valid_deferred_cleanup, wav_bytes,
     };
@@ -5647,7 +5786,7 @@ mod tests {
             event_proxy: Mutex::new(None),
         };
 
-        app.remember_result("raw dictated text", "dictated text")?;
+        app.remember_result("raw dictated text", "dictated text", None)?;
 
         let state = app.lock_state()?;
         assert_eq!(state.last_result.as_deref(), Some("dictated text"));
@@ -5659,6 +5798,51 @@ mod tests {
             state.history.front().map(|entry| entry.raw.as_str()),
             Some("raw dictated text")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn post_insert_edit_marks_latest_history_without_text_logging() -> Result<(), AppError> {
+        let app = App {
+            config: Config {
+                telnyx_api_key: String::from("test"),
+                llm_cleanup: CleanupMode::Off,
+                litellm_base: None,
+                litellm_key: None,
+                stt_model: String::from("deepgram/nova-3"),
+                stt_language: String::from("en-US"),
+                streaming_stt: None,
+                stt_fallbacks: Vec::new(),
+                microphone: None,
+                replacements: Vec::new(),
+                root_dir: PathBuf::new(),
+                hotkey: String::from("right_option"),
+                paste_last_hotkey: None,
+                preserve_clipboard: true,
+                log_transcripts: false,
+                max_recording_seconds: 30,
+            },
+            http: reqwest::blocking::Client::new(),
+            vocabulary: Mutex::new(Vec::new()),
+            state: Mutex::new(AppState::default()),
+            event_proxy: Mutex::new(None),
+        };
+        let prepared = PreparedText {
+            text: String::from("dictated text"),
+            llm_cleanup_ran: false,
+            llm_cleanup_deferred: true,
+            cleanup_input: Some(String::from("dictated text")),
+        };
+
+        app.remember_result("raw dictated text", "dictated text", Some(&prepared))?;
+        app.handle_post_insert_edit("backspace")?;
+
+        let state = app.lock_state()?;
+        assert_eq!(
+            state.history.front().map(|entry| entry.edited_after_insert),
+            Some(true)
+        );
+        assert_eq!(state.post_insert_watch, None);
         Ok(())
     }
 

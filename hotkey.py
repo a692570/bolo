@@ -14,6 +14,7 @@ from AppKit import (
     NSDefaultRunLoopMode,
     NSEvent,
     NSEventMaskFlagsChanged,
+    NSEventMaskKeyDown,
     NSRunLoop,
 )
 from Foundation import NSDate
@@ -83,6 +84,21 @@ pending_recheck_count = 0
 def emit(event):
     sys.stdout.write(json.dumps({"event": event}) + "\n")
     sys.stdout.flush()
+
+
+def emit_post_insert_edit(action):
+    sys.stdout.write(json.dumps({"event": "post_insert_edit", "action": action}) + "\n")
+    sys.stdout.flush()
+
+
+def key_down(event):
+    key_code = int(event.keyCode())
+    flags = int(event.modifierFlags())
+    command_down = bool(flags & (1 << 20))
+    if key_code == 51:
+        emit_post_insert_edit("backspace")
+    elif key_code == 0 and command_down:
+        emit_post_insert_edit("cmd_a")
 
 
 def is_hotkey_down():
@@ -214,6 +230,13 @@ else:
     sys.exit(1)
 
 state = is_hotkey_down()
+
+edit_monitor = NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(
+    NSEventMaskKeyDown,
+    key_down,
+)
+if edit_monitor is None:
+    print("[hotkey] key-down monitor unavailable", file=sys.stderr, flush=True)
 
 while True:
     if not parent_is_alive():

@@ -177,9 +177,9 @@ To keep dictated text on the clipboard after insertion, set:
 export BOLO_PRESERVE_CLIPBOARD="off"
 ```
 
-By default, Bolo restores whatever was on your clipboard before dictation. The dictated text is still kept in Bolo's correction state for commands like `scratch that` and `actually ...`.
+By default, Bolo restores whatever was on your clipboard before dictation, including non-text pasteboard contents when macOS allows it. The dictated text is still kept in Bolo's correction state for commands like `scratch that` and `actually ...`.
 
-Bolo also stores your 10 most recent transcripts locally at `~/.bolo/transcripts.json`. Use the menu bar icon to copy the latest transcript or a recent transcript into the clipboard on demand. When cleanup changes the text, Bolo keeps both the raw STT transcript and the cleaned transcript so you can copy either one from history.
+Bolo also stores your 10 most recent transcripts locally at `~/.bolo/transcripts.json`. Use the menu bar icon to copy the latest transcript or a recent transcript into the clipboard on demand. When cleanup changes the text, Bolo keeps both the raw STT transcript and the cleaned transcript so you can copy either one from history. If you immediately edit inserted text with Backspace or Cmd+A, Bolo marks only that history item as edited and logs a content-free quality signal.
 
 Use **Clear Transcript History** from the menu bar to delete local transcript history, or **Run Health Check** to confirm Bolo can see microphones, the active language, STT mode, and history state.
 
