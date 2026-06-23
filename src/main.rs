@@ -410,6 +410,7 @@ impl StreamingRecording {
         provider: StreamingProvider,
         language: String,
         vocabulary: Vec<String>,
+        preview_proxy: Option<EventLoopProxy<UserEvent>>,
     ) -> Self {
         let (sender, receiver) = mpsc::channel::<Vec<i16>>();
         let result = Arc::new(Mutex::new(StreamingTranscript::default()));
@@ -430,6 +431,7 @@ impl StreamingRecording {
                             vocabulary,
                             receiver,
                             thread_result,
+                            preview_proxy,
                         )
                         .await
                         {
@@ -625,6 +627,7 @@ async fn run_telnyx_stream(
     vocabulary: Vec<String>,
     receiver: Receiver<Vec<i16>>,
     result: Arc<Mutex<StreamingTranscript>>,
+    preview_proxy: Option<EventLoopProxy<UserEvent>>,
 ) -> Result<(), String> {
     let query = telnyx_stream_query(provider, &language, &vocabulary);
     let url = format!("{TELNYX_STT_STREAMING_ENDPOINT}?{query}");
@@ -691,7 +694,7 @@ async fn run_telnyx_stream(
                     return Ok(());
                 }
                 if let Message::Text(text) = message {
-                    update_streaming_transcript(&result, &text);
+                    update_streaming_transcript(&result, &text, preview_proxy.as_ref());
                 }
             }
             Ok(Some(Err(error))) => {
@@ -765,7 +768,11 @@ fn query_escape(value: &str) -> String {
     escaped
 }
 
-fn update_streaming_transcript(result: &Arc<Mutex<StreamingTranscript>>, text: &str) {
+fn update_streaming_transcript(
+    result: &Arc<Mutex<StreamingTranscript>>,
+    text: &str,
+    preview_proxy: Option<&EventLoopProxy<UserEvent>>,
+) {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
         return;
     };
@@ -816,6 +823,12 @@ fn update_streaming_transcript(result: &Arc<Mutex<StreamingTranscript>>, text: &
             result.latest_partial = Some(transcript.to_owned());
         }
     }
+    if let Some(proxy) = preview_proxy {
+        let preview = streaming_preview_tail(transcript);
+        if !preview.is_empty() {
+            drop(proxy.send_event(UserEvent::OverlayPreview(preview)));
+        }
+    }
 }
 
 fn pcm_bytes(samples: &[i16]) -> Vec<u8> {
@@ -852,6 +865,7 @@ impl std::fmt::Debug for App {
 enum UserEvent {
     Menu(MenuEvent),
     Overlay(OverlayPhase),
+    OverlayPreview(String),
     HideOverlay,
     HideOverlayAfter(Duration),
     HistoryChanged,
@@ -1256,12 +1270,24 @@ fn run_app_event_loop(app: Arc<App>) -> Result<(), AppError> {
                 overlay_hide_at = None;
                 *control_flow = ControlFlow::Wait;
                 if let Err(error) =
-                    show_native_overlay(&mut native_overlay, &app.config.root_dir, phase)
+                    show_native_overlay(&mut native_overlay, &app.config.root_dir, phase, None)
                 {
                     error!("{error}");
                 }
                 if let Some(ui) = tray_ui.as_ref() {
                     ui.tray_icon.set_title(Some(phase.tray_title()));
+                }
+            }
+            TaoEvent::UserEvent(UserEvent::OverlayPreview(preview)) => {
+                overlay_hide_at = None;
+                *control_flow = ControlFlow::Wait;
+                if let Err(error) = show_native_overlay(
+                    &mut native_overlay,
+                    &app.config.root_dir,
+                    OverlayPhase::Dictating,
+                    Some(&preview),
+                ) {
+                    error!("{error}");
                 }
             }
             TaoEvent::UserEvent(UserEvent::HideOverlay) => {
@@ -1697,8 +1723,17 @@ impl App {
             .stt_language()
             .unwrap_or_else(|_| self.config.stt_language.clone());
         let vocabulary = self.vocabulary_snapshot().unwrap_or_default();
+        let preview_proxy = self
+            .event_proxy
+            .lock()
+            .ok()
+            .and_then(|proxy| proxy.as_ref().cloned());
         Some(StreamingRecording::start(
-            api_key, provider, language, vocabulary,
+            api_key,
+            provider,
+            language,
+            vocabulary,
+            preview_proxy,
         ))
     }
 
@@ -3392,6 +3427,7 @@ fn show_native_overlay(
     overlay: &mut Option<NativeOverlay>,
     root_dir: &Path,
     phase: OverlayPhase,
+    preview: Option<&str>,
 ) -> Result<(), AppError> {
     let needs_spawn = match overlay.as_mut() {
         Some(existing) => !existing.is_running()?,
@@ -3403,12 +3439,12 @@ fn show_native_overlay(
         info!("recording overlay shown");
     }
     if let Some(existing) = overlay.as_mut()
-        && let Err(error) = existing.update(phase)
+        && let Err(error) = existing.update(phase, preview)
     {
         warn!("overlay update failed, restarting: {error}");
         hide_native_overlay(overlay);
         let mut replacement = spawn_native_overlay(root_dir)?;
-        replacement.update(phase)?;
+        replacement.update(phase, preview)?;
         *overlay = Some(replacement);
     }
     Ok(())
@@ -3468,10 +3504,10 @@ impl NativeOverlay {
             .map_err(AppError::Io)
     }
 
-    fn update(&mut self, phase: OverlayPhase) -> Result<(), AppError> {
+    fn update(&mut self, phase: OverlayPhase, preview: Option<&str>) -> Result<(), AppError> {
         let payload = serde_json::json!({
             "phase": phase.overlay_phase(),
-            "text": "",
+            "text": preview.unwrap_or_default(),
         });
         writeln!(self.stdin, "{payload}")?;
         self.stdin.flush()?;
@@ -4250,6 +4286,24 @@ fn transcript_menu_preview(text: &str) -> String {
         preview.push_str("...");
     }
     preview
+}
+
+fn streaming_preview_tail(text: &str) -> String {
+    const MAX_CHARS: usize = 64;
+    let single_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let char_count = single_line.chars().count();
+    if char_count <= MAX_CHARS {
+        return single_line;
+    }
+    let tail = single_line
+        .chars()
+        .rev()
+        .take(MAX_CHARS.saturating_sub(3))
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+    format!("...{tail}")
 }
 
 const fn words_bucket(words: usize) -> &'static str {
@@ -5151,8 +5205,9 @@ mod tests {
         parse_replacements_json, parse_stt_fallbacks, parse_u64_env_value, parse_update_outcome,
         read_vocabulary_file, remove_fillers, sanitize_transcript_history, speech_stats,
         stable_streaming_best_is_ready_elapsed, streaming_batch_fallback_reason,
-        strip_reasoning_tags, stt_language_for_model, stt_model_config, telnyx_stream_query,
-        transcript_log_value, transcript_menu_preview, valid_deferred_cleanup, wav_bytes,
+        streaming_preview_tail, strip_reasoning_tags, stt_language_for_model, stt_model_config,
+        telnyx_stream_query, transcript_log_value, transcript_menu_preview, valid_deferred_cleanup,
+        wav_bytes,
     };
     use std::collections::VecDeque;
     use std::path::PathBuf;
@@ -5956,6 +6011,17 @@ mod tests {
             "line one line two"
         );
         assert!(transcript_menu_preview(&"a".repeat(80)).ends_with("..."));
+    }
+
+    #[test]
+    fn streaming_preview_tail_keeps_recent_text() {
+        assert_eq!(streaming_preview_tail("hello\nworld"), "hello world");
+        let preview = streaming_preview_tail(
+            "this is a long partial transcript that should keep the latest words visible",
+        );
+        assert!(preview.starts_with("..."));
+        assert!(preview.ends_with("latest words visible"));
+        assert!(preview.chars().count() <= 64);
     }
 
     #[test]

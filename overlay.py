@@ -38,7 +38,7 @@ from Foundation import NSDate
 warnings.filterwarnings("ignore", category=ObjCPointerWarning)
 
 
-WIDTH = 190
+WIDTH = 420
 HEIGHT = 44
 BOTTOM_MARGIN = 220
 DOT_SIZE = 8
@@ -119,14 +119,23 @@ content.addSubview_(dot)
 content.addSubview_(label)
 
 
-def render(phase):
+def preview_text(value):
+    text = " ".join(str(value or "").split())
+    if len(text) > 56:
+        return "..." + text[-53:]
+    return text
+
+
+def render(phase, preview=""):
     text, accent = PHASES.get(phase, PHASES["dictating"])
-    label.setStringValue_(text)
+    preview = preview_text(preview)
+    label.setStringValue_(preview or text)
     dot.layer().setBackgroundColor_(accent.CGColor())
 
 
 phase = "dictating"
-render(phase)
+preview = ""
+render(phase, preview)
 window.orderFrontRegardless()
 last_message_at = time.time()
 
@@ -141,7 +150,8 @@ while True:
         except json.JSONDecodeError:
             message = {}
         phase = message.get("phase", phase)
-        render(phase)
+        preview = message.get("text", "") if phase == "dictating" else ""
+        render(phase, preview)
         last_message_at = time.time()
 
     if time.time() - last_message_at > STALL_TIMEOUT:
