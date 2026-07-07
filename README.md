@@ -183,6 +183,8 @@ Bolo also stores your 10 most recent transcripts locally at `~/.bolo/transcripts
 
 Use **Clear Transcript History** from the menu bar to delete local transcript history, or **Run Health Check** to confirm Bolo can see microphones, the active language, STT mode, and history state.
 
+To rewrite text already in another app, select the text, open the Bolo menu bar icon, and choose **Rewrite Selected Text...**. Bolo captures the selected text through macOS Accessibility, asks what change you want, runs the same LLM backend, then pastes the replacement back into the original app.
+
 LLM cleanup defaults to `auto`: short clean dictations skip the LLM, while longer or messy dictations use the LLM for grammar, punctuation, contractions, and missing articles.
 
 To force LLM cleanup for every dictation, set:

@@ -9,6 +9,7 @@ from Foundation import NSMakeRange
 
 MAX_TEXT_BEFORE_CURSOR = 500
 MAX_FALLBACK_TEXT = 500
+MAX_SELECTED_TEXT = 8000
 
 
 def frontmost_app():
@@ -94,6 +95,30 @@ def text_before_cursor(element):
     return text[-MAX_FALLBACK_TEXT:].strip()
 
 
+def selected_text(element):
+    value = copy_attribute(element, AX.kAXSelectedTextAttribute)
+    if value is not None:
+        text = str(value).strip()
+        if text:
+            return text[:MAX_SELECTED_TEXT]
+
+    selection = selected_range(element)
+    if selection is None:
+        return ""
+    location, length = selection
+    text = string_for_range(element, location, length).strip()
+    if text:
+        return text[:MAX_SELECTED_TEXT]
+
+    value = copy_attribute(element, AX.kAXValueAttribute)
+    if value is None:
+        return ""
+    full_text = str(value)
+    if length <= 0 or location >= len(full_text):
+        return ""
+    return full_text[location : location + length].strip()[:MAX_SELECTED_TEXT]
+
+
 def main():
     app_name, bundle_id = frontmost_app()
     element = focused_element()
@@ -101,6 +126,7 @@ def main():
         "app_name": app_name,
         "bundle_id": bundle_id,
         "text_before_cursor": text_before_cursor(element) if element is not None else "",
+        "selected_text": selected_text(element) if element is not None else "",
     }
     print(json.dumps(context, ensure_ascii=True))
 
