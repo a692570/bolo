@@ -1,6 +1,6 @@
 [package]
 name = "bolo"
-version = "1.4.1"
+version = "1.4.2"
 edition = "2024"
 rust-version = "1.88"
 description = "Push-to-talk macOS dictation powered by Telnyx AI"
