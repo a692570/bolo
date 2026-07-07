@@ -25,6 +25,10 @@ class VocabularyStore:
                 term = item.strip()
                 if term:
                     terms.append(term)
+            elif isinstance(item, dict):
+                term = item.get("text") or item.get("term") or item.get("value")
+                if isinstance(term, str) and term.strip():
+                    terms.append(term.strip())
         return terms
 
     def terms(self):

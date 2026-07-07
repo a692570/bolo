@@ -122,6 +122,21 @@ struct TextReplacement {
     replacement: String,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct LoadedVocabulary {
+    terms: Vec<String>,
+    aliases: Vec<TextReplacement>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct PromptBinding {
+    #[serde(default)]
+    bundle_id: String,
+    #[serde(default)]
+    app_name: String,
+    profile: CleanupProfile,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum SttFallback {
     Telnyx(String),
@@ -142,7 +157,8 @@ enum CleanupMode {
     Off,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
 enum CleanupProfile {
     Default,
     Email,
@@ -844,6 +860,8 @@ struct App {
     config: Config,
     http: Client,
     vocabulary: Mutex<Vec<String>>,
+    vocabulary_aliases: Mutex<Vec<TextReplacement>>,
+    prompt_bindings: Mutex<Vec<PromptBinding>>,
     state: Mutex<AppState>,
     event_proxy: Mutex<Option<EventLoopProxy<UserEvent>>>,
 }
@@ -910,6 +928,7 @@ struct TrayUi {
     microphone_items: Vec<(String, CheckMenuItem)>,
     copy_last_item: MenuItem,
     rewrite_selected_item: MenuItem,
+    bind_prompt_profile_item: MenuItem,
     cleanup_status_item: MenuItem,
     history_menu: Submenu,
     history_items: Vec<MenuItem>,
@@ -918,6 +937,7 @@ struct TrayUi {
     health_check_item: MenuItem,
     update_item: MenuItem,
     add_vocabulary_item: MenuItem,
+    add_vocabulary_alias_item: MenuItem,
     add_replacement_item: MenuItem,
     quit_item: MenuItem,
 }
@@ -1374,12 +1394,15 @@ impl App {
         let selected_microphone = config.microphone.clone();
         let selected_language = Some(config.stt_language.clone());
         let vocabulary = load_vocabulary(&config.root_dir);
+        let prompt_bindings = load_prompt_bindings();
         let history = load_transcript_history();
         let http = Client::builder().timeout(Duration::from_secs(12)).build()?;
         Ok(Self {
             config,
             http,
-            vocabulary: Mutex::new(vocabulary),
+            vocabulary: Mutex::new(vocabulary.terms),
+            vocabulary_aliases: Mutex::new(vocabulary.aliases),
+            prompt_bindings: Mutex::new(prompt_bindings),
             state: Mutex::new(AppState {
                 history,
                 selected_microphone,
@@ -2111,14 +2134,17 @@ impl App {
             })
         );
         let normalized = canonicalize_known_terms(&whitespace_normalized);
+        let vocabulary_aliases = self.vocabulary_aliases_snapshot();
+        let alias_normalized = apply_text_replacements(&normalized, &vocabulary_aliases);
         let vocabulary = self.vocabulary_snapshot().unwrap_or_default();
-        let vocabulary_normalized = apply_vocabulary_corrections(&normalized, &vocabulary);
+        let vocabulary_normalized = apply_vocabulary_corrections(&alias_normalized, &vocabulary);
         info!(
             "[cleanup] canonicalize_terms {}",
             serde_json::json!({
                 "before": self.log_text(&whitespace_normalized),
                 "after": self.log_text(&vocabulary_normalized),
                 "vocabulary_count": vocabulary.len(),
+                "alias_count": vocabulary_aliases.len(),
             })
         );
         let stripped = remove_fillers(&vocabulary_normalized)?;
@@ -2191,7 +2217,8 @@ impl App {
         let endpoint = self.config.llm_endpoint();
         let model = self.config.llm_model();
         let accessibility_context = self.accessibility_context_for_cleanup(warmup);
-        let cleanup_profile = cleanup_profile(accessibility_context.as_ref());
+        let prompt_bindings = self.prompt_bindings_snapshot();
+        let cleanup_profile = cleanup_profile(accessibility_context.as_ref(), &prompt_bindings);
         let system_prompt = cleanup_prompt(cleanup_profile);
         let user_content = build_cleanup_user_content(transcript, accessibility_context.as_ref());
         let request = ChatRequest {
@@ -2789,6 +2816,18 @@ impl App {
             .map_err(|error| AppError::PoisonedMutex(error.to_string()))
     }
 
+    fn vocabulary_aliases_snapshot(&self) -> Vec<TextReplacement> {
+        self.vocabulary_aliases
+            .lock()
+            .map_or_else(|_| Vec::new(), |aliases| aliases.clone())
+    }
+
+    fn prompt_bindings_snapshot(&self) -> Vec<PromptBinding> {
+        self.prompt_bindings
+            .lock()
+            .map_or_else(|_| Vec::new(), |bindings| bindings.clone())
+    }
+
     fn set_microphone(&self, microphone: &str) -> Result<(), AppError> {
         let mut state = self.lock_state()?;
         state.selected_microphone = Some(microphone.to_owned());
@@ -2830,6 +2869,81 @@ impl App {
             }
         }
         Ok(added)
+    }
+
+    fn add_vocabulary_alias(&self, term: &str, alias: &str) -> Result<bool, AppError> {
+        let term = term.trim();
+        let alias = alias.trim();
+        if term.is_empty() || alias.is_empty() {
+            return Ok(false);
+        }
+        let added = add_personal_vocabulary_alias(term, alias)?;
+        if added {
+            let mut vocabulary = self
+                .vocabulary
+                .lock()
+                .map_err(|error| AppError::PoisonedMutex(error.to_string()))?;
+            let key = term.to_ascii_lowercase();
+            if !vocabulary
+                .iter()
+                .any(|existing| existing.to_ascii_lowercase() == key)
+            {
+                vocabulary.push(term.to_owned());
+            }
+            drop(vocabulary);
+
+            let mut aliases = self
+                .vocabulary_aliases
+                .lock()
+                .map_err(|error| AppError::PoisonedMutex(error.to_string()))?;
+            upsert_replacement(
+                &mut aliases,
+                TextReplacement {
+                    spoken: alias.to_owned(),
+                    replacement: term.to_owned(),
+                },
+            );
+            sort_replacements(&mut aliases);
+        }
+        Ok(added)
+    }
+
+    fn bind_current_app_prompt_profile(
+        &self,
+        profile: CleanupProfile,
+        context: &AccessibilityContext,
+    ) -> Result<(), AppError> {
+        let binding = PromptBinding {
+            bundle_id: context.bundle_id.trim().to_owned(),
+            app_name: context.app_name.trim().to_owned(),
+            profile,
+        };
+        if binding.bundle_id.is_empty() && binding.app_name.is_empty() {
+            show_notification("Bolo", "Could not identify the current app.");
+            return Ok(());
+        }
+        let bindings = {
+            let mut stored = self
+                .prompt_bindings
+                .lock()
+                .map_err(|error| AppError::PoisonedMutex(error.to_string()))?;
+            upsert_prompt_binding(&mut stored, binding.clone());
+            stored.clone()
+        };
+        save_prompt_bindings(&bindings)?;
+        show_notification(
+            "Bolo",
+            &format!(
+                "{} uses {} cleanup.",
+                if binding.app_name.is_empty() {
+                    binding.bundle_id.as_str()
+                } else {
+                    binding.app_name.as_str()
+                },
+                cleanup_profile_label(binding.profile)
+            ),
+        );
+        Ok(())
     }
 
     fn replacements_snapshot(&self) -> Vec<TextReplacement> {
@@ -3111,6 +3225,16 @@ fn create_tray_ui(app: &App) -> Result<TrayUi, AppError> {
         .append(&rewrite_selected_item)
         .map_err(|error| AppError::MenuBar(error.to_string()))?;
 
+    let bind_prompt_profile_item = MenuItem::with_id(
+        "bind-prompt-profile",
+        "Set Cleanup Style for Current App...",
+        true,
+        None,
+    );
+    tray_menu
+        .append(&bind_prompt_profile_item)
+        .map_err(|error| AppError::MenuBar(error.to_string()))?;
+
     let cleanup_status_item =
         MenuItem::with_id("cleanup-status", app.cleanup_status(), false, None);
     tray_menu
@@ -3173,6 +3297,16 @@ fn create_tray_ui(app: &App) -> Result<TrayUi, AppError> {
         .append(&add_vocabulary_item)
         .map_err(|error| AppError::MenuBar(error.to_string()))?;
 
+    let add_vocabulary_alias_item = MenuItem::with_id(
+        "add-vocabulary-alias",
+        "Add Vocabulary Alias...",
+        true,
+        None,
+    );
+    tray_menu
+        .append(&add_vocabulary_alias_item)
+        .map_err(|error| AppError::MenuBar(error.to_string()))?;
+
     let add_replacement_item =
         MenuItem::with_id("add-replacement-rule", "Add Correction Rule...", true, None);
     tray_menu
@@ -3230,6 +3364,7 @@ fn create_tray_ui(app: &App) -> Result<TrayUi, AppError> {
         microphone_items,
         copy_last_item,
         rewrite_selected_item,
+        bind_prompt_profile_item,
         cleanup_status_item,
         history_menu,
         history_items: Vec::new(),
@@ -3238,6 +3373,7 @@ fn create_tray_ui(app: &App) -> Result<TrayUi, AppError> {
         health_check_item,
         update_item,
         add_vocabulary_item,
+        add_vocabulary_alias_item,
         add_replacement_item,
         quit_item,
     };
@@ -3264,6 +3400,10 @@ fn handle_menu_event(
         rewrite_selected_from_menu(Arc::clone(app));
         return;
     }
+    if event_id == tray_ui.bind_prompt_profile_item.id().as_ref() {
+        bind_prompt_profile_from_menu(app);
+        return;
+    }
     if event_id == tray_ui.clear_history_item.id().as_ref() {
         if let Err(error) = app.clear_transcript_history() {
             warn!("history clear failed: {error}");
@@ -3280,6 +3420,10 @@ fn handle_menu_event(
     }
     if event_id == tray_ui.add_vocabulary_item.id().as_ref() {
         add_vocabulary_from_menu(app);
+        return;
+    }
+    if event_id == tray_ui.add_vocabulary_alias_item.id().as_ref() {
+        add_vocabulary_alias_from_menu(app);
         return;
     }
     if event_id == tray_ui.add_replacement_item.id().as_ref() {
@@ -3545,6 +3689,36 @@ fn add_vocabulary_from_menu(app: &App) {
     }
 }
 
+fn add_vocabulary_alias_from_menu(app: &App) {
+    let term = match prompt_for_text(
+        "Add Vocabulary Alias",
+        "Enter the correct word or phrase, for example Claude.",
+    ) {
+        Ok(Some(value)) => value,
+        Ok(None) => return,
+        Err(error) => {
+            warn!("vocabulary alias prompt failed: {error}");
+            return;
+        }
+    };
+    let alias = match prompt_for_text(
+        "Add Vocabulary Alias",
+        "Enter what Bolo often hears instead, for example cloud.",
+    ) {
+        Ok(Some(value)) => value,
+        Ok(None) => return,
+        Err(error) => {
+            warn!("vocabulary alias prompt failed: {error}");
+            return;
+        }
+    };
+    match app.add_vocabulary_alias(&term, &alias) {
+        Ok(true) => show_notification("Bolo", "Vocabulary alias added."),
+        Ok(false) => show_notification("Bolo", "That vocabulary alias is already saved."),
+        Err(error) => warn!("vocabulary alias save failed: {error}"),
+    }
+}
+
 fn add_replacement_from_menu() {
     let spoken = match prompt_for_text(
         "Add Correction Rule",
@@ -3572,6 +3746,31 @@ fn add_replacement_from_menu() {
         Ok(true) => show_notification("Bolo", "Correction rule added."),
         Ok(false) => show_notification("Bolo", "Correction rule was empty."),
         Err(error) => warn!("replacement save failed: {error}"),
+    }
+}
+
+fn bind_prompt_profile_from_menu(app: &Arc<App>) {
+    let Some(context) = read_accessibility_context(&app.config.root_dir) else {
+        show_notification("Bolo", "Could not identify the current app.");
+        return;
+    };
+    let profile_text = match prompt_for_text(
+        "Set Cleanup Style",
+        "Enter default, email, chat, or notes for the current app.",
+    ) {
+        Ok(Some(value)) => value,
+        Ok(None) => return,
+        Err(error) => {
+            warn!("prompt profile prompt failed: {error}");
+            return;
+        }
+    };
+    let Some(profile) = parse_cleanup_profile(&profile_text) else {
+        show_notification("Bolo", "Use default, email, chat, or notes.");
+        return;
+    };
+    if let Err(error) = app.bind_current_app_prompt_profile(profile, &context) {
+        warn!("prompt profile save failed: {error}");
     }
 }
 
@@ -4567,10 +4766,16 @@ fn valid_deferred_cleanup(input: &str, output: &str) -> bool {
     true
 }
 
-fn cleanup_profile(context: Option<&AccessibilityContext>) -> CleanupProfile {
+fn cleanup_profile(
+    context: Option<&AccessibilityContext>,
+    bindings: &[PromptBinding],
+) -> CleanupProfile {
     let Some(context) = context else {
         return CleanupProfile::Default;
     };
+    if let Some(profile) = prompt_binding_profile(context, bindings) {
+        return profile;
+    }
     let app = format!(
         "{} {}",
         context.app_name.to_ascii_lowercase(),
@@ -4597,6 +4802,46 @@ fn cleanup_profile(context: Option<&AccessibilityContext>) -> CleanupProfile {
         return CleanupProfile::Notes;
     }
     CleanupProfile::Default
+}
+
+fn prompt_binding_profile(
+    context: &AccessibilityContext,
+    bindings: &[PromptBinding],
+) -> Option<CleanupProfile> {
+    let bundle_id = context.bundle_id.trim().to_ascii_lowercase();
+    let app_name = context.app_name.trim().to_ascii_lowercase();
+    for binding in bindings {
+        let binding_bundle_id = binding.bundle_id.trim().to_ascii_lowercase();
+        if !binding_bundle_id.is_empty() && binding_bundle_id == bundle_id {
+            return Some(binding.profile);
+        }
+    }
+    for binding in bindings {
+        let binding_app_name = binding.app_name.trim().to_ascii_lowercase();
+        if !binding_app_name.is_empty() && binding_app_name == app_name {
+            return Some(binding.profile);
+        }
+    }
+    None
+}
+
+fn cleanup_profile_label(profile: CleanupProfile) -> &'static str {
+    match profile {
+        CleanupProfile::Default => "default",
+        CleanupProfile::Email => "email",
+        CleanupProfile::Chat => "chat",
+        CleanupProfile::Notes => "notes",
+    }
+}
+
+fn parse_cleanup_profile(value: &str) -> Option<CleanupProfile> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "default" => Some(CleanupProfile::Default),
+        "email" => Some(CleanupProfile::Email),
+        "chat" => Some(CleanupProfile::Chat),
+        "notes" | "note" => Some(CleanupProfile::Notes),
+        _ => None,
+    }
 }
 
 fn build_stt_prompt(vocabulary: &[String]) -> Option<String> {
@@ -4855,36 +5100,64 @@ fn strip_reasoning_tags(text: &str) -> String {
     before_reasoning.trim().to_owned()
 }
 
-fn load_vocabulary(root_dir: &Path) -> Vec<String> {
-    let mut terms = Vec::new();
+fn load_vocabulary(root_dir: &Path) -> LoadedVocabulary {
+    let mut loaded = LoadedVocabulary::default();
     let mut seen = Vec::<String>::new();
     for path in [
         root_dir.join("vocabulary.json"),
         home_path(".bolo_vocabulary.json"),
     ] {
-        if let Some(loaded) = read_vocabulary_file(&path) {
-            for term in loaded {
+        if let Some(file) = read_vocabulary_file(&path) {
+            for term in file.terms {
                 let key = term.to_ascii_lowercase();
                 if !seen.contains(&key) {
                     seen.push(key);
-                    terms.push(term);
+                    loaded.terms.push(term);
                 }
+            }
+            for alias in file.aliases {
+                upsert_replacement(&mut loaded.aliases, alias);
             }
         }
     }
-    terms
+    sort_replacements(&mut loaded.aliases);
+    loaded
 }
 
-fn read_vocabulary_file(path: &Path) -> Option<Vec<String>> {
+fn read_vocabulary_file(path: &Path) -> Option<LoadedVocabulary> {
     let text = fs::read_to_string(path).ok()?;
-    let values = serde_json::from_str::<Vec<String>>(&text).ok()?;
-    Some(
-        values
-            .into_iter()
-            .map(|term| term.trim().to_owned())
-            .filter(|term| !term.is_empty())
-            .collect(),
-    )
+    let values = serde_json::from_str::<Vec<serde_json::Value>>(&text).ok()?;
+    let mut loaded = LoadedVocabulary::default();
+    for value in values {
+        match value {
+            serde_json::Value::String(term) => {
+                let term = term.trim();
+                if !term.is_empty() {
+                    loaded.terms.push(term.to_owned());
+                }
+            }
+            serde_json::Value::Object(object) => {
+                let Some(term) = vocabulary_object_term(&object) else {
+                    continue;
+                };
+                loaded.terms.push(term.clone());
+                for alias in vocabulary_object_aliases(&object) {
+                    if !alias.eq_ignore_ascii_case(&term) {
+                        upsert_replacement(
+                            &mut loaded.aliases,
+                            TextReplacement {
+                                spoken: alias,
+                                replacement: term.clone(),
+                            },
+                        );
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    sort_replacements(&mut loaded.aliases);
+    Some(loaded)
 }
 
 fn add_personal_vocabulary_term(term: &str) -> Result<bool, AppError> {
@@ -4893,30 +5166,201 @@ fn add_personal_vocabulary_term(term: &str) -> Result<bool, AppError> {
         return Ok(false);
     }
     let path = home_path(".bolo_vocabulary.json");
-    let mut terms = read_vocabulary_file(&path).unwrap_or_default();
+    let mut terms = read_vocabulary_values(&path)?;
     let key = term.to_ascii_lowercase();
     if terms
         .iter()
+        .filter_map(vocabulary_value_term)
         .any(|existing| existing.to_ascii_lowercase() == key)
     {
         return Ok(false);
     }
-    terms.push(term.to_owned());
-    save_vocabulary_file(&path, &terms)?;
+    terms.push(serde_json::Value::String(term.to_owned()));
+    save_vocabulary_values(&path, &terms)?;
     Ok(true)
 }
 
-fn save_vocabulary_file(path: &Path, terms: &[String]) -> Result<(), AppError> {
+fn add_personal_vocabulary_alias(term: &str, alias: &str) -> Result<bool, AppError> {
+    let term = term.trim();
+    let alias = alias.trim();
+    if term.is_empty() || alias.is_empty() {
+        return Ok(false);
+    }
+    let path = home_path(".bolo_vocabulary.json");
+    let mut values = read_vocabulary_values(&path)?;
+    let term_key = term.to_ascii_lowercase();
+    let alias_key = alias.to_ascii_lowercase();
+    for value in &mut values {
+        let Some(existing) = vocabulary_value_term(value) else {
+            continue;
+        };
+        if existing.to_ascii_lowercase() != term_key {
+            continue;
+        }
+        let object = vocabulary_value_as_object(value, &existing);
+        let aliases = object
+            .entry(String::from("aliases"))
+            .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+        let Some(alias_values) = aliases.as_array_mut() else {
+            return Ok(false);
+        };
+        if alias_values
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .any(|existing| existing.trim().to_ascii_lowercase() == alias_key)
+        {
+            return Ok(false);
+        }
+        alias_values.push(serde_json::Value::String(alias.to_owned()));
+        save_vocabulary_values(&path, &values)?;
+        return Ok(true);
+    }
+    values.push(serde_json::json!({
+        "text": term,
+        "aliases": [alias],
+    }));
+    save_vocabulary_values(&path, &values)?;
+    Ok(true)
+}
+
+fn read_vocabulary_values(path: &Path) -> Result<Vec<serde_json::Value>, AppError> {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let values = serde_json::from_str::<Vec<serde_json::Value>>(&text)?;
+    Ok(values)
+}
+
+fn vocabulary_value_as_object<'a>(
+    value: &'a mut serde_json::Value,
+    term: &str,
+) -> &'a mut serde_json::Map<String, serde_json::Value> {
+    if value.is_string() {
+        *value = serde_json::json!({ "text": term, "aliases": [] });
+    }
+    value.as_object_mut().expect("vocabulary entry is object")
+}
+
+fn vocabulary_value_term(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(term) => {
+            let term = term.trim();
+            (!term.is_empty()).then(|| term.to_owned())
+        }
+        serde_json::Value::Object(object) => vocabulary_object_term(object),
+        _ => None,
+    }
+}
+
+fn vocabulary_object_term(object: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
+    ["text", "term", "value"]
+        .into_iter()
+        .filter_map(|key| object.get(key).and_then(serde_json::Value::as_str))
+        .map(str::trim)
+        .find(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+fn vocabulary_object_aliases(object: &serde_json::Map<String, serde_json::Value>) -> Vec<String> {
+    let mut aliases = Vec::new();
+    if let Some(alias) = object
+        .get("alias")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|alias| !alias.is_empty())
+    {
+        aliases.push(alias.to_owned());
+    }
+    if let Some(values) = object.get("aliases").and_then(serde_json::Value::as_array) {
+        aliases.extend(
+            values
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|alias| !alias.is_empty())
+                .map(str::to_owned),
+        );
+    }
+    aliases
+}
+
+fn save_vocabulary_values(path: &Path, values: &[serde_json::Value]) -> Result<(), AppError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
     let tmp = path.with_extension("json.tmp");
-    let text = serde_json::to_string_pretty(terms)?;
+    let text = serde_json::to_string_pretty(values)?;
     fs::write(&tmp, format!("{text}\n"))?;
     #[cfg(unix)]
     fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))?;
     fs::rename(tmp, path)?;
     Ok(())
+}
+
+fn load_prompt_bindings() -> Vec<PromptBinding> {
+    match read_prompt_bindings_file(&prompt_bindings_path()) {
+        Ok(bindings) => bindings,
+        Err(AppError::Io(error)) if error.kind() == ErrorKind::NotFound => Vec::new(),
+        Err(error) => {
+            warn!("prompt binding config ignored: {error}");
+            Vec::new()
+        }
+    }
+}
+
+fn read_prompt_bindings_file(path: &Path) -> Result<Vec<PromptBinding>, AppError> {
+    let text = fs::read_to_string(path)?;
+    let mut bindings = serde_json::from_str::<Vec<PromptBinding>>(&text)?;
+    bindings.retain(|binding| {
+        !binding.bundle_id.trim().is_empty() || !binding.app_name.trim().is_empty()
+    });
+    Ok(bindings)
+}
+
+fn upsert_prompt_binding(bindings: &mut Vec<PromptBinding>, binding: PromptBinding) {
+    if !binding.bundle_id.trim().is_empty()
+        && let Some(existing) = bindings.iter_mut().find(|existing| {
+            existing
+                .bundle_id
+                .trim()
+                .eq_ignore_ascii_case(binding.bundle_id.trim())
+        })
+    {
+        *existing = binding;
+        return;
+    }
+    if !binding.app_name.trim().is_empty()
+        && let Some(existing) = bindings.iter_mut().find(|existing| {
+            existing
+                .app_name
+                .trim()
+                .eq_ignore_ascii_case(binding.app_name.trim())
+        })
+    {
+        *existing = binding;
+        return;
+    }
+    bindings.push(binding);
+}
+
+fn save_prompt_bindings(bindings: &[PromptBinding]) -> Result<(), AppError> {
+    let path = prompt_bindings_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    let text = serde_json::to_string_pretty(bindings)?;
+    fs::write(&tmp, format!("{text}\n"))?;
+    #[cfg(unix)]
+    fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))?;
+    fs::rename(tmp, path)?;
+    Ok(())
+}
+
+fn prompt_bindings_path() -> PathBuf {
+    home_path(".bolo/prompt_bindings.json")
 }
 
 fn load_replacements() -> Vec<TextReplacement> {
@@ -5397,7 +5841,7 @@ mod tests {
 
     use super::{
         AccessibilityContext, App, AppError, AppState, CleanupMode, CleanupProfile, Config,
-        DictationCommandKind, DictationWarmup, PreparedText, StreamingProvider,
+        DictationCommandKind, DictationWarmup, PreparedText, PromptBinding, StreamingProvider,
         StreamingTranscript, SttFallback, TRANSCRIPT_HISTORY_LIMIT, TextReplacement,
         TranscriptHistoryEntry, UpdateOutcome, apply_text_replacements,
         apply_vocabulary_corrections, build_cleanup_user_content, build_rewrite_user_content,
@@ -5609,7 +6053,36 @@ mod tests {
                 "vocabulary file read failed",
             )));
         };
-        assert_eq!(loaded, vec!["Telnyx", "Bolo", "wispr"]);
+        assert_eq!(loaded.terms, vec!["Telnyx", "Bolo", "wispr"]);
+        assert!(loaded.aliases.is_empty());
+
+        fs::remove_file(&path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn reads_vocabulary_alias_objects() -> Result<(), AppError> {
+        let mut path = env::temp_dir();
+        path.push(format!("bolo-vocab-alias-test-{}.json", process::id()));
+        fs::write(
+            &path,
+            r#"[
+                {"text":"Claude","aliases":["cloud","claud"]},
+                {"term":"cron","alias":"chrome"},
+                "Telnyx"
+            ]"#,
+        )?;
+
+        let Some(loaded) = read_vocabulary_file(&path) else {
+            return Err(AppError::Transcription(String::from(
+                "vocabulary file read failed",
+            )));
+        };
+        assert_eq!(loaded.terms, vec!["Claude", "cron", "Telnyx"]);
+        assert_eq!(
+            apply_text_replacements("cloud and chrome", &loaded.aliases),
+            "Claude and cron"
+        );
 
         fs::remove_file(&path)?;
         Ok(())
@@ -5907,10 +6380,30 @@ mod tests {
             selected_text: String::new(),
         };
 
-        assert_eq!(cleanup_profile(Some(&email)), CleanupProfile::Email);
-        assert_eq!(cleanup_profile(Some(&chat)), CleanupProfile::Chat);
-        assert_eq!(cleanup_profile(Some(&notes)), CleanupProfile::Notes);
-        assert_eq!(cleanup_profile(None), CleanupProfile::Default);
+        assert_eq!(cleanup_profile(Some(&email), &[]), CleanupProfile::Email);
+        assert_eq!(cleanup_profile(Some(&chat), &[]), CleanupProfile::Chat);
+        assert_eq!(cleanup_profile(Some(&notes), &[]), CleanupProfile::Notes);
+        assert_eq!(cleanup_profile(None, &[]), CleanupProfile::Default);
+    }
+
+    #[test]
+    fn cleanup_profile_uses_prompt_binding_before_guessing() {
+        let context = AccessibilityContext {
+            app_name: String::from("Slack"),
+            bundle_id: String::from("com.tinyspeck.slackmacgap"),
+            text_before_cursor: String::new(),
+            selected_text: String::new(),
+        };
+        let bindings = vec![PromptBinding {
+            bundle_id: String::from("com.tinyspeck.slackmacgap"),
+            app_name: String::from("Slack"),
+            profile: CleanupProfile::Notes,
+        }];
+
+        assert_eq!(
+            cleanup_profile(Some(&context), &bindings),
+            CleanupProfile::Notes
+        );
     }
 
     #[test]
@@ -5936,6 +6429,8 @@ mod tests {
             },
             http: reqwest::blocking::Client::new(),
             vocabulary: Mutex::new(Vec::new()),
+            vocabulary_aliases: Mutex::new(Vec::new()),
+            prompt_bindings: Mutex::new(Vec::new()),
             state: Mutex::new(AppState::default()),
             event_proxy: Mutex::new(None),
         };
@@ -5974,6 +6469,8 @@ mod tests {
             },
             http: reqwest::blocking::Client::new(),
             vocabulary: Mutex::new(Vec::new()),
+            vocabulary_aliases: Mutex::new(Vec::new()),
+            prompt_bindings: Mutex::new(Vec::new()),
             state: Mutex::new(AppState::default()),
             event_proxy: Mutex::new(None),
         };
@@ -6011,6 +6508,8 @@ mod tests {
             },
             http: reqwest::blocking::Client::new(),
             vocabulary: Mutex::new(Vec::new()),
+            vocabulary_aliases: Mutex::new(Vec::new()),
+            prompt_bindings: Mutex::new(Vec::new()),
             state: Mutex::new(AppState::default()),
             event_proxy: Mutex::new(None),
         };
@@ -6058,6 +6557,8 @@ mod tests {
             },
             http: reqwest::blocking::Client::new(),
             vocabulary: Mutex::new(Vec::new()),
+            vocabulary_aliases: Mutex::new(Vec::new()),
+            prompt_bindings: Mutex::new(Vec::new()),
             state: Mutex::new(AppState::default()),
             event_proxy: Mutex::new(None),
         };
@@ -6100,6 +6601,8 @@ mod tests {
             },
             http: reqwest::blocking::Client::new(),
             vocabulary: Mutex::new(Vec::new()),
+            vocabulary_aliases: Mutex::new(Vec::new()),
+            prompt_bindings: Mutex::new(Vec::new()),
             state: Mutex::new(AppState::default()),
             event_proxy: Mutex::new(None),
         };
@@ -6145,6 +6648,8 @@ mod tests {
             },
             http: reqwest::blocking::Client::new(),
             vocabulary: Mutex::new(Vec::new()),
+            vocabulary_aliases: Mutex::new(Vec::new()),
+            prompt_bindings: Mutex::new(Vec::new()),
             state: Mutex::new(AppState {
                 last_result: Some(String::from("current transcript")),
                 history: VecDeque::from([TranscriptHistoryEntry::new(
@@ -6180,6 +6685,8 @@ mod tests {
             },
             http: reqwest::blocking::Client::new(),
             vocabulary: Mutex::new(Vec::new()),
+            vocabulary_aliases: Mutex::new(Vec::new()),
+            prompt_bindings: Mutex::new(Vec::new()),
             state: Mutex::new(AppState {
                 history: VecDeque::from([TranscriptHistoryEntry::new(
                     "raw history transcript",

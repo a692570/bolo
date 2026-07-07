@@ -199,15 +199,45 @@ When LiteLLM is configured, Bolo uses `Kimi-K2.5` for cleanup unless `BOLO_LLM_M
 
 When LLM cleanup runs, Bolo also reads the frontmost app and nearby cursor text through macOS Accessibility so cleanup can choose natural spacing, capitalization, and continuation. That context is used only for cleanup prompting.
 
+Cleanup style is selected automatically for common email, chat, and notes apps. To override an app, use **Set Cleanup Style for Current App...** from the menu bar and enter `default`, `email`, `chat`, or `notes`.
+
+Overrides are saved in `~/.bolo/prompt_bindings.json`:
+
+```json
+[
+  {
+    "bundle_id": "com.tinyspeck.slackmacgap",
+    "app_name": "Slack",
+    "profile": "chat"
+  }
+]
+```
+
 You can also add personal vocabulary in `~/.bolo_vocabulary.json` as a JSON string array, for example:
 
 ```json
 ["Release note", "Remotion", "Telnyx", "Abhishek"]
 ```
 
-Bolo merges that with its built-in vocabulary and uses it to preserve known terms more reliably.
+You can also teach Bolo common mishears with alias objects:
 
-You can add vocabulary from the menu bar with **Add Vocabulary Term...**. New terms are saved to `~/.bolo_vocabulary.json` and start applying immediately.
+```json
+[
+  "Telnyx",
+  {
+    "text": "Claude",
+    "aliases": ["cloud", "claud"]
+  },
+  {
+    "text": "cron",
+    "aliases": ["chrome"]
+  }
+]
+```
+
+Bolo merges that with its built-in vocabulary and uses it to preserve known terms more reliably. Aliases are applied locally before LLM cleanup, so common accent or model mistakes are fixed without adding latency.
+
+You can add vocabulary from the menu bar with **Add Vocabulary Term...** and add mishear aliases with **Add Vocabulary Alias...**. New terms are saved to `~/.bolo_vocabulary.json` and start applying immediately.
 
 For deterministic phrase fixes after transcription, add replacements in `~/.bolo/replacements.json`:
 
