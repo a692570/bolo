@@ -3,7 +3,9 @@
 
 def parse_command(transcript: str, correction_active: bool = False):
     stripped = (transcript or "").strip()
-    lowered = stripped.lower()
+    # STT often appends terminal punctuation ("Scratch that."); ignore it
+    # for whole-utterance command matching.
+    lowered = stripped.lower().rstrip(".!?, ")
 
     if lowered == "scratch that":
         return {"kind": "scratch", "display": ""}
