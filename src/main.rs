@@ -94,6 +94,8 @@ enum AppError {
     RateLimited,
     #[error("transcription failed: {0}")]
     Transcription(String),
+    #[error("Accessibility permission is not granted; text cannot be pasted")]
+    AccessibilityNotGranted,
 }
 
 #[derive(Clone, Debug)]
@@ -1044,7 +1046,27 @@ fn main() -> Result<(), AppError> {
             human_readable_hotkey(hotkey)
         );
     }
+    check_accessibility_at_startup(&app.config.root_dir);
     run_app_event_loop(app)
+}
+
+/// Verify Accessibility trust once at startup and surface an actionable
+/// notification when missing. The macOS prompt only fires when the toggle is
+/// genuinely off; subsequent restarts after granting will pass silently.
+fn check_accessibility_at_startup(root_dir: &Path) {
+    if ax_is_trusted(root_dir, true) {
+        info!("[accessibility] trusted at startup");
+        return;
+    }
+    warn!(
+        "[accessibility] NOT TRUSTED at startup. Text will not paste. \
+         Open System Settings > Privacy & Security > Accessibility, \
+         toggle Bolo ON, then run ./restart.sh."
+    );
+    show_notification(
+        "Bolo needs Accessibility",
+        "Grant it in System Settings > Privacy & Security > Accessibility, then run ./restart.sh.",
+    );
 }
 
 impl AppLock {
@@ -5635,12 +5657,79 @@ fn copy_to_clipboard(text: &str) -> Result<(), AppError> {
 }
 
 fn paste_text(root_dir: &Path, text: &str) -> Result<(), AppError> {
+    if !ax_is_trusted(root_dir, false) {
+        warn!(
+            "[accessibility] NOT TRUSTED at paste time. Open System Settings \
+             > Privacy & Security > Accessibility, toggle Bolo ON, then run \
+             ./restart.sh."
+        );
+        show_notification(
+            "Bolo cannot paste",
+            "Grant Accessibility in System Settings > Privacy & Security, then run ./restart.sh.",
+        );
+        return Err(AppError::AccessibilityNotGranted);
+    }
     if run_insert_text_helper(root_dir, text).is_ok() {
         info!("pasted {} chars via insert helper", text.chars().count());
         return Ok(());
     }
     warn!("insert helper failed; falling back to plain clipboard paste");
     paste_text_with_plain_clipboard(text)
+}
+
+/// Ask macOS whether this process is trusted for Accessibility events.
+///
+/// When `prompt` is true, the first untrusted call opens the System Settings
+/// prompt. Shells out to `accessibility_trusted.py` so the trust check lives
+/// in the same Python/PyObjC layer that already reads accessibility context
+/// and performs the paste. Returns `true` when the helper cannot run, so a
+/// broken Python install never blocks dictation paste.
+fn ax_is_trusted(root_dir: &Path, prompt: bool) -> bool {
+    let script = root_dir.join("accessibility_trusted.py");
+    if !script.exists() {
+        warn!(
+            "[accessibility] helper missing at {}; assuming trusted",
+            script.display()
+        );
+        return true;
+    }
+    let mut args: Vec<std::ffi::OsString> = vec![std::ffi::OsString::from(script.as_os_str())];
+    if prompt {
+        args.push(std::ffi::OsString::from("--prompt"));
+    }
+    match Command::new("python3")
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .output()
+    {
+        Ok(output) => {
+            if !output.status.success() {
+                warn!(
+                    "[accessibility] helper exited with {}; assuming trusted",
+                    output.status
+                );
+                return true;
+            }
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            match stdout.trim() {
+                "true" => true,
+                "false" => false,
+                other => {
+                    warn!(
+                        "[accessibility] helper returned unexpected output {other:?}; assuming trusted"
+                    );
+                    true
+                }
+            }
+        }
+        Err(error) => {
+            warn!(
+                "[accessibility] helper failed to run: {error}; assuming trusted"
+            );
+            true
+        }
+    }
 }
 
 fn run_insert_text_helper(root_dir: &Path, text: &str) -> Result<(), AppError> {

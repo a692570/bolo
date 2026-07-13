@@ -324,6 +324,8 @@ Say `Correct heard phrase to desired phrase`, or use **Add Correction Rule...** 
 
 - **No text appears after releasing hotkey**: Check `/tmp/bolo.log`. Verify `TELNYX_API_KEY` is set. Ensure Accessibility permission is granted and Bolo was restarted after granting it.
 
+- **Paste stops working after an update**: The rebuilt binary has a fresh ad-hoc code signature, which can invalidate the existing Accessibility grant. Open System Settings > Privacy & Security > Accessibility, toggle Bolo OFF then ON, then run `./restart.sh`. Bolo also checks at startup and posts a notification when Accessibility is missing.
+
 - **Audio not recording**: Verify Microphone permission is granted in System Settings. Run `./restart.sh` after granting permissions so macOS re-prompts cleanly.
 
 - **Multiple Bolo processes appear**: Run `./restart.sh`.

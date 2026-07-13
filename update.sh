@@ -114,3 +114,8 @@ if ! mv "$new_binary" "$BOLO_DIR/target/release/bolo"; then
 fi
 
 result updated
+
+# The rebuilt binary has a fresh ad-hoc signature, so macOS may invalidate the
+# existing Accessibility grant. Surface this so the user connects "paste stopped
+# working after update" with the right fix instead of filing a bug.
+osascript -e 'display notification "If paste stops working, re-grant Accessibility in System Settings > Privacy & Security, then run ./restart.sh" with title "Bolo updated" with sound name "Glass"' >/dev/null 2>&1 || true
