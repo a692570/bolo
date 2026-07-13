@@ -1,39 +1,27 @@
 #!/usr/bin/env python3
+"""UI-side state for one dictation, plus transcript text helpers.
 
-import threading
-from dataclasses import dataclass, field
+TranscriptState tracks what the app has shown and inserted (visible text,
+final text and its source, correction target, LLM timing marks). All
+transcription-side state and timings live in the Transcriber session
+(transcriber.py). merge_transcript and longest_common_prefix are pure
+helpers shared by the transcription and insertion modules."""
+
+from dataclasses import dataclass
 
 
 @dataclass
 class TranscriptState:
-    committed_text: str = ""
-    unstable_text: str = ""
     visible_text: str = ""
     final_text: str = ""
     final_source: str = ""
-    first_partial_at: float = None
-    first_final_at: float = None
     first_visible_at: float = None
-    stream_finalized_at: float = None
-    batch_started_at: float = None
-    batch_finished_at: float = None
-    chunked_started_at: float = None
-    chunked_finished_at: float = None
-    chunked_segments: int = 0
     rate_limited: bool = False
     reconcile_started_at: float = None
     reconcile_finished_at: float = None
     cleanup_started_at: float = None
     cleanup_finished_at: float = None
     correction_target: str = ""
-    stream_failed: bool = False
-    stream_error: str = ""
-    stop_requested_at: float = None
-    closed: bool = False
-    done: threading.Event = field(default_factory=threading.Event)
-
-    def display_text(self) -> str:
-        return merge_transcript(self.committed_text, self.unstable_text)
 
 
 def merge_transcript(base: str, incoming: str) -> str:
