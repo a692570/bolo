@@ -25,6 +25,7 @@ import rumps
 import sounddevice as sd
 from commands import parse_command
 from corrections import CorrectionStore
+from inserter import Inserter
 from overlay_controller import RecordingOverlay
 from stt import SilenceDetector, TelnyxStreamingSTT
 from transcript_state import TranscriptState, longest_common_prefix, merge_transcript
@@ -39,10 +40,6 @@ from AppKit import (
 )
 
 from Quartz import (
-    CGEventCreateKeyboardEvent,
-    CGEventKeyboardSetUnicodeString,
-    CGEventPost,
-    CGEventSetFlags,
     CGEventSourceFlagsState,
     CGEventTapCreate,
     CGEventTapEnable,
@@ -56,7 +53,6 @@ from Quartz import (
     kCGEventTapOptionListenOnly,
     kCGHeadInsertEventTap,
     kCGSessionEventTap,
-    kCGHIDEventTap,
     kCGEventSourceStateCombinedSessionState,
     kCGEventFlagsChanged,
 )
@@ -169,7 +165,6 @@ CORRECTION_WINDOW_SECONDS = 3.0
 STREAM_DRAIN_SECONDS = 0.35
 _SILENCE_PADDING = bytes(int(16000 * 0.35 * 2))  # 350ms of silence at 16kHz mono 16-bit
 LLM_CLEANUP_MODE = _load_env_value("BOLO_LLM_CLEANUP").strip().lower() or "auto"
-DELETE_KEYCODE = 51
 RATE_LIMIT_BACKOFF_SECONDS = 45.0
 MAX_RECORDING_SECONDS = 90.0  # force-stop if stuck recording longer than this
 AUTO_SILENCE_SECONDS = 5.0    # stop after this many seconds of silence
@@ -365,6 +360,11 @@ class BoloApp(rumps.App):
         self._clipboard_mode_enabled = prefs.get("clipboard_mode_enabled", False)
         self._update_auto_silence_menu()
         self._update_clipboard_mode_menu()
+        self._inserter = Inserter(
+            self._frontmost_app_name,
+            lambda: self._clipboard_mode_enabled,
+            log=self._log,
+        )
 
         # Streaming STT state
         self._stt            = None
@@ -1810,8 +1810,8 @@ class BoloApp(rumps.App):
             self._log("[llm] in-place skipped (cleaned text suspiciously long)")
             return
         chars_to_delete = len(raw_text)
-        self._delete_text(chars_to_delete)
-        self._inject_text(cleaned)
+        self._inserter.delete(chars_to_delete)
+        self._inserter.inject(cleaned)
         # Update last_result so corrections reference the cleaned version
         self.last_result = cleaned
         if state:
@@ -1849,13 +1849,13 @@ class BoloApp(rumps.App):
         kind = command["kind"]
         visible_len = len(state.visible_text) if state else 0
         if visible_len:
-            self._delete_text(visible_len)
+            self._inserter.delete(visible_len)
             if state:
                 state.visible_text = ""
         if kind == "scratch":
             target = "" if (state and state.correction_target) else (self.last_result or "")
             if target:
-                self._delete_text(len(target))
+                self._inserter.delete(len(target))
             self.last_result = None
             self.correction_mode = False
             self.correction_window_until = 0.0
@@ -1863,8 +1863,8 @@ class BoloApp(rumps.App):
             target = state.correction_target if state and state.correction_target else self.last_result
             if target:
                 if not (state and state.correction_target):
-                    self._delete_text(len(target))
-                self._inject_text(command["text"])
+                    self._inserter.delete(len(target))
+                self._inserter.inject(command["text"])
                 self._remember_result(command["text"])
                 self.last_paste_time = time.time()
                 self.correction_window_until = self.last_paste_time + CORRECTION_WINDOW_SECONDS
@@ -1874,7 +1874,7 @@ class BoloApp(rumps.App):
             self.correction_mode = False
             self._play("Pop")
         elif kind == "insert":
-            self._inject_text(command["text"])
+            self._inserter.inject(command["text"])
             self._remember_result(command["text"])
             self.last_paste_time = time.time()
             self.correction_window_until = self.last_paste_time + CORRECTION_WINDOW_SECONDS
@@ -1888,156 +1888,11 @@ class BoloApp(rumps.App):
         state = self._transcript_state
         if state is None:
             return
-        previous = state.visible_text
         target = text or ""
-        prefix = longest_common_prefix(previous, target)
-        to_delete = len(previous) - prefix
-        if to_delete > 0:
-            if self._should_use_clipboard():
-                self._delete_text(to_delete)
-            else:
-                self._delete_text(to_delete)
-        suffix = target[prefix:]
-        if suffix:
-            self._inject_text(suffix)
-            if state.first_visible_at is None:
-                state.first_visible_at = time.time()
+        injected = self._inserter.render(state.visible_text, target)
+        if injected and state.first_visible_at is None:
+            state.first_visible_at = time.time()
         state.visible_text = target
-
-    def _type_text(self, text):
-        if not text:
-            return
-        down = CGEventCreateKeyboardEvent(None, 0, True)
-        up = CGEventCreateKeyboardEvent(None, 0, False)
-        CGEventKeyboardSetUnicodeString(down, len(text), text)
-        CGEventKeyboardSetUnicodeString(up, len(text), text)
-        CGEventSetFlags(down, 0)
-        CGEventSetFlags(up, 0)
-        CGEventPost(kCGHIDEventTap, down)
-        CGEventPost(kCGHIDEventTap, up)
-
-    def _delete_text(self, count):
-        for _ in range(max(0, count)):
-            down = CGEventCreateKeyboardEvent(None, DELETE_KEYCODE, True)
-            up = CGEventCreateKeyboardEvent(None, DELETE_KEYCODE, False)
-            CGEventSetFlags(down, 0)
-            CGEventSetFlags(up, 0)
-            CGEventPost(kCGHIDEventTap, down)
-            CGEventPost(kCGHIDEventTap, up)
-
-    # ── Clipboard paste fallback ────────────────────────────────────────────
-
-    # Apps known to reject CGEvent keyboard simulation (sandboxed, Electron, etc.)
-    KNOWN_CLIPBOARD_APPS = {
-        "1Password",
-        "Bitwarden",
-        "Discord",
-        "Figma",
-        "Notion",
-        "Signal",
-        "Slack",
-        "Spotify",
-        "Teams",
-        "WhatsApp",
-    }
-
-    def _should_use_clipboard(self) -> bool:
-        """Check if clipboard paste mode should be used."""
-        # User preference overrides everything
-        if self._clipboard_mode_enabled:
-            return True
-        # Auto-detect: frontmost app is known to reject CGEvent
-        app_name = self._frontmost_app_name()
-        if app_name in self.KNOWN_CLIPBOARD_APPS:
-            return True
-        return False
-
-    def _type_text_via_clipboard(self, text: str):
-        """Insert text by saving it to clipboard and simulating Cmd+V.
-
-        This is a fallback for apps that reject CGEvent keyboard simulation.
-        The user's original clipboard contents are restored after paste.
-        """
-        if not text:
-            return
-        pb = NSPasteboard.generalPasteboard()
-
-        # Save current clipboard contents
-        saved_clipboard = None
-        try:
-            saved_clipboard = pb.stringForType_(NSPasteboardTypeString)
-        except Exception:
-            pass
-
-        # Set clipboard to our text
-        pb.clearContents()
-        pb.setString_forType_(text, NSPasteboardTypeString)
-
-        # Small delay to ensure clipboard is set
-        time.sleep(0.02)
-
-        # Simulate Cmd+V
-        cmd_key = 55  # kVK_Command
-        v_keycode = 9  # kVK_ANSI_V
-
-        cmd_down = CGEventCreateKeyboardEvent(None, cmd_key, True)
-        v_down = CGEventCreateKeyboardEvent(None, v_keycode, True)
-        v_up = CGEventCreateKeyboardEvent(None, v_keycode, False)
-        cmd_up = CGEventCreateKeyboardEvent(None, cmd_key, False)
-
-        # Set Cmd flag on all events
-        cmd_flag = 1 << 20  # kCGEventFlagMaskCommand
-        CGEventSetFlags(cmd_down, cmd_flag)
-        CGEventSetFlags(v_down, cmd_flag)
-        CGEventSetFlags(v_up, cmd_flag)
-        CGEventSetFlags(cmd_up, cmd_flag)
-
-        CGEventPost(kCGHIDEventTap, cmd_down)
-        CGEventPost(kCGHIDEventTap, v_down)
-        CGEventPost(kCGHIDEventTap, v_up)
-        CGEventPost(kCGHIDEventTap, cmd_up)
-
-        # Wait for paste to complete before restoring clipboard
-        time.sleep(0.05)
-
-        # Restore original clipboard contents
-        try:
-            pb.clearContents()
-            if saved_clipboard is not None:
-                pb.setString_forType_(saved_clipboard, NSPasteboardTypeString)
-        except Exception:
-            pass
-
-        self._log(f"[clipboard] pasted {len(text)} chars via clipboard fallback")
-
-    def _delete_text_via_clipboard(self, count: int):
-        """Delete text by selecting it and replacing via clipboard.
-
-        Used as fallback when CGEvent backspace simulation fails.
-        Selects characters via Shift+Left, then deletes via Backspace.
-        """
-        if count <= 0:
-            return
-
-        # Try regular CGEvent delete first
-        self._delete_text(count)
-        return
-
-    def _inject_text(self, text: str):
-        """Insert text using the best available method.
-
-        Tries CGEvent first, falls back to clipboard paste if the app
-        is known to reject simulated keystrokes or clipboard mode is enabled.
-        """
-        if not text:
-            return
-
-        if self._should_use_clipboard():
-            self._log("[inject] using clipboard paste method")
-            self._type_text_via_clipboard(text)
-        else:
-            self._log("[inject] using CGEvent keyboard simulation")
-            self._type_text(text)
 
     def _log_metrics(self, state, final_text):
         if state is None:
