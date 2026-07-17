@@ -208,6 +208,7 @@ def test_updater_does_not_activate_when_incoming_helpers_fail(tmp_path):
     initial_head = _git(seed, "rev-parse", "HEAD").stdout.strip()
     _git(seed, "remote", "add", "origin", str(remote))
     _git(seed, "push", "-u", "origin", "main")
+    _git(remote, "symbolic-ref", "HEAD", "refs/heads/main")
     _git(tmp_path, "clone", str(remote), str(installed))
 
     _write_executable(
