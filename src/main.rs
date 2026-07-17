@@ -1061,10 +1061,10 @@ fn check_accessibility_at_startup(root_dir: &Path) {
     let python3 = python3_executable_path();
     warn!(
         "[accessibility] NOT TRUSTED at startup. Text will not paste. \
-         The paste keystroke is sent by a python3 helper process, not by the \
-         bolo binary itself, so macOS needs Accessibility trust for BOTH. \
-         Open System Settings > Privacy & Security > Accessibility and add \
-         this Python interpreter: {python3}. Then run ./restart.sh."
+         The paste keystroke is sent by a python3 helper process, so macOS \
+         needs Accessibility trust for this Python interpreter: {python3}. \
+         Add it in System Settings > Privacy & Security > Accessibility, \
+         then run ./restart.sh."
     );
     show_notification(
         "Bolo needs Accessibility",
@@ -5684,10 +5684,10 @@ fn paste_text(root_dir: &Path, text: &str) -> Result<(), AppError> {
         let python3 = python3_executable_path();
         warn!(
             "[accessibility] NOT TRUSTED at paste time. The paste keystroke is \
-             sent by a python3 helper process, not by the bolo binary itself, \
-             so macOS needs Accessibility trust for BOTH. Open System Settings \
-             > Privacy & Security > Accessibility and add this Python \
-             interpreter: {python3}. Then run ./restart.sh."
+             sent by a python3 helper process, so macOS needs Accessibility \
+             trust for this Python interpreter: {python3}. Add it in System \
+             Settings > Privacy & Security > Accessibility, then run \
+             ./restart.sh."
         );
         show_notification(
             "Bolo cannot paste",
@@ -5753,9 +5753,7 @@ fn ax_is_trusted(root_dir: &Path, prompt: bool) -> bool {
             }
         }
         Err(error) => {
-            warn!(
-                "[accessibility] helper failed to run: {error}; assuming trusted"
-            );
+            warn!("[accessibility] helper failed to run: {error}; assuming trusted");
             true
         }
     }
