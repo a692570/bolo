@@ -74,6 +74,8 @@ enum AppError {
     MissingAudioDevice,
     #[error("configuration value {0} is missing")]
     MissingConfig(&'static str),
+    #[error("configuration value {0} is invalid: {1}")]
+    InvalidConfig(&'static str, String),
     #[error("mutex was poisoned: {0}")]
     PoisonedMutex(String),
     #[error("I/O failed: {0}")]
@@ -157,6 +159,13 @@ enum CleanupMode {
     Auto,
     On,
     Off,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AccessibilityTrust {
+    Trusted,
+    Untrusted,
+    Unavailable,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1034,6 +1043,7 @@ struct AccessibilityContext {
 fn main() -> Result<(), AppError> {
     let _guard = setup_logging()?;
     let _lock = AppLock::acquire()?;
+    ensure_python_helpers_at_startup()?;
     run_onboarding_if_needed();
     let app = Arc::new(App::new()?);
     info!(
@@ -1050,29 +1060,59 @@ fn main() -> Result<(), AppError> {
     run_app_event_loop(app)
 }
 
+fn ensure_python_helpers_at_startup() -> Result<(), AppError> {
+    let script = app_root_dir()?.join("ensure-python-env.sh");
+    if !script.exists() {
+        return Err(AppError::MenuBar(String::from(
+            "Python helper installer is missing; restore ensure-python-env.sh",
+        )));
+    }
+    let output = Command::new(&script).output()?;
+    if !output.status.success() {
+        return Err(AppError::MenuBar(format!(
+            "Python helper setup failed: {}",
+            short_menu_message(&command_output_text(&output))
+        )));
+    }
+    info!("[python] helper environment verified");
+    Ok(())
+}
+
 /// Verify Accessibility trust once at startup and surface an actionable
 /// notification when missing. The macOS prompt only fires when the toggle is
 /// genuinely off; subsequent restarts after granting will pass silently.
 fn check_accessibility_at_startup(root_dir: &Path) {
-    if ax_is_trusted(root_dir, true) {
-        info!("[accessibility] trusted at startup");
-        return;
+    match accessibility_trust(root_dir, true) {
+        AccessibilityTrust::Trusted => {
+            info!("[accessibility] trusted at startup");
+        }
+        AccessibilityTrust::Untrusted => {
+            let python3 = python3_executable_path();
+            warn!(
+                "[accessibility] NOT TRUSTED at startup. Text will not paste. \
+                 The paste keystroke is sent by a Python helper process, so macOS \
+                 needs Accessibility trust for this interpreter: {python3}. \
+                 Add it in System Settings > Privacy & Security > Accessibility, \
+                 then run ./restart.sh."
+            );
+            show_notification(
+                "Bolo needs Accessibility",
+                &format!(
+                    "Add this Python interpreter in System Settings > Privacy & Security > \
+                     Accessibility, then run ./restart.sh: {python3}"
+                ),
+            );
+        }
+        AccessibilityTrust::Unavailable => {
+            warn!(
+                "[accessibility] helper unavailable at startup. Run ./install.sh, then ./restart.sh."
+            );
+            show_notification(
+                "Bolo helper needs repair",
+                "Run ./install.sh, then ./restart.sh. Bolo will not paste until the helper is ready.",
+            );
+        }
     }
-    let python3 = python3_executable_path();
-    warn!(
-        "[accessibility] NOT TRUSTED at startup. Text will not paste. \
-         The paste keystroke is sent by a python3 helper process, so macOS \
-         needs Accessibility trust for this Python interpreter: {python3}. \
-         Add it in System Settings > Privacy & Security > Accessibility, \
-         then run ./restart.sh."
-    );
-    show_notification(
-        "Bolo needs Accessibility",
-        &format!(
-            "Add this Python interpreter in System Settings > Privacy & Security > \
-             Accessibility, then run ./restart.sh: {python3}"
-        ),
-    );
 }
 
 impl AppLock {
@@ -1199,7 +1239,7 @@ fn run_hotkey_helper(
         .hotkey(app)
         .ok_or_else(|| AppError::MenuBar(String::from("hotkey action is not configured")))?;
     let script = root_dir.join("hotkey.py");
-    let mut child = Command::new("python3")
+    let mut child = Command::new(python_helper_executable())
         .arg(script)
         .env("BOLO_PARENT_PID", std::process::id().to_string())
         .env("BOLO_HOTKEY", hotkey)
@@ -3001,6 +3041,19 @@ impl Config {
             "on" => CleanupMode::On,
             _ => CleanupMode::Auto,
         };
+        let hotkey = load_env_value("BOLO_HOTKEY").unwrap_or_else(|| String::from("right_option"));
+        if !is_supported_hotkey(&hotkey) {
+            return Err(AppError::InvalidConfig("BOLO_HOTKEY", hotkey));
+        }
+        let paste_last_hotkey = load_env_value("BOLO_PASTE_LAST_HOTKEY");
+        if let Some(value) = paste_last_hotkey.as_deref()
+            && !is_supported_hotkey(value)
+        {
+            return Err(AppError::InvalidConfig(
+                "BOLO_PASTE_LAST_HOTKEY",
+                value.to_owned(),
+            ));
+        }
         Ok(Self {
             telnyx_api_key,
             llm_cleanup,
@@ -3015,8 +3068,8 @@ impl Config {
             microphone: load_env_value("BOLO_MICROPHONE"),
             replacements: load_replacements(),
             root_dir,
-            hotkey: load_env_value("BOLO_HOTKEY").unwrap_or_else(|| String::from("right_option")),
-            paste_last_hotkey: load_env_value("BOLO_PASTE_LAST_HOTKEY"),
+            hotkey,
+            paste_last_hotkey,
             preserve_clipboard: load_bool_env("BOLO_PRESERVE_CLIPBOARD", true),
             log_transcripts: load_bool_env("BOLO_LOG_TRANSCRIPTS", false),
             max_recording_seconds: load_u64_env(
@@ -3057,6 +3110,19 @@ impl Config {
             String::from("Qwen/Qwen3-235B-A22B")
         }
     }
+}
+
+fn is_supported_hotkey(value: &str) -> bool {
+    if matches!(
+        value,
+        "right_option" | "right_control" | "right_shift" | "fn" | "caps_lock"
+    ) {
+        return true;
+    }
+    value
+        .strip_prefix('f')
+        .and_then(|number| number.parse::<u8>().ok())
+        .is_some_and(|number| (1..=19).contains(&number))
 }
 
 impl SttFallback {
@@ -3831,7 +3897,7 @@ fn show_native_overlay(
 
 fn spawn_native_overlay(root_dir: &Path) -> Result<NativeOverlay, AppError> {
     let script = root_dir.join("overlay.py");
-    let mut child = Command::new("python3")
+    let mut child = Command::new(python_helper_executable())
         .arg(script)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -5077,7 +5143,10 @@ fn read_accessibility_context(root_dir: &Path) -> Option<AccessibilityContext> {
     if !script.exists() {
         return None;
     }
-    let output = match Command::new("python3").arg(&script).output() {
+    let output = match Command::new(python_helper_executable())
+        .arg(&script)
+        .output()
+    {
         Ok(output) => output,
         Err(error) => {
             warn!("accessibility context helper failed to launch: {error}");
@@ -5603,6 +5672,8 @@ fn write_bolo_env_value(name: &str, value: &str) -> Result<(), AppError> {
     let path = home_path(".bolo/env");
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
+        #[cfg(unix)]
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
     }
     let mut lines = fs::read_to_string(&path)
         .map(|text| text.lines().map(str::to_owned).collect::<Vec<_>>())
@@ -5654,13 +5725,22 @@ fn parse_u64_env_value(value: Option<&str>, default: u64) -> u64 {
     }
 }
 
-/// Resolve the python3 interpreter that the accessibility/paste helpers run
-/// under, so warnings can name the exact executable macOS needs Accessibility
-/// trust for. Trust is granted per-binary, and it is this python3 process --
-/// not the bolo binary -- that calls the AX/CGEvent APIs, so pointing users at
-/// "Bolo" in System Settings sends them to the wrong entry.
+fn python_helper_executable() -> PathBuf {
+    if let Some(value) = load_env_value("BOLO_PYTHON") {
+        return PathBuf::from(value);
+    }
+    let managed = home_path(".bolo/venv/bin/python3");
+    if managed.is_file() {
+        return managed;
+    }
+    PathBuf::from("python3")
+}
+
+/// Resolve the interpreter that Bolo's macOS helpers run under so permission
+/// guidance can name the exact executable macOS needs to trust.
 fn python3_executable_path() -> String {
-    Command::new("python3")
+    let python = python_helper_executable();
+    Command::new(&python)
         .args(["-c", "import sys; print(sys.executable)"])
         .output()
         .ok()
@@ -5668,7 +5748,7 @@ fn python3_executable_path() -> String {
         .and_then(|output| String::from_utf8(output.stdout).ok())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "python3".to_string())
+        .unwrap_or_else(|| python.display().to_string())
 }
 
 fn copy_to_clipboard(text: &str) -> Result<(), AppError> {
@@ -5680,23 +5760,31 @@ fn copy_to_clipboard(text: &str) -> Result<(), AppError> {
 }
 
 fn paste_text(root_dir: &Path, text: &str) -> Result<(), AppError> {
-    if !ax_is_trusted(root_dir, false) {
-        let python3 = python3_executable_path();
-        warn!(
-            "[accessibility] NOT TRUSTED at paste time. The paste keystroke is \
-             sent by a python3 helper process, so macOS needs Accessibility \
-             trust for this Python interpreter: {python3}. Add it in System \
-             Settings > Privacy & Security > Accessibility, then run \
-             ./restart.sh."
-        );
-        show_notification(
-            "Bolo cannot paste",
-            &format!(
-                "Add this Python interpreter in System Settings > Privacy & Security > \
-                 Accessibility, then run ./restart.sh: {python3}"
-            ),
-        );
-        return Err(AppError::AccessibilityNotGranted);
+    match accessibility_trust(root_dir, false) {
+        AccessibilityTrust::Trusted => {}
+        AccessibilityTrust::Untrusted => {
+            let python3 = python3_executable_path();
+            warn!(
+                "[accessibility] NOT TRUSTED at paste time. Add {python3} in System \
+                 Settings > Privacy & Security > Accessibility, then run ./restart.sh."
+            );
+            show_notification(
+                "Bolo cannot paste",
+                &format!(
+                    "Add this Python interpreter in System Settings > Privacy & Security > \
+                     Accessibility, then run ./restart.sh: {python3}"
+                ),
+            );
+            return Err(AppError::AccessibilityNotGranted);
+        }
+        AccessibilityTrust::Unavailable => {
+            warn!("[accessibility] helper unavailable at paste time");
+            show_notification(
+                "Bolo cannot paste",
+                "Run ./install.sh, then ./restart.sh to repair Bolo's Python helper.",
+            );
+            return Err(AppError::AccessibilityNotGranted);
+        }
     }
     if run_insert_text_helper(root_dir, text).is_ok() {
         info!("pasted {} chars via insert helper", text.chars().count());
@@ -5706,27 +5794,18 @@ fn paste_text(root_dir: &Path, text: &str) -> Result<(), AppError> {
     paste_text_with_plain_clipboard(text)
 }
 
-/// Ask macOS whether this process is trusted for Accessibility events.
-///
-/// When `prompt` is true, the first untrusted call opens the System Settings
-/// prompt. Shells out to `accessibility_trusted.py` so the trust check lives
-/// in the same Python/PyObjC layer that already reads accessibility context
-/// and performs the paste. Returns `true` when the helper cannot run, so a
-/// broken Python install never blocks dictation paste.
-fn ax_is_trusted(root_dir: &Path, prompt: bool) -> bool {
+/// Ask macOS whether Bolo's Python helper is trusted for Accessibility events.
+fn accessibility_trust(root_dir: &Path, prompt: bool) -> AccessibilityTrust {
     let script = root_dir.join("accessibility_trusted.py");
     if !script.exists() {
-        warn!(
-            "[accessibility] helper missing at {}; assuming trusted",
-            script.display()
-        );
-        return true;
+        warn!("[accessibility] helper missing at {}", script.display());
+        return AccessibilityTrust::Unavailable;
     }
     let mut args: Vec<std::ffi::OsString> = vec![std::ffi::OsString::from(script.as_os_str())];
     if prompt {
         args.push(std::ffi::OsString::from("--prompt"));
     }
-    match Command::new("python3")
+    match Command::new(python_helper_executable())
         .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -5734,28 +5813,31 @@ fn ax_is_trusted(root_dir: &Path, prompt: bool) -> bool {
     {
         Ok(output) => {
             if !output.status.success() {
-                warn!(
-                    "[accessibility] helper exited with {}; assuming trusted",
-                    output.status
-                );
-                return true;
+                warn!("[accessibility] helper exited with {}", output.status);
+                return AccessibilityTrust::Unavailable;
             }
             let stdout = String::from_utf8_lossy(&output.stdout);
-            match stdout.trim() {
-                "true" => true,
-                "false" => false,
-                other => {
-                    warn!(
-                        "[accessibility] helper returned unexpected output {other:?}; assuming trusted"
-                    );
-                    true
-                }
+            let trust = parse_accessibility_trust(&stdout);
+            if trust == AccessibilityTrust::Unavailable {
+                warn!(
+                    "[accessibility] helper returned unexpected output {:?}",
+                    stdout.trim()
+                );
             }
+            trust
         }
         Err(error) => {
-            warn!("[accessibility] helper failed to run: {error}; assuming trusted");
-            true
+            warn!("[accessibility] helper failed to run: {error}");
+            AccessibilityTrust::Unavailable
         }
+    }
+}
+
+fn parse_accessibility_trust(output: &str) -> AccessibilityTrust {
+    match output.trim() {
+        "true" => AccessibilityTrust::Trusted,
+        "false" => AccessibilityTrust::Untrusted,
+        _ => AccessibilityTrust::Unavailable,
     }
 }
 
@@ -5767,7 +5849,7 @@ fn run_insert_text_helper(root_dir: &Path, text: &str) -> Result<(), AppError> {
             "insert_text.py missing",
         )));
     }
-    let mut child = Command::new("python3")
+    let mut child = Command::new(python_helper_executable())
         .arg(script)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -5904,22 +5986,8 @@ fn unix_time_ms() -> u64 {
 }
 
 fn run_onboarding_if_needed() {
-    if env::var("BOLO_HOTKEY").is_ok() {
+    if load_env_value("BOLO_HOTKEY").is_some_and(|value| is_supported_hotkey(&value)) {
         return;
-    }
-    let env_file = home_path(".bolo/env");
-    if let Ok(contents) = fs::read_to_string(&env_file) {
-        for line in contents.lines() {
-            let trimmed = line.trim();
-            if trimmed.starts_with('#') || trimmed.is_empty() {
-                continue;
-            }
-            if let Some((key, _)) = trimmed.split_once('=')
-                && key.trim() == "BOLO_HOTKEY"
-            {
-                return;
-            }
-        }
     }
     let script = match app_root_dir() {
         Ok(dir) => dir.join("onboarding.py"),
@@ -5929,7 +5997,9 @@ fn run_onboarding_if_needed() {
         return;
     }
     info!("running first-run onboarding");
-    let result = Command::new("python3").arg(&script).status();
+    let result = Command::new(python_helper_executable())
+        .arg(&script)
+        .status();
     match result {
         Ok(status) if status.success() => info!("onboarding completed"),
         Ok(status) => warn!("onboarding exited with {status}"),
@@ -5956,16 +6026,17 @@ mod tests {
     #![allow(clippy::panic_in_result_fn)]
 
     use super::{
-        AccessibilityContext, App, AppError, AppState, CleanupMode, CleanupProfile, Config,
-        DictationCommandKind, DictationWarmup, PreparedText, PromptBinding, StreamingProvider,
-        StreamingTranscript, SttFallback, TRANSCRIPT_HISTORY_LIMIT, TextReplacement,
-        TranscriptHistoryEntry, UpdateOutcome, apply_text_replacements,
+        AccessibilityContext, AccessibilityTrust, App, AppError, AppState, CleanupMode,
+        CleanupProfile, Config, DictationCommandKind, DictationWarmup, PreparedText, PromptBinding,
+        StreamingProvider, StreamingTranscript, SttFallback, TRANSCRIPT_HISTORY_LIMIT,
+        TextReplacement, TranscriptHistoryEntry, UpdateOutcome, apply_text_replacements,
         apply_vocabulary_corrections, build_cleanup_user_content, build_rewrite_user_content,
         build_stt_prompt, canonicalize_known_terms, cleanup_decision, cleanup_max_tokens,
         cleanup_profile, final_streaming_result_is_ready_elapsed, is_known_no_speech_transcript,
-        parse_command, parse_replacements_json, parse_stt_fallbacks, parse_u64_env_value,
-        parse_update_outcome, read_vocabulary_file, remove_fillers, sanitize_transcript_history,
-        speech_stats, stable_streaming_best_is_ready_elapsed, streaming_batch_fallback_reason,
+        is_supported_hotkey, parse_accessibility_trust, parse_command, parse_replacements_json,
+        parse_stt_fallbacks, parse_u64_env_value, parse_update_outcome, read_vocabulary_file,
+        remove_fillers, sanitize_transcript_history, speech_stats,
+        stable_streaming_best_is_ready_elapsed, streaming_batch_fallback_reason,
         streaming_preview_tail, strip_reasoning_tags, stt_language_for_model, stt_model_config,
         telnyx_stream_query, transcript_log_value, transcript_menu_preview, valid_deferred_cleanup,
         wav_bytes,
@@ -5986,6 +6057,39 @@ mod tests {
         assert_eq!(parse_u64_env_value(Some("-5"), 30), 30);
         assert_eq!(parse_u64_env_value(Some("abc"), 30), 30);
         assert_eq!(parse_u64_env_value(Some(""), 30), 30);
+    }
+
+    #[test]
+    fn validates_supported_hotkeys() {
+        assert!(is_supported_hotkey("right_option"));
+        assert!(is_supported_hotkey("right_shift"));
+        assert!(is_supported_hotkey("fn"));
+        assert!(is_supported_hotkey("f1"));
+        assert!(is_supported_hotkey("f19"));
+        assert!(is_supported_hotkey("caps_lock"));
+        assert!(!is_supported_hotkey("f0"));
+        assert!(!is_supported_hotkey("f20"));
+        assert!(!is_supported_hotkey("banana"));
+    }
+
+    #[test]
+    fn parses_accessibility_helper_status_without_failing_open() {
+        assert_eq!(
+            parse_accessibility_trust("true\n"),
+            AccessibilityTrust::Trusted
+        );
+        assert_eq!(
+            parse_accessibility_trust("false\n"),
+            AccessibilityTrust::Untrusted
+        );
+        assert_eq!(
+            parse_accessibility_trust("unexpected\n"),
+            AccessibilityTrust::Unavailable
+        );
+        assert_eq!(
+            parse_accessibility_trust(""),
+            AccessibilityTrust::Unavailable
+        );
     }
 
     #[test]

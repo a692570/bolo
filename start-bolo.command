@@ -2,9 +2,10 @@
 # Bolo launcher designed to run as a macOS Login Item through Terminal.
 
 BOLO_DIR="$(cd "$(dirname "$0")" && pwd)"
-LOG=/tmp/bolo.log
-LOCK_DIR=/tmp/bolo-supervisor.lock
-PID_FILE=/tmp/bolo-supervisor.pid
+RUNTIME_DIR="${BOLO_RUNTIME_DIR:-/tmp}"
+LOG="$RUNTIME_DIR/bolo.log"
+LOCK_DIR="$RUNTIME_DIR/bolo-supervisor.lock"
+PID_FILE="$RUNTIME_DIR/bolo-supervisor.pid"
 BIN="$BOLO_DIR/target/release/bolo"
 
 if ! mkdir "$LOCK_DIR" 2>/dev/null; then
@@ -22,7 +23,11 @@ fi
 
 cd "$BOLO_DIR" || exit 1
 
-if [ "${BOLO_AUTO_UPDATE:-on}" != "off" ] && [ -x "$BOLO_DIR/update.sh" ]; then
+auto_update="${BOLO_AUTO_UPDATE:-}"
+if [ -z "$auto_update" ] && [ -f "$HOME/.bolo/env" ]; then
+    auto_update="$(awk -F= '$1 == "BOLO_AUTO_UPDATE" { value = substr($0, index($0, "=") + 1); gsub(/^[[:space:]\"'\'' ]+|[[:space:]\"'\'' ]+$/, "", value); print tolower(value); exit }' "$HOME/.bolo/env")"
+fi
+if [ "${auto_update:-on}" != "off" ] && [ -x "$BOLO_DIR/update.sh" ]; then
     echo "[bolo] checking for updates" >> "$LOG"
     "$BOLO_DIR/update.sh" >> "$LOG" 2>&1 || echo "[bolo] update check failed" >> "$LOG"
 fi
@@ -40,7 +45,7 @@ pkill -f "$BOLO_DIR/bolo.py" 2>/dev/null || true
 pkill -f "$BOLO_DIR/hotkey.py" 2>/dev/null || true
 pkill -f "$BOLO_DIR/overlay.py" 2>/dev/null || true
 
-export BIN LOG LOCK_DIR PID_FILE
+export BIN LOG LOCK_DIR PID_FILE RUNTIME_DIR
 nohup bash -c '
     cleanup() {
         rm -rf "$LOCK_DIR" "$PID_FILE" /tmp/bolo-instance.lock 2>/dev/null || true

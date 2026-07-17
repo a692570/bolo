@@ -27,9 +27,9 @@ git clone https://github.com/a692570/bolo.git && cd bolo && ./install.sh
 > *"Install Bolo from github.com/a692570/bolo on my Mac. It needs Rust, Python 3, and a Telnyx API key. Run install.sh, then help me grant Microphone and Accessibility permissions."*
 
 The install script does the following, in order:
-1. Installs PyObjC native macOS helpers if needed
+1. Creates a private Python helper environment at `~/.bolo/venv`
 2. Builds the Rust binary
-3. Checks for an existing Telnyx API key in `~/.codex/.env` or your environment — if none is found, prompts you for one and saves it to `~/.bolo/env`
+3. Checks for an existing Telnyx API key in `~/.codex/.env` or your environment. If none is found, it prompts you and saves the key to `~/.bolo/env`
 4. Registers Bolo as a login item so it starts automatically
 5. Starts Bolo
 
@@ -47,10 +47,10 @@ export BOLO_HOTKEY="right_control"
 Bolo needs two macOS permissions in **System Settings > Privacy & Security**:
 
 - **Microphone**: Captures audio only while your hotkey is held. Nothing is saved to disk.
-- **Accessibility**: Bolo's Python helper pastes text into other apps. Add the exact interpreter printed by this command:
+- **Accessibility**: Bolo's Python helper pastes text into other apps. Add this managed interpreter:
 
 ```bash
-python3 -c 'import sys; print(sys.executable)'
+echo "$HOME/.bolo/venv/bin/python3"
 
 # Restart after enabling that interpreter in Accessibility
 ./restart.sh
@@ -74,10 +74,10 @@ You can also use **Check for Updates** from the Bolo menu bar icon.
 
 Updates are skipped if local files have uncommitted changes, GitHub is unreachable, Rust is missing, or the checkout cannot fast-forward cleanly.
 
-To disable launch-time update checks, set:
+To disable launch-time update checks persistently, add this line to `~/.bolo/env`:
 
 ```bash
-export BOLO_AUTO_UPDATE="off"
+BOLO_AUTO_UPDATE=off
 ```
 
 ## Configuration
@@ -90,6 +90,7 @@ export TELNYX_API_KEY="your_key_here"
 
 Add it to your shell profile to persist it, or put it in `~/.bolo/env`. The install script writes prompted keys to `~/.bolo/env`.
 Bolo reads `TELNYX_API_KEY` from the process environment first, then falls back to `~/.bolo/env`, `~/.codex/.env`, and `~/.zshrc`.
+The installer keeps `~/.bolo` private to your macOS account and stores `~/.bolo/env` with owner-only permissions.
 
 Bolo redacts dictated text from `/tmp/bolo.log` by default. To temporarily log transcript text while debugging, set:
 
@@ -324,9 +325,9 @@ Say `Correct heard phrase to desired phrase`, or use **Add Correction Rule...** 
 
 ## Troubleshooting
 
-- **No text appears after releasing hotkey**: Check `/tmp/bolo.log`. Verify `TELNYX_API_KEY` is set. Ensure the Python interpreter printed by `python3 -c 'import sys; print(sys.executable)'` is enabled in Accessibility, then run `./restart.sh`.
+- **No text appears after releasing hotkey**: Check `/tmp/bolo.log`. Verify `TELNYX_API_KEY` is set. Ensure `~/.bolo/venv/bin/python3` is enabled in Accessibility, then run `./restart.sh`.
 
-- **Paste stops working after an update**: Open System Settings > Privacy & Security > Accessibility and enable the Python interpreter printed by `python3 -c 'import sys; print(sys.executable)'`, then run `./restart.sh`. Bolo also checks at startup and posts a notification with the exact interpreter path when Accessibility is missing.
+- **Paste stops working after an update**: Run `./install.sh` to verify the managed helper, enable `~/.bolo/venv/bin/python3` in System Settings > Privacy & Security > Accessibility, then run `./restart.sh`. Bolo reports helper failures separately from missing permissions.
 
 - **Audio not recording**: Verify Microphone permission is granted in System Settings. Run `./restart.sh` after granting permissions so macOS re-prompts cleanly.
 
