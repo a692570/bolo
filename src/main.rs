@@ -3054,16 +3054,18 @@ impl Config {
                 value.to_owned(),
             ));
         }
+        let stt_model =
+            load_env_value("BOLO_STT_MODEL").unwrap_or_else(|| String::from("deepgram/nova-3"));
+        let streaming_stt = load_streaming_provider(&stt_model);
         Ok(Self {
             telnyx_api_key,
             llm_cleanup,
             litellm_base: load_env_value("LITELLM_BASE"),
             litellm_key: load_env_value("LITELLM_KEY"),
-            stt_model: load_env_value("BOLO_STT_MODEL")
-                .unwrap_or_else(|| String::from("deepgram/nova-3")),
+            stt_model,
             stt_language: load_env_value("BOLO_STT_LANGUAGE")
                 .unwrap_or_else(|| String::from("en-US")),
-            streaming_stt: load_streaming_provider(),
+            streaming_stt,
             stt_fallbacks: load_stt_fallbacks(),
             microphone: load_env_value("BOLO_MICROPHONE"),
             replacements: load_replacements(),
@@ -4981,11 +4983,27 @@ fn stt_language_for_model(model: &str, configured_language: &str) -> Option<Stri
     Some(language.to_owned())
 }
 
-fn load_streaming_provider() -> Option<StreamingProvider> {
-    let value = load_env_value("BOLO_STT_STREAMING")
-        .or_else(|| load_env_value("BOLO_STREAMING_STT"))
-        .unwrap_or_else(|| String::from("off"));
-    match value.trim().to_ascii_lowercase().as_str() {
+fn load_streaming_provider(stt_model: &str) -> Option<StreamingProvider> {
+    let value =
+        load_env_value("BOLO_STT_STREAMING").or_else(|| load_env_value("BOLO_STREAMING_STT"));
+    streaming_provider_from_config(value.as_deref(), stt_model)
+}
+
+fn streaming_provider_from_config(
+    value: Option<&str>,
+    stt_model: &str,
+) -> Option<StreamingProvider> {
+    let default = if stt_model.eq_ignore_ascii_case("deepgram/nova-3") {
+        "deepgram"
+    } else {
+        "off"
+    };
+    match value
+        .unwrap_or(default)
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
         "assemblyai" | "assembly" | "on" | "true" | "1" => Some(StreamingProvider::AssemblyAi),
         "deepgram" | "nova-3" | "nova3" => Some(StreamingProvider::Deepgram),
         _ => None,
@@ -6037,9 +6055,9 @@ mod tests {
         parse_stt_fallbacks, parse_u64_env_value, parse_update_outcome, read_vocabulary_file,
         remove_fillers, sanitize_transcript_history, speech_stats,
         stable_streaming_best_is_ready_elapsed, streaming_batch_fallback_reason,
-        streaming_preview_tail, strip_reasoning_tags, stt_language_for_model, stt_model_config,
-        telnyx_stream_query, transcript_log_value, transcript_menu_preview, valid_deferred_cleanup,
-        wav_bytes,
+        streaming_preview_tail, streaming_provider_from_config, strip_reasoning_tags,
+        stt_language_for_model, stt_model_config, telnyx_stream_query, transcript_log_value,
+        transcript_menu_preview, valid_deferred_cleanup, wav_bytes,
     };
     use std::collections::VecDeque;
     use std::path::PathBuf;
@@ -6449,6 +6467,30 @@ mod tests {
         assert!(assembly.contains("model=assemblyai%2Funiversal-streaming"));
         assert!(assembly.contains("input_format=linear16"));
         assert!(!assembly.contains("keyterm="));
+    }
+
+    #[test]
+    fn defaults_to_deepgram_streaming_for_the_default_stt_model() {
+        assert_eq!(
+            streaming_provider_from_config(None, "deepgram/nova-3"),
+            Some(StreamingProvider::Deepgram)
+        );
+        assert_eq!(
+            streaming_provider_from_config(None, "openai/whisper-large-v3-turbo"),
+            None
+        );
+        assert_eq!(
+            streaming_provider_from_config(Some("off"), "deepgram/nova-3"),
+            None
+        );
+        assert_eq!(
+            streaming_provider_from_config(Some("deepgram"), "openai/whisper-large-v3-turbo"),
+            Some(StreamingProvider::Deepgram)
+        );
+        assert_eq!(
+            streaming_provider_from_config(Some("assemblyai"), "deepgram/nova-3"),
+            Some(StreamingProvider::AssemblyAi)
+        );
     }
 
     #[test]

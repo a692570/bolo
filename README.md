@@ -166,13 +166,15 @@ Supported fallback entries:
 
 Set `BOLO_STT_FALLBACKS=off` to fail fast instead of retrying when the primary model is rate limited. `BOLO_STT_FALLBACK_MODEL` still works for a single Telnyx fallback model.
 
-To try streaming STT, set:
+Deepgram streaming STT is enabled by default with the default `deepgram/nova-3` model. It starts sending audio while you speak and falls back to batch transcription when a complete result is not ready quickly enough after release.
+
+To disable streaming and always use batch transcription, set:
 
 ```bash
-export BOLO_STT_STREAMING="deepgram"
+export BOLO_STT_STREAMING="off"
 ```
 
-Streaming uses the existing Telnyx API key, starts sending audio while you speak, and falls back to the normal batch path if it does not produce a transcript quickly enough after release. Supported values are `deepgram` for Nova-3 streaming and `assemblyai` for AssemblyAI Universal-Streaming through Telnyx.
+Streaming uses the existing Telnyx API key. Supported values are `deepgram` for Nova-3 streaming and `assemblyai` for AssemblyAI Universal-Streaming through Telnyx. Selecting a different `BOLO_STT_MODEL` keeps streaming off unless `BOLO_STT_STREAMING` is explicitly set.
 
 To keep dictated text on the clipboard after insertion, set:
 
