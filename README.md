@@ -44,13 +44,15 @@ export BOLO_HOTKEY="right_control"
 
 **Step 3: Grant permissions**
 
-Bolo needs two macOS permissions. Grant both in **System Settings > Privacy & Security**:
+Bolo needs two macOS permissions in **System Settings > Privacy & Security**:
 
-- **Microphone** — Captures audio only while your hotkey is held. Nothing saved to disk.
-- **Accessibility** — Pastes text into other apps.
+- **Microphone**: Captures audio only while your hotkey is held. Nothing is saved to disk.
+- **Accessibility**: Bolo's Python helper pastes text into other apps. Add the exact interpreter printed by this command:
 
 ```bash
-# Restart after granting Accessibility
+python3 -c 'import sys; print(sys.executable)'
+
+# Restart after enabling that interpreter in Accessibility
 ./restart.sh
 ```
 
@@ -322,9 +324,9 @@ Say `Correct heard phrase to desired phrase`, or use **Add Correction Rule...** 
 
 ## Troubleshooting
 
-- **No text appears after releasing hotkey**: Check `/tmp/bolo.log`. Verify `TELNYX_API_KEY` is set. Ensure Accessibility permission is granted and Bolo was restarted after granting it.
+- **No text appears after releasing hotkey**: Check `/tmp/bolo.log`. Verify `TELNYX_API_KEY` is set. Ensure the Python interpreter printed by `python3 -c 'import sys; print(sys.executable)'` is enabled in Accessibility, then run `./restart.sh`.
 
-- **Paste stops working after an update**: The rebuilt binary has a fresh ad-hoc code signature, which can invalidate the existing Accessibility grant. Open System Settings > Privacy & Security > Accessibility, toggle Bolo OFF then ON, then run `./restart.sh`. Bolo also checks at startup and posts a notification when Accessibility is missing.
+- **Paste stops working after an update**: Open System Settings > Privacy & Security > Accessibility and enable the Python interpreter printed by `python3 -c 'import sys; print(sys.executable)'`, then run `./restart.sh`. Bolo also checks at startup and posts a notification with the exact interpreter path when Accessibility is missing.
 
 - **Audio not recording**: Verify Microphone permission is granted in System Settings. Run `./restart.sh` after granting permissions so macOS re-prompts cleanly.
 

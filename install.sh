@@ -14,11 +14,12 @@ import objc
 import AppKit
 import Foundation
 import Quartz
+import ApplicationServices
 PY
 then
   echo "Installing native macOS helper dependencies..."
   python3 -m pip install --user --upgrade pip
-  python3 -m pip install --user pyobjc-framework-Cocoa pyobjc-framework-Quartz
+  python3 -m pip install --user pyobjc-framework-Cocoa pyobjc-framework-Quartz pyobjc-framework-ApplicationServices
 fi
 
 echo "Building Rust binary..."
@@ -68,7 +69,9 @@ echo ""
 echo "Done. Bolo is running from the Rust runtime."
 echo ""
 echo "Grant two permissions when prompted or in System Settings:"
-echo " 1. Accessibility"
+echo " 1. Accessibility for the Python interpreter Bolo uses:"
+echo "    $(python3 -c 'import sys; print(sys.executable)')"
+echo "    Add that executable in Privacy & Security > Accessibility."
 echo " 2. Microphone"
 echo ""
 echo "Usage: Hold Right Option anywhere to dictate. Release to transcribe and paste."

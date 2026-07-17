@@ -115,7 +115,6 @@ fi
 
 result updated
 
-# The rebuilt binary has a fresh ad-hoc signature, so macOS may invalidate the
-# existing Accessibility grant. Surface this so the user connects "paste stopped
-# working after update" with the right fix instead of filing a bug.
-osascript -e 'display notification "If paste stops working, re-grant Accessibility in System Settings > Privacy & Security, then run ./restart.sh" with title "Bolo updated" with sound name "Glass"' >/dev/null 2>&1 || true
+# Surface the recovery path in case an update changes the Python interpreter
+# that macOS identifies as Bolo's Accessibility client.
+osascript -e 'display notification "If paste stops working, enable Accessibility for the Python interpreter Bolo reports, then run ./restart.sh" with title "Bolo updated" with sound name "Glass"' >/dev/null 2>&1 || true

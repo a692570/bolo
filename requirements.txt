@@ -5,3 +5,4 @@ requests
 websockets
 pyobjc-framework-Quartz
 pyobjc-framework-Cocoa
+pyobjc-framework-ApplicationServices

@@ -1058,14 +1058,20 @@ fn check_accessibility_at_startup(root_dir: &Path) {
         info!("[accessibility] trusted at startup");
         return;
     }
+    let python3 = python3_executable_path();
     warn!(
         "[accessibility] NOT TRUSTED at startup. Text will not paste. \
-         Open System Settings > Privacy & Security > Accessibility, \
-         toggle Bolo ON, then run ./restart.sh."
+         The paste keystroke is sent by a python3 helper process, so macOS \
+         needs Accessibility trust for this Python interpreter: {python3}. \
+         Add it in System Settings > Privacy & Security > Accessibility, \
+         then run ./restart.sh."
     );
     show_notification(
         "Bolo needs Accessibility",
-        "Grant it in System Settings > Privacy & Security > Accessibility, then run ./restart.sh.",
+        &format!(
+            "Add this Python interpreter in System Settings > Privacy & Security > \
+             Accessibility, then run ./restart.sh: {python3}"
+        ),
     );
 }
 
@@ -5648,6 +5654,23 @@ fn parse_u64_env_value(value: Option<&str>, default: u64) -> u64 {
     }
 }
 
+/// Resolve the python3 interpreter that the accessibility/paste helpers run
+/// under, so warnings can name the exact executable macOS needs Accessibility
+/// trust for. Trust is granted per-binary, and it is this python3 process --
+/// not the bolo binary -- that calls the AX/CGEvent APIs, so pointing users at
+/// "Bolo" in System Settings sends them to the wrong entry.
+fn python3_executable_path() -> String {
+    Command::new("python3")
+        .args(["-c", "import sys; print(sys.executable)"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "python3".to_string())
+}
+
 fn copy_to_clipboard(text: &str) -> Result<(), AppError> {
     let mut clipboard = Clipboard::new().map_err(|error| AppError::Clipboard(error.to_string()))?;
     clipboard
@@ -5658,14 +5681,20 @@ fn copy_to_clipboard(text: &str) -> Result<(), AppError> {
 
 fn paste_text(root_dir: &Path, text: &str) -> Result<(), AppError> {
     if !ax_is_trusted(root_dir, false) {
+        let python3 = python3_executable_path();
         warn!(
-            "[accessibility] NOT TRUSTED at paste time. Open System Settings \
-             > Privacy & Security > Accessibility, toggle Bolo ON, then run \
+            "[accessibility] NOT TRUSTED at paste time. The paste keystroke is \
+             sent by a python3 helper process, so macOS needs Accessibility \
+             trust for this Python interpreter: {python3}. Add it in System \
+             Settings > Privacy & Security > Accessibility, then run \
              ./restart.sh."
         );
         show_notification(
             "Bolo cannot paste",
-            "Grant Accessibility in System Settings > Privacy & Security, then run ./restart.sh.",
+            &format!(
+                "Add this Python interpreter in System Settings > Privacy & Security > \
+                 Accessibility, then run ./restart.sh: {python3}"
+            ),
         );
         return Err(AppError::AccessibilityNotGranted);
     }
@@ -5724,9 +5753,7 @@ fn ax_is_trusted(root_dir: &Path, prompt: bool) -> bool {
             }
         }
         Err(error) => {
-            warn!(
-                "[accessibility] helper failed to run: {error}; assuming trusted"
-            );
+            warn!("[accessibility] helper failed to run: {error}; assuming trusted");
             true
         }
     }

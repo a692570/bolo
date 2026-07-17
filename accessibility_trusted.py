@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Report whether macOS has granted Bolo Accessibility trust.
+"""Report whether macOS trusts the Python helper for Accessibility.
 
 Prints ``true`` on stdout when the calling process is trusted, ``false``
 otherwise. With ``--prompt`` the first untrusted call also opens the macOS
