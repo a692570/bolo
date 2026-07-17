@@ -14,14 +14,20 @@ You will also need a `TELNYX_API_KEY` to exercise the transcription flow.
 ## Development setup
 
 1. Clone the repository.
-2. Use Python 3.9 or newer.
-3. Install dependencies:
+2. Install Rust 1.88 or newer and Python 3.9 or newer.
+3. Prepare the macOS helper environment:
 
 ```bash
-pip3 install -r requirements.txt
+./ensure-python-env.sh
 ```
 
-If you are not using `requirements.txt` yet, `install.sh` shows the packages required by the current app.
+For Python unit tests, use a separate development environment:
+
+```bash
+python3 -m venv .venv-dev
+. .venv-dev/bin/activate
+python -m pip install -r requirements.txt pytest
+```
 
 4. Export your API key:
 
@@ -29,10 +35,18 @@ If you are not using `requirements.txt` yet, `install.sh` shows the packages req
 export TELNYX_API_KEY="your_key_here"
 ```
 
-5. Run the app:
+5. Build and run the shipped Rust app:
 
 ```bash
-python3 bolo.py
+cargo build --release
+./start-bolo.sh
+```
+
+Run both test suites before opening a pull request:
+
+```bash
+cargo test --release
+python -m pytest -q
 ```
 
 Logs are written to:

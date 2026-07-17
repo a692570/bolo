@@ -91,6 +91,16 @@ if ! git worktree add --detach "$worktree_dir" "$upstream" >/dev/null 2>&1; then
     exit 0
 fi
 
+if [ ! -x "$worktree_dir/ensure-python-env.sh" ]; then
+    result skipped "Fetched Bolo update has no Python helper installer."
+    exit 0
+fi
+
+if ! "$worktree_dir/ensure-python-env.sh" --sync >/dev/null; then
+    result skipped "Fetched Bolo update could not prepare its Python helpers."
+    exit 0
+fi
+
 if ! cargo build --release --manifest-path "$worktree_dir/Cargo.toml" --target-dir "$target_dir"; then
     result skipped "Fetched Bolo update did not build."
     exit 0
@@ -114,7 +124,4 @@ if ! mv "$new_binary" "$BOLO_DIR/target/release/bolo"; then
 fi
 
 result updated
-
-# Surface the recovery path in case an update changes the Python interpreter
-# that macOS identifies as Bolo's Accessibility client.
-osascript -e 'display notification "If paste stops working, enable Accessibility for the Python interpreter Bolo reports, then run ./restart.sh" with title "Bolo updated" with sound name "Glass"' >/dev/null 2>&1 || true
+osascript -e 'display notification "Code and Python helpers are ready. Bolo will restart now." with title "Bolo updated" with sound name "Glass"' >/dev/null 2>&1 || true

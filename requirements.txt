@@ -3,6 +3,4 @@ sounddevice
 numpy
 requests
 websockets
-pyobjc-framework-Quartz
-pyobjc-framework-Cocoa
-pyobjc-framework-ApplicationServices
+-r helper-requirements.txt
