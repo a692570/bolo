@@ -62,10 +62,13 @@ const STREAMING_FINAL_RESULT_IDLE: Duration = Duration::from_millis(250);
 const STREAMING_STABLE_RESULT_MAX: Duration = Duration::from_millis(1_200);
 const STREAMING_STABLE_RESULT_IDLE: Duration = Duration::from_millis(250);
 const STREAMING_DRAIN_MAX: Duration = Duration::from_millis(2_500);
+const STREAMING_BATCH_VERIFY_TIMEOUT: Duration = Duration::from_secs(2);
 const STREAMING_TRAILING_SILENCE_MS: usize = 600;
 const STREAMING_SAMPLE_RATE: u32 = 48_000;
+const STT_REQUEST_TIMEOUT: Duration = Duration::from_secs(12);
 const UPDATE_RESTART_EXIT_CODE: i32 = 42;
 const POST_INSERT_EDIT_MAX: Duration = Duration::from_secs(15);
+const POST_INSERT_OVERLAY_HOLD: Duration = Duration::from_millis(300);
 const MAX_SELECTED_TEXT_CHARS: usize = 8_000;
 
 #[derive(Debug, Error)]
@@ -622,16 +625,16 @@ fn streaming_batch_fallback_reason(
     source: &str,
     recording_duration: Duration,
 ) -> Option<&'static str> {
-    if source != "final" {
-        return Some("non_final_streaming_result");
-    }
     let words = text.split_whitespace().count();
     if recording_duration >= Duration::from_secs(6)
         && words.saturating_mul(1_000) < recording_duration.as_millis() as usize * 3 / 2
     {
         return Some("low_streaming_word_rate");
     }
-    None
+    match source {
+        "final" | "stable_best_available" => None,
+        _ => Some("non_final_streaming_result"),
+    }
 }
 
 fn best_streaming_text(result: &StreamingTranscript) -> Option<String> {
@@ -1464,7 +1467,7 @@ impl App {
         let vocabulary = load_vocabulary(&config.root_dir);
         let prompt_bindings = load_prompt_bindings();
         let history = load_transcript_history();
-        let http = Client::builder().timeout(Duration::from_secs(12)).build()?;
+        let http = Client::builder().timeout(STT_REQUEST_TIMEOUT).build()?;
         Ok(Self {
             config,
             http,
@@ -1700,7 +1703,7 @@ impl App {
         metrics.insert_duration = Some(insert_started.elapsed());
         metrics.outcome = "inserted";
         self.send_user_event(UserEvent::Overlay(OverlayPhase::Copied));
-        self.send_user_event(UserEvent::HideOverlayAfter(Duration::from_millis(900)));
+        self.send_user_event(UserEvent::HideOverlayAfter(POST_INSERT_OVERLAY_HOLD));
         Ok(())
     }
 
@@ -1726,7 +1729,7 @@ impl App {
                 "recording_duration_ms": recording_duration.as_millis(),
             })
         );
-        match self.transcribe(wav, warmup) {
+        match self.verify_streaming_transcript(wav, warmup) {
             Ok(batch)
                 if batch.split_whitespace().count() > streaming.text.split_whitespace().count() =>
             {
@@ -1862,6 +1865,7 @@ impl App {
             request.model_config.as_ref(),
             request.prompt.as_deref(),
             request.language.as_deref(),
+            STT_REQUEST_TIMEOUT,
         ) {
             Ok(transcript) => Ok(transcript),
             Err(AppError::RateLimited) => {
@@ -1877,10 +1881,28 @@ impl App {
                     request.model_config.as_ref(),
                     request.prompt.as_deref(),
                     request.language.as_deref(),
+                    STT_REQUEST_TIMEOUT,
                 )
             }
             Err(error) => Err(error),
         }
+    }
+
+    fn verify_streaming_transcript(
+        &self,
+        wav: &[u8],
+        warmup: &DictationWarmup,
+    ) -> Result<String, AppError> {
+        info!("sending bounded batch transcription verification");
+        let request = self.stt_request_parts(warmup);
+        self.transcribe_with_model(
+            wav,
+            &request.primary_model,
+            request.model_config.as_ref(),
+            request.prompt.as_deref(),
+            request.language.as_deref(),
+            STREAMING_BATCH_VERIFY_TIMEOUT,
+        )
     }
 
     fn transcribe_with_fallbacks(
@@ -1925,6 +1947,7 @@ impl App {
                         .unwrap_or_else(|_| self.config.stt_language.clone()),
                 )
                 .as_deref(),
+                STT_REQUEST_TIMEOUT,
             ),
             SttFallback::Xai => self.transcribe_with_xai(wav),
             SttFallback::AssemblyAi(model) => {
@@ -1940,6 +1963,7 @@ impl App {
         model_config: Option<&serde_json::Value>,
         prompt: Option<&str>,
         language: Option<&str>,
+        request_timeout: Duration,
     ) -> Result<String, AppError> {
         info!(
             "[stt] request {}",
@@ -1973,6 +1997,7 @@ impl App {
             .post(TELNYX_STT_ENDPOINT)
             .bearer_auth(&self.config.telnyx_api_key)
             .multipart(form)
+            .timeout(request_timeout)
             .send()?;
         let status = response.status();
         info!(
@@ -6574,7 +6599,15 @@ mod tests {
                 "stable_best_available",
                 std::time::Duration::from_secs(3)
             ),
-            Some("non_final_streaming_result")
+            None
+        );
+        assert_eq!(
+            streaming_batch_fallback_reason(
+                "too short",
+                "stable_best_available",
+                std::time::Duration::from_secs(6)
+            ),
+            Some("low_streaming_word_rate")
         );
         assert_eq!(
             streaming_batch_fallback_reason(
@@ -6592,6 +6625,16 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn streaming_batch_verification_has_a_short_deadline() {
+        assert!(super::STREAMING_BATCH_VERIFY_TIMEOUT <= std::time::Duration::from_secs(2));
+    }
+
+    #[test]
+    fn post_insert_overlay_clears_quickly() {
+        assert!(super::POST_INSERT_OVERLAY_HOLD <= std::time::Duration::from_millis(400));
     }
 
     #[test]
