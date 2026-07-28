@@ -4,11 +4,13 @@ race, backoff/auth availability, chunked retry, and the warm pool.
 FakeStream and a fake batch transport stand in at the module's seams, so the
 whole race runs with no mic, network, or API key."""
 
+import json
 import os
 import sys
 import time
 
 import numpy as np
+import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -157,6 +159,55 @@ def test_stream_final_wins_and_batch_is_skipped():
     assert (text, source) == ("hello there world", "stream")
     assert partials  # overlay preview callback fired
     assert stream.closed is True
+
+
+def test_request_stop_sends_no_padding():
+    """CloseStream finalizes without needing silence, so the old 350ms of
+    padding on key release is dead weight."""
+    stream = FakeStream([("hello", False)])
+    t = make_transcriber(stream=stream, transport=transport_returning("batch text"))
+    session = t.begin_session("context")
+    deadline = time.time() + 2.0
+    while session.timings["stream_connected_at"] is None and time.time() < deadline:
+        time.sleep(0.01)
+    session.feed(b"\x01\x02")
+    sent_before = list(stream.sent)
+    session.request_stop()
+    assert stream.sent == sent_before
+    session.abandon()
+
+
+def test_finalize_sends_close_stream_not_finalize():
+    """`Finalize` also produces a final but skips smart formatting, turning
+    "472938" into "four seven two nine three eight". finish() closes the
+    stream straight after, so there is no reason to keep the socket open."""
+    import stt as stt_module
+
+    assert json.loads(stt_module._CLOSE_STREAM_FRAME) == {"type": "CloseStream"}
+
+    client = stt_module.TelnyxStreamingSTT()
+    enqueued = []
+
+    class Loop:
+        def call_soon_threadsafe(self, fn, arg):
+            fn(arg)
+
+    class Q:
+        def put_nowait(self, item):
+            enqueued.append(item)
+
+    client._loop = Loop()
+    client._send_queue = Q()
+    client.finalize()
+    assert enqueued == [stt_module._CLOSE_STREAM_FRAME]
+
+
+def test_finalize_requires_a_connection():
+    """finalize() on an unconnected client is a programming error, not a no-op."""
+    import stt as stt_module
+
+    with pytest.raises(RuntimeError, match="Not connected"):
+        stt_module.TelnyxStreamingSTT().finalize()
 
 
 def test_finish_finalizes_the_stream():

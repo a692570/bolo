@@ -63,7 +63,6 @@ const STREAMING_STABLE_RESULT_MAX: Duration = Duration::from_millis(1_200);
 const STREAMING_STABLE_RESULT_IDLE: Duration = Duration::from_millis(250);
 const STREAMING_DRAIN_MAX: Duration = Duration::from_millis(2_500);
 const STREAMING_BATCH_VERIFY_TIMEOUT: Duration = Duration::from_secs(2);
-const STREAMING_TRAILING_SILENCE_MS: usize = 600;
 const STREAMING_SAMPLE_RATE: u32 = 48_000;
 const STT_REQUEST_TIMEOUT: Duration = Duration::from_secs(12);
 const UPDATE_RESTART_EXIT_CODE: i32 = 42;
@@ -691,18 +690,9 @@ async fn run_telnyx_stream(
                     input_closed = true;
                     close_deadline = Some(Instant::now() + Duration::from_millis(1_500));
                     if provider == StreamingProvider::Deepgram {
-                        let silence_samples = usize::try_from(STREAMING_SAMPLE_RATE)
-                            .unwrap_or(48_000)
-                            .saturating_mul(STREAMING_TRAILING_SILENCE_MS)
-                            / 1_000;
-                        if let Err(error) = write
-                            .send(Message::Binary(
-                                pcm_bytes(&vec![0_i16; silence_samples]).into(),
-                            ))
-                            .await
-                        {
-                            warn!("streaming trailing silence failed: {error}");
-                        }
+                        // CloseStream alone finalizes: it drains the server's
+                        // buffer before emitting the final, so it does not
+                        // depend on endpointing seeing trailing silence.
                         if let Err(error) = write
                             .send(Message::Text(
                                 String::from(r#"{"type":"CloseStream"}"#).into(),

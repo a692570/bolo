@@ -105,8 +105,8 @@ _WS_ENDPOINT = (
     "&language=en-US"
 )
 
-# Text frame that tells the engine to flush its buffer and emit a final.
-_FINALIZE_FRAME = json.dumps({"type": "Finalize"})
+# Text frame that ends the audio stream so the engine emits a final transcript.
+_CLOSE_STREAM_FRAME = json.dumps({"type": "CloseStream"})
 
 # 44-byte WAV header: PCM, 16 kHz, mono, 16-bit, streaming (data size = 0xFFFFFFFF)
 _SAMPLE_RATE  = 16000
@@ -225,21 +225,23 @@ class TelnyxStreamingSTT:
 
     def finalize(self) -> None:
         """
-        Ask the engine to flush what it has and emit a final transcript.
+        Ask the engine to terminate the stream and emit a final transcript.
 
-        Deepgram only marks a transcript `is_final` once the audio stream is
-        terminated, by endpointing silence or an explicit signal. We stop
-        sending the moment the hotkey is released, so without this call no
-        final ever arrives and the streaming result is discarded in favour of
-        the batch request.
+        Deepgram only marks a transcript `is_final` once the audio stream ends.
+        The 350ms of padding we send on key release is not enough on its own:
+        measured against the live API it produced a final in 0/4 sessions, so
+        every utterance fell through to the batch request.
 
-        `Finalize` flushes without closing, so a warm connection survives it.
-        It flushes only the audio the engine has already received, which is
-        everything when audio is fed from the mic at realtime pace.
+        `CloseStream` drains the server's buffer before finalizing, so it does
+        not depend on endpointing seeing silence. `Finalize` also works and
+        keeps the socket open, but it flushes early enough that smart
+        formatting is skipped, turning "472938" into "four seven two nine three
+        eight". The caller closes the stream straight after this, so there is
+        no open-socket benefit to trade for that.
         """
         if self._loop is None or self._send_queue is None:
             raise RuntimeError("Not connected — call connect() first.")
-        self._loop.call_soon_threadsafe(self._send_queue.put_nowait, _FINALIZE_FRAME)
+        self._loop.call_soon_threadsafe(self._send_queue.put_nowait, _CLOSE_STREAM_FRAME)
 
     def get_transcript(self, timeout: float = 0.05) -> Optional[Tuple[str, bool]]:
         """

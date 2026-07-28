@@ -28,7 +28,6 @@ CHANNELS = 1
 # Telnyx/Deepgram, and the drain exits as soon as the final lands, so a wider
 # budget only costs time on a slow response.
 STREAM_DRAIN_SECONDS = 0.7
-SILENCE_PADDING = bytes(int(SAMPLE_RATE * 0.35 * 2))  # 350ms of 16kHz mono 16-bit
 RATE_LIMIT_BACKOFF_SECONDS = 45.0
 AUTH_BACKOFF_SECONDS = 86400.0
 WARM_STREAM_MAX_AGE_SECONDS = 45.0
@@ -192,18 +191,14 @@ class TranscriptionSession:
             pass
 
     def request_stop(self):
-        """Called on key release: stamps the stop time and pads the stream
-        with silence so the provider's VAD finalizes the utterance."""
+        """Called on key release: stamps the stop time.
+
+        Padding the stream with silence here used to be the finalization
+        mechanism. finish() now sends CloseStream, which does not need silence
+        to trigger endpointing, so the padding is dead weight."""
         if self.timings["stop_requested_at"] is None:
             self.timings["stop_requested_at"] = time.time()
         self._stopping = True
-        with self._lock:
-            stream = self._stream
-        if stream is not None:
-            try:
-                stream.send_audio(SILENCE_PADDING)
-            except Exception:
-                pass
 
     def finish(self, wav_bytes, duration_seconds):
         """Start the batch request, drain and close the stream, return the
