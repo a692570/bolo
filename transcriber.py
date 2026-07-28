@@ -24,7 +24,10 @@ from transcript_state import merge_transcript
 STT_ENDPOINT = "https://api.telnyx.com/v2/ai/audio/transcriptions"
 SAMPLE_RATE = 16000
 CHANNELS = 1
-STREAM_DRAIN_SECONDS = 0.35
+# Budget for the post-stop final to arrive. Measured at 0.18-0.26s against
+# Telnyx/Deepgram, and the drain exits as soon as the final lands, so a wider
+# budget only costs time on a slow response.
+STREAM_DRAIN_SECONDS = 0.7
 SILENCE_PADDING = bytes(int(SAMPLE_RATE * 0.35 * 2))  # 350ms of 16kHz mono 16-bit
 RATE_LIMIT_BACKOFF_SECONDS = 45.0
 AUTH_BACKOFF_SECONDS = 86400.0
@@ -208,6 +211,7 @@ class TranscriptionSession:
         if self.timings["stop_requested_at"] is None:
             self.timings["stop_requested_at"] = time.time()
         self._stopping = True
+        self._finalize_stream()
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         batch_future = executor.submit(
             self._transcriber._batch_transcribe,
@@ -237,6 +241,21 @@ class TranscriptionSession:
         self._close_stream()
         self._transcriber.end_session(self)
         self._transcriber.warm()
+
+    def _finalize_stream(self):
+        """Ask the engine for a final before we start waiting for one.
+
+        Without this the stream only ever produces interim results, so
+        `had_final` stays False and the batch request always wins the race.
+        """
+        with self._lock:
+            stream = self._stream
+        if stream is None:
+            return
+        try:
+            stream.finalize()
+        except Exception as e:
+            self._transcriber._log(f"[stream] finalize error: {e}")
 
     def _close_stream(self):
         with self._lock:
@@ -285,7 +304,7 @@ class TranscriptionSession:
         stop_at = self.timings["stop_requested_at"]
         if stop_at is not None:
             deadline = stop_at + STREAM_DRAIN_SECONDS
-            while time.time() < deadline:
+            while time.time() < deadline and not self.had_final:
                 with self._lock:
                     stream = self._stream
                 if stream is None:

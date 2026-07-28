@@ -12,7 +12,7 @@ import queue
 import struct
 import threading
 import urllib.parse
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
 
 
 # ── SilenceDetector ───────────────────────────────────────────────────────────
@@ -105,6 +105,9 @@ _WS_ENDPOINT = (
     "&language=en-US"
 )
 
+# Text frame that tells the engine to flush its buffer and emit a final.
+_FINALIZE_FRAME = json.dumps({"type": "Finalize"})
+
 # 44-byte WAV header: PCM, 16 kHz, mono, 16-bit, streaming (data size = 0xFFFFFFFF)
 _SAMPLE_RATE  = 16000
 _CHANNELS     = 1
@@ -168,7 +171,7 @@ class TelnyxStreamingSTT:
         self._ws = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._thread: Optional[threading.Thread] = None
-        self._send_queue: "asyncio.Queue[Optional[bytes]]" = None
+        self._send_queue: "asyncio.Queue[Optional[Union[bytes, str]]]" = None
         self._transcript_queue: queue.Queue = queue.Queue()
         self._connected = threading.Event()
         self._connect_error: Optional[Exception] = None
@@ -219,6 +222,24 @@ class TelnyxStreamingSTT:
             payload = pcm16_bytes
 
         self._loop.call_soon_threadsafe(self._send_queue.put_nowait, payload)
+
+    def finalize(self) -> None:
+        """
+        Ask the engine to flush what it has and emit a final transcript.
+
+        Deepgram only marks a transcript `is_final` once the audio stream is
+        terminated, by endpointing silence or an explicit signal. We stop
+        sending the moment the hotkey is released, so without this call no
+        final ever arrives and the streaming result is discarded in favour of
+        the batch request.
+
+        `Finalize` flushes without closing, so a warm connection survives it.
+        It flushes only the audio the engine has already received, which is
+        everything when audio is fed from the mic at realtime pace.
+        """
+        if self._loop is None or self._send_queue is None:
+            raise RuntimeError("Not connected — call connect() first.")
+        self._loop.call_soon_threadsafe(self._send_queue.put_nowait, _FINALIZE_FRAME)
 
     def get_transcript(self, timeout: float = 0.05) -> Optional[Tuple[str, bool]]:
         """
@@ -318,7 +339,9 @@ class TelnyxStreamingSTT:
             raise
 
     async def _sender(self, ws) -> None:
-        """Drains the send queue and forwards binary frames to the WebSocket."""
+        """Drains the send queue and forwards frames to the WebSocket.
+
+        bytes go out as binary audio frames, str as text control frames."""
         while True:
             payload = await self._send_queue.get()
             if payload is None:

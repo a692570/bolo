@@ -20,15 +20,19 @@ from transcriber import (
     should_retry_chunked_batch,
     to_wav_bytes,
     SAMPLE_RATE,
+    STREAM_DRAIN_SECONDS,
 )
 
 
 class FakeStream:
-    def __init__(self, transcripts=None, fail=None):
+    def __init__(self, transcripts=None, fail=None, on_finalize=None):
         self.sent = []
         self.closed = False
+        self.finalized = 0
         self._queue = list(transcripts or [])
         self._fail = fail
+        # Transcripts the engine only releases once finalize() is called.
+        self._on_finalize = list(on_finalize or [])
 
     def connect(self, api_key, keywords=None):
         if self._fail:
@@ -36,6 +40,11 @@ class FakeStream:
 
     def send_audio(self, pcm):
         self.sent.append(pcm)
+
+    def finalize(self):
+        self.finalized += 1
+        self._queue.extend(self._on_finalize)
+        self._on_finalize = []
 
     def get_transcript(self, timeout=0.05):
         if self._queue:
@@ -148,6 +157,61 @@ def test_stream_final_wins_and_batch_is_skipped():
     assert (text, source) == ("hello there world", "stream")
     assert partials  # overlay preview callback fired
     assert stream.closed is True
+
+
+def test_finish_finalizes_the_stream():
+    """Deepgram only emits a final once the stream is terminated, so finish()
+    has to ask for one before it waits."""
+    stream = FakeStream([("hello there", False)])
+    t = make_transcriber(stream=stream, transport=transport_returning("batch text"))
+    run_session(t, duration=5.0)
+    assert stream.finalized == 1
+
+
+def test_finalize_final_wins_over_batch():
+    """The real endpoint releases the final only after finalize(). That result
+    must win the race instead of being discarded for the batch request."""
+    stream = FakeStream(
+        [("hello there", False)],
+        on_finalize=[("hello there world", True)],
+    )
+    t = make_transcriber(stream=stream, transport=transport_returning("batch text"))
+    session, result = run_session(t, duration=5.0)
+    assert session.had_final is True
+    assert result.preview == "hello there world"
+    assert result.final() == ("hello there world", "stream")
+
+
+def test_finalize_is_skipped_when_no_stream_attached():
+    """A session whose stream never connected still finishes cleanly."""
+    t = make_transcriber(stream=FakeStream(fail=RuntimeError("boom")))
+    session, result = run_session(t, duration=5.0)
+    assert session.had_final is False
+    assert result.final() == ("batch result", "batch")
+
+
+def test_finalize_error_does_not_break_finish():
+    """A stream that raises on finalize() falls back to batch, not a crash."""
+
+    class ExplodingStream(FakeStream):
+        def finalize(self):
+            raise RuntimeError("socket gone")
+
+    stream = ExplodingStream([("hello", False)])
+    t = make_transcriber(stream=stream, transport=transport_returning("batch text"))
+    session, result = run_session(t, duration=5.0)
+    assert session.had_final is False
+    assert result.final() == ("batch text", "batch")
+
+
+def test_drain_stops_as_soon_as_final_arrives():
+    """Waiting out the full drain budget would add latency to every utterance."""
+    stream = FakeStream([("hello there world", True)])
+    t = make_transcriber(stream=stream, transport=transport_returning("batch text"))
+    started = time.time()
+    session, result = run_session(t, duration=5.0)
+    assert session.had_final is True
+    assert time.time() - started < STREAM_DRAIN_SECONDS
 
 
 def test_batch_wins_when_stream_has_no_final():
