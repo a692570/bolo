@@ -2,7 +2,8 @@
 
 mod recording_fsm;
 
-use std::collections::{BTreeMap, VecDeque};
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::env;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, ErrorKind, Write};
@@ -56,7 +57,45 @@ const RECORDING_WATCHDOG_INTERVAL: Duration = Duration::from_secs(5);
 const DEFAULT_MAX_RECORDING_SECONDS: u64 = 30;
 const SPEECH_RMS_THRESHOLD: f32 = 0.006;
 const SPEECH_FRAME_MS: usize = 20;
+/// Minimum drain after release: the audio callback hands over whole buffers, so
+/// tearing the stream down immediately throws away whatever is already in flight.
 const AUDIO_RELEASE_DRAIN: Duration = Duration::from_millis(120);
+/// How long the tail must stay quiet before trailing capture stops.
+const TRAILING_QUIET_TO_STOP: Duration = Duration::from_millis(250);
+/// Hard ceiling on trailing capture. A room that never goes quiet must not hold
+/// the pipeline open.
+const TRAILING_CAPTURE_CAP: Duration = Duration::from_millis(1_500);
+/// Poll cadence while draining the tail.
+const TRAILING_POLL_INTERVAL: Duration = Duration::from_millis(25);
+/// Speech threshold for the tail.
+///
+/// jot's 0.08 lives on its compressive level curve, not on RMS, so it is
+/// converted rather than copied: inverting `level = (rms * 11) ^ 0.65` gives
+/// `rms = 0.08 ^ (1 / 0.65) / 11` = 0.00187.
+///
+/// Deliberately NOT derived from `SPEECH_RMS_THRESHOLD`. That constant gates
+/// "did this recording contain speech at all" and only ~30% of frames clear it
+/// during continuous speech, so scaling it produced a bar of 0.008 that a
+/// mid-word release sailed under. Measured on an M-series built-in mic: a
+/// finished dictation releases at 0.0003-0.0005 and a mid-word cut releases at
+/// 0.0021, against a 0.0004 room floor and a 0.035 speech peak. 0.0019 sits in
+/// that gap.
+const TRAILING_SPEECH_RMS_THRESHOLD: f32 = 0.0019;
+/// +3 dB over the measured room floor, as an amplitude ratio.
+const TRAILING_FLOOR_MARGIN: f32 = 1.413;
+/// Ceiling on the floor-relative threshold, so a loud room cannot raise the bar
+/// into ordinary speech and cut the tail off immediately. jot's 0.30 through the
+/// same curve inversion.
+const TRAILING_RELATIVE_CAP: f32 = 0.0143;
+/// Only trust a floor-relative threshold when speech clears the room by ~12 dB
+/// (x3.98 in amplitude). Below that the absolute threshold is the safer bar.
+const TRAILING_TRUST_SNR: f32 = 3.98;
+/// The room is the quietest tenth of the session, not its minimum: one anomalous
+/// frame should not define the floor.
+const NOISE_FLOOR_PERCENTILE: f64 = 0.10;
+/// Below this the percentile is meaningless. Frames are `SPEECH_FRAME_MS`, so 25
+/// frames is ~0.5s of audio.
+const NOISE_FLOOR_MIN_FRAMES: usize = 25;
 const STREAMING_DRAIN_MIN: Duration = Duration::from_millis(450);
 const STREAMING_FINAL_RESULT_IDLE: Duration = Duration::from_millis(250);
 const STREAMING_STABLE_RESULT_MAX: Duration = Duration::from_millis(1_200);
@@ -1555,9 +1594,19 @@ impl App {
         recording: ActiveRecording,
         released_at: Instant,
     ) -> Result<(), AppError> {
-        std::thread::sleep(AUDIO_RELEASE_DRAIN);
+        let trailing = capture_trailing_audio(&recording)?;
         let elapsed = recording.started_at.elapsed();
         drop(recording.stream);
+        info!(
+            "[pipeline] trailing_capture {}",
+            serde_json::json!({
+                "stop_reason": trailing.stop_reason,
+                "extra_ms": trailing.extra.as_millis(),
+                "release_rms": trailing.release_rms,
+                "threshold_rms": trailing.threshold_rms,
+                "floor_rms": trailing.floor_rms,
+            })
+        );
         let mut metrics = DictationLatencyMetrics::new(elapsed, released_at);
         if elapsed < MIN_RECORDING {
             metrics.outcome = "too_short";
@@ -2443,10 +2492,11 @@ impl App {
         warmup: &DictationWarmup,
     ) -> Result<DeferredCleanupOutcome, AppError> {
         let cleaned = self.cleanup_transcript(&cleanup_input, warmup)?;
-        if cleaned.trim().is_empty() {
+        let cleaned = strip_cleanup_artifacts(&cleaned);
+        if cleaned.is_empty() {
             return Ok(DeferredCleanupOutcome::Skipped("empty_llm_output"));
         }
-        let normalized_cleaned = normalize_transcript(cleaned.trim());
+        let normalized_cleaned = normalize_transcript(&cleaned);
         let replacements = self.replacements_snapshot();
         let final_text = apply_text_replacements(
             &canonicalize_known_terms(&normalized_cleaned),
@@ -2455,8 +2505,16 @@ impl App {
         if final_text.is_empty() || is_known_no_speech_transcript(&final_text) {
             return Ok(DeferredCleanupOutcome::Skipped("empty_final_text"));
         }
-        if !valid_deferred_cleanup(&cleanup_input, &final_text) {
-            return Ok(DeferredCleanupOutcome::Skipped("low_quality_llm_output"));
+        if let Some(reason) = cleanup_rejection_reason(&cleanup_input, &final_text) {
+            info!(
+                "[cleanup] validation_rejected {}",
+                serde_json::json!({
+                    "reason": reason,
+                    "raw_words": cleanup_input.split_whitespace().count(),
+                    "cleaned_words": final_text.split_whitespace().count(),
+                })
+            );
+            return Ok(DeferredCleanupOutcome::Skipped(reason));
         }
         if final_text == pasted_text {
             return Ok(DeferredCleanupOutcome::Skipped("unchanged"));
@@ -4183,19 +4241,29 @@ fn wav_bytes(samples: &[i16], sample_rate: u32) -> Result<Vec<u8>, AppError> {
     Ok(bytes)
 }
 
-fn speech_stats(samples: &[i16], sample_rate: u32) -> SpeechStats {
-    if samples.is_empty() || sample_rate == 0 {
-        return SpeechStats::default();
-    }
-
-    let frame_len = usize::try_from(sample_rate)
+fn frame_len_for(sample_rate: u32) -> usize {
+    (usize::try_from(sample_rate)
         .unwrap_or(usize::MAX)
         .saturating_mul(SPEECH_FRAME_MS)
-        / 1_000;
-    let frame_len = frame_len.max(1);
+        / 1_000)
+        .max(1)
+}
+
+/// One RMS value per `SPEECH_FRAME_MS` frame. The single definition of how audio is
+/// framed, so speech detection and the noise floor cannot drift apart.
+fn frame_rms_series(samples: &[i16], sample_rate: u32) -> Vec<f32> {
+    if samples.is_empty() || sample_rate == 0 {
+        return Vec::new();
+    }
+    samples
+        .chunks(frame_len_for(sample_rate))
+        .map(frame_rms)
+        .collect()
+}
+
+fn speech_stats(samples: &[i16], sample_rate: u32) -> SpeechStats {
     let mut stats = SpeechStats::default();
-    for frame in samples.chunks(frame_len) {
-        let rms = frame_rms(frame);
+    for rms in frame_rms_series(samples, sample_rate) {
         stats.frame_count += 1;
         stats.peak_rms = stats.peak_rms.max(rms);
         if rms >= SPEECH_RMS_THRESHOLD {
@@ -4203,6 +4271,210 @@ fn speech_stats(samples: &[i16], sample_rate: u32) -> SpeechStats {
         }
     }
     stats
+}
+
+/// The room, as an RMS level: the 10th percentile of frame RMS across the session.
+///
+/// A low percentile rather than the minimum so one anomalous frame does not define
+/// the room, and rather than "the first N milliseconds" because a fast speaker is
+/// already talking when the buffer starts, which would classify speech as the floor
+/// and make every decision downstream of it worse.
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "percentile index over a frame count that cannot approach f64's mantissa"
+)]
+fn noise_floor_rms(series: &[f32]) -> Option<f32> {
+    if series.len() < NOISE_FLOOR_MIN_FRAMES {
+        return None;
+    }
+    let mut sorted = series.to_vec();
+    sorted.sort_by(|left, right| left.partial_cmp(right).unwrap_or(Ordering::Equal));
+    let index = ((sorted.len() - 1) as f64 * NOISE_FLOOR_PERCENTILE).round() as usize;
+    sorted.get(index).copied()
+}
+
+/// The level the tail must fall below to count as quiet, or `None` when no
+/// threshold can do the job and the caller should skip trailing capture entirely.
+///
+/// Absolute by default. When the room is measurable the bar rises to the floor
+/// plus a margin, which is what stops the loop running to its cap in a noisy room.
+///
+/// Measured 2026-08-27 with pink noise played into a built-in laptop mic: a room floor
+/// of 0.0148 against a 0.0576 speech peak is 3.89x, just under
+/// `TRAILING_TRUST_SNR`, so the old code fell back to the absolute 0.0019 bar,
+/// eight times BELOW the room. Nothing could ever read as quiet and every
+/// dictation ran to the 1.5s cap. Falling back to an absolute threshold is only
+/// safe while that threshold sits above the room, so the floor is now used even
+/// when the SNR is untrustworthy: a poor SNR makes the floor a bad speech
+/// reference, not a bad measurement of the room.
+fn trailing_stop_threshold(floor_rms: Option<f32>, peak_rms: f32) -> Option<f32> {
+    let Some(floor_rms) = floor_rms else {
+        return Some(TRAILING_SPEECH_RMS_THRESHOLD);
+    };
+    if floor_rms <= 0.0 {
+        return Some(TRAILING_SPEECH_RMS_THRESHOLD);
+    }
+    let relative = floor_rms * TRAILING_FLOOR_MARGIN;
+    if peak_rms >= floor_rms * TRAILING_TRUST_SNR {
+        // The room itself sits at or above the ceiling: no bar separates a speech
+        // tail from the room, because any bar low enough to be crossed is inside
+        // the noise. Decline rather than burn 1.5s per dictation discovering it.
+        if relative >= TRAILING_RELATIVE_CAP {
+            return None;
+        }
+        return Some(relative.clamp(TRAILING_SPEECH_RMS_THRESHOLD, TRAILING_RELATIVE_CAP));
+    }
+    // Speech barely clears the measured floor, so the "floor" may be speech itself
+    // (a session with no gaps between words puts the 10th percentile inside the
+    // talking). Prefer the absolute bar, but only while it is genuinely above what
+    // was measured. Below the room it can never be crossed, and insisting on it is
+    // what made every loud-room dictation run to the cap.
+    if TRAILING_SPEECH_RMS_THRESHOLD > floor_rms {
+        return Some(TRAILING_SPEECH_RMS_THRESHOLD);
+    }
+    None
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TrailingDecision {
+    KeepListening,
+    Stop(&'static str),
+}
+
+/// The pure decision core of the trailing-capture loop, kept clock-free so the
+/// quiet and cap rules are testable without recording anything.
+#[derive(Clone, Copy, Debug)]
+struct TrailingCapture {
+    threshold_rms: f32,
+    quiet_for: Duration,
+    total: Duration,
+}
+
+impl TrailingCapture {
+    const fn new(threshold_rms: f32) -> Self {
+        Self {
+            threshold_rms,
+            quiet_for: Duration::ZERO,
+            total: Duration::ZERO,
+        }
+    }
+
+    fn observe(&mut self, chunk_rms: f32, chunk_span: Duration) -> TrailingDecision {
+        self.total = self.total.saturating_add(chunk_span);
+        if chunk_rms >= self.threshold_rms {
+            self.quiet_for = Duration::ZERO;
+        } else {
+            self.quiet_for = self.quiet_for.saturating_add(chunk_span);
+        }
+        if self.quiet_for >= TRAILING_QUIET_TO_STOP {
+            TrailingDecision::Stop("quiet")
+        } else if self.total >= TRAILING_CAPTURE_CAP {
+            TrailingDecision::Stop("cap")
+        } else {
+            TrailingDecision::KeepListening
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TrailingCaptureReport {
+    extra: Duration,
+    threshold_rms: f32,
+    floor_rms: f32,
+    release_rms: f32,
+    stop_reason: &'static str,
+}
+
+/// Keeps the microphone open past key release until the tail actually goes quiet.
+///
+/// Releasing the hotkey mid-word is common and a fixed drain cuts the last
+/// syllable. So: always drain `AUDIO_RELEASE_DRAIN` for the in-flight buffer, then
+/// look at what was captured around the release. If it was already quiet the
+/// speaker had finished, and we stop there, which is the common case and costs no
+/// latency at all. If it was still hot, keep listening until
+/// `TRAILING_QUIET_TO_STOP` of quiet or `TRAILING_CAPTURE_CAP`, whichever lands
+/// first.
+fn capture_trailing_audio(
+    recording: &ActiveRecording,
+) -> Result<TrailingCaptureReport, AppError> {
+    std::thread::sleep(AUDIO_RELEASE_DRAIN);
+    let sample_rate = recording.sample_rate;
+    let release_window = frame_len_for(sample_rate).saturating_mul(6);
+
+    let (mut cursor, floor_rms, peak_rms, release_rms) = {
+        let samples = recording
+            .samples
+            .lock()
+            .map_err(|error| AppError::PoisonedMutex(error.to_string()))?;
+        let series = frame_rms_series(&samples, sample_rate);
+        let floor = noise_floor_rms(&series);
+        let peak = series.iter().copied().fold(0.0_f32, f32::max);
+        let tail_start = samples.len().saturating_sub(release_window);
+        let release = frame_rms(&samples[tail_start..]);
+        (samples.len(), floor, peak, release)
+    };
+
+    let Some(threshold) = trailing_stop_threshold(floor_rms, peak_rms) else {
+        return Ok(TrailingCaptureReport {
+            extra: Duration::ZERO,
+            threshold_rms: 0.0,
+            floor_rms: floor_rms.unwrap_or_default(),
+            release_rms,
+            stop_reason: "room_too_loud",
+        });
+    };
+    let mut report = TrailingCaptureReport {
+        extra: Duration::ZERO,
+        threshold_rms: threshold,
+        floor_rms: floor_rms.unwrap_or_default(),
+        release_rms,
+        stop_reason: "settled",
+    };
+    if release_rms < threshold {
+        return Ok(report);
+    }
+
+    let mut capture = TrailingCapture::new(threshold);
+    let frame_len = frame_len_for(sample_rate);
+    let started = Instant::now();
+    loop {
+        std::thread::sleep(TRAILING_POLL_INTERVAL);
+        let chunk = {
+            let samples = recording
+                .samples
+                .lock()
+                .map_err(|error| AppError::PoisonedMutex(error.to_string()))?;
+            let start = cursor.min(samples.len());
+            let chunk = samples[start..].to_vec();
+            cursor = samples.len();
+            drop(samples);
+            chunk
+        };
+        // Frame by frame, not one mean over the whole buffer: a 100 ms buffer
+        // holding a 40 ms tail then silence averages out below the threshold, and
+        // stopping on that average is the exact truncation this loop exists to fix.
+        //
+        // Only real audio advances the quiet timer. A poll landing between two
+        // buffer deliveries is not silence, it is nothing, and counting it as quiet
+        // would cut the tail short on a device with a long buffer.
+        for frame in chunk.chunks(frame_len) {
+            let span = Duration::from_secs_f64(f64::from(
+                u32::try_from(frame.len()).unwrap_or(u32::MAX),
+            ) / f64::from(sample_rate));
+            if let TrailingDecision::Stop(reason) = capture.observe(frame_rms(frame), span) {
+                report.stop_reason = reason;
+                report.extra = started.elapsed();
+                return Ok(report);
+            }
+        }
+        if started.elapsed() >= TRAILING_CAPTURE_CAP {
+            report.stop_reason = "cap";
+            report.extra = started.elapsed();
+            return Ok(report);
+        }
+    }
 }
 
 fn frame_rms(samples: &[i16]) -> f32 {
@@ -4952,21 +5224,204 @@ fn cleanup_max_tokens(transcript: &str) -> u16 {
     ((word_count * 12).clamp(1_200, 3_000)) as u16
 }
 
-fn valid_deferred_cleanup(input: &str, output: &str) -> bool {
-    let input_words = input.split_whitespace().count();
-    let output_words = output.split_whitespace().count();
-    if output_words == 0 {
-        return false;
+/// Wrappers a cleanup model puts around an otherwise fine result.
+const CLEANUP_ARTIFACT_LABELS: [&str; 6] = [
+    "CLEAN:",
+    "Clean:",
+    "clean:",
+    "TRANSCRIPT:",
+    "Transcript:",
+    "transcript:",
+];
+/// Cleaned text may not grow past this multiple of the raw word count.
+const CLEANUP_MAX_LENGTH_RATIO: f64 = 1.60;
+/// ...nor shrink below this one.
+const CLEANUP_MIN_LENGTH_RATIO: f64 = 0.20;
+/// A one or two word raw cannot fail the ratio guard (two words at 1.60x is
+/// still three), and trigram similarity saturates when a short raw is fully
+/// contained in a long output, so short dictations are exactly where invented
+/// content lands. Allow a small absolute expansion for punctuation and filler
+/// restoration, nothing more.
+const CLEANUP_SHORT_RAW_WORD_ALLOWANCE: usize = 4;
+/// Minimum share of cleaned words that also appear in the raw transcript.
+const CLEANUP_MIN_CONTAINMENT: f64 = 0.50;
+/// Minimum character-trigram overlap between raw and cleaned text.
+const CLEANUP_MIN_TRIGRAM_SIMILARITY: f64 = 0.55;
+
+/// Spoken numbers, so "three" in the raw matches "3" in inverse-text-normalized
+/// cleanup output instead of reading as dropped content.
+const SPOKEN_NUMBERS: [(&str, &str); 18] = [
+    ("zero", "0"),
+    ("one", "1"),
+    ("two", "2"),
+    ("three", "3"),
+    ("four", "4"),
+    ("five", "5"),
+    ("six", "6"),
+    ("seven", "7"),
+    ("eight", "8"),
+    ("nine", "9"),
+    ("ten", "10"),
+    ("eleven", "11"),
+    ("twelve", "12"),
+    ("twenty", "20"),
+    ("thirty", "30"),
+    ("forty", "40"),
+    ("fifty", "50"),
+    ("hundred", "100"),
+];
+
+/// Strips packaging that is not a failure: code fences, "Transcript:" labels and
+/// wrapping quotes. Runs before the gate so a good result is not rejected for how
+/// the model wrapped it.
+fn strip_cleanup_artifacts(text: &str) -> String {
+    let unfenced = strip_code_fence(text.trim());
+    let unlabelled = CLEANUP_ARTIFACT_LABELS
+        .iter()
+        .find_map(|label| unfenced.strip_prefix(label))
+        .unwrap_or(unfenced.as_str())
+        .trim();
+    strip_wrapping_quotes(unlabelled).trim().to_owned()
+}
+
+fn strip_code_fence(text: &str) -> String {
+    if !text.starts_with("```") {
+        return text.to_owned();
     }
-    if input_words >= 6 && output_words < 3 {
-        return false;
+    let opened = Regex::new(r"(?s)^```[a-zA-Z]*\r?\n?").map_or_else(
+        |_| text.to_owned(),
+        |regex| regex.replace(text, "").into_owned(),
+    );
+    opened.replace("```", "").trim().to_owned()
+}
+
+fn strip_wrapping_quotes(text: &str) -> &str {
+    text.strip_prefix('"')
+        .and_then(|inner| inner.strip_suffix('"'))
+        .map_or(text, str::trim)
+}
+
+/// The "never replace good text with garbage" gate, run between LLM cleanup and
+/// the history rewrite.
+///
+/// Guards the documented failure modes of prompted cleanup models: answering the
+/// dictation instead of cleaning it, hallucinated expansion, paraphrase drift and
+/// silent content dropping. Returns the rejection reason, or `None` to accept.
+///
+/// Structure and tuning follow the `ValidationGate` in Google's jot
+/// (`JotCore/Sources/FormattingPipeline/ValidationGate.swift`, Apache-2.0);
+/// the Rust here is bolo's own.
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "word counts of a single dictation, far below f64's mantissa"
+)]
+fn cleanup_rejection_reason(raw: &str, cleaned: &str) -> Option<&'static str> {
+    let raw_words = content_words(raw);
+    let clean_words = content_words(cleaned);
+
+    if clean_words.is_empty() {
+        return if raw_words.is_empty() {
+            None
+        } else {
+            Some("empty_output")
+        };
     }
-    let input_chars = input.trim().chars().count();
-    let output_chars = output.trim().chars().count();
-    if input_chars >= 40 && output_chars.saturating_mul(3) < input_chars {
-        return false;
+    // An answering model prepends words the speaker never said. A faithful cleanup
+    // keeps the speaker's own opener, so this only fires when the first word also
+    // changed: otherwise a dictation that genuinely starts with "Okay" trips it.
+    if starts_with_answer_preamble(cleaned) && clean_words.first() != raw_words.first() {
+        return Some("answer_pattern");
     }
-    true
+    let lowered = cleaned.to_ascii_lowercase();
+    if lowered.contains("as an ai") || lowered.contains("language model") {
+        return Some("ai_selfreference");
+    }
+    if raw_words.is_empty() {
+        return None;
+    }
+
+    let ratio = clean_words.len() as f64 / raw_words.len() as f64;
+    // Expansion is most dangerous on short raws, where invented content dominates,
+    // so the ceiling applies early. Shrink is often legitimate (fillers removed, a
+    // spoken self-correction collapsing), so the floor only applies to longer raws.
+    if raw_words.len() >= 3 && ratio > CLEANUP_MAX_LENGTH_RATIO {
+        return Some("expansion_ratio");
+    }
+    if raw_words.len() < 3 && clean_words.len() > raw_words.len() + CLEANUP_SHORT_RAW_WORD_ALLOWANCE
+    {
+        return Some("expansion_short_raw");
+    }
+    if raw_words.len() >= 6 && ratio < CLEANUP_MIN_LENGTH_RATIO {
+        return Some("shrink_ratio");
+    }
+
+    let raw_set: HashSet<&str> = raw_words.iter().map(String::as_str).collect();
+    let contained = clean_words
+        .iter()
+        .filter(|word| raw_set.contains(word.as_str()))
+        .count();
+    let containment = contained as f64 / clean_words.len() as f64;
+    let trigram = trigram_similarity(raw, cleaned);
+    // Reject only when both signals diverge: cleanup legitimately rewrites number
+    // words and punctuation, which hurts each measure on its own.
+    if containment < CLEANUP_MIN_CONTAINMENT && trigram < CLEANUP_MIN_TRIGRAM_SIMILARITY {
+        return Some("content_divergence");
+    }
+    None
+}
+
+fn starts_with_answer_preamble(text: &str) -> bool {
+    Regex::new(
+        r"(?i)^\s*(sure|okay|certainly|of course|great question|here'?s|here is|i can'?t|i cannot|as an ai|i'?m sorry|i'?m an ai)\b",
+    )
+    .is_ok_and(|regex| regex.is_match(text))
+}
+
+fn normalize_for_comparison(text: &str) -> String {
+    let mut result = text.to_ascii_lowercase();
+    for (word, digit) in SPOKEN_NUMBERS {
+        if let Ok(regex) = Regex::new(&format!(r"\b{word}\b")) {
+            result = regex.replace_all(&result, digit).into_owned();
+        }
+    }
+    result
+}
+
+fn content_words(text: &str) -> Vec<String> {
+    normalize_for_comparison(text)
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "trigram counts of a single dictation, far below f64's mantissa"
+)]
+fn trigram_similarity(left: &str, right: &str) -> f64 {
+    let left_grams = trigrams(&normalize_for_comparison(left));
+    let right_grams = trigrams(&normalize_for_comparison(right));
+    if left_grams.is_empty() || right_grams.is_empty() {
+        return if left == right { 1.0 } else { 0.0 };
+    }
+    let intersection = left_grams.intersection(&right_grams).count();
+    intersection as f64 / left_grams.len().min(right_grams.len()) as f64
+}
+
+fn trigrams(text: &str) -> HashSet<String> {
+    let chars: Vec<char> = text.chars().filter(|c| !c.is_whitespace()).collect();
+    if chars.len() < 3 {
+        return if chars.is_empty() {
+            HashSet::new()
+        } else {
+            HashSet::from([chars.into_iter().collect::<String>()])
+        };
+    }
+    chars
+        .windows(3)
+        .map(|window| window.iter().collect::<String>())
+        .collect()
 }
 
 fn cleanup_profile(
@@ -6198,7 +6653,7 @@ mod tests {
         stable_streaming_best_is_ready_elapsed, streaming_batch_fallback_reason,
         streaming_preview_tail, streaming_provider_from_config, strip_reasoning_tags,
         stt_language_for_model, stt_model_config, telnyx_stream_query, transcript_log_value,
-        transcript_menu_preview, valid_deferred_cleanup, wav_bytes,
+        transcript_menu_preview, wav_bytes,
     };
     use std::collections::VecDeque;
     use std::path::PathBuf;
@@ -6780,15 +7235,297 @@ mod tests {
     }
 
     #[test]
+    fn trailing_capture_stops_after_a_quarter_second_of_quiet() {
+        let mut capture = super::TrailingCapture::new(0.008);
+        let step = std::time::Duration::from_millis(50);
+        assert_eq!(
+            capture.observe(0.02, step),
+            super::TrailingDecision::KeepListening
+        );
+        for _ in 0..4 {
+            assert_eq!(
+                capture.observe(0.001, step),
+                super::TrailingDecision::KeepListening
+            );
+        }
+        assert_eq!(
+            capture.observe(0.001, step),
+            super::TrailingDecision::Stop("quiet")
+        );
+    }
+
+    #[test]
+    fn trailing_capture_resets_the_quiet_timer_when_speech_returns() {
+        let mut capture = super::TrailingCapture::new(0.008);
+        let step = std::time::Duration::from_millis(100);
+        assert_eq!(
+            capture.observe(0.001, step),
+            super::TrailingDecision::KeepListening
+        );
+        assert_eq!(
+            capture.observe(0.001, step),
+            super::TrailingDecision::KeepListening
+        );
+        // Speech resumes: the two quiet chunks must not carry over.
+        assert_eq!(
+            capture.observe(0.05, step),
+            super::TrailingDecision::KeepListening
+        );
+        assert_eq!(
+            capture.observe(0.001, step),
+            super::TrailingDecision::KeepListening
+        );
+        assert_eq!(
+            capture.observe(0.001, step),
+            super::TrailingDecision::KeepListening
+        );
+        assert_eq!(
+            capture.observe(0.001, step),
+            super::TrailingDecision::Stop("quiet")
+        );
+    }
+
+    #[test]
+    fn trailing_capture_gives_up_at_the_cap_in_a_room_that_never_settles() {
+        let mut capture = super::TrailingCapture::new(0.008);
+        let step = std::time::Duration::from_millis(100);
+        let mut decision = super::TrailingDecision::KeepListening;
+        for _ in 0..15 {
+            decision = capture.observe(0.05, step);
+        }
+        assert_eq!(decision, super::TrailingDecision::Stop("cap"));
+    }
+
+    #[test]
+    fn trailing_threshold_declines_when_the_room_drowns_every_possible_bar() {
+        // Measured 2026-08-27 with pink noise into a MacBook Pro mic: floor 0.0148
+        // against a 0.0576 peak. The old code fell back to the absolute 0.0019 bar,
+        // eight times below the room, so nothing read as quiet and the loop ran to
+        // its 1.5s cap on every dictation.
+        assert_eq!(super::trailing_stop_threshold(Some(0.014_798), 0.057_638), None);
+    }
+
+    #[test]
+    fn trailing_threshold_tracks_a_merely_noisy_room() {
+        // Same session, quieter moment: floor 0.00423, peak 0.0312. This one worked
+        // and must keep working: the bar sits just above the room and settles at 0ms.
+        let threshold = super::trailing_stop_threshold(Some(0.004_228), 0.031_196)
+            .unwrap_or_default();
+        assert!(
+            threshold > 0.004_228,
+            "bar {threshold} must sit above the room"
+        );
+        assert!(threshold <= super::TRAILING_RELATIVE_CAP);
+    }
+
+    #[test]
+    fn trailing_threshold_separates_a_finished_dictation_from_a_mid_word_cut() {
+        // Measured on an M-series built-in mic, 2026-08-26. Four dictations that
+        // ran to completion released at 0.00033-0.00045; one deliberately cut off
+        // mid-word released at 0.00215. Room floor 0.0004, speech peak 0.035.
+        // The threshold has to land between those two clusters or the loop either
+        // never fires or never stops.
+        let threshold = super::trailing_stop_threshold(Some(0.0004), 0.035).unwrap_or_default();
+        for finished in [0.000_33_f32, 0.000_34, 0.000_40, 0.000_45] {
+            assert!(
+                finished < threshold,
+                "{finished} should read as finished, threshold {threshold}"
+            );
+        }
+        assert!(
+            0.002_15_f32 >= threshold,
+            "a mid-word release must clear the threshold {threshold}"
+        );
+    }
+
+    #[test]
+    fn trailing_threshold_falls_back_to_absolute_without_a_usable_floor() {
+        assert!(
+            (super::trailing_stop_threshold(None, 0.2).unwrap_or_default()
+                - super::TRAILING_SPEECH_RMS_THRESHOLD)
+                .abs()
+                < f32::EPSILON
+        );
+    }
+
+    #[test]
+    fn trailing_threshold_rises_with_a_noisy_room() {
+        // Room floor 0.01, speech peaking at 0.2: 20x headroom, well past the
+        // trust threshold, so the bar moves up to floor x margin.
+        let threshold = super::trailing_stop_threshold(Some(0.01), 0.2).unwrap_or_default();
+        assert!(threshold > super::TRAILING_SPEECH_RMS_THRESHOLD);
+        assert!(threshold <= super::TRAILING_RELATIVE_CAP);
+    }
+
+    #[test]
+    fn trailing_threshold_never_drops_below_the_absolute_bar() {
+        // A very quiet room must not make the bar so low that hiss reads as speech.
+        let threshold = super::trailing_stop_threshold(Some(0.0001), 0.2).unwrap_or_default();
+        assert!(threshold >= super::TRAILING_SPEECH_RMS_THRESHOLD);
+    }
+
+    #[test]
+    fn trailing_threshold_ignores_a_floor_that_is_close_to_the_speech() {
+        // Peak only 2x the floor: the room is not clearly quieter than the talker,
+        // so the floor may be speech and is not a trustworthy bar. The absolute bar
+        // is no use either at 0.0019 against a 0.01 floor, so decline and let the
+        // caller fall back to the fixed drain.
+        assert_eq!(super::trailing_stop_threshold(Some(0.01), 0.02), None);
+    }
+
+    #[test]
+    fn trailing_threshold_prefers_the_absolute_bar_when_it_clears_an_untrusted_floor() {
+        // Same distrust, but a quiet room: 0.0019 sits above a 0.0005 floor, so it
+        // is still a usable bar and trailing capture stays available.
+        let threshold = super::trailing_stop_threshold(Some(0.0005), 0.001).unwrap_or_default();
+        assert!(
+            (threshold - super::TRAILING_SPEECH_RMS_THRESHOLD).abs() < f32::EPSILON,
+            "expected the absolute threshold, got {threshold}"
+        );
+    }
+
+    #[test]
+    fn noise_floor_needs_enough_frames_to_mean_anything() {
+        let short = vec![0.01_f32; super::NOISE_FLOOR_MIN_FRAMES - 1];
+        assert!(super::noise_floor_rms(&short).is_none());
+        let long = vec![0.01_f32; super::NOISE_FLOOR_MIN_FRAMES];
+        assert!(super::noise_floor_rms(&long).is_some());
+    }
+
+    #[test]
+    fn noise_floor_ignores_the_loud_majority_of_a_session() {
+        // 80 loud frames, 20 quiet ones (the gaps between words): the floor must
+        // track the room, not the speech that dominates the session.
+        let mut series = vec![0.002_f32; 20];
+        series.extend(vec![0.2_f32; 80]);
+        let floor = super::noise_floor_rms(&series).unwrap_or_default();
+        assert!(floor < 0.01, "floor tracked the speech instead: {floor}");
+    }
+
+    #[test]
+    fn frame_rms_series_frames_at_the_declared_width() {
+        // 16 kHz at 20 ms frames is 320 samples per frame.
+        let samples = vec![0_i16; 3_200];
+        assert_eq!(super::frame_rms_series(&samples, 16_000).len(), 10);
+        assert!(super::frame_rms_series(&[], 16_000).is_empty());
+        assert!(super::frame_rms_series(&samples, 0).is_empty());
+    }
+
+    #[test]
     fn rejects_bad_deferred_cleanup_outputs() {
-        assert!(!valid_deferred_cleanup(
-            "This is a longer dictated sentence that should not become one letter.",
-            "I"
-        ));
-        assert!(valid_deferred_cleanup(
-            "This is a longer dictated sentence that needs cleanup.",
-            "This is a longer dictated sentence that needs cleanup."
-        ));
+        assert_eq!(
+            super::cleanup_rejection_reason(
+                "This is a longer dictated sentence that should not become one letter.",
+                "I"
+            ),
+            Some("shrink_ratio")
+        );
+        assert_eq!(
+            super::cleanup_rejection_reason(
+                "This is a longer dictated sentence that needs cleanup.",
+                "This is a longer dictated sentence that needs cleanup."
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn rejects_cleanup_that_answers_the_dictation() {
+        assert_eq!(
+            super::cleanup_rejection_reason(
+                "what is the capital of france",
+                "Sure! The capital of France is Paris."
+            ),
+            Some("answer_pattern")
+        );
+    }
+
+    #[test]
+    fn keeps_cleanup_that_preserves_the_speakers_own_opener() {
+        // The dogfood bug jot documents: a dictation that genuinely starts with
+        // "Okay" must not be rejected for keeping its own first word.
+        assert_eq!(
+            super::cleanup_rejection_reason(
+                "okay so lets ship the release notes today",
+                "Okay, so let's ship the release notes today."
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn rejects_cleanup_that_talks_about_itself() {
+        assert_eq!(
+            super::cleanup_rejection_reason(
+                "send the invoice over when you get a chance please",
+                "I am unable to send invoices, as an AI language model."
+            ),
+            Some("ai_selfreference")
+        );
+    }
+
+    #[test]
+    fn rejects_hallucinated_expansion() {
+        assert_eq!(
+            super::cleanup_rejection_reason(
+                "ship it",
+                "Ship it. I have reviewed the deployment plan and everything looks ready to go."
+            ),
+            Some("expansion_short_raw")
+        );
+    }
+
+    #[test]
+    fn rejects_paraphrase_that_drops_the_content() {
+        assert_eq!(
+            super::cleanup_rejection_reason(
+                "book the flight to bangalore for tuesday morning and email the itinerary",
+                "Kindly arrange southbound travel arrangements plus written confirmation thereof."
+            ),
+            Some("content_divergence")
+        );
+    }
+
+    #[test]
+    fn accepts_spoken_numbers_rewritten_as_digits() {
+        assert_eq!(
+            super::cleanup_rejection_reason(
+                "move the meeting to three pm on the twenty first",
+                "Move the meeting to 3 PM on the 21st."
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn accepts_self_correction_collapsing_the_transcript() {
+        assert_eq!(
+            super::cleanup_rejection_reason(
+                "lets meet at one pm actually no make it two pm",
+                "Let's meet at 2 PM."
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn strips_model_packaging_without_touching_the_text() {
+        assert_eq!(
+            super::strip_cleanup_artifacts("\nShip the release notes.\n"),
+            "Ship the release notes."
+        );
+        assert_eq!(
+            super::strip_cleanup_artifacts("Transcript: Ship the release notes."),
+            "Ship the release notes."
+        );
+        assert_eq!(
+            super::strip_cleanup_artifacts("\"Ship the release notes.\""),
+            "Ship the release notes."
+        );
+        assert_eq!(
+            super::strip_cleanup_artifacts("Ship the \"release notes\" today."),
+            "Ship the \"release notes\" today."
+        );
     }
 
     #[test]
