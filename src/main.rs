@@ -104,6 +104,11 @@ const STREAMING_DRAIN_MAX: Duration = Duration::from_millis(2_500);
 const STREAMING_BATCH_VERIFY_TIMEOUT: Duration = Duration::from_secs(2);
 const STREAMING_SAMPLE_RATE: u32 = 48_000;
 const STT_REQUEST_TIMEOUT: Duration = Duration::from_secs(12);
+/// How many failed dictations keep their audio on disk before the oldest is dropped.
+const FAILED_AUDIO_KEEP: usize = 5;
+/// Share of the request budget an attempt must burn before a retry is judged
+/// pointless. Below this the request failed fast and is worth one more try.
+const RETRY_BUDGET_SHARE: f32 = 0.9;
 const UPDATE_RESTART_EXIT_CODE: i32 = 42;
 const POST_INSERT_EDIT_MAX: Duration = Duration::from_secs(15);
 const POST_INSERT_OVERLAY_HOLD: Duration = Duration::from_millis(300);
@@ -1679,9 +1684,16 @@ impl App {
                 }
             }
         } else {
-            self.transcribe(&wav, &recording.warmup)?
+            match self.transcribe(&wav, &recording.warmup) {
+                Ok(transcript) => transcript,
+                Err(error) => {
+                    save_failed_audio(&wav);
+                    return Err(error);
+                }
+            }
         };
         if raw.trim().is_empty() {
+            save_failed_audio(&wav);
             return Err(AppError::Transcription(String::from(
                 "STT returned empty transcript",
             )));
@@ -1900,6 +1912,7 @@ impl App {
     fn transcribe(&self, wav: &[u8], warmup: &DictationWarmup) -> Result<String, AppError> {
         info!("sending batch transcription request");
         let request = self.stt_request_parts(warmup);
+        let attempt_started = Instant::now();
         match self.transcribe_with_model(
             wav,
             &request.primary_model,
@@ -1912,6 +1925,20 @@ impl App {
             Err(AppError::RateLimited) => {
                 warn!("primary STT model rate limited; trying fallback chain");
                 self.transcribe_with_fallbacks(wav, request.prompt.as_deref())
+            }
+            // A retry only helps a request that failed fast. One that already spent
+            // the whole budget will spend it again, and the overlay sits on
+            // "Thinking" for both. Judge that by the clock, not by the error: a
+            // stall while the multipart body is still uploading arrives as a body
+            // error, not a timeout, so `is_timeout()` misses it. Measured
+            // 2026-09-01 during a DNS outage: two 12s attempts back to back, 27s of
+            // frozen overlay, same empty transcript.
+            Err(AppError::Http(error)) if exhausted_request_budget(attempt_started.elapsed()) => {
+                warn!(
+                    "primary STT request used its full {}s budget; not retrying: {error}",
+                    STT_REQUEST_TIMEOUT.as_secs()
+                );
+                Err(AppError::Http(error))
             }
             Err(AppError::Http(error)) => {
                 warn!("primary STT request failed; retrying once after delay: {error}");
@@ -6214,10 +6241,6 @@ fn load_env_value(name: &'static str) -> Option<String> {
     if let Some(value) = read_key_value_file(&env_file, name) {
         return Some(value);
     }
-    let codex_env_file = home_path(".codex/.env");
-    if let Some(value) = read_key_value_file(&codex_env_file, name) {
-        return Some(value);
-    }
     read_shell_export(&home_path(".zshrc"), name)
 }
 
@@ -6582,6 +6605,62 @@ fn play_sound(name: &str) {
             Err(error) => warn!("sound status failed: {error}"),
         },
         Err(error) => warn!("sound failed: {error}"),
+    }
+}
+
+/// Did an attempt spend effectively all of its time budget? Anything at or above
+/// this share of `STT_REQUEST_TIMEOUT` was killed by the clock rather than by a
+/// fast server-side failure, so a retry buys another full wait and nothing else.
+fn exhausted_request_budget(elapsed: Duration) -> bool {
+    elapsed >= STT_REQUEST_TIMEOUT.mul_f32(RETRY_BUDGET_SHARE)
+}
+
+/// Hold on to audio that STT could not turn into text. A dictation costs the
+/// speaker real time, and dropping the recording on a transient network failure
+/// makes that time unrecoverable. Best effort: a failure to save is logged and
+/// never masks the transcription error that got us here.
+fn save_failed_audio(wav: &[u8]) {
+    let dir = home_path(".bolo/failed-audio");
+    if let Err(error) = fs::create_dir_all(&dir) {
+        warn!("[stt] failed_audio_dir_error {error}");
+        return;
+    }
+    let path = dir.join(format!("{}.wav", unix_time_ms()));
+    if let Err(error) = fs::write(&path, wav) {
+        warn!("[stt] failed_audio_write_error {error}");
+        return;
+    }
+    info!(
+        "[stt] failed_audio_saved {}",
+        serde_json::json!({
+            "path": path.display().to_string(),
+            "bytes": wav.len(),
+        })
+    );
+    prune_failed_audio(&dir, FAILED_AUDIO_KEEP);
+}
+
+/// Keep only the newest `keep` recordings so the directory cannot grow without
+/// bound during a sustained outage.
+fn prune_failed_audio(dir: &Path, keep: usize) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let mut wavs: Vec<PathBuf> = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "wav"))
+        .collect();
+    if wavs.len() <= keep {
+        return;
+    }
+    // Names are millisecond stamps, so lexical order is chronological order.
+    wavs.sort();
+    let drop_count = wavs.len() - keep;
+    for path in wavs.into_iter().take(drop_count) {
+        if let Err(error) = fs::remove_file(&path) {
+            warn!("[stt] failed_audio_prune_error {error}");
+        }
     }
 }
 
@@ -8066,5 +8145,62 @@ mod tests {
         assert_eq!(&wav[8..12], b"WAVE");
         assert_eq!(&wav[36..40], b"data");
         assert_eq!(wav.len(), 50);
+    }
+
+    #[test]
+    fn pruning_failed_audio_keeps_the_newest_recordings() {
+        let dir = env::temp_dir().join(format!("bolo-prune-{}", super::unix_time_ms()));
+        assert!(fs::create_dir_all(&dir).is_ok());
+        // Names are millisecond stamps, written oldest first.
+        for stamp in ["100", "200", "300", "400"] {
+            assert!(fs::write(dir.join(format!("{stamp}.wav")), b"x").is_ok());
+        }
+        assert!(fs::write(dir.join("notes.txt"), b"x").is_ok());
+
+        super::prune_failed_audio(&dir, 2);
+
+        assert!(!dir.join("100.wav").exists());
+        assert!(!dir.join("200.wav").exists());
+        assert!(dir.join("300.wav").exists());
+        assert!(dir.join("400.wav").exists());
+        // Anything that is not a recording is left alone.
+        assert!(dir.join("notes.txt").exists());
+        drop(fs::remove_dir_all(&dir));
+    }
+
+    #[test]
+    fn pruning_failed_audio_leaves_a_short_directory_alone() {
+        let dir = env::temp_dir().join(format!("bolo-prune-short-{}", super::unix_time_ms()));
+        assert!(fs::create_dir_all(&dir).is_ok());
+        assert!(fs::write(dir.join("100.wav"), b"x").is_ok());
+
+        super::prune_failed_audio(&dir, 5);
+
+        assert!(dir.join("100.wav").exists());
+        drop(fs::remove_dir_all(&dir));
+    }
+
+    #[test]
+    fn a_full_budget_attempt_is_not_retried() {
+        // The real STT call is a multipart upload, and a stall part-way through the
+        // body arrives as a body error rather than a timeout. The first version of
+        // this guard tested `is_timeout()` and let two 12s attempts through on
+        // 2026-09-01. Judge by the clock so the error taxonomy cannot matter.
+        assert!(super::exhausted_request_budget(super::STT_REQUEST_TIMEOUT));
+        assert!(super::exhausted_request_budget(
+            super::STT_REQUEST_TIMEOUT + std::time::Duration::from_millis(1)
+        ));
+    }
+
+    #[test]
+    fn a_fast_failure_still_gets_its_retry() {
+        // A refused connection or a 5xx comes back in milliseconds. That is the
+        // case the retry exists for and it must survive.
+        assert!(!super::exhausted_request_budget(
+            std::time::Duration::from_millis(40)
+        ));
+        assert!(!super::exhausted_request_budget(
+            super::STT_REQUEST_TIMEOUT / 2
+        ));
     }
 }
