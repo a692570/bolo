@@ -8196,7 +8196,9 @@ mod tests {
     fn a_fast_failure_still_gets_its_retry() {
         // A refused connection or a 5xx comes back in milliseconds. That is the
         // case the retry exists for and it must survive.
-        assert!(!super::exhausted_request_budget(std::time::Duration::from_millis(40)));
+        assert!(!super::exhausted_request_budget(
+            std::time::Duration::from_millis(40)
+        ));
         assert!(!super::exhausted_request_budget(
             super::STT_REQUEST_TIMEOUT / 2
         ));
