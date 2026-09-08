@@ -4480,9 +4480,7 @@ struct TrailingCaptureReport {
 /// latency at all. If it was still hot, keep listening until
 /// `TRAILING_QUIET_TO_STOP` of quiet or `TRAILING_CAPTURE_CAP`, whichever lands
 /// first.
-fn capture_trailing_audio(
-    recording: &ActiveRecording,
-) -> Result<TrailingCaptureReport, AppError> {
+fn capture_trailing_audio(recording: &ActiveRecording) -> Result<TrailingCaptureReport, AppError> {
     std::thread::sleep(AUDIO_RELEASE_DRAIN);
     let sample_rate = recording.sample_rate;
     let release_window = frame_len_for(sample_rate).saturating_mul(6);
@@ -4544,9 +4542,9 @@ fn capture_trailing_audio(
         // buffer deliveries is not silence, it is nothing, and counting it as quiet
         // would cut the tail short on a device with a long buffer.
         for frame in chunk.chunks(frame_len) {
-            let span = Duration::from_secs_f64(f64::from(
-                u32::try_from(frame.len()).unwrap_or(u32::MAX),
-            ) / f64::from(sample_rate));
+            let span = Duration::from_secs_f64(
+                f64::from(u32::try_from(frame.len()).unwrap_or(u32::MAX)) / f64::from(sample_rate),
+            );
             if let TrailingDecision::Stop(reason) = capture.observe(frame_rms(frame), span) {
                 report.stop_reason = reason;
                 report.extra = started.elapsed();
@@ -7681,15 +7679,18 @@ mod tests {
         // against a 0.0576 peak. The old code fell back to the absolute 0.0019 bar,
         // eight times below the room, so nothing read as quiet and the loop ran to
         // its 1.5s cap on every dictation.
-        assert_eq!(super::trailing_stop_threshold(Some(0.014_798), 0.057_638), None);
+        assert_eq!(
+            super::trailing_stop_threshold(Some(0.014_798), 0.057_638),
+            None
+        );
     }
 
     #[test]
     fn trailing_threshold_tracks_a_merely_noisy_room() {
         // Same session, quieter moment: floor 0.00423, peak 0.0312. This one worked
         // and must keep working: the bar sits just above the room and settles at 0ms.
-        let threshold = super::trailing_stop_threshold(Some(0.004_228), 0.031_196)
-            .unwrap_or_default();
+        let threshold =
+            super::trailing_stop_threshold(Some(0.004_228), 0.031_196).unwrap_or_default();
         assert!(
             threshold > 0.004_228,
             "bar {threshold} must sit above the room"
