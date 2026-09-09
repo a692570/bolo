@@ -3,199 +3,383 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Bolo — Open source dictation for macOS</title>
-    <meta name="description" content="Bolo is an open source push-to-talk dictation app for macOS, powered by Telnyx AI.">
-    <meta property="og:title" content="Bolo — Open source dictation for macOS">
-    <meta property="og:description" content="Hold a key. Speak. Text appears. Free, private, no subscription.">
+    <title>Bolo — Hold a key. Speak. Text appears.</title>
+    <meta name="description" content="Bolo is open source push-to-talk dictation for macOS. Hold a key, talk, release: clean text lands in any app. No always-on microphone, no subscription, bring your own Telnyx key.">
+    <meta property="og:title" content="Bolo — Hold a key. Speak. Text appears.">
+    <meta property="og:description" content="Push-to-talk dictation for macOS. Voice transforms, self-correction collapse, per-app cleanup styles. Free and open source.">
     <meta property="og:type" content="website">
     <meta property="og:image" content="assets/bolo-icon.png">
     <link rel="icon" href="assets/icon-idle.png">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,300..800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="styles.css">
   </head>
   <body>
     <header class="site-header">
       <a class="brand" href="#top" aria-label="Bolo home">
-        <img src="assets/icon-idle.png" width="32" height="32" alt="">
+        <img src="assets/icon-idle.png" width="28" height="28" alt="">
         <span>Bolo</span>
       </a>
-      <nav class="nav-links">
-        <a href="#how-it-works">How it works</a>
+      <nav class="nav-links" aria-label="Site">
+        <a href="#flow">How it works</a>
+        <a href="#commands">Voice commands</a>
         <a href="#install">Install</a>
         <a href="https://github.com/a692570/bolo">GitHub</a>
       </nav>
     </header>
 
     <main id="top">
+
+      <!-- ============ HERO: the voice instrument ============ -->
       <section class="hero" aria-labelledby="hero-title">
-        <canvas class="voice-field" aria-hidden="true"></canvas>
+        <canvas id="voiceField" aria-hidden="true"></canvas>
+        <canvas id="voiceField2d" aria-hidden="true"></canvas>
+        <p class="hero-side" aria-hidden="true">Push-to-talk &middot; Rust &middot; MIT</p>
         <div class="hero-inner">
-          <div class="hero-copy">
-            <p class="eyebrow">Open source voice dictation</p>
-            <h1 id="hero-title">Speak.<br>Text appears.</h1>
-            <p class="hero-subtitle">
-              Hold a key, talk, release. Your words land in any app.
-              Works with every keyboard. No subscription.
+          <p class="eyebrow reveal">Free, open source dictation for macOS</p>
+          <h1 id="hero-title">
+            <span class="reveal">Hold a key.</span>
+            <span class="reveal">Speak.</span>
+            <span class="reveal hero-accent">Text appears.</span>
+          </h1>
+          <p class="hero-sub reveal">
+            Bolo turns your voice into clean text in the app you are already
+            using. It listens only while you hold the key, cleans up as it
+            goes, and lands the words at your cursor.
+          </p>
+
+          <div class="instrument reveal" role="group" aria-label="Try the Bolo flow: press and hold the key, release to land text">
+            <div class="instrument-left">
+              <button class="keycap" id="holdKey" type="button" aria-pressed="false">
+                <svg class="keycap-glyph" width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 8h5l7 9h4"/></svg>
+                <span class="keycap-label">Right Option</span>
+              </button>
+              <p class="key-hint">press and hold &middot; or hold <kbd>space</kbd></p>
+            </div>
+            <div class="instrument-right">
+              <div class="status-chip" id="statusChip" data-state="ready">
+                <span class="status-dot" aria-hidden="true"></span>
+                <span id="statusText">Ready</span>
+              </div>
+              <div class="transcript-line" id="transcriptLine" aria-live="polite">
+                <span class="transcript-placeholder">Your sentence shows up here, cleaned up.</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="hero-actions reveal">
+            <a class="button button-primary" href="#install">Install Bolo</a>
+            <a class="button button-secondary" href="https://github.com/a692570/bolo">View source</a>
+          </div>
+        </div>
+      </section>
+
+      <section class="proof-section" aria-label="Measured performance">
+        <dl class="proof-strip reveal">
+          <div>
+            <dt>average startup</dt>
+            <dd>188&nbsp;ms</dd>
+          </div>
+          <div>
+            <dt>fastest release-to-paste</dt>
+            <dd>715&nbsp;ms</dd>
+          </div>
+          <div>
+            <dt>keyboard</dt>
+            <dd>any hotkey you like</dd>
+          </div>
+        </dl>
+      </section>
+
+      <!-- ============ FLOW: the product's three gestures ============ -->
+      <section class="section flow-section" id="flow" aria-labelledby="flow-title">
+        <div class="section-head">
+          <p class="eyebrow">The whole product is three gestures</p>
+          <h2 id="flow-title">Nothing listens before the hold. Nothing survives the release.</h2>
+        </div>
+        <ol class="flow-steps">
+          <li class="flow-step reveal">
+            <span class="step-no" aria-hidden="true">01</span>
+            <div class="step-visual key-visual" aria-hidden="true">
+              <span class="mini-key"><i></i></span>
+            </div>
+            <h3>Hold</h3>
+            <p>The microphone opens the instant you press and closes the instant you release. Nothing before, nothing after, nothing saved.</p>
+          </li>
+          <li class="flow-step reveal">
+            <span class="step-no" aria-hidden="true">02</span>
+            <div class="step-visual bars-visual" aria-hidden="true">
+              <span class="mini-bars"><i></i><i></i><i></i><i></i><i></i><i></i><i></i></span>
+            </div>
+            <h3>Speak</h3>
+            <p>Talk the way you actually talk. Rambles, fillers, wrong dates you correct mid-sentence. Bolo keeps up with streaming transcription.</p>
+          </li>
+          <li class="flow-step reveal">
+            <span class="step-no" aria-hidden="true">03</span>
+            <div class="step-visual text-visual" aria-hidden="true">
+              <span class="mini-text">Let&rsquo;s move the sync to October&nbsp;15th.</span>
+            </div>
+            <h3>Release</h3>
+            <p>Fillers drop, self-corrections collapse, punctuation lands. Clean text pastes at your cursor and your clipboard is restored.</p>
+          </li>
+        </ol>
+      </section>
+
+      <!-- ============ FEATURES: asymmetric ledger, no card grid ============ -->
+      <section class="section" id="features" aria-labelledby="features-title">
+        <div class="section-head">
+          <p class="eyebrow">What&rsquo;s inside</p>
+          <h2 id="features-title">Dictation is easy. Cleanup is the product.</h2>
+        </div>
+        <ul class="feature-ledger">
+          <li class="reveal">
+            <h3>Voice transforms</h3>
+            <p>Select any text and say <em>&ldquo;Bolo, rewrite that: make it formal&rdquo;</em> or <em>&ldquo;Bolo, polish that&rdquo;</em> to rewrite in place. No dialog, no switching windows.</p>
+          </li>
+          <li class="reveal">
+            <h3>Self-correction collapse</h3>
+            <p>Say the wrong date, catch yourself, keep talking. <em>&ldquo;September 15th&hellip; actually, October&rdquo;</em> cleans down to October. It knows the difference between a correction and new information.</p>
+          </li>
+          <li class="reveal">
+            <h3>Vocabulary aliases</h3>
+            <p>Teach Bolo your recurring names once. <code>cloud</code> becomes <code>Claude</code> before the model ever sees it, and the terms you correct most get priority in transcription.</p>
+          </li>
+          <li class="reveal">
+            <h3>Per-app cleanup styles</h3>
+            <p>Email gets structure. Chat stays casual. Bind a cleanup style to Slack, Mail, Notes, or any app from the menu bar.</p>
+          </li>
+          <li class="reveal">
+            <h3>Any hotkey</h3>
+            <p>Right Option, Right Control, Right Shift, Fn, F1&ndash;F19, Caps Lock. Bind a second key to re-paste your last transcript.</p>
+          </li>
+          <li class="reveal">
+            <h3>Local history, clipboard intact</h3>
+            <p>Recent dictations stay on your Mac and are one menu-bar click away. Bolo snapshots your clipboard before pasting, then puts it back.</p>
+          </li>
+        </ul>
+      </section>
+
+      <!-- ============ COMMANDS: what you can say ============ -->
+      <section class="section commands-section" id="commands" aria-labelledby="commands-title">
+        <div class="section-head">
+          <p class="eyebrow">Voice commands</p>
+          <h2 id="commands-title">Say this. Get that.</h2>
+        </div>
+        <table class="command-table">
+          <thead>
+            <tr><th scope="col">Say</th><th scope="col">Bolo does</th></tr>
+          </thead>
+          <tbody>
+            <tr class="reveal">
+              <td><code>scratch that</code></td>
+              <td>Deletes what you just dictated.</td>
+            </tr>
+            <tr class="reveal">
+              <td><code>actually &lt;replacement&gt;</code></td>
+              <td>Corrects what you just said, in place.</td>
+            </tr>
+            <tr class="reveal">
+              <td><code>Bolo, polish that</code></td>
+              <td>Rewrites the last dictation, cleaned up.</td>
+            </tr>
+            <tr class="reveal">
+              <td><code>Bolo, prompt that</code></td>
+              <td>Rewrites the last dictation as a prompt.</td>
+            </tr>
+            <tr class="reveal">
+              <td><code>Bolo, rewrite that &lt;instruction&gt;</code></td>
+              <td>Rewrites any selected text with your instruction.</td>
+            </tr>
+            <tr class="reveal">
+              <td><code>paste-last hotkey</code></td>
+              <td>Re-pastes your most recent transcript.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============ UNDER THE HOOD ============ -->
+      <section class="section hood-section" id="hood" aria-labelledby="hood-title">
+        <div class="section-head">
+          <p class="eyebrow">Under the hood</p>
+          <h2 id="hood-title">A small Rust runtime and boring, reliable infrastructure.</h2>
+        </div>
+        <div class="hood-grid">
+          <div class="hood-item reveal"><span>Runtime</span><strong>Rust 1.88+</strong></div>
+          <div class="hood-item reveal"><span>Hotkeys</span><strong>Native AppKit listener</strong></div>
+          <div class="hood-item reveal"><span>Transcription</span><strong>Telnyx AI, Nova 3 streaming</strong></div>
+          <div class="hood-item reveal"><span>Cleanup</span><strong>Deferred LLM, never blocks paste</strong></div>
+          <div class="hood-item reveal"><span>Resilience</span><strong>Retry, 16&nbsp;kHz fallback, fast stream fail</strong></div>
+          <div class="hood-item reveal"><span>Logs</span><strong>Readable, redacted, in /tmp/bolo.log</strong></div>
+        </div>
+      </section>
+
+      <!-- ============ INSTALL ============ -->
+      <section class="section install-section" id="install" aria-labelledby="install-title">
+        <div class="install-grid">
+          <div class="install-copy">
+            <p class="eyebrow">Install</p>
+            <h2 id="install-title">Two minutes, one script.</h2>
+            <p class="install-reqs">macOS 12+ &middot; Rust &middot; Python 3 &middot; your Telnyx API key</p>
+            <p class="install-note">
+              The script builds the binary, walks you through the hotkey picker,
+              and registers Bolo as a login item. Grant Microphone and
+              Accessibility when macOS asks. That&rsquo;s the whole setup.
             </p>
-            <div class="hero-actions">
-              <a class="button button-primary" href="#install">Install Bolo</a>
-              <a class="button button-secondary" href="https://github.com/a692570/bolo">View source</a>
-            </div>
           </div>
-
-          <div class="product-scene" aria-label="Bolo dictation preview">
-            <div class="mac-bar">
-              <span class="traffic traffic-red"></span>
-              <span class="traffic traffic-yellow"></span>
-              <span class="traffic traffic-green"></span>
-              <span class="mac-title">Notes</span>
-              <span class="menu-pill">
-                <img src="assets/icon-recording.png" width="22" height="22" alt="">
-                Bolo
-              </span>
-            </div>
-            <div class="editor-surface">
-              <div class="document-label">Voice draft</div>
-              <p class="dictation-text" id="dictationText">
-                Bolo turns short spoken thoughts into clean text in the app you are already using.
-              </p>
-              <span class="cursor" aria-hidden="true"></span>
-            </div>
-            <div class="hud" id="hud">
-              <span class="live-dot" aria-hidden="true"></span>
-              <span id="hudText">Dictating</span>
-              <span class="hud-bars" aria-hidden="true">
-                <i></i><i></i><i></i><i></i><i></i>
-              </span>
-            </div>
-            <button class="demo-button" id="demoButton" type="button">
-              Try the flow
-            </button>
-          </div>
-        </div>
-      </section>
-
-      <section class="proof-strip" aria-label="Key facts">
-        <div>
-          <strong>188 ms</strong>
-          <span>average startup</span>
-        </div>
-        <div>
-          <strong>715 ms</strong>
-          <span>fastest release-to-paste</span>
-        </div>
-        <div>
-          <strong>Any keyboard</strong>
-          <span>Right Option, F19, Caps Lock, or pick your own</span>
-        </div>
-      </section>
-
-      <section class="section" id="how-it-works">
-        <div class="section-grid">
-          <div class="section-copy">
-            <p class="eyebrow">How it works</p>
-            <h2>Fast local control, cloud transcription.</h2>
-            <p>
-              Bolo runs as a menu bar app. It records only while your
-              hotkey is held, sends audio to Telnyx AI for transcription, then
-              discards it. A small local transcript history stays on your Mac so
-              you can recover recent dictations from the menu bar.
-            </p>
-          </div>
-          <div class="feature-stack">
-            <article class="feature-card">
-              <div class="feature-icon">
-                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="22"/></svg>
-              </div>
-              <div>
-                <h3>No always-on microphone</h3>
-                <p>Audio captured only while your hotkey is held. Nothing before, nothing after.</p>
-              </div>
-            </article>
-            <article class="feature-card">
-              <div class="feature-icon">
-                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="M6 8h.01"/><path d="M10 8h.01"/><path d="M14 8h.01"/><path d="M18 8h.01"/><path d="M6 12h.01"/><path d="M10 12h.01"/><path d="M14 12h.01"/><path d="M18 12h.01"/><path d="M6 16h12"/></svg>
-              </div>
-              <div>
-                <h3>Any keyboard, any key</h3>
-                <p>Right Option on MacBooks, Right Control on external keyboards, F19 on mechanical boards, or pick your own.</p>
-              </div>
-            </article>
-            <article class="feature-card">
-              <div class="feature-icon">
-                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
-              </div>
-              <div>
-                <h3>Recover recent dictations</h3>
-                <p>Text lands at your cursor, and recent transcripts stay available from the menu bar when you need to copy one again.</p>
-              </div>
-            </article>
-            <article class="feature-card">
-              <div class="feature-icon">
-                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
-              </div>
-              <div>
-                <h3>No subscription, no cloud storage</h3>
-                <p>Bring a Telnyx API key. Audio is transcribed and discarded. Transcript history is local and can be cleared from the menu bar.</p>
-              </div>
-            </article>
-          </div>
-        </div>
-      </section>
-
-      <section class="tech-section">
-        <div class="tech-inner">
-          <div class="tech-copy">
-            <p class="eyebrow">Under the hood</p>
-            <h3>Built for speed and transparency.</h3>
-            <p>Rust runtime, native AppKit hotkey listener, Telnyx AI transcription with Nova 3, optional LLM cleanup, and open logs you can actually read.</p>
-          </div>
-          <div class="tech-grid">
-            <div class="tech-item">
-              <span>Runtime</span>
-              <strong>Rust 1.88+</strong>
-            </div>
-            <div class="tech-item">
-              <span>Hotkey</span>
-              <strong>Configurable AppKit listener</strong>
-            </div>
-            <div class="tech-item">
-              <span>STT</span>
-              <strong>Telnyx AI, Nova 3</strong>
-            </div>
-            <div class="tech-item">
-              <span>Cleanup</span>
-              <strong>Local default, LLM optional</strong>
-            </div>
-          </div>
-        </div>
-      </section>
-
-      <section class="install-section" id="install">
-        <div class="install-copy">
-          <p class="eyebrow">Install</p>
-          <h2>Run Bolo on macOS.</h2>
-          <p>Requires macOS 12+, Rust, Python 3, and a Telnyx API key.</p>
-        </div>
-        <div class="terminal" aria-label="Install command">
-          <div class="terminal-top">
-            <span></span><span></span><span></span>
-          </div>
-          <pre><code>git clone https://github.com/a692570/bolo.git
+          <div class="install-terminal">
+            <div class="terminal-frame" aria-label="Install command">
+              <div class="terminal-top"><span></span><span></span><span></span></div>
+              <pre><code>git clone https://github.com/a692570/bolo.git
 cd bolo
 ./install.sh</code></pre>
+            </div>
+            <details class="agent-block">
+              <summary>Or paste this into your coding agent</summary>
+              <pre><code>&ldquo;Install Bolo from github.com/a692570/bolo on my Mac.
+It needs Rust, Python 3, and a Telnyx API key.
+Run install.sh, then help me grant Microphone
+and Accessibility permissions.&rdquo;</code></pre>
+            </details>
+          </div>
         </div>
       </section>
     </main>
 
     <footer class="site-footer">
-      <span>Bolo is MIT licensed.</span>
+      <span class="footer-name"><em>Bolo</em> means &ldquo;speak&rdquo; in Hindi.</span>
+      <span class="footer-meta">MIT license &middot; v1.5.2</span>
       <a href="https://github.com/a692570/bolo">GitHub</a>
-      <a href="https://github.com/a692570/bolo/blob/main/README.md">README</a>
     </footer>
 
-    <script src="site.js"></script>
+    <script src="site.js" defer></script>
+    <script type="importmap">
+      { "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.164.1/build/three.module.js" } }
+    </script>
+    <script type="module">
+      // 3D voice field: a spectrum-bar floor that ripples toward the cursor,
+      // surges amber while the key is held, and pulses green on release.
+      // Skipped entirely on small screens, reduced motion, or missing WebGL.
+      const canvas = document.getElementById("voiceField");
+      const reduced = matchMedia("(prefers-reduced-motion: reduce)").matches;
+      const small = matchMedia("(max-width: 760px)").matches;
+      const hasWebGL = (() => { try { return !!document.createElement("canvas").getContext("webgl2") || !!document.createElement("canvas").getContext("webgl"); } catch { return false; } })();
+
+      if (canvas && !reduced && !small && hasWebGL) {
+        try {
+          const THREE = await import("three");
+          const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
+          renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+          const scene = new THREE.Scene();
+          const camera = new THREE.PerspectiveCamera(52, 1, 0.1, 100);
+          camera.position.set(0, 1.0, 12);
+          camera.lookAt(0, 1.1, -2);
+
+          const COLS = 84, ROWS = 16, GAP = 0.5;
+          const count = COLS * ROWS;
+          const geo = new THREE.BoxGeometry(0.09, 1, 0.09);
+          geo.translate(0, 0.5, 0);
+          const mat = new THREE.MeshBasicMaterial({ transparent: true, opacity: 0.92 });
+          const mesh = new THREE.InstancedMesh(geo, mat, count);
+          mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+          scene.add(mesh);
+
+          const colorDim = new THREE.Color("#1c2a23");
+          const colorIdle = new THREE.Color("#38614c");
+          const colorHi = new THREE.Color("#6fcb9c");
+          const colorAmber = new THREE.Color("#f0a53f");
+          const colorGreen = new THREE.Color("#06b66a");
+          const dummy = new THREE.Object3D();
+          const tmp = new THREE.Color();
+
+          let holding = 0, holdingTarget = 0, pulse = -1, pulseT = 0;
+          const pointer = { x: 999, z: 999, active: false };
+          const raycaster = new THREE.Raycaster();
+          const ground = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+          const ndc = new THREE.Vector2();
+
+          window.addEventListener("pointermove", (e) => {
+            ndc.set((e.clientX / innerWidth) * 2 - 1, -(e.clientY / innerHeight) * 2 + 1);
+            raycaster.setFromCamera(ndc, camera);
+            const hit = new THREE.Vector3();
+            if (raycaster.ray.intersectPlane(ground, hit)) { pointer.x = hit.x; pointer.z = hit.z; pointer.active = true; }
+          }, { passive: true });
+          // Poll the shared hold flag so event ordering can never strand the state
+          // (the ?demo hooks fire before this module registers listeners).
+          window.addEventListener("bolo-release", () => { pulse = 0; pulseT = 0; });
+
+          function resize() {
+            const w = canvas.clientWidth, h = canvas.clientHeight;
+            renderer.setSize(w, h, false);
+            camera.aspect = w / h; camera.updateProjectionMatrix();
+          }
+          resize(); addEventListener("resize", resize);
+
+          let visible = true, raf = null;
+          new IntersectionObserver(([en]) => { visible = en.isIntersecting; }, { threshold: 0.02 }).observe(canvas);
+          document.addEventListener("visibilitychange", () => { if (!document.hidden) { last = performance.now(); } });
+
+          let t = 0, last = performance.now(), frameErr = null;
+          function frame(now) {
+            raf = requestAnimationFrame(frame);
+            try {
+              const dt = Math.min((now - last) / 1000, 0.05); last = now;
+              if (!visible || document.hidden) return;
+              t += dt;
+            holdingTarget = window.__boloHolding ? 1 : 0;
+            holding += (holdingTarget - holding) * Math.min(1, dt * 5);
+            if (pulse >= 0) { pulseT += dt * 2.4; pulse = Math.max(0, 1 - pulseT); if (pulseT > 1.4) pulse = -1; }
+
+            let i = 0;
+            const halfW = (COLS - 1) * GAP / 2;
+            for (let r = 0; r < ROWS; r++) {
+              for (let c = 0; c < COLS; c++) {
+                const x = c * GAP - halfW;
+                const z = -r * GAP + 4.5;
+                const depth = 1 - r / ROWS; // far rows are dimmer
+                const wave = Math.sin(x * 0.55 + t * 1.1) * 0.5 + Math.sin(z * 0.8 - t * 0.7) * 0.5;
+                let hgt = 0.12 + (wave * 0.5 + 0.5) * 0.3 * (1 + holding * 2.2);
+                if (pointer.active) {
+                  const dx = x - pointer.x, dz = z - pointer.z;
+                  const d2 = dx * dx + dz * dz;
+                  hgt += Math.exp(-d2 * 0.5) * 0.45;
+                }
+                if (pulse >= 0) {
+                  const dx = x, dz = z;
+                  const d = Math.sqrt(dx * dx + dz * dz);
+                  const band = Math.exp(-((d - pulseT * 7) ** 2) * 0.35);
+                  hgt += band * 1.1 * pulse;
+                }
+                hgt = Math.min(hgt, 1.3);
+                dummy.position.set(x, -1.6, z);
+                dummy.scale.set(1, Math.max(0.03, hgt), 1);
+                dummy.updateMatrix();
+                mesh.setMatrixAt(i, dummy.matrix);
+                tmp.copy(colorDim).lerp(colorIdle, 0.15 + depth * 0.55);
+                tmp.lerp(colorHi, Math.min(0.3, hgt * 0.16));
+                if (holding > 0.01) tmp.lerp(colorAmber, Math.min(0.55, holding * (0.25 + hgt * 0.5)));
+                if (pulse >= 0) tmp.lerp(colorGreen, Math.min(1, pulse * (hgt * 1.2)));
+                mesh.setColorAt(i, tmp);
+                i++;
+              }
+            }
+            mesh.instanceMatrix.needsUpdate = true;
+              if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+              renderer.render(scene, camera);
+            } catch (err) {
+              frameErr = err && err.message;
+            }
+          }
+          raf = requestAnimationFrame(frame);
+          // Handshake: tell site.js the 3D field is live so the 2D fallback stands down.
+          window.__bolo3d = true;
+          if (window.__bolo3dStop) window.__bolo3dStop();
+        } catch (err) {
+          canvas.style.display = "none"; // graceful: the instrument still carries the hero
+          document.dispatchEvent(new CustomEvent("bolo-3d-failed"));
+        }
+      }
+    </script>
   </body>
 </html>
