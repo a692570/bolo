@@ -6,6 +6,7 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs::{self, File};
+use std::future::Future;
 use std::io::{BufRead, BufReader, ErrorKind, Write};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -101,9 +102,18 @@ const STREAMING_FINAL_RESULT_IDLE: Duration = Duration::from_millis(250);
 const STREAMING_STABLE_RESULT_MAX: Duration = Duration::from_millis(1_200);
 const STREAMING_STABLE_RESULT_IDLE: Duration = Duration::from_millis(250);
 const STREAMING_DRAIN_MAX: Duration = Duration::from_millis(2_500);
+/// Ceiling on the streaming WebSocket handshake, measured from press. During
+/// the 2026-09-09 gateway degradation the edge held dying handshakes open and
+/// answered with a 524 roughly two minutes later; the client-side deadline
+/// marks the session dead long before that so release never waits on it.
+const STREAMING_HANDSHAKE_DEADLINE: Duration = Duration::from_secs(3);
 const STREAMING_BATCH_VERIFY_TIMEOUT: Duration = Duration::from_secs(2);
 const STREAMING_SAMPLE_RATE: u32 = 48_000;
 const STT_REQUEST_TIMEOUT: Duration = Duration::from_secs(12);
+/// Sample rate of the payload-reduced batch retry. A 16 kHz re-encode passed
+/// live replay during the 2026-09-09 gateway incident while the captured
+/// 48 kHz WAV was rejected nondeterministically with 413.
+const STT_RETRY_SAMPLE_RATE: u32 = 16_000;
 /// How many failed dictations keep their audio on disk before the oldest is dropped.
 const FAILED_AUDIO_KEEP: usize = 5;
 /// Share of the request budget an attempt must burn before a retry is judged
@@ -142,6 +152,11 @@ enum AppError {
     RateLimited,
     #[error("transcription failed: {0}")]
     Transcription(String),
+    /// A non-success HTTP status from the STT endpoint, with the status code
+    /// carried through so the batch retry arm can match precisely on gateway
+    /// faults (413, 5xx) and leave transcript-level failures terminal.
+    #[error("Telnyx STT returned status {status}: {message}")]
+    TranscriptionStatus { status: u16, message: String },
     #[error("Accessibility permission is not granted; text cannot be pasted")]
     AccessibilityNotGranted,
 }
@@ -326,8 +341,21 @@ struct StreamingRecording {
     _thread: JoinHandle<()>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum StreamingConnectionState {
+    /// The WebSocket handshake is still in flight.
+    #[default]
+    Pending,
+    /// The handshake completed; audio flows and transcripts can arrive.
+    Connected,
+    /// The handshake failed or missed its deadline; this session can never
+    /// produce a transcript.
+    Dead,
+}
+
 #[derive(Clone, Debug, Default)]
 struct StreamingTranscript {
+    connection: StreamingConnectionState,
     latest_partial: Option<String>,
     latest_final: Option<String>,
     final_segments: Vec<String>,
@@ -538,6 +566,17 @@ impl StreamingRecording {
 
     fn finish(mut self) -> Option<StreamingText> {
         drop(self.sender.take());
+        // A session whose handshake never completed has no transcript to
+        // drain, so release goes straight to batch instead of burning the
+        // full 2.5s drain. During the 2026-09-09 gateway degradation every
+        // empty-fallback session did exactly that, and the only answer the
+        // handshake ever got was a 524 roughly two minutes later.
+        if streaming_connection(&self.result)
+            .is_some_and(|connection| connection != StreamingConnectionState::Connected)
+        {
+            info!("[stt] streaming_skip_drain_not_connected");
+            return None;
+        }
         let started = Instant::now();
         let deadline = started + STREAMING_DRAIN_MAX;
         let mut best = String::new();
@@ -623,6 +662,57 @@ impl StreamingRecording {
 fn set_streaming_error(result: &Arc<Mutex<StreamingTranscript>>, error: String) {
     if let Ok(mut result) = result.lock() {
         result.error = Some(error);
+    }
+}
+
+fn set_streaming_connection(
+    result: &Arc<Mutex<StreamingTranscript>>,
+    state: StreamingConnectionState,
+) {
+    if let Ok(mut result) = result.lock() {
+        result.connection = state;
+    }
+}
+
+/// Handshake state of the streaming session, or None when the shared state
+/// cannot be read (poisoned mutex). None falls through to the drain loop, which
+/// already handles unreadable state by breaking out.
+fn streaming_connection(
+    result: &Arc<Mutex<StreamingTranscript>>,
+) -> Option<StreamingConnectionState> {
+    result.lock().ok().map(|state| state.connection)
+}
+
+/// Connect the streaming WebSocket under a handshake deadline.
+///
+/// The deadline marks the session dead at ~3s from press so the release path
+/// falls back to batch immediately instead of waiting on a handshake that will
+/// not complete, and dropping the connect future closes the socket so nothing
+/// lingers for the gateway's late 524.
+async fn handshake_with_deadline<T, F>(
+    connect: F,
+    deadline: Duration,
+    result: &Arc<Mutex<StreamingTranscript>>,
+) -> Result<T, String>
+where
+    F: Future<Output = Result<T, String>>,
+{
+    match tokio::time::timeout(deadline, connect).await {
+        Ok(Ok(value)) => {
+            set_streaming_connection(result, StreamingConnectionState::Connected);
+            Ok(value)
+        }
+        Ok(Err(error)) => {
+            set_streaming_connection(result, StreamingConnectionState::Dead);
+            Err(error)
+        }
+        Err(_) => {
+            set_streaming_connection(result, StreamingConnectionState::Dead);
+            Err(format!(
+                "streaming handshake did not complete within {} ms",
+                deadline.as_millis()
+            ))
+        }
     }
 }
 
@@ -717,9 +807,15 @@ async fn run_telnyx_stream(
     let auth = format!("Bearer {api_key}");
     let header = HeaderValue::from_str(&auth).map_err(|error| error.to_string())?;
     drop(request.headers_mut().insert(AUTHORIZATION, header));
-    let (socket, _response) = connect_async(request)
-        .await
-        .map_err(|error| error.to_string())?;
+    // Boxed so the (large) handshake future does not inflate the whole stream
+    // loop's future; the handshake deadline below aborts it on timeout.
+    let connect = Box::pin(async move {
+        connect_async(request)
+            .await
+            .map_err(|error| error.to_string())
+    });
+    let (socket, _response) =
+        handshake_with_deadline(connect, STREAMING_HANDSHAKE_DEADLINE, &result).await?;
     info!("[stt] streaming_connected {}", provider.label());
     let (mut write, mut read) = socket.split();
     let mut input_closed = false;
@@ -1922,47 +2018,24 @@ impl App {
     fn transcribe(&self, wav: &[u8], warmup: &DictationWarmup) -> Result<String, AppError> {
         info!("sending batch transcription request");
         let request = self.stt_request_parts(warmup);
+        let mut attempt = |payload: &[u8]| {
+            self.transcribe_with_model(
+                payload,
+                &request.primary_model,
+                request.model_config.as_ref(),
+                request.prompt.as_deref(),
+                request.language.as_deref(),
+                STT_REQUEST_TIMEOUT,
+            )
+        };
         let attempt_started = Instant::now();
-        match self.transcribe_with_model(
-            wav,
-            &request.primary_model,
-            request.model_config.as_ref(),
-            request.prompt.as_deref(),
-            request.language.as_deref(),
-            STT_REQUEST_TIMEOUT,
-        ) {
+        match attempt(wav) {
             Ok(transcript) => Ok(transcript),
             Err(AppError::RateLimited) => {
                 warn!("primary STT model rate limited; trying fallback chain");
                 self.transcribe_with_fallbacks(wav, request.prompt.as_deref())
             }
-            // A retry only helps a request that failed fast. One that already spent
-            // the whole budget will spend it again, and the overlay sits on
-            // "Thinking" for both. Judge that by the clock, not by the error: a
-            // stall while the multipart body is still uploading arrives as a body
-            // error, not a timeout, so `is_timeout()` misses it. Measured
-            // 2026-09-01 during a DNS outage: two 12s attempts back to back, 27s of
-            // frozen overlay, same empty transcript.
-            Err(AppError::Http(error)) if exhausted_request_budget(attempt_started.elapsed()) => {
-                warn!(
-                    "primary STT request used its full {}s budget; not retrying: {error}",
-                    STT_REQUEST_TIMEOUT.as_secs()
-                );
-                Err(AppError::Http(error))
-            }
-            Err(AppError::Http(error)) => {
-                warn!("primary STT request failed; retrying once after delay: {error}");
-                std::thread::sleep(Duration::from_millis(300));
-                self.transcribe_with_model(
-                    wav,
-                    &request.primary_model,
-                    request.model_config.as_ref(),
-                    request.prompt.as_deref(),
-                    request.language.as_deref(),
-                    STT_REQUEST_TIMEOUT,
-                )
-            }
-            Err(error) => Err(error),
+            Err(error) => retry_failed_primary(&mut attempt, wav, error, attempt_started),
         }
     }
 
@@ -2096,10 +2169,10 @@ impl App {
         }
         if !status.is_success() {
             let body = response.text().unwrap_or_default();
-            return Err(AppError::Transcription(format!(
-                "Telnyx STT returned {status}: {}",
-                body.chars().take(200).collect::<String>()
-            )));
+            return Err(AppError::TranscriptionStatus {
+                status: status.as_u16(),
+                message: body.chars().take(200).collect::<String>(),
+            });
         }
         let parsed: SttResponse = response.json()?;
         let transcript = parsed.text.unwrap_or_default();
@@ -4323,6 +4396,165 @@ fn wav_bytes(samples: &[i16], sample_rate: u32) -> Result<Vec<u8>, AppError> {
         bytes.extend_from_slice(&sample.to_le_bytes());
     }
     Ok(bytes)
+}
+
+/// The PCM fields of a WAV that `wav_bytes` could have written.
+#[derive(Debug)]
+struct ParsedWav {
+    channels: u16,
+    sample_rate: u32,
+    samples: Vec<i16>,
+}
+
+fn read_le_u16(bytes: &[u8], offset: usize) -> Option<u16> {
+    bytes
+        .get(offset..offset + 2)
+        .and_then(|slice| <[u8; 2]>::try_from(slice).ok())
+        .map(u16::from_le_bytes)
+}
+
+fn read_le_u32(bytes: &[u8], offset: usize) -> Option<u32> {
+    bytes
+        .get(offset..offset + 4)
+        .and_then(|slice| <[u8; 4]>::try_from(slice).ok())
+        .map(u32::from_le_bytes)
+}
+
+/// Parse the subset of WAV this app writes: PCM, 16-bit, any channel count.
+/// Anything else returns None so the 413 retry can be skipped cleanly.
+fn parse_wav_pcm16(wav: &[u8]) -> Option<ParsedWav> {
+    if wav.len() < 12 || &wav[0..4] != b"RIFF" || &wav[8..12] != b"WAVE" {
+        return None;
+    }
+    let mut channels = None;
+    let mut sample_rate = None;
+    let mut data = None;
+    let mut offset = 12;
+    while offset + 8 <= wav.len() {
+        let chunk_id = &wav[offset..offset + 4];
+        let chunk_size = usize::try_from(read_le_u32(wav, offset + 4)?).unwrap_or(usize::MAX);
+        let body = offset.checked_add(8)?;
+        let end = body.checked_add(chunk_size)?;
+        if end > wav.len() {
+            return None;
+        }
+        if chunk_id == b"fmt " && chunk_size >= 16 {
+            if read_le_u16(wav, body)? != 1 {
+                return None; // PCM only
+            }
+            channels = Some(read_le_u16(wav, body + 2)?);
+            sample_rate = Some(read_le_u32(wav, body + 4)?);
+            if read_le_u16(wav, body + 14)? != 16 {
+                return None; // 16-bit only
+            }
+        } else if chunk_id == b"data" {
+            data = Some(&wav[body..end]);
+        }
+        // Chunks are word-aligned: an odd-sized body carries one pad byte.
+        offset = end + (chunk_size & 1);
+    }
+    let channels = channels?;
+    let sample_rate = sample_rate?;
+    if channels == 0 || sample_rate == 0 {
+        return None;
+    }
+    let samples: Vec<i16> = data?
+        .chunks_exact(2)
+        .map(|pair| i16::from_le_bytes([pair[0], pair[1]]))
+        .collect();
+    // A truncated final frame means the file was not written by `wav_bytes`.
+    if !samples.len().is_multiple_of(usize::from(channels)) {
+        return None;
+    }
+    Some(ParsedWav {
+        channels,
+        sample_rate,
+        samples,
+    })
+}
+
+/// Mean of a frame of `i16` samples. The mean of `i16` values always fits
+/// `i16`, so the `try_from` fallback is unreachable in practice.
+fn mean_sample(frame: &[i16]) -> i16 {
+    if frame.is_empty() {
+        return 0;
+    }
+    let sum: i32 = frame.iter().copied().map(i32::from).sum();
+    let len = i32::try_from(frame.len()).unwrap_or(i32::MAX);
+    i16::try_from(sum / len).unwrap_or(i16::MAX)
+}
+
+/// Collapse interleaved channels to mono by averaging each frame.
+fn collapse_to_mono(samples: &[i16], channels: u16) -> Vec<i16> {
+    if channels <= 1 {
+        return samples.to_vec();
+    }
+    samples
+        .chunks(usize::from(channels))
+        .map(mean_sample)
+        .collect()
+}
+
+/// Linear resample for capture rates that do not divide evenly into the retry
+/// rate (44.1 kHz, for example). Only the 413 retry path uses this.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)]
+fn linear_resample(samples: &[i16], source_rate: u32, target_rate: u32) -> Vec<i16> {
+    if samples.len() < 2 {
+        return samples.to_vec();
+    }
+    let step = f64::from(source_rate) / f64::from(target_rate);
+    let output_len = ((samples.len() - 1) as f64 / step) as usize + 1;
+    let mut resampled = Vec::with_capacity(output_len);
+    for index in 0..output_len {
+        let position = index as f64 * step;
+        let base = position.floor();
+        let start = base as usize;
+        if start + 1 >= samples.len() {
+            resampled.push(samples[samples.len() - 1]);
+            break;
+        }
+        let weight = position - base;
+        let start_value = f64::from(samples[start]);
+        let end_value = f64::from(samples[start + 1]);
+        let value = (end_value - start_value)
+            .mul_add(weight, start_value)
+            .round();
+        resampled.push(value.clamp(f64::from(i16::MIN), f64::from(i16::MAX)) as i16);
+    }
+    resampled
+}
+
+/// Resample to the 413 retry rate. Integer ratios decimate with a box filter
+/// (48 kHz -> 16 kHz averages every three samples, cutting the payload ~3x);
+/// rates that do not divide evenly get a linear resample; 16 kHz passes
+/// through untouched.
+fn resample_to_16k(samples: &[i16], source_rate: u32) -> Option<Vec<i16>> {
+    if source_rate == 0 {
+        return None;
+    }
+    if source_rate == STT_RETRY_SAMPLE_RATE {
+        return Some(samples.to_vec());
+    }
+    if source_rate.is_multiple_of(STT_RETRY_SAMPLE_RATE) {
+        let factor = usize::try_from(source_rate / STT_RETRY_SAMPLE_RATE).unwrap_or(usize::MAX);
+        return Some(samples.chunks(factor).map(mean_sample).collect());
+    }
+    Some(linear_resample(samples, source_rate, STT_RETRY_SAMPLE_RATE))
+}
+
+/// Build the 16 kHz mono payload for the 413 retry: parse the recorded WAV,
+/// collapse to mono, resample, and re-encode. None means the input is not a
+/// PCM16 WAV this app could have written, and the caller keeps the original
+/// error instead of retrying.
+fn downsample_wav_16k_mono(wav: &[u8]) -> Option<Vec<u8>> {
+    let parsed = parse_wav_pcm16(wav)?;
+    let mono = collapse_to_mono(&parsed.samples, parsed.channels);
+    let resampled = resample_to_16k(&mono, parsed.sample_rate)?;
+    wav_bytes(&resampled, STT_RETRY_SAMPLE_RATE).ok()
 }
 
 fn frame_len_for(sample_rate: u32) -> usize {
@@ -6728,6 +6960,103 @@ fn play_sound(name: &str) {
     }
 }
 
+/// What a failed primary batch attempt deserves.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BatchRetry {
+    /// Terminal: return the error unchanged.
+    None,
+    /// The gateway rejected the request itself (5xx); send the same audio on a
+    /// fresh request.
+    SamePayload,
+    /// The gateway rejected the payload size (HTTP 413); send a 16 kHz mono
+    /// downsampling of the same audio.
+    DownsampledPayload,
+}
+
+/// Retry plan for a failed primary batch attempt. Only 413 and 5xx responses
+/// retry: both are gateway faults where a fresh request re-rolls the edge, and
+/// both were seen nondeterministically during the 2026-09-09 Telnyx STT
+/// degradation (identical requests failing then passing). Transcript-level
+/// failures such as "STT returned empty transcript" are legitimate silence
+/// and stay terminal, so the plan matches on the status-carrying variant alone.
+fn batch_retry_plan(error: &AppError, elapsed: Duration) -> BatchRetry {
+    let AppError::TranscriptionStatus { status, .. } = error else {
+        return BatchRetry::None;
+    };
+    // Same clock guard as the transport retry: a status failure that already
+    // burned the request budget must not double the total wait.
+    if exhausted_request_budget(elapsed) {
+        return BatchRetry::None;
+    }
+    if *status == 413 {
+        return BatchRetry::DownsampledPayload;
+    }
+    if (500..600).contains(status) {
+        return BatchRetry::SamePayload;
+    }
+    BatchRetry::None
+}
+
+/// Retry policy for a primary batch attempt that failed with a non-429 error.
+/// `attempt` is the transport seam: production wires it to
+/// `transcribe_with_model`, tests wire it to a scripted fake. Every retry is a
+/// brand-new request, so a re-rolled gateway edge gets a new chance, and a
+/// retry's result is returned as-is so each failure mode gets exactly one
+/// extra attempt and never re-enters the 429 fallback chain.
+fn retry_failed_primary<F>(
+    attempt: &mut F,
+    wav: &[u8],
+    error: AppError,
+    attempt_started: Instant,
+) -> Result<String, AppError>
+where
+    F: FnMut(&[u8]) -> Result<String, AppError>,
+{
+    match batch_retry_plan(&error, attempt_started.elapsed()) {
+        BatchRetry::SamePayload => {
+            warn!(
+                "primary STT request failed with a server status; retrying once with a fresh request: {error}"
+            );
+            return attempt(wav);
+        }
+        BatchRetry::DownsampledPayload => {
+            let Some(retry_wav) = downsample_wav_16k_mono(wav) else {
+                warn!(
+                    "primary STT request rejected the payload size (HTTP 413); \
+                     {STT_RETRY_SAMPLE_RATE} Hz downsample unavailable, not retrying"
+                );
+                return Err(error);
+            };
+            warn!(
+                "primary STT request rejected the payload size (HTTP 413); \
+                 retrying once with {STT_RETRY_SAMPLE_RATE} Hz mono audio"
+            );
+            return attempt(&retry_wav);
+        }
+        BatchRetry::None => {}
+    }
+    if let AppError::Http(error) = error {
+        // A retry only helps a request that failed fast. One that already spent
+        // the whole budget will spend it again, and the overlay sits on
+        // "Thinking" for both. Judge that by the clock, not by the error: a
+        // stall while the multipart body is still uploading arrives as a body
+        // error, not a timeout, so `is_timeout()` misses it. Measured
+        // 2026-09-01 during a DNS outage: two 12s attempts back to back, 27s of
+        // frozen overlay, same empty transcript.
+        if exhausted_request_budget(attempt_started.elapsed()) {
+            warn!(
+                "primary STT request used its full {}s budget; not retrying: {error}",
+                STT_REQUEST_TIMEOUT.as_secs()
+            );
+            return Err(AppError::Http(error));
+        }
+        warn!("primary STT request failed; retrying once after delay: {error}");
+        std::thread::sleep(Duration::from_millis(300));
+        return attempt(wav);
+    }
+    Err(error)
+}
+
 /// Did an attempt spend effectively all of its time budget? Anything at or above
 /// this share of `STT_REQUEST_TIMEOUT` was killed by the clock rather than by a
 /// fast server-side failure, so a retry buys another full wait and nothing else.
@@ -6839,25 +7168,28 @@ mod tests {
     #![allow(clippy::panic_in_result_fn)]
 
     use super::{
-        AccessibilityContext, AccessibilityTrust, App, AppError, AppState, CleanupMode,
+        AccessibilityContext, AccessibilityTrust, App, AppError, AppState, BatchRetry, CleanupMode,
         CleanupProfile, Config, DictationCommandKind, DictationWarmup, PreparedText, PromptBinding,
-        StreamingProvider, StreamingTranscript, SttFallback, TRANSCRIPT_HISTORY_LIMIT,
+        STREAMING_DRAIN_MIN, STT_RETRY_SAMPLE_RATE, StreamingConnectionState, StreamingProvider,
+        StreamingRecording, StreamingTranscript, SttFallback, TRANSCRIPT_HISTORY_LIMIT,
         TextReplacement, TranscriptHistoryEntry, UpdateOutcome, apply_text_replacements,
-        apply_vocabulary_corrections_with_matches, build_cleanup_user_content,
+        apply_vocabulary_corrections_with_matches, batch_retry_plan, build_cleanup_user_content,
         build_rewrite_user_content, build_stt_prompt, canonicalize_known_terms, cleanup_decision,
-        cleanup_max_tokens, cleanup_profile, final_streaming_result_is_ready_elapsed,
+        cleanup_max_tokens, cleanup_profile, downsample_wav_16k_mono,
+        final_streaming_result_is_ready_elapsed, handshake_with_deadline,
         is_known_no_speech_transcript, is_supported_hotkey, load_vocabulary_usage,
         parse_accessibility_trust, parse_command, parse_replacements_json, parse_stt_fallbacks,
         parse_u64_env_value, parse_update_outcome, read_vocabulary_file,
-        read_vocabulary_usage_file, remove_fillers, sanitize_transcript_history, speech_stats,
-        stable_streaming_best_is_ready_elapsed, streaming_batch_fallback_reason,
-        streaming_preview_tail, streaming_provider_from_config, strip_reasoning_tags,
-        stt_language_for_model, stt_model_config, telnyx_stream_query, transcript_log_value,
-        transcript_menu_preview, wav_bytes,
+        read_vocabulary_usage_file, remove_fillers, retry_failed_primary,
+        sanitize_transcript_history, speech_stats, stable_streaming_best_is_ready_elapsed,
+        streaming_batch_fallback_reason, streaming_connection, streaming_preview_tail,
+        streaming_provider_from_config, strip_reasoning_tags, stt_language_for_model,
+        stt_model_config, telnyx_stream_query, transcript_log_value, transcript_menu_preview,
+        wav_bytes,
     };
     use std::collections::{HashMap, VecDeque};
     use std::path::PathBuf;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
     use std::{env, fs, process};
 
     #[test]
@@ -8616,5 +8948,411 @@ mod tests {
         assert!(!super::exhausted_request_budget(
             super::STT_REQUEST_TIMEOUT / 2
         ));
+    }
+
+    fn wav_sample_rate(wav: &[u8]) -> u32 {
+        super::read_le_u32(wav, 24).unwrap_or_default()
+    }
+
+    fn wav_channels(wav: &[u8]) -> u16 {
+        super::read_le_u16(wav, 22).unwrap_or_default()
+    }
+
+    fn wav_samples(wav: &[u8]) -> Vec<i16> {
+        wav.get(44..)
+            .unwrap_or_default()
+            .chunks_exact(2)
+            .map(|pair| i16::from_le_bytes([pair[0], pair[1]]))
+            .collect()
+    }
+
+    fn streaming_recording(
+        connection: StreamingConnectionState,
+        transcript: StreamingTranscript,
+    ) -> StreamingRecording {
+        StreamingRecording {
+            sender: None,
+            result: Arc::new(Mutex::new(StreamingTranscript {
+                connection,
+                ..transcript
+            })),
+            _thread: std::thread::spawn(|| {}),
+        }
+    }
+
+    fn block_on_test_runtime() -> Result<tokio::runtime::Runtime, AppError> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(AppError::Io)
+    }
+
+    #[test]
+    fn a_413_retries_once_with_16k_audio_then_succeeds() {
+        // The recorded payload is 48 kHz; the 413 retry must arrive as a 16 kHz
+        // mono re-encode, which is what passed live replay during the incident.
+        let samples: Vec<i16> = (0..4_800_i16).collect();
+        let source = wav_bytes(&samples, 48_000).unwrap_or_default();
+        assert_eq!(wav_sample_rate(&source), 48_000);
+        let mut attempts: Vec<Vec<u8>> = Vec::new();
+        let mut attempt = |wav: &[u8]| -> Result<String, AppError> {
+            attempts.push(wav.to_vec());
+            Ok(String::from("retried text"))
+        };
+        let first = AppError::TranscriptionStatus {
+            status: 413,
+            message: String::from("Payload Too Large"),
+        };
+
+        let outcome = retry_failed_primary(&mut attempt, &source, first, std::time::Instant::now());
+
+        assert_eq!(outcome.unwrap_or_default(), "retried text");
+        // Exactly one retry, carrying the downsampled payload.
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(wav_sample_rate(&attempts[0]), STT_RETRY_SAMPLE_RATE);
+        assert_eq!(wav_channels(&attempts[0]), 1);
+        assert!(attempts[0].len() < source.len());
+    }
+
+    #[test]
+    fn a_413_fails_after_the_single_retry() {
+        let source = wav_bytes(&[1, 2, 3], 48_000).unwrap_or_default();
+        let mut attempts = 0;
+        let mut attempt = |_: &[u8]| -> Result<String, AppError> {
+            attempts += 1;
+            Err(AppError::TranscriptionStatus {
+                status: 413,
+                message: String::from("Payload Too Large"),
+            })
+        };
+        let first = AppError::TranscriptionStatus {
+            status: 413,
+            message: String::from("Payload Too Large"),
+        };
+
+        let outcome = retry_failed_primary(&mut attempt, &source, first, std::time::Instant::now());
+
+        // The retry fired once, failed again, and stopped there.
+        assert_eq!(attempts, 1);
+        assert!(matches!(
+            outcome,
+            Err(AppError::TranscriptionStatus { status: 413, .. })
+        ));
+    }
+
+    #[test]
+    fn a_budget_exhausted_413_is_not_retried() {
+        // The clock guard PR #14 added for transport failures governs the
+        // status retries too: a first attempt that burned the whole request
+        // budget must not buy a second full wait.
+        let mut attempts = 0;
+        let mut attempt = |_: &[u8]| -> Result<String, AppError> {
+            attempts += 1;
+            Ok(String::from("must not happen"))
+        };
+        let first = AppError::TranscriptionStatus {
+            status: 413,
+            message: String::from("Payload Too Large"),
+        };
+        let started = std::time::Instant::now()
+            .checked_sub(super::STT_REQUEST_TIMEOUT)
+            .unwrap_or_else(std::time::Instant::now);
+
+        let outcome = retry_failed_primary(&mut attempt, &[], first, started);
+
+        assert_eq!(attempts, 0);
+        assert!(matches!(
+            outcome,
+            Err(AppError::TranscriptionStatus { status: 413, .. })
+        ));
+    }
+
+    #[test]
+    fn an_empty_transcript_error_is_terminal() {
+        // Empty transcripts are legitimate silence, not a server fault. Retrying
+        // them would make silent dictations spin, so no retry may fire.
+        let mut attempts = 0;
+        let mut attempt = |_: &[u8]| -> Result<String, AppError> {
+            attempts += 1;
+            Ok(String::from("must not happen"))
+        };
+        let first = AppError::Transcription(String::from("STT returned empty transcript"));
+
+        let outcome = retry_failed_primary(&mut attempt, &[], first, std::time::Instant::now());
+
+        assert_eq!(attempts, 0);
+        assert!(matches!(outcome, Err(AppError::Transcription(_))));
+    }
+
+    #[test]
+    fn a_5xx_retries_once_with_the_same_payload() {
+        let source = wav_bytes(&[5, 6, 7], 48_000).unwrap_or_default();
+        let mut attempts: Vec<Vec<u8>> = Vec::new();
+        let mut attempt = |wav: &[u8]| -> Result<String, AppError> {
+            attempts.push(wav.to_vec());
+            Ok(String::from("recovered"))
+        };
+        let first = AppError::TranscriptionStatus {
+            status: 502,
+            message: String::from("Bad Gateway"),
+        };
+
+        let outcome = retry_failed_primary(&mut attempt, &source, first, std::time::Instant::now());
+
+        assert_eq!(outcome.unwrap_or_default(), "recovered");
+        // Exactly one retry; only the 413 retry downsamples, so a 5xx retries
+        // the same bytes.
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0], source);
+    }
+
+    #[test]
+    fn a_429_passes_through_the_retry_arm_to_the_fallback_chain() {
+        // The model-fallback chain lives in `transcribe`; the retry arm must
+        // return 429 untouched and without any extra attempt.
+        let mut attempts = 0;
+        let mut attempt = |_: &[u8]| -> Result<String, AppError> {
+            attempts += 1;
+            Ok(String::from("must not happen"))
+        };
+
+        let outcome = retry_failed_primary(
+            &mut attempt,
+            &[],
+            AppError::RateLimited,
+            std::time::Instant::now(),
+        );
+
+        assert_eq!(attempts, 0);
+        assert!(matches!(outcome, Err(AppError::RateLimited)));
+    }
+
+    #[test]
+    fn the_retry_plan_respects_the_request_budget_and_matches_only_gateway_faults() {
+        let too_large = AppError::TranscriptionStatus {
+            status: 413,
+            message: String::new(),
+        };
+        let bad_gateway = AppError::TranscriptionStatus {
+            status: 503,
+            message: String::new(),
+        };
+        let bad_request = AppError::TranscriptionStatus {
+            status: 400,
+            message: String::new(),
+        };
+        let empty = AppError::Transcription(String::from("STT returned empty transcript"));
+        let fast = std::time::Duration::from_millis(40);
+
+        assert_eq!(
+            batch_retry_plan(&too_large, fast),
+            BatchRetry::DownsampledPayload
+        );
+        assert_eq!(
+            batch_retry_plan(&bad_gateway, fast),
+            BatchRetry::SamePayload
+        );
+        // A status failure that already burned the budget must not double the
+        // total wait: same guard the PR #14 retry lives by.
+        assert_eq!(
+            batch_retry_plan(&too_large, super::STT_REQUEST_TIMEOUT),
+            BatchRetry::None
+        );
+        assert_eq!(
+            batch_retry_plan(&bad_gateway, super::STT_REQUEST_TIMEOUT),
+            BatchRetry::None
+        );
+        // Client faults and transcript-level failures stay terminal.
+        assert_eq!(batch_retry_plan(&bad_request, fast), BatchRetry::None);
+        assert_eq!(batch_retry_plan(&empty, fast), BatchRetry::None);
+        assert_eq!(
+            batch_retry_plan(&AppError::RateLimited, fast),
+            BatchRetry::None
+        );
+    }
+
+    #[test]
+    fn downsample_rewrites_a_48k_wav_as_16k_mono() {
+        // 30 input samples at 48 kHz become 10 at 16 kHz: each output sample is
+        // the mean of three consecutive inputs.
+        let samples: Vec<i16> = (0..30_i16).collect();
+        let source = wav_bytes(&samples, 48_000).unwrap_or_default();
+
+        let retry_wav = downsample_wav_16k_mono(&source).unwrap_or_default();
+
+        assert_eq!(wav_sample_rate(&retry_wav), STT_RETRY_SAMPLE_RATE);
+        assert_eq!(wav_channels(&retry_wav), 1);
+        assert_eq!(
+            wav_samples(&retry_wav),
+            (0..10_i16).map(|index| index * 3 + 1).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn downsample_linearly_resamples_non_integer_rates() {
+        // 0.1 s at 44.1 kHz (4 410 samples) becomes exactly 1 600 samples at
+        // 16 kHz; integer positions must map to their input samples unchanged.
+        let samples: Vec<i16> = (0..4_410_i16).collect();
+        let source = wav_bytes(&samples, 44_100).unwrap_or_default();
+
+        let retry_wav = downsample_wav_16k_mono(&source).unwrap_or_default();
+
+        assert_eq!(wav_sample_rate(&retry_wav), STT_RETRY_SAMPLE_RATE);
+        let decoded = wav_samples(&retry_wav);
+        assert_eq!(decoded.len(), 1_600);
+        // Position 800 maps exactly onto input sample 2205; position 1 sits
+        // between 2 and 3 and rounds up to 3.
+        assert_eq!(decoded[800], 2_205);
+        assert_eq!(decoded[1], 3);
+    }
+
+    #[test]
+    fn downsample_passes_a_16k_wav_through() {
+        let samples: Vec<i16> = (0..100_i16).collect();
+        let source = wav_bytes(&samples, 16_000).unwrap_or_default();
+
+        let retry_wav = downsample_wav_16k_mono(&source).unwrap_or_default();
+
+        assert_eq!(retry_wav, source);
+    }
+
+    #[test]
+    fn downsample_collapses_stereo_frames_to_mono() {
+        // Hand-build a 3-frame stereo WAV: mono collapse averages each frame
+        // to [150, 0, -150], then the 3:1 decimation averages those to a single
+        // 16 kHz sample.
+        let mut stereo = Vec::new();
+        stereo.extend_from_slice(b"RIFF");
+        stereo.extend_from_slice(&36_u32.to_le_bytes());
+        stereo.extend_from_slice(b"WAVEfmt ");
+        stereo.extend_from_slice(&16_u32.to_le_bytes());
+        stereo.extend_from_slice(&1_u16.to_le_bytes());
+        stereo.extend_from_slice(&2_u16.to_le_bytes());
+        stereo.extend_from_slice(&48_000_u32.to_le_bytes());
+        stereo.extend_from_slice(&(48_000_u32 * 4).to_le_bytes());
+        stereo.extend_from_slice(&4_u16.to_le_bytes());
+        stereo.extend_from_slice(&16_u16.to_le_bytes());
+        stereo.extend_from_slice(b"data");
+        stereo.extend_from_slice(&12_u32.to_le_bytes());
+        for sample in [100_i16, 200, 0, 0, -100, -200] {
+            stereo.extend_from_slice(&sample.to_le_bytes());
+        }
+
+        let retry_wav = downsample_wav_16k_mono(&stereo).unwrap_or_default();
+
+        assert_eq!(wav_sample_rate(&retry_wav), STT_RETRY_SAMPLE_RATE);
+        assert_eq!(wav_channels(&retry_wav), 1);
+        assert_eq!(wav_samples(&retry_wav), vec![0]);
+    }
+
+    #[test]
+    fn release_skips_the_drain_while_the_handshake_is_pending() {
+        // The incident shape: the handshake never completed, so release must go
+        // straight to batch instead of waiting out the drain window.
+        let recording = streaming_recording(
+            StreamingConnectionState::Pending,
+            StreamingTranscript::default(),
+        );
+        let started = std::time::Instant::now();
+
+        let outcome = recording.finish();
+
+        assert!(outcome.is_none());
+        assert!(started.elapsed() < STREAMING_DRAIN_MIN);
+    }
+
+    #[test]
+    fn release_skips_the_drain_when_the_stream_is_dead() {
+        let recording = streaming_recording(
+            StreamingConnectionState::Dead,
+            StreamingTranscript::default(),
+        );
+        let started = std::time::Instant::now();
+
+        let outcome = recording.finish();
+
+        assert!(outcome.is_none());
+        assert!(started.elapsed() < STREAMING_DRAIN_MIN);
+    }
+
+    #[test]
+    fn a_connected_stream_still_drains_to_a_final_result() {
+        // A healthy session must be unaffected: the drain runs and hands back
+        // the final streaming text, so the fast-fail never fires.
+        let recording = streaming_recording(
+            StreamingConnectionState::Connected,
+            StreamingTranscript {
+                latest_final: Some(String::from("final streaming text")),
+                ..StreamingTranscript::default()
+            },
+        );
+        let started = std::time::Instant::now();
+
+        let outcome = recording.finish();
+
+        let (text, source) = outcome.map_or((String::new(), ""), |streaming| {
+            (streaming.text, streaming.source)
+        });
+        assert_eq!(text, "final streaming text");
+        assert_eq!(source, "final");
+        assert!(started.elapsed() >= STREAMING_DRAIN_MIN);
+    }
+
+    #[test]
+    fn a_handshake_that_misses_its_deadline_marks_the_stream_dead() -> Result<(), AppError> {
+        let runtime = block_on_test_runtime()?;
+        let result = Arc::new(Mutex::new(StreamingTranscript::default()));
+        let never = std::future::pending::<Result<u8, String>>();
+
+        let outcome = runtime.block_on(handshake_with_deadline(
+            never,
+            std::time::Duration::from_millis(20),
+            &result,
+        ));
+
+        assert!(outcome.is_err());
+        assert_eq!(
+            streaming_connection(&result),
+            Some(StreamingConnectionState::Dead)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_failed_handshake_marks_the_stream_dead() -> Result<(), AppError> {
+        let runtime = block_on_test_runtime()?;
+        let result = Arc::new(Mutex::new(StreamingTranscript::default()));
+
+        let outcome = runtime.block_on(handshake_with_deadline(
+            async { Err::<u8, String>(String::from("connect refused")) },
+            std::time::Duration::from_secs(3),
+            &result,
+        ));
+
+        assert!(outcome.is_err());
+        assert_eq!(
+            streaming_connection(&result),
+            Some(StreamingConnectionState::Dead)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_completed_handshake_marks_the_stream_connected() -> Result<(), AppError> {
+        let runtime = block_on_test_runtime()?;
+        let result = Arc::new(Mutex::new(StreamingTranscript::default()));
+
+        let outcome = runtime.block_on(handshake_with_deadline(
+            async { Ok::<u8, String>(7) },
+            std::time::Duration::from_secs(3),
+            &result,
+        ));
+
+        assert_eq!(outcome.unwrap_or_default(), 7);
+        assert_eq!(
+            streaming_connection(&result),
+            Some(StreamingConnectionState::Connected)
+        );
+        Ok(())
     }
 }
