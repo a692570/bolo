@@ -543,3 +543,32 @@ code, kbd, pre { font-family: var(--mono); }
   .keycap, .button { transition: none; }
   #voiceField { display: none; }
 }
+
+.demo-note {
+  margin-top: 16px;
+  max-width: 620px;
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.6;
+  letter-spacing: 0.02em;
+  color: var(--ink-3);
+}
+
+.demo-badge {
+  display: inline-block;
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--amber);
+  border: 1px solid rgba(240, 165, 63, 0.4);
+  background: var(--amber-soft);
+  border-radius: 999px;
+  padding: 2px 9px;
+  margin-left: 10px;
+  vertical-align: middle;
+  white-space: nowrap;
+}
+
+.t-interim { color: var(--ink-2); }
+.t-none { color: var(--ink-3); }

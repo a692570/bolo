@@ -82,7 +82,7 @@
         var d = Math.abs(x - pointerX);
         hgt += Math.exp(-(d * d) / (2 * (w * 0.06) * (w * 0.06))) * maxH * 0.55;
       }
-      hgt *= 1 + holdLevel * 1.7;
+      hgt *= 1 + holdLevel * 1.7 + (window.__boloVoiceLevel || 0) * 1.8;
       if (pulseT2d >= 0) {
         var dist = Math.abs(x - w / 2);
         var front = pulseT2d * w * 0.7;
@@ -196,6 +196,223 @@
     "Let\u2019s move the sync to <span class=\"clean-mark\">October 15th</span>.";
   var PLACEHOLDER = '<span class="transcript-placeholder">Your sentence shows up here, cleaned up.</span>';
 
+  /* ---------- live demo: real microphone + browser speech recognition ----------
+     The scripted sentence is the FALLBACK, shown only when the mic is
+     unavailable (denied, missing, unsupported) or a QA hook forces it.
+     When live, holding the key transcribes what the speaker actually says
+     via the browser's SpeechRecognition API; release applies a simplified
+     local cleanup. The 3D/2D fields read window.__boloVoiceLevel for real
+     amplitude, so the visual responds to the actual voice in the room. */
+
+  var demoParam = new URLSearchParams(window.location.search).get("demo");
+  var forceScripted = demoParam === "hold" || demoParam === "land";
+  var liveMode = false;
+
+  var SRClass = window.SpeechRecognition || window.webkitSpeechRecognition || null;
+
+  var mic = {
+    state: "unknown", // unknown | pending | ready | denied
+    ctx: null,
+    analyser: null,
+    buf: null,
+    raf: null,
+    stream: null,
+    rec: null,
+    recActive: false,
+    recFinal: "",
+    recInterim: "",
+    recFailedNotified: false
+  };
+
+  function micSupported() {
+    return !!SRClass && !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
+  }
+
+  function escapeHtml(text) {
+    var div = document.createElement("div");
+    div.textContent = text;
+    return div.innerHTML;
+  }
+
+  function requestMic() {
+    mic.state = "pending";
+    navigator.mediaDevices.getUserMedia({ audio: true }).then(function (stream) {
+      mic.state = "ready";
+      mic.stream = stream;
+      var Ctx = window.AudioContext || window.webkitAudioContext;
+      if (!mic.ctx && Ctx) mic.ctx = new Ctx();
+      if (mic.ctx && mic.ctx.state === "suspended") mic.ctx.resume();
+      if (mic.ctx) {
+        var source = mic.ctx.createMediaStreamSource(stream);
+        mic.analyser = mic.ctx.createAnalyser();
+        mic.analyser.fftSize = 512;
+        source.connect(mic.analyser);
+        mic.buf = new Uint8Array(mic.analyser.fftSize);
+      }
+      // Tracks stay open only while the key is held; if permission resolves
+      // after release, wait for the next hold instead of listening idle.
+      if (holding) {
+        startVoiceRaf();
+        startRecognition();
+      }
+    }).catch(function () {
+      mic.state = "denied";
+      if (holding) {
+        // Permission refused mid-hold: fall back to the scripted sentence so
+        // the demo never stalls on an empty transcript.
+        liveMode = false;
+        startScriptedTyping();
+        showDemoBadge();
+      }
+    });
+  }
+
+  function startVoiceRaf() {
+    if (!mic.analyser) return;
+    var tick = function () {
+      mic.raf = requestAnimationFrame(tick);
+      if (document.hidden || !mic.analyser) return;
+      mic.analyser.getByteTimeDomainData(mic.buf);
+      var sum = 0;
+      for (var i = 0; i < mic.buf.length; i++) {
+        var v = (mic.buf[i] - 128) / 128;
+        sum += v * v;
+      }
+      var rms = Math.sqrt(sum / mic.buf.length);
+      window.__boloVoiceLevel = Math.min(1, rms * 4.5);
+    };
+    tick();
+  }
+
+  function stopVoiceRaf() {
+    if (mic.raf) cancelAnimationFrame(mic.raf);
+    mic.raf = null;
+    window.__boloVoiceLevel = 0;
+  }
+
+  function startRecognition() {
+    if (!SRClass) return;
+    mic.rec = new SRClass();
+    mic.rec.lang = navigator.language || "en-US";
+    mic.rec.continuous = true;
+    mic.rec.interimResults = true;
+    mic.rec.onresult = function (event) {
+      var interim = "", finals = "";
+      for (var i = event.resultIndex; i < event.results.length; i++) {
+        var result = event.results[i];
+        if (result.isFinal) finals += result[0].transcript;
+        else interim += result[0].transcript;
+      }
+      if (finals) mic.recFinal = (mic.recFinal + " " + finals).trim();
+      mic.recInterim = interim;
+      if (holding) updateLiveTranscript();
+    };
+    mic.rec.onerror = function (event) {
+      var kind = event && event.error;
+      if (kind === "not-allowed" || kind === "service-not-allowed" || kind === "audio-capture") {
+        mic.recFailedNotified = true;
+        showDemoBadge();
+      }
+      // no-speech / network / aborted: the onend restart loop keeps listening.
+    };
+    mic.rec.onend = function () {
+      mic.recActive = false;
+      if (holding && mic.stream && !mic.recFailedNotified) {
+        setTimeout(function () {
+          if (holding && mic.stream) {
+            try { mic.rec.start(); mic.recActive = true; } catch (err) { /* ignore */ }
+          }
+        }, 250);
+      }
+    };
+    try { mic.rec.start(); mic.recActive = true; } catch (err) { /* already started */ }
+  }
+
+  function stopRecognition() {
+    if (mic.rec && mic.recActive) {
+      try { mic.rec.stop(); } catch (err) { /* ignore */ }
+      mic.recActive = false;
+    }
+  }
+
+  function releaseMic() {
+    stopVoiceRaf();
+    stopRecognition();
+    if (mic.stream) {
+      mic.stream.getTracks().forEach(function (track) { track.stop(); });
+      mic.stream = null;
+    }
+  }
+
+  function clearTranscript() {
+    line.innerHTML = "";
+    var wrap = document.createElement("span");
+    wrap.className = "typed-wrap";
+    line.appendChild(wrap);
+    var caret = document.createElement("span");
+    caret.className = "t-caret";
+    caret.setAttribute("aria-hidden", "true");
+    wrap.appendChild(caret);
+  }
+
+  function updateLiveTranscript() {
+    if (!holding || !liveMode) return;
+    var wrap = line.querySelector(".typed-wrap");
+    if (!wrap) return;
+    var spoken = (mic.recFinal + " " + mic.recInterim).replace(/\s+/g, " ").trim();
+    var caret = wrap.querySelector(".t-caret");
+    wrap.innerHTML = "";
+    if (mic.recFinal) {
+      var finalSpan = document.createElement("span");
+      finalSpan.className = "transcript-raw";
+      finalSpan.textContent = mic.recFinal;
+      wrap.appendChild(finalSpan);
+    }
+    if (mic.recInterim) {
+      var interimSpan = document.createElement("span");
+      interimSpan.className = "t-interim";
+      interimSpan.textContent = (mic.recFinal ? " " : "") + mic.recInterim;
+      wrap.appendChild(interimSpan);
+    }
+    if (!spoken) {
+      var hintSpan = document.createElement("span");
+      hintSpan.className = "t-interim";
+      hintSpan.textContent = "speak while holding the key";
+      wrap.appendChild(hintSpan);
+    }
+    if (caret) wrap.appendChild(caret);
+  }
+
+  function showDemoBadge() {
+    if (line.querySelector(".demo-badge")) return;
+    var badge = document.createElement("span");
+    badge.className = "demo-badge";
+    badge.textContent = "demo sentence \u00b7 mic unavailable";
+    line.appendChild(badge);
+  }
+
+  var FILLER_RE = /\b(uh+|um+|er+|erm+|mmm+)\b[,.!?]*\s*/gi;
+  function cleanLiveText(text) {
+    var t = (text || "").replace(/\s+/g, " ").trim();
+    if (!t) return "";
+    t = t.replace(FILLER_RE, " ").replace(/\s{2,}/g, " ").trim();
+    if (!t) return "";
+    t = t.charAt(0).toUpperCase() + t.slice(1);
+    if (!/[.!?]$/.test(t)) t += ".";
+    return t;
+  }
+
+  function scheduleReset() {
+    // In ?demo=land QA mode, keep the landed state on screen.
+    if (demoParam === "land") return;
+    resetTimer = setTimeout(function () {
+      line.innerHTML = PLACEHOLDER;
+      line.removeAttribute("data-state");
+      chip.dataset.state = "ready";
+      statusText.textContent = "Ready";
+    }, 5200);
+  }
+
   var holding = false;
   var typeTimer = null;
   var resetTimer = null;
@@ -224,6 +441,8 @@
     startedAt = performance.now();
     clearTimeout(resetTimer);
     clearInterval(typeTimer);
+    mic.recFinal = "";
+    mic.recInterim = "";
 
     if (reduced) {
       // No animation: jump straight to the end state on any press.
@@ -234,15 +453,41 @@
     }
 
     line.querySelector(".transcript-placeholder")?.remove();
+
+    // Live mode when the mic is available (or permission is in flight);
+    // scripted fallback when unavailable or forced by a QA hook.
+    liveMode = false;
+    if (!forceScripted && micSupported()) {
+      if (mic.state === "ready" || mic.state === "pending") {
+        liveMode = true;
+      } else if (mic.state === "unknown") {
+        mic.state = "pending";
+        requestMic();
+        liveMode = true; // optimistic: show the live caret while permission resolves
+      }
+    }
+
+    setState("listening", "Listening");
+    key.classList.add("is-holding");
+    window.dispatchEvent(new CustomEvent("bolo-hold", { detail: true }));
+
+    if (liveMode) {
+      clearTranscript();
+      updateLiveTranscript(); // show the "speak while holding" hint before the first result
+      if (mic.state === "ready" && !mic.recActive) startRecognition();
+      return;
+    }
+
+    startScriptedTyping();
+    if (mic.state === "denied") showDemoBadge();
+  }
+
+  function startScriptedTyping() {
     line.innerHTML = "";
     var wrap = document.createElement("span");
     wrap.className = "typed-wrap";
     line.appendChild(wrap);
     tokenIndex = 0;
-    setState("listening", "Listening");
-    key.classList.add("is-holding");
-    window.dispatchEvent(new CustomEvent("bolo-hold", { detail: true }));
-
     var caret = document.createElement("span");
     caret.className = "t-caret";
     caret.setAttribute("aria-hidden", "true");
@@ -267,18 +512,43 @@
     window.dispatchEvent(new CustomEvent("bolo-release"));
     clearInterval(typeTimer);
     typeTimer = null;
+    releaseMic(); // tracks + analyser die with the hold; Chrome flushes finals after stop()
+
+    if (liveMode && mic.state === "ready") {
+      // Give the final recognition flush a beat or two before landing.
+      var attempts = 0;
+      var land = function () {
+        var spoken = (mic.recFinal + " " + mic.recInterim).replace(/\s+/g, " ").trim();
+        if (!spoken && attempts < 2) {
+          attempts++;
+          setTimeout(land, 220);
+          return;
+        }
+        var cleaned = cleanLiveText(spoken);
+        setState("landed", "Landed");
+        if (cleaned) {
+          line.innerHTML = '<span class="typed-wrap">' + escapeHtml(cleaned) + "</span>";
+        } else {
+          line.innerHTML = '<span class="typed-wrap"><span class="t-none">Nothing recognized. Hold the key and speak.</span></span>';
+        }
+        scheduleReset();
+      };
+      land();
+      return;
+    }
+
+    // Live hold that never got mic permission: degrade to the scripted landing
+    // so the visitor still sees the full flow.
+    if (liveMode && mic.state !== "ready") {
+      liveMode = false;
+      startScriptedTyping();
+      showDemoBadge();
+    }
 
     var finish = function () {
       line.innerHTML = '<span class="typed-wrap">' + CLEAN_HTML + "</span>";
       setState("landed", "Landed");
-      // In ?demo=land QA mode, keep the landed state on screen.
-      if (demoParam === "land") return;
-      resetTimer = setTimeout(function () {
-        line.innerHTML = PLACEHOLDER;
-        line.removeAttribute("data-state");
-        chip.dataset.state = "ready";
-        statusText.textContent = "Ready";
-      }, 5200);
+      scheduleReset();
     };
 
     if (reduced) return;
@@ -345,8 +615,8 @@
   });
 
   // Debug/demo affordance for visual QA: ?demo=hold keeps the key pressed,
-  // ?demo=land shows the full press-release cycle automatically.
-  var demoParam = new URLSearchParams(window.location.search).get("demo");
+  // ?demo=land shows the full press-release cycle automatically. Both force
+  // the scripted demo so captures stay deterministic.
   if (demoParam === "hold") startHold();
   else if (demoParam === "land") { startHold(); setTimeout(endHold, 520); }
 })();

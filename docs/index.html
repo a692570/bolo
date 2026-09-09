@@ -67,7 +67,7 @@
               </div>
             </div>
           </div>
-
+          <p class="demo-note">This browser demo uses your browser&rsquo;s speech recognition and a simplified local cleanup. The real Bolo streams audio to Telnyx and cleans it up with an LLM. The microphone opens only while the key is held.</p>
           <div class="hero-actions reveal">
             <a class="button button-primary" href="#install">Install Bolo</a>
             <a class="button button-secondary" href="https://github.com/a692570/bolo">View source</a>
@@ -328,6 +328,7 @@ and Accessibility permissions.&rdquo;</code></pre>
               if (!visible || document.hidden) return;
               t += dt;
             holdingTarget = window.__boloHolding ? 1 : 0;
+            const voice = Math.min(1, window.__boloVoiceLevel || 0);
             holding += (holdingTarget - holding) * Math.min(1, dt * 5);
             if (pulse >= 0) { pulseT += dt * 2.4; pulse = Math.max(0, 1 - pulseT); if (pulseT > 1.4) pulse = -1; }
 
@@ -339,7 +340,7 @@ and Accessibility permissions.&rdquo;</code></pre>
                 const z = -r * GAP + 4.5;
                 const depth = 1 - r / ROWS; // far rows are dimmer
                 const wave = Math.sin(x * 0.55 + t * 1.1) * 0.5 + Math.sin(z * 0.8 - t * 0.7) * 0.5;
-                let hgt = 0.12 + (wave * 0.5 + 0.5) * 0.3 * (1 + holding * 2.2);
+                let hgt = 0.12 + (wave * 0.5 + 0.5) * 0.3 * (1 + holding * 2.2 + voice * 2.4);
                 if (pointer.active) {
                   const dx = x - pointer.x, dz = z - pointer.z;
                   const d2 = dx * dx + dz * dz;
