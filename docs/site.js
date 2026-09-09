@@ -326,22 +326,21 @@
     }, { threshold: 0.15 }).observe(heroEl);
   }
 
-  function isDemoKey(code) {
-    return code === "Space" || code === "AltRight" || code === "AltLeft";
-  }
-
   window.addEventListener("keydown", function (e) {
     if (!heroInView) return;
-    if (e.repeat) return;
-    if (e.metaKey || e.ctrlKey || e.altKey) return;
-    if (!isDemoKey(e.code)) return;
+    var isOption = e.code === "AltRight" || e.code === "AltLeft";
+    if (e.code !== "Space" && !isOption) return;
+    // Do not hijack real shortcuts; altKey is inherent to the Option key
+    // itself, so it is allowed through while metaKey/ctrlKey are not.
+    if (e.metaKey || e.ctrlKey) return;
     var tag = e.target && e.target.tagName;
     if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
-    e.preventDefault();
+    e.preventDefault(); // suppress the space-scroll on every repeat, not just the first
+    if (e.repeat) return;
     startHold();
   });
   window.addEventListener("keyup", function (e) {
-    if (!isDemoKey(e.code)) return;
+    if (e.code !== "Space" && e.code !== "AltRight" && e.code !== "AltLeft") return;
     endHold();
   });
 
