@@ -313,6 +313,38 @@
   });
   key.addEventListener("blur", endHold);
 
+  /* ---------- real keyboard: the page does what the keycap says ----------
+     Hold SPACE or the RIGHT OPTION/ALT key anywhere while the hero is on
+     screen to run the demo. Space stays a scroll key once the hero is
+     scrolled past, so interception is scoped to hero visibility. */
+  var heroInView = true;
+  var heroEl = document.querySelector(".hero");
+  if (heroEl && "IntersectionObserver" in window) {
+    heroInView = false; // set on first observation tick
+    new IntersectionObserver(function (entries) {
+      heroInView = entries[0].isIntersecting;
+    }, { threshold: 0.15 }).observe(heroEl);
+  }
+
+  function isDemoKey(code) {
+    return code === "Space" || code === "AltRight" || code === "AltLeft";
+  }
+
+  window.addEventListener("keydown", function (e) {
+    if (!heroInView) return;
+    if (e.repeat) return;
+    if (e.metaKey || e.ctrlKey || e.altKey) return;
+    if (!isDemoKey(e.code)) return;
+    var tag = e.target && e.target.tagName;
+    if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+    e.preventDefault();
+    startHold();
+  });
+  window.addEventListener("keyup", function (e) {
+    if (!isDemoKey(e.code)) return;
+    endHold();
+  });
+
   // Debug/demo affordance for visual QA: ?demo=hold keeps the key pressed,
   // ?demo=land shows the full press-release cycle automatically.
   var demoParam = new URLSearchParams(window.location.search).get("demo");
