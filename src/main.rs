@@ -119,6 +119,13 @@ const FAILED_AUDIO_KEEP: usize = 5;
 /// Share of the request budget an attempt must burn before a retry is judged
 /// pointless. Below this the request failed fast and is worth one more try.
 const RETRY_BUDGET_SHARE: f32 = 0.9;
+/// Minimum recording length before an empty batch transcript can earn a
+/// retry. The 2026-09-14 degradation returned 200-empty on real speech, but a
+/// clip this short cannot prove the speaker said anything recoverable, so
+/// empties on short clips stay terminal no matter how loud they are. Real
+/// dictations measure seconds, and 1.2s clears the 1s `MIN_RECORDING` gate
+/// with room for the fastest single word.
+const EMPTY_RETRY_MIN_DURATION_MS: u64 = 1_200;
 const UPDATE_RESTART_EXIT_CODE: i32 = 42;
 const POST_INSERT_EDIT_MAX: Duration = Duration::from_secs(15);
 const POST_INSERT_OVERLAY_HOLD: Duration = Duration::from_millis(300);
@@ -157,6 +164,15 @@ enum AppError {
     /// faults (413, 5xx) and leave transcript-level failures terminal.
     #[error("Telnyx STT returned status {status}: {message}")]
     TranscriptionStatus { status: u16, message: String },
+    /// A 200 response with an empty transcript on audio that demonstrably
+    /// carried sound, with the evidence parsed from the submitted WAV. The
+    /// 2026-09-14 degradation showed the batch endpoint can 200-empty real
+    /// speech, so this variant is retryable while evidence-free empties
+    /// (silence, clips too short to prove anything) stay terminal.
+    #[error(
+        "STT returned an empty transcript on audible audio (rms={rms:.4}, duration_ms={duration_ms})"
+    )]
+    EmptyTranscriptWithAudio { duration_ms: u64, rms: f32 },
     #[error("Accessibility permission is not granted; text cannot be pasted")]
     AccessibilityNotGranted,
 }
@@ -2184,6 +2200,14 @@ impl App {
                 "transcript": self.log_text(&transcript),
             })
         );
+        // A 200-empty transcript is silence on quiet audio but a server fault
+        // on audio that demonstrably carried sound (2026-09-14: the degraded
+        // endpoint 200-emptied a 2s real-speech dictation). Classify against
+        // the evidence in the submitted WAV so the retry arm can tell the two
+        // apart. xAI and AssemblyAI empties keep the plain terminal error.
+        if transcript.trim().is_empty() {
+            return Err(empty_transcript_error(wav));
+        }
         Ok(transcript)
     }
 
@@ -5970,6 +5994,40 @@ fn parse_stt_fallback(value: &str) -> Option<SttFallback> {
     }
 }
 
+/// Classify a 200-empty Telnyx batch transcript against the audio that was
+/// sent. Parsed only on the empty path, so success requests pay nothing.
+///
+/// A clip longer than `EMPTY_RETRY_MIN_DURATION_MS` whose whole-recording RMS
+/// clears the recorder's own speech/silence bar demonstrably carried sound, so
+/// the empty response is a degraded-server fault
+/// (`AppError::EmptyTranscriptWithAudio`) and the batch retry arm gets one
+/// fresh request. Silence, clips too short to prove anything, and bytes this
+/// app could not have recorded keep the plain terminal error, so accidental
+/// holds never spin.
+fn empty_transcript_error(wav: &[u8]) -> AppError {
+    let terminal = || AppError::Transcription(String::from("STT returned empty transcript"));
+    let Some(parsed) = parse_wav_pcm16(wav) else {
+        return terminal();
+    };
+    // data_len / byte_rate, in milliseconds: the WAV's own duration.
+    let data_len = u64::try_from(parsed.samples.len().saturating_mul(2)).unwrap_or(u64::MAX);
+    let byte_rate = u64::from(parsed.sample_rate)
+        .saturating_mul(u64::from(parsed.channels))
+        .saturating_mul(2);
+    let duration_ms = data_len.saturating_mul(1_000) / byte_rate;
+    // Whole-recording RMS on the [-1, 1] amplitude scale `frame_rms` produces,
+    // the same scale the trailing-stop threshold lives on. The existing bar
+    // (`TRAILING_SPEECH_RMS_THRESHOLD`, 0.0019) already separates a measured
+    // 0.0004 room floor from a 0.0021 mid-word release, so a whole clip
+    // averaging above it carried real sound; a conservative floor keeps every
+    // real dictation retryable and only true silence terminal.
+    let rms = frame_rms(&parsed.samples);
+    if duration_ms > EMPTY_RETRY_MIN_DURATION_MS && rms > TRAILING_SPEECH_RMS_THRESHOLD {
+        return AppError::EmptyTranscriptWithAudio { duration_ms, rms };
+    }
+    terminal()
+}
+
 fn non_empty_transcript(text: Option<&str>, provider: &str) -> Result<String, AppError> {
     let transcript = text.unwrap_or_default().trim();
     if transcript.is_empty() {
@@ -6973,21 +7031,29 @@ enum BatchRetry {
     DownsampledPayload,
 }
 
-/// Retry plan for a failed primary batch attempt. Only 413 and 5xx responses
-/// retry: both are gateway faults where a fresh request re-rolls the edge, and
-/// both were seen nondeterministically during the 2026-09-09 Telnyx STT
-/// degradation (identical requests failing then passing). Transcript-level
-/// failures such as "STT returned empty transcript" are legitimate silence
-/// and stay terminal, so the plan matches on the status-carrying variant alone.
+/// Retry plan for a failed primary batch attempt. Three faults retry, and all
+/// were observed during Telnyx STT degradations: 413 and 5xx responses (both
+/// gateway faults where a fresh request re-rolls the edge, seen
+/// nondeterministically on 2026-09-09 with identical requests failing then
+/// passing) and a 200-empty transcript on audio that demonstrably carried
+/// sound (seen 2026-09-14: the degraded endpoint 200-emptied a 2s real-speech
+/// dictation). A plain empty transcript on silence, or on a clip too short to
+/// prove anything, is still a legitimate empty and stays terminal, so
+/// accidental holds do not spin.
 fn batch_retry_plan(error: &AppError, elapsed: Duration) -> BatchRetry {
-    let AppError::TranscriptionStatus { status, .. } = error else {
-        return BatchRetry::None;
-    };
-    // Same clock guard as the transport retry: a status failure that already
-    // burned the request budget must not double the total wait.
+    // Same clock guard as the transport retry: a failure that already burned
+    // the request budget must not double the total wait.
     if exhausted_request_budget(elapsed) {
         return BatchRetry::None;
     }
+    if let AppError::EmptyTranscriptWithAudio { .. } = error {
+        // A server fault, not size-related: a fresh request re-rolls the
+        // gateway edge with the same payload.
+        return BatchRetry::SamePayload;
+    }
+    let AppError::TranscriptionStatus { status, .. } = error else {
+        return BatchRetry::None;
+    };
     if *status == 413 {
         return BatchRetry::DownsampledPayload;
     }
@@ -7014,9 +7080,15 @@ where
 {
     match batch_retry_plan(&error, attempt_started.elapsed()) {
         BatchRetry::SamePayload => {
-            warn!(
-                "primary STT request failed with a server status; retrying once with a fresh request: {error}"
-            );
+            if let AppError::EmptyTranscriptWithAudio { duration_ms, rms } = error {
+                warn!(
+                    "[stt] empty transcript with audible audio; retrying once (rms={rms:.4}, duration_ms={duration_ms})"
+                );
+            } else {
+                warn!(
+                    "primary STT request failed with a server status; retrying once with a fresh request: {error}"
+                );
+            }
             return attempt(wav);
         }
         BatchRetry::DownsampledPayload => {
@@ -7175,11 +7247,11 @@ mod tests {
         TextReplacement, TranscriptHistoryEntry, UpdateOutcome, apply_text_replacements,
         apply_vocabulary_corrections_with_matches, batch_retry_plan, build_cleanup_user_content,
         build_rewrite_user_content, build_stt_prompt, canonicalize_known_terms, cleanup_decision,
-        cleanup_max_tokens, cleanup_profile, downsample_wav_16k_mono,
+        cleanup_max_tokens, cleanup_profile, downsample_wav_16k_mono, empty_transcript_error,
         final_streaming_result_is_ready_elapsed, handshake_with_deadline,
         is_known_no_speech_transcript, is_supported_hotkey, load_vocabulary_usage,
-        parse_accessibility_trust, parse_command, parse_replacements_json, parse_stt_fallbacks,
-        parse_u64_env_value, parse_update_outcome, read_vocabulary_file,
+        non_empty_transcript, parse_accessibility_trust, parse_command, parse_replacements_json,
+        parse_stt_fallbacks, parse_u64_env_value, parse_update_outcome, read_vocabulary_file,
         read_vocabulary_usage_file, remove_fillers, retry_failed_primary,
         sanitize_transcript_history, speech_stats, stable_streaming_best_is_ready_elapsed,
         streaming_batch_fallback_reason, streaming_connection, streaming_preview_tail,
@@ -9068,20 +9140,208 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_transcript_error_is_terminal() {
-        // Empty transcripts are legitimate silence, not a server fault. Retrying
-        // them would make silent dictations spin, so no retry may fire.
+    fn an_empty_transcript_without_audio_evidence_is_terminal() {
+        // Deliberate policy revision, 2026-09-14: an empty transcript used to be
+        // terminal unconditionally because empty was assumed to mean silence.
+        // The degraded Telnyx endpoint was then seen 200-empting a 2s
+        // real-speech dictation, so empty is now retryable only when the WAV
+        // proves the recording carried sound. A silent hold has no evidence,
+        // produces the plain terminal error, and must not retry.
+        let samples: Vec<i16> = vec![0_i16; 96_000];
+        let silent = wav_bytes(&samples, 48_000).unwrap_or_default();
+        let first = empty_transcript_error(&silent);
+
+        assert!(matches!(first, AppError::Transcription(_)));
         let mut attempts = 0;
         let mut attempt = |_: &[u8]| -> Result<String, AppError> {
             attempts += 1;
             Ok(String::from("must not happen"))
         };
-        let first = AppError::Transcription(String::from("STT returned empty transcript"));
 
-        let outcome = retry_failed_primary(&mut attempt, &[], first, std::time::Instant::now());
+        let outcome = retry_failed_primary(&mut attempt, &silent, first, std::time::Instant::now());
 
         assert_eq!(attempts, 0);
         assert!(matches!(outcome, Err(AppError::Transcription(_))));
+    }
+
+    #[test]
+    fn an_empty_transcript_on_a_clip_too_short_to_prove_speech_is_terminal() {
+        // 500ms of loud audio clears the silence floor but not the 1.2s
+        // minimum: a clip this short cannot prove the speaker said anything
+        // recoverable, so the empty stays terminal.
+        let samples: Vec<i16> = vec![6_000_i16; 24_000];
+        let short = wav_bytes(&samples, 48_000).unwrap_or_default();
+        let first = empty_transcript_error(&short);
+
+        assert!(matches!(first, AppError::Transcription(_)));
+        let mut attempts = 0;
+        let mut attempt = |_: &[u8]| -> Result<String, AppError> {
+            attempts += 1;
+            Ok(String::from("must not happen"))
+        };
+
+        let outcome = retry_failed_primary(&mut attempt, &short, first, std::time::Instant::now());
+
+        assert_eq!(attempts, 0);
+        assert!(matches!(outcome, Err(AppError::Transcription(_))));
+    }
+
+    #[test]
+    fn empty_transcript_classification_follows_the_audio_evidence() {
+        // 1.25s of loud audio at the captured rate carries the evidence: the
+        // recorded duration and the whole-clip RMS on the [-1, 1] scale.
+        let loud_samples: Vec<i16> = vec![6_000_i16; 60_000];
+        let loud = wav_bytes(&loud_samples, 48_000).unwrap_or_default();
+        assert!(matches!(
+            empty_transcript_error(&loud),
+            AppError::EmptyTranscriptWithAudio {
+                duration_ms: 1_250,
+                rms,
+            } if (rms - 6_000.0_f32 / 32_768.0_f32).abs() < 0.0001
+        ));
+        // Exactly the 1.2s minimum is still terminal: the bar is strict.
+        let boundary_samples: Vec<i16> = vec![6_000_i16; 57_600];
+        let boundary = wav_bytes(&boundary_samples, 48_000).unwrap_or_default();
+        assert!(matches!(
+            empty_transcript_error(&boundary),
+            AppError::Transcription(_)
+        ));
+        // 2s of digital silence is the refined terminal case.
+        let silent_samples: Vec<i16> = vec![0_i16; 96_000];
+        let silent = wav_bytes(&silent_samples, 48_000).unwrap_or_default();
+        assert!(matches!(
+            empty_transcript_error(&silent),
+            AppError::Transcription(_)
+        ));
+        // Quiet room tone (whole-clip RMS 0.0018) sits under the 0.0019 floor
+        // the recorder's own trailing-stop threshold defines.
+        let hushed_samples: Vec<i16> = vec![60_i16; 96_000];
+        let hushed = wav_bytes(&hushed_samples, 48_000).unwrap_or_default();
+        assert!(matches!(
+            empty_transcript_error(&hushed),
+            AppError::Transcription(_)
+        ));
+        // Bytes this app could not have recorded fall back to the terminal
+        // error rather than panicking.
+        assert!(matches!(
+            empty_transcript_error(b"not a wav at all"),
+            AppError::Transcription(_)
+        ));
+    }
+
+    #[test]
+    fn an_empty_transcript_with_audible_audio_retries_once_then_succeeds() {
+        // The incident shape: a 200-empty response on real speech. The evidence
+        // comes from the submitted WAV, so the retry resends the same bytes on
+        // a fresh request and the second response's text wins.
+        let samples: Vec<i16> = vec![6_000_i16; 60_000];
+        let source = wav_bytes(&samples, 48_000).unwrap_or_default();
+        let first = empty_transcript_error(&source);
+        assert!(matches!(
+            first,
+            AppError::EmptyTranscriptWithAudio {
+                duration_ms: 1_250,
+                ..
+            }
+        ));
+        let mut attempts: Vec<Vec<u8>> = Vec::new();
+        let mut attempt = |wav: &[u8]| -> Result<String, AppError> {
+            attempts.push(wav.to_vec());
+            Ok(String::from("retried text"))
+        };
+
+        let outcome = retry_failed_primary(&mut attempt, &source, first, std::time::Instant::now());
+
+        assert_eq!(outcome.unwrap_or_default(), "retried text");
+        // Exactly one retry, carrying the same payload: the fault is not
+        // size-related, so no downsample.
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0], source);
+    }
+
+    #[test]
+    fn an_empty_transcript_with_audible_audio_is_terminal_after_the_single_retry() {
+        let samples: Vec<i16> = vec![6_000_i16; 60_000];
+        let source = wav_bytes(&samples, 48_000).unwrap_or_default();
+        let first = empty_transcript_error(&source);
+        let mut attempts = 0;
+        let mut attempt = |_: &[u8]| -> Result<String, AppError> {
+            attempts += 1;
+            Err(AppError::EmptyTranscriptWithAudio {
+                duration_ms: 1_250,
+                rms: 0.18,
+            })
+        };
+
+        let outcome = retry_failed_primary(&mut attempt, &source, first, std::time::Instant::now());
+
+        // The retry fired once, 200-emptied again, and stopped there.
+        assert_eq!(attempts, 1);
+        assert!(matches!(
+            outcome,
+            Err(AppError::EmptyTranscriptWithAudio {
+                duration_ms: 1_250,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn a_budget_exhausted_empty_transcript_with_audio_is_not_retried() {
+        // The same PR #14 clock guard governs the evidence retry: an attempt
+        // that already burned the full request budget must not buy a second
+        // full wait, audible audio or not.
+        let samples: Vec<i16> = vec![6_000_i16; 60_000];
+        let source = wav_bytes(&samples, 48_000).unwrap_or_default();
+        let first = empty_transcript_error(&source);
+        let mut attempts = 0;
+        let mut attempt = |_: &[u8]| -> Result<String, AppError> {
+            attempts += 1;
+            Ok(String::from("must not happen"))
+        };
+        let started = std::time::Instant::now()
+            .checked_sub(super::STT_REQUEST_TIMEOUT)
+            .unwrap_or_else(std::time::Instant::now);
+
+        let outcome = retry_failed_primary(&mut attempt, &source, first, started);
+
+        assert_eq!(attempts, 0);
+        assert!(matches!(
+            outcome,
+            Err(AppError::EmptyTranscriptWithAudio {
+                duration_ms: 1_250,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn fallback_provider_empty_transcripts_stay_terminal() {
+        // The xAI and AssemblyAI empty checks keep the plain terminal error:
+        // no evidence is computed there, so nothing about their empties became
+        // retryable.
+        for provider in ["xAI", "AssemblyAI"] {
+            assert!(matches!(
+                non_empty_transcript(None, provider),
+                Err(AppError::Transcription(_))
+            ));
+            assert!(matches!(
+                non_empty_transcript(Some("   "), provider),
+                Err(AppError::Transcription(_))
+            ));
+            let first =
+                AppError::Transcription(format!("{provider} STT returned empty transcript"));
+            let mut attempts = 0;
+            let mut attempt = |_: &[u8]| -> Result<String, AppError> {
+                attempts += 1;
+                Ok(String::from("must not happen"))
+            };
+
+            let outcome = retry_failed_primary(&mut attempt, &[], first, std::time::Instant::now());
+
+            assert_eq!(attempts, 0);
+            assert!(matches!(outcome, Err(AppError::Transcription(_))));
+        }
     }
 
     #[test]
@@ -9128,7 +9388,7 @@ mod tests {
     }
 
     #[test]
-    fn the_retry_plan_respects_the_request_budget_and_matches_only_gateway_faults() {
+    fn the_retry_plan_respects_the_request_budget_and_matches_only_retryable_faults() {
         let too_large = AppError::TranscriptionStatus {
             status: 413,
             message: String::new(),
@@ -9142,6 +9402,10 @@ mod tests {
             message: String::new(),
         };
         let empty = AppError::Transcription(String::from("STT returned empty transcript"));
+        let empty_with_audio = AppError::EmptyTranscriptWithAudio {
+            duration_ms: 1_250,
+            rms: 0.18,
+        };
         let fast = std::time::Duration::from_millis(40);
 
         assert_eq!(
@@ -9152,8 +9416,14 @@ mod tests {
             batch_retry_plan(&bad_gateway, fast),
             BatchRetry::SamePayload
         );
-        // A status failure that already burned the budget must not double the
-        // total wait: same guard the PR #14 retry lives by.
+        // A 200-empty transcript on audio that carried sound is a server fault
+        // (2026-09-14), not size-related: same payload, fresh request.
+        assert_eq!(
+            batch_retry_plan(&empty_with_audio, fast),
+            BatchRetry::SamePayload
+        );
+        // A failure that already burned the budget must not double the total
+        // wait: same guard the PR #14 retry lives by.
         assert_eq!(
             batch_retry_plan(&too_large, super::STT_REQUEST_TIMEOUT),
             BatchRetry::None
@@ -9162,7 +9432,11 @@ mod tests {
             batch_retry_plan(&bad_gateway, super::STT_REQUEST_TIMEOUT),
             BatchRetry::None
         );
-        // Client faults and transcript-level failures stay terminal.
+        assert_eq!(
+            batch_retry_plan(&empty_with_audio, super::STT_REQUEST_TIMEOUT),
+            BatchRetry::None
+        );
+        // Client faults and evidence-free transcript failures stay terminal.
         assert_eq!(batch_retry_plan(&bad_request, fast), BatchRetry::None);
         assert_eq!(batch_retry_plan(&empty, fast), BatchRetry::None);
         assert_eq!(
