@@ -3,6 +3,7 @@
 
 import json
 import sys
+from datetime import datetime
 
 import ApplicationServices as AX
 from AppKit import NSWorkspace
@@ -11,6 +12,10 @@ from Foundation import NSMakeRange, NSString
 MAX_TEXT_BEFORE_CURSOR = 500
 MAX_FALLBACK_TEXT = 500
 MAX_SELECTED_TEXT = 8000
+
+LOG_FILE = "/tmp/bolo.log"
+SECURE_LABEL_KEYWORDS = ("password", "secure")
+SECURE_REFUSAL_LOG_LINE = "[accessibility] secure field focused; context withheld"
 
 
 def frontmost_app():
@@ -133,6 +138,44 @@ def focused_element():
     return element
 
 
+def is_secure_element(element):
+    """Return True when the focused element must be treated as a password field.
+
+    Fail-closed: the exact secure-text-field subrole, or the element's own
+    role description, title, description, placeholder, or help text naming a
+    password or secure control. Element content (AXValue, AXSelectedText) is
+    never scanned, so a normal document that merely mentions passwords still
+    returns context.
+    """
+    subrole = copy_attribute(element, AX.kAXSubroleAttribute)
+    if subrole is not None and str(subrole) == str(AX.kAXSecureTextFieldSubrole):
+        return True
+    for attribute in (
+        AX.kAXRoleDescriptionAttribute,
+        AX.kAXTitleAttribute,
+        AX.kAXDescriptionAttribute,
+        AX.kAXPlaceholderValueAttribute,
+        AX.kAXHelpAttribute,
+    ):
+        text = copy_attribute(element, attribute)
+        if text is None:
+            continue
+        lowered = str(text).lower()
+        if any(keyword in lowered for keyword in SECURE_LABEL_KEYWORDS):
+            return True
+    return False
+
+
+def log_secure_refusal():
+    """Append the one-line refusal note to the app log; never include field text."""
+    try:
+        stamp = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+        with open(LOG_FILE, "a", encoding="utf-8") as log_file:
+            log_file.write(f"{stamp} {SECURE_REFUSAL_LOG_LINE}\n")
+    except Exception:
+        pass
+
+
 def text_before_cursor(element):
     selection = selected_range(element)
     if selection is not None:
@@ -177,17 +220,24 @@ def main():
     if len(sys.argv) > 1 and sys.argv[1] == "--select-before-caret":
         element = focused_element()
         target = sys.stdin.read()
+        if element is not None and is_secure_element(element):
+            log_secure_refusal()
+            print(json.dumps({"selected": False}))
+            return 3
         selected = element is not None and select_text_immediately_before_caret(element, target)
         print(json.dumps({"selected": selected}))
         return 0 if selected else 3
 
     app_name, bundle_id = frontmost_app()
     element = focused_element()
+    secure = element is not None and is_secure_element(element)
+    if secure:
+        log_secure_refusal()
     context = {
         "app_name": app_name,
         "bundle_id": bundle_id,
-        "text_before_cursor": text_before_cursor(element) if element is not None else "",
-        "selected_text": selected_text(element) if element is not None else "",
+        "text_before_cursor": "" if (element is None or secure) else text_before_cursor(element),
+        "selected_text": "" if (element is None or secure) else selected_text(element),
     }
     print(json.dumps(context, ensure_ascii=True))
 
