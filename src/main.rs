@@ -50,8 +50,21 @@ const TELNYX_STT_ENDPOINT: &str = "https://api.telnyx.com/v2/ai/audio/transcript
 const TELNYX_STT_STREAMING_ENDPOINT: &str = "wss://api.telnyx.com/v2/speech-to-text/transcription";
 const TELNYX_LLM_ENDPOINT: &str = "https://api.telnyx.com/v2/ai/chat/completions";
 const XAI_STT_ENDPOINT: &str = "https://api.x.ai/v1/stt";
+const ASSEMBLYAI_DICTATION_ENDPOINT: &str = "https://dictation.assemblyai.com/v1/transcribe/live";
+const ASSEMBLYAI_LLM_GATEWAY_ENDPOINT: &str =
+    "https://llm-gateway.assemblyai.com/v1/chat/completions";
+const ASSEMBLYAI_LLM_DEFAULT_MODEL: &str = "gemini-2.5-flash-lite";
 const ASSEMBLYAI_UPLOAD_ENDPOINT: &str = "https://api.assemblyai.com/v2/upload";
 const ASSEMBLYAI_TRANSCRIPT_ENDPOINT: &str = "https://api.assemblyai.com/v2/transcript";
+const ASSEMBLYAI_STREAMING_ENDPOINT: &str = "wss://streaming.assemblyai.com/v3/ws";
+const ASSEMBLYAI_DICTATION_MODEL: &str = "universal-3-5-pro";
+const ASSEMBLYAI_STREAMING_MODEL: &str = "universal-streaming-english";
+const ASSEMBLYAI_SYNC_MAX_DURATION_MS: u64 = 120_000;
+const ASSEMBLYAI_LANGUAGE_CODES: [&str; 32] = [
+    "af", "ar", "yue", "ca", "da", "nl", "en", "et", "fi", "fr", "gl", "de", "he", "hi", "it",
+    "ja", "ko", "zh", "mr", "no", "nn", "fa", "pt", "ro", "ru", "es", "sv", "tr", "ur", "vi", "xh",
+    "zu",
+];
 const CORRECTION_WINDOW: Duration = Duration::from_secs(3);
 const MIN_RECORDING: Duration = Duration::from_secs(1);
 const RECORDING_WATCHDOG_INTERVAL: Duration = Duration::from_secs(5);
@@ -179,7 +192,8 @@ enum AppError {
 
 #[derive(Clone, Debug)]
 struct Config {
-    telnyx_api_key: String,
+    telnyx_api_key: Option<String>,
+    assemblyai_api_key: Option<String>,
     llm_cleanup: CleanupMode,
     litellm_base: Option<String>,
     litellm_key: Option<String>,
@@ -227,6 +241,7 @@ enum SttFallback {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum StreamingProvider {
+    AssemblyAiDirect,
     AssemblyAi,
     Deepgram,
 }
@@ -397,6 +412,17 @@ impl SpeechStats {
     }
 }
 
+/// Resolved LLM target: the OpenAI-shaped endpoint to call, its credential,
+/// the auth style the endpoint expects, and whether it understands the
+/// Telnyx-only `enable_thinking` request field.
+#[derive(Clone, Debug)]
+struct LlmEndpoint {
+    url: String,
+    key: Option<String>,
+    bearer: bool,
+    legacy_qwen: bool,
+}
+
 #[derive(Clone, Debug, Default)]
 enum WarmupValue<T> {
     #[default]
@@ -441,6 +467,24 @@ struct SttRequestParts {
     model_config: Option<serde_json::Value>,
     prompt: Option<String>,
     language: Option<String>,
+}
+
+/// One STT outcome: `text` is the verbatim transcript every caller needs, and
+/// `llm_cleaned` carries the provider-side cleanup when the provider bundles
+/// one (`AssemblyAI` Dictation), so Bolo's own LLM cleanup pass can be skipped.
+#[derive(Clone, Debug, Default)]
+struct SttResult {
+    text: String,
+    llm_cleaned: Option<String>,
+}
+
+impl SttResult {
+    const fn verbatim(text: String) -> Self {
+        Self {
+            text,
+            llm_cleaned: None,
+        }
+    }
 }
 
 impl SttRequestParts {
@@ -548,7 +592,7 @@ impl StreamingRecording {
                     .build()
                 {
                     Ok(runtime) => runtime.block_on(async move {
-                        if let Err(error) = run_telnyx_stream(
+                        if let Err(error) = run_stt_stream(
                             api_key,
                             provider,
                             language,
@@ -806,7 +850,7 @@ fn best_streaming_text(result: &StreamingTranscript) -> Option<String> {
     }
 }
 
-async fn run_telnyx_stream(
+async fn run_stt_stream(
     api_key: String,
     provider: StreamingProvider,
     language: String,
@@ -815,12 +859,25 @@ async fn run_telnyx_stream(
     result: Arc<Mutex<StreamingTranscript>>,
     preview_proxy: Option<EventLoopProxy<UserEvent>>,
 ) -> Result<(), String> {
-    let query = telnyx_stream_query(provider, &language, &vocabulary);
-    let url = format!("{TELNYX_STT_STREAMING_ENDPOINT}?{query}");
+    let (url, auth) = match provider {
+        StreamingProvider::AssemblyAiDirect => (
+            format!(
+                "{ASSEMBLYAI_STREAMING_ENDPOINT}?{}",
+                assemblyai_direct_query(&language, &vocabulary)
+            ),
+            api_key,
+        ),
+        other => (
+            format!(
+                "{TELNYX_STT_STREAMING_ENDPOINT}?{}",
+                telnyx_stream_query(other, &language, &vocabulary)
+            ),
+            format!("Bearer {api_key}"),
+        ),
+    };
     let mut request = url
         .into_client_request()
         .map_err(|error| error.to_string())?;
-    let auth = format!("Bearer {api_key}");
     let header = HeaderValue::from_str(&auth).map_err(|error| error.to_string())?;
     drop(request.headers_mut().insert(AUTHORIZATION, header));
     // Boxed so the (large) handshake future does not inflate the whole stream
@@ -860,6 +917,17 @@ async fn run_telnyx_stream(
                             .await
                         {
                             warn!("streaming close failed: {error}");
+                        }
+                    } else if provider == StreamingProvider::AssemblyAiDirect {
+                        // AssemblyAI v3 requires an explicit Terminate to
+                        // finalize the in-flight turn before the server closes.
+                        if let Err(error) = write
+                            .send(Message::Text(
+                                String::from(r#"{"type":"Terminate"}"#).into(),
+                            ))
+                            .await
+                        {
+                            warn!("streaming terminate failed: {error}");
                         }
                     }
                     break;
@@ -901,7 +969,7 @@ fn telnyx_stream_query(
     vocabulary: &[String],
 ) -> String {
     let mut params = match provider {
-        StreamingProvider::AssemblyAi => vec![
+        StreamingProvider::AssemblyAi | StreamingProvider::AssemblyAiDirect => vec![
             String::from("transcription_engine=AssemblyAI"),
             String::from("model=assemblyai%2Funiversal-streaming"),
             String::from("input_format=linear16"),
@@ -929,6 +997,86 @@ fn telnyx_stream_query(
         params.push(format!("keyterm={keyterms}"));
     }
     params.join("&")
+}
+
+/// `AssemblyAI` direct streaming (v3 WebSocket) is only reachable when the
+/// resolved provider is `AssemblyAiDirect`; Telnyx-routed providers never take
+/// this path.
+fn assemblyai_streaming_model() -> String {
+    load_env_value("BOLO_STT_STREAMING_MODEL")
+        .unwrap_or_else(|| String::from(ASSEMBLYAI_STREAMING_MODEL))
+        .to_ascii_lowercase()
+}
+
+fn assemblyai_direct_query(language: &str, vocabulary: &[String]) -> String {
+    assemblyai_direct_query_with(&assemblyai_streaming_model(), language, vocabulary)
+}
+
+/// Core of `assemblyai_direct_query` with the streaming model passed in, so the
+/// query string can be tested without reading the environment.
+fn assemblyai_direct_query_with(model: &str, language: &str, vocabulary: &[String]) -> String {
+    let mut params = vec![
+        format!("sample_rate={STREAMING_SAMPLE_RATE}"),
+        format!("speech_model={model}"),
+    ];
+    if model.starts_with("universal-streaming-") {
+        // The dictation models return formatted final turns natively.
+        params.push(String::from("format_turns=true"));
+    } else if let Some(code) = assemblyai_language_code(language) {
+        params.push(format!(
+            "language_codes={}",
+            query_escape(&serde_json::json!([code]).to_string())
+        ));
+    }
+    if !vocabulary.is_empty() {
+        let terms: Vec<String> = vocabulary.iter().take(50).cloned().collect();
+        if let Ok(json) = serde_json::to_string(&terms) {
+            params.push(format!("keyterms_prompt={}", query_escape(&json)));
+        }
+    }
+    params.join("&")
+}
+
+/// Map a configured Bolo language (for example `en-IN`) onto the ISO 639-1
+/// codes `AssemblyAI`'s dictation and streaming APIs accept. Regional variants
+/// collapse to their base language; anything outside the supported set is
+/// omitted so the provider falls back to its own defaults.
+fn assemblyai_language_code(configured: &str) -> Option<String> {
+    let value = configured.trim();
+    if value.is_empty()
+        || value.eq_ignore_ascii_case("auto")
+        || value.eq_ignore_ascii_case("auto_detect")
+        || value.eq_ignore_ascii_case("off")
+        || value.eq_ignore_ascii_case("none")
+        || value.eq_ignore_ascii_case("false")
+    {
+        return None;
+    }
+    let base = value
+        .split('-')
+        .next()
+        .unwrap_or(value)
+        .trim()
+        .to_ascii_lowercase();
+    if ASSEMBLYAI_LANGUAGE_CODES.contains(&base.as_str()) {
+        Some(base)
+    } else {
+        None
+    }
+}
+
+/// Duration of a parsed WAV in milliseconds; `None` when the buffer is not a
+/// parseable PCM16 WAV.
+fn wav_duration_ms(wav: &[u8]) -> Option<u64> {
+    let parsed = parse_wav_pcm16(wav)?;
+    let data_len = u64::try_from(parsed.samples.len().saturating_mul(2)).ok()?;
+    let byte_rate = u64::from(parsed.sample_rate)
+        .saturating_mul(u64::from(parsed.channels))
+        .saturating_mul(2);
+    if byte_rate == 0 {
+        return None;
+    }
+    Some(data_len.saturating_mul(1_000) / byte_rate)
 }
 
 fn benign_stream_close_error(error: &str) -> bool {
@@ -1143,6 +1291,21 @@ struct SttResponse {
 #[derive(Debug, Deserialize)]
 struct AssemblyUploadResponse {
     upload_url: String,
+}
+
+/// `AssemblyAI` Dictation response: `text` is the verbatim transcript, and
+/// `llm_response` is the provider-side cleaned text (null when the rewrite
+/// failed, with `llm_error` describing it).
+#[derive(serde::Deserialize)]
+struct AssemblyDictationResponse {
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    llm_response: Option<String>,
+    #[serde(default)]
+    llm_error: Option<String>,
+    #[serde(default)]
+    request_time_ms: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1788,33 +1951,33 @@ impl App {
         );
         metrics.outcome = "stt_failed";
         let stt_started = Instant::now();
-        let raw = if let Some(streaming) = recording.streaming {
+        let stt = if let Some(streaming) = recording.streaming {
             match streaming.finish() {
-                Some(streaming_text) => self.recheck_streaming_transcript(
+                Some(streaming_text) => SttResult::verbatim(self.recheck_streaming_transcript(
                     streaming_text,
                     &wav,
                     elapsed,
                     &recording.warmup,
-                ),
+                )),
                 None => {
                     warn!("[stt] streaming_empty_fallback");
                     self.transcribe(&wav, &recording.warmup)
                         .unwrap_or_else(|error| {
                             warn!("batch fallback after streaming failed: {error}");
-                            String::new()
+                            SttResult::verbatim(String::new())
                         })
                 }
             }
         } else {
             match self.transcribe(&wav, &recording.warmup) {
-                Ok(transcript) => transcript,
+                Ok(result) => result,
                 Err(error) => {
                     save_failed_audio(&wav);
                     return Err(error);
                 }
             }
         };
-        if raw.trim().is_empty() {
+        if stt.text.trim().is_empty() {
             save_failed_audio(&wav);
             return Err(AppError::Transcription(String::from(
                 "STT returned empty transcript",
@@ -1825,14 +1988,15 @@ impl App {
         info!(
             "[pipeline] stt_understanding {}",
             serde_json::json!({
-                "transcript": self.log_text(&raw),
-                "chars": raw.chars().count(),
-                "words": raw.split_whitespace().count(),
+                "transcript": self.log_text(&stt.text),
+                "chars": stt.text.chars().count(),
+                "words": stt.text.split_whitespace().count(),
             })
         );
         metrics.outcome = "cleanup_failed";
         let cleanup_started = Instant::now();
-        let prepared = self.prepare_text(&raw, &recording.warmup)?;
+        let prepared =
+            self.prepare_text(&stt.text, &recording.warmup, stt.llm_cleaned.as_deref())?;
         metrics.cleanup_duration = Some(cleanup_started.elapsed());
         metrics.llm_cleanup_ran = prepared.llm_cleanup_ran;
         metrics.llm_cleanup_deferred = prepared.llm_cleanup_deferred;
@@ -1869,7 +2033,7 @@ impl App {
             );
             let pasted_text = prepared.text.clone();
             paste_text(&self.config.root_dir, &prepared.text)?;
-            self.remember_result(&raw, &prepared.text, Some(&prepared))?;
+            self.remember_result(&stt.text, &prepared.text, Some(&prepared))?;
             if let Some(cleanup_input) = prepared.cleanup_input {
                 self.start_deferred_cleanup(cleanup_input, pasted_text, &recording.warmup)?;
             }
@@ -1991,7 +2155,19 @@ impl App {
 
     fn start_streaming_recording(&self) -> Option<StreamingRecording> {
         let provider = self.config.streaming_stt?;
-        let api_key = self.config.telnyx_api_key.clone();
+        let api_key = match provider {
+            StreamingProvider::AssemblyAiDirect => load_env_value("ASSEMBLYAI_API_KEY"),
+            StreamingProvider::AssemblyAi | StreamingProvider::Deepgram => {
+                self.config.telnyx_api_key.clone()
+            }
+        };
+        let Some(api_key) = api_key else {
+            warn!(
+                "[stt] streaming skipped: {} is not configured",
+                provider.required_key_name()
+            );
+            return None;
+        };
         let language = self
             .stt_language()
             .unwrap_or_else(|_| self.config.stt_language.clone());
@@ -2031,18 +2207,32 @@ impl App {
         }
     }
 
-    fn transcribe(&self, wav: &[u8], warmup: &DictationWarmup) -> Result<String, AppError> {
+    fn transcribe(&self, wav: &[u8], warmup: &DictationWarmup) -> Result<SttResult, AppError> {
         info!("sending batch transcription request");
         let request = self.stt_request_parts(warmup);
-        let mut attempt = |payload: &[u8]| {
-            self.transcribe_with_model(
-                payload,
-                &request.primary_model,
-                request.model_config.as_ref(),
-                request.prompt.as_deref(),
-                request.language.as_deref(),
-                STT_REQUEST_TIMEOUT,
-            )
+        let mut attempt = |payload: &[u8]| -> Result<SttResult, AppError> {
+            if let Some(model) = request.primary_model.strip_prefix("assemblyai/") {
+                if wav_duration_ms(payload)
+                    .is_some_and(|duration| duration <= ASSEMBLYAI_SYNC_MAX_DURATION_MS)
+                {
+                    self.transcribe_with_assemblyai_dictation(payload, STT_REQUEST_TIMEOUT)
+                } else {
+                    // The Dictation endpoint caps audio at 120 seconds; longer
+                    // clips fall to the async upload+poll path.
+                    self.transcribe_with_assemblyai(payload, Some(model))
+                        .map(SttResult::verbatim)
+                }
+            } else {
+                self.transcribe_with_model(
+                    payload,
+                    &request.primary_model,
+                    request.model_config.as_ref(),
+                    request.prompt.as_deref(),
+                    request.language.as_deref(),
+                    STT_REQUEST_TIMEOUT,
+                )
+                .map(SttResult::verbatim)
+            }
         };
         let attempt_started = Instant::now();
         match attempt(wav) {
@@ -2062,6 +2252,11 @@ impl App {
     ) -> Result<String, AppError> {
         info!("sending bounded batch transcription verification");
         let request = self.stt_request_parts(warmup);
+        if request.primary_model.starts_with("assemblyai/") {
+            return self
+                .transcribe_with_assemblyai_dictation(wav, STREAMING_BATCH_VERIFY_TIMEOUT)
+                .map(|result| result.text);
+        }
         self.transcribe_with_model(
             wav,
             &request.primary_model,
@@ -2076,7 +2271,7 @@ impl App {
         &self,
         wav: &[u8],
         prompt: Option<&str>,
-    ) -> Result<String, AppError> {
+    ) -> Result<SttResult, AppError> {
         if self.config.stt_fallbacks.is_empty() {
             return Err(AppError::RateLimited);
         }
@@ -2085,7 +2280,7 @@ impl App {
         for fallback in &self.config.stt_fallbacks {
             info!("[stt] trying_fallback {}", fallback.label());
             match self.transcribe_with_fallback(wav, fallback, prompt) {
-                Ok(transcript) => return Ok(transcript),
+                Ok(text) => return Ok(SttResult::verbatim(text)),
                 Err(error) => {
                     warn!("[stt] fallback_failed {}: {error}", fallback.label());
                     last_error = error;
@@ -2144,6 +2339,11 @@ impl App {
                 "prompt": &prompt,
             })
         );
+        let api_key = self
+            .config
+            .telnyx_api_key
+            .as_deref()
+            .ok_or(AppError::MissingConfig("TELNYX_API_KEY"))?;
         let part = multipart::Part::bytes(wav.to_vec())
             .file_name(String::from("audio.wav"))
             .mime_str("audio/wav")?;
@@ -2162,7 +2362,7 @@ impl App {
         let response = self
             .http
             .post(TELNYX_STT_ENDPOINT)
-            .bearer_auth(&self.config.telnyx_api_key)
+            .bearer_auth(api_key)
             .multipart(form)
             .timeout(request_timeout)
             .send()?;
@@ -2266,6 +2466,114 @@ impl App {
         }
         let parsed: SttResponse = response.json()?;
         non_empty_transcript(parsed.text.as_deref(), "xAI")
+    }
+
+    /// `AssemblyAI` Dictation: one POST returns the verbatim transcript plus the
+    /// provider-side cleaned text, which replaces Bolo's separate LLM cleanup
+    /// pass for this provider. Contract (2026-10-01):
+    /// <https://www.assemblyai.com/docs/dictation> — multipart with a required
+    /// `config` part first, then `audio` (WAV or raw PCM, max 120s), raw key
+    /// in the `Authorization` header, and a reply carrying `text` and
+    /// `llm_response`.
+    fn transcribe_with_assemblyai_dictation(
+        &self,
+        wav: &[u8],
+        timeout: Duration,
+    ) -> Result<SttResult, AppError> {
+        let api_key = load_env_value("ASSEMBLYAI_API_KEY")
+            .ok_or(AppError::MissingConfig("ASSEMBLYAI_API_KEY"))?;
+        let vocabulary = self.vocabulary_snapshot().unwrap_or_default();
+        let language = self
+            .stt_language()
+            .unwrap_or_else(|_| self.config.stt_language.clone());
+        let mut config_json = serde_json::json!({});
+        if let Some(code) = assemblyai_language_code(&language) {
+            config_json["language_codes"] = serde_json::json!([code]);
+        }
+        if !vocabulary.is_empty() {
+            config_json["keyterms_prompt"] =
+                serde_json::json!(vocabulary.iter().take(50).collect::<Vec<_>>());
+        }
+        info!(
+            "[stt] request {}",
+            serde_json::json!({
+                "endpoint": ASSEMBLYAI_DICTATION_ENDPOINT,
+                "provider": "assemblyai_dictation",
+                "model": ASSEMBLYAI_DICTATION_MODEL,
+                "language": &language,
+                "audio_mime": "audio/wav",
+                "audio_bytes": wav.len(),
+                "keyterms": vocabulary.iter().take(50).collect::<Vec<_>>(),
+            })
+        );
+        let form = multipart::Form::new()
+            .part(
+                "config",
+                multipart::Part::text(config_json.to_string()).mime_str("application/json")?,
+            )
+            .part(
+                "audio",
+                multipart::Part::bytes(wav.to_vec())
+                    .file_name(String::from("audio.wav"))
+                    .mime_str("audio/wav")?,
+            );
+        let response = self
+            .http
+            .post(ASSEMBLYAI_DICTATION_ENDPOINT)
+            .header("Authorization", api_key.as_str())
+            .multipart(form)
+            .timeout(timeout)
+            .send()?;
+        let status = response.status();
+        info!(
+            "[stt] response_status {}",
+            serde_json::json!({
+                "endpoint": ASSEMBLYAI_DICTATION_ENDPOINT,
+                "provider": "assemblyai_dictation",
+                "status": status.as_u16(),
+            })
+        );
+        if status.as_u16() == 429 {
+            return Err(AppError::RateLimited);
+        }
+        if status.as_u16() == 401 {
+            return Err(AppError::Transcription(String::from(
+                "401 Unauthorized: check ASSEMBLYAI_API_KEY",
+            )));
+        }
+        if !status.is_success() {
+            let body = response.text().unwrap_or_default();
+            return Err(AppError::TranscriptionStatus {
+                status: status.as_u16(),
+                message: body.chars().take(200).collect::<String>(),
+            });
+        }
+        let parsed: AssemblyDictationResponse = response.json()?;
+        let verbatim = parsed.text.unwrap_or_default();
+        let cleaned = parsed
+            .llm_response
+            .as_deref()
+            .map(str::trim)
+            .filter(|cleaned| !cleaned.is_empty() && *cleaned != verbatim.trim())
+            .map(str::to_owned);
+        info!(
+            "[stt] response_text {}",
+            serde_json::json!({
+                "endpoint": ASSEMBLYAI_DICTATION_ENDPOINT,
+                "provider": "assemblyai_dictation",
+                "transcript": self.log_text(&verbatim),
+                "provider_cleanup": cleaned.is_some(),
+                "llm_error": &parsed.llm_error,
+                "request_time_ms": &parsed.request_time_ms,
+            })
+        );
+        if verbatim.trim().is_empty() {
+            return Err(empty_transcript_error(wav));
+        }
+        Ok(SttResult {
+            text: verbatim,
+            llm_cleaned: cleaned,
+        })
     }
 
     fn transcribe_with_assemblyai(
@@ -2377,23 +2685,11 @@ impl App {
         )))
     }
 
-    fn prepare_text(&self, raw: &str, _warmup: &DictationWarmup) -> Result<PreparedText, AppError> {
-        info!(
-            "[cleanup] input {}",
-            serde_json::json!({
-                "raw_stt": self.log_text(raw),
-            })
-        );
-        let whitespace_normalized = normalize_transcript(raw);
-        if is_known_no_speech_transcript(&whitespace_normalized) {
-            info!("[cleanup] dropped_known_no_speech_transcript");
-            return Ok(PreparedText {
-                text: String::new(),
-                llm_cleanup_ran: false,
-                llm_cleanup_deferred: false,
-                cleanup_input: None,
-            });
-        }
+    /// The local correction chain shared by the verbatim and provider-cleaned
+    /// paths: whitespace normalization, known-term canonicalization, vocabulary
+    /// aliases and corrections, and filler removal.
+    fn local_cleanup_chain(&self, source: &str, raw: &str) -> Result<String, AppError> {
+        let whitespace_normalized = normalize_transcript(source);
         info!(
             "[cleanup] normalize_whitespace {}",
             serde_json::json!({
@@ -2425,11 +2721,61 @@ impl App {
                 "after": self.log_text(&stripped),
             })
         );
+        Ok(stripped)
+    }
+
+    fn prepare_text(
+        &self,
+        raw: &str,
+        _warmup: &DictationWarmup,
+        provider_cleaned: Option<&str>,
+    ) -> Result<PreparedText, AppError> {
+        // When the provider bundled a cleaned text (AssemblyAI Dictation), run
+        // the local correction chain on that text instead of the verbatim
+        // transcript, and skip Bolo's own LLM cleanup pass afterwards.
+        let source = provider_cleaned.unwrap_or(raw);
+        info!(
+            "[cleanup] input {}",
+            serde_json::json!({
+                "raw_stt": self.log_text(raw),
+                "provider_cleaned": provider_cleaned.map(|cleaned| self.log_text(cleaned)),
+            })
+        );
+        let whitespace_normalized = normalize_transcript(source);
+        if is_known_no_speech_transcript(&whitespace_normalized) {
+            info!("[cleanup] dropped_known_no_speech_transcript");
+            return Ok(PreparedText {
+                text: String::new(),
+                llm_cleanup_ran: false,
+                llm_cleanup_deferred: false,
+                cleanup_input: None,
+            });
+        }
+        let stripped = self.local_cleanup_chain(source, raw)?;
         if is_known_no_speech_transcript(&stripped) {
             info!("[cleanup] dropped_known_no_speech_transcript");
             return Ok(PreparedText {
                 text: String::new(),
                 llm_cleanup_ran: false,
+                llm_cleanup_deferred: false,
+                cleanup_input: None,
+            });
+        }
+        if provider_cleaned.is_some() && !matches!(self.config.llm_cleanup, CleanupMode::Off) {
+            // The provider's cleaned text already did the LLM cleanup work, so
+            // there is nothing to defer; only Bolo's local replacements run.
+            let replacements = self.replacements_snapshot();
+            let final_text = apply_text_replacements(&stripped, &replacements);
+            info!(
+                "[cleanup] provider_cleanup_applied {}",
+                serde_json::json!({
+                    "text": self.log_text(&final_text),
+                    "replacement_count": replacements.len(),
+                })
+            );
+            return Ok(PreparedText {
+                text: final_text,
+                llm_cleanup_ran: true,
                 llm_cleanup_deferred: false,
                 cleanup_input: None,
             });
@@ -2484,7 +2830,10 @@ impl App {
         transcript: &str,
         warmup: &DictationWarmup,
     ) -> Result<String, AppError> {
-        let endpoint = self.config.llm_endpoint();
+        let Some(endpoint) = self.config.llm_endpoint() else {
+            info!("[llm] cleanup_not_configured");
+            return Ok(String::new());
+        };
         let model = self.config.llm_model();
         let accessibility_context = self.accessibility_context_for_cleanup(warmup);
         let prompt_bindings = self.prompt_bindings_snapshot();
@@ -2505,7 +2854,7 @@ impl App {
             ],
             max_tokens: cleanup_max_tokens(transcript),
             temperature: 0,
-            enable_thinking: false,
+            enable_thinking: endpoint.legacy_qwen,
         };
         let context_app = accessibility_context
             .as_ref()
@@ -2517,7 +2866,7 @@ impl App {
         info!(
             "[llm] request {}",
             serde_json::json!({
-                "endpoint": &endpoint,
+                "endpoint": &endpoint.url,
                 "model": &model,
                 "system_prompt": system_prompt,
                 "user_transcript": self.log_text(transcript),
@@ -2531,18 +2880,22 @@ impl App {
         );
         let mut builder = self
             .http
-            .post(&endpoint)
+            .post(&endpoint.url)
             .timeout(Duration::from_secs(30))
             .json(&request);
-        if let Some(key) = self.config.llm_key() {
-            builder = builder.bearer_auth(key);
+        if let Some(key) = endpoint.key.as_deref() {
+            builder = if endpoint.bearer {
+                builder.bearer_auth(key)
+            } else {
+                builder.header(AUTHORIZATION, key)
+            };
         }
         let response = builder.send()?;
         let status = response.status();
         info!(
             "[llm] response_status {}",
             serde_json::json!({
-                "endpoint": &endpoint,
+                "endpoint": &endpoint.url,
                 "model": &model,
                 "status": status.as_u16(),
             })
@@ -2558,7 +2911,7 @@ impl App {
         info!(
             "[llm] response_text {}",
             serde_json::json!({
-                "endpoint": &endpoint,
+                "endpoint": &endpoint.url,
                 "model": &model,
                 "finish_reason": parsed.choices.first().and_then(|choice| choice.finish_reason.as_deref()),
                 "reasoning_chars": parsed.choices.first().and_then(|choice| choice.message.reasoning_content.as_ref()).map_or(0, |reasoning| reasoning.chars().count()),
@@ -2627,6 +2980,9 @@ impl App {
         pasted_text: String,
         warmup: &DictationWarmup,
     ) -> Result<DeferredCleanupOutcome, AppError> {
+        if self.config.llm_endpoint().is_none() {
+            return Ok(DeferredCleanupOutcome::Skipped("llm_not_configured"));
+        }
         let cleaned = self.cleanup_transcript(&cleanup_input, warmup)?;
         let cleaned = strip_cleanup_artifacts(&cleaned);
         if cleaned.is_empty() {
@@ -3023,7 +3379,9 @@ impl App {
         instruction: &str,
         context: &AccessibilityContext,
     ) -> Result<String, AppError> {
-        let endpoint = self.config.llm_endpoint();
+        let Some(endpoint) = self.config.llm_endpoint() else {
+            return Err(AppError::MissingConfig("LITELLM_BASE"));
+        };
         let model = self.config.llm_model();
         let user_content = build_rewrite_user_content(selected_text, instruction, context);
         let request = ChatRequest {
@@ -3040,12 +3398,12 @@ impl App {
             ],
             max_tokens: cleanup_max_tokens(selected_text),
             temperature: 0,
-            enable_thinking: false,
+            enable_thinking: endpoint.legacy_qwen,
         };
         info!(
             "[rewrite] llm_request {}",
             serde_json::json!({
-                "endpoint": &endpoint,
+                "endpoint": &endpoint.url,
                 "model": &model,
                 "selected_text": self.log_text(selected_text),
                 "instruction_chars": instruction.chars().count(),
@@ -3057,18 +3415,22 @@ impl App {
         );
         let mut builder = self
             .http
-            .post(&endpoint)
+            .post(&endpoint.url)
             .timeout(Duration::from_secs(30))
             .json(&request);
-        if let Some(key) = self.config.llm_key() {
-            builder = builder.bearer_auth(key);
+        if let Some(key) = endpoint.key.as_deref() {
+            builder = if endpoint.bearer {
+                builder.bearer_auth(key)
+            } else {
+                builder.header(AUTHORIZATION, key)
+            };
         }
         let response = builder.send()?;
         let status = response.status();
         info!(
             "[rewrite] llm_response_status {}",
             serde_json::json!({
-                "endpoint": &endpoint,
+                "endpoint": &endpoint.url,
                 "model": &model,
                 "status": status.as_u16(),
             })
@@ -3115,6 +3477,9 @@ impl App {
             .unwrap_or_else(|_| self.config.stt_language.clone());
         let history_count = self.history_entries().map_or(0, |history| history.len());
         let streaming_status = match self.config.streaming_stt {
+            Some(StreamingProvider::AssemblyAiDirect) => {
+                "AssemblyAI streaming (dictation model, direct)"
+            }
             Some(StreamingProvider::AssemblyAi) => "AssemblyAI streaming via Telnyx",
             Some(StreamingProvider::Deepgram) => "Deepgram streaming via Telnyx",
             None => "Batch STT",
@@ -3357,8 +3722,8 @@ impl App {
 
 impl Config {
     fn load(root_dir: PathBuf) -> Result<Self, AppError> {
-        let telnyx_api_key =
-            load_env_value("TELNYX_API_KEY").ok_or(AppError::MissingConfig("TELNYX_API_KEY"))?;
+        let telnyx_api_key = load_env_value("TELNYX_API_KEY");
+        let assemblyai_api_key = load_env_value("ASSEMBLYAI_API_KEY");
         let llm_cleanup = match load_env_value("BOLO_LLM_CLEANUP")
             .unwrap_or_else(|| String::from("auto"))
             .to_ascii_lowercase()
@@ -3381,11 +3746,13 @@ impl Config {
                 value.to_owned(),
             ));
         }
-        let stt_model =
-            load_env_value("BOLO_STT_MODEL").unwrap_or_else(|| String::from("deepgram/nova-3"));
+        let stt_model = load_env_value("BOLO_STT_MODEL")
+            .unwrap_or_else(|| String::from("assemblyai/universal-3-5-pro"));
         let streaming_stt = load_streaming_provider(&stt_model);
-        Ok(Self {
+        let stt_fallbacks = load_stt_fallbacks(&stt_model);
+        let config = Self {
             telnyx_api_key,
+            assemblyai_api_key,
             llm_cleanup,
             litellm_base: load_env_value("LITELLM_BASE"),
             litellm_key: load_env_value("LITELLM_KEY"),
@@ -3393,7 +3760,7 @@ impl Config {
             stt_language: load_env_value("BOLO_STT_LANGUAGE")
                 .unwrap_or_else(|| String::from("en-US")),
             streaming_stt,
-            stt_fallbacks: load_stt_fallbacks(),
+            stt_fallbacks,
             microphone: load_env_value("BOLO_MICROPHONE"),
             replacements: load_replacements(),
             root_dir,
@@ -3405,28 +3772,105 @@ impl Config {
                 "BOLO_MAX_RECORDING_SECONDS",
                 DEFAULT_MAX_RECORDING_SECONDS,
             ),
-        })
+        };
+        if let Some(missing) = config.missing_required_key() {
+            return Err(AppError::MissingConfig(missing));
+        }
+        Ok(config)
     }
 
-    fn llm_endpoint(&self) -> String {
-        self.litellm_base.as_ref().map_or_else(
-            || String::from(TELNYX_LLM_ENDPOINT),
-            |base| {
-                let trimmed = base.trim_end_matches('/');
-                if trimmed.ends_with("/v1") {
-                    format!("{trimmed}/chat/completions")
-                } else {
-                    format!("{trimmed}/v1/chat/completions")
-                }
-            },
+    /// First API key the resolved pipeline requires but cannot find. The
+    /// `AssemblyAI`-first default needs only `ASSEMBLYAI_API_KEY`; Telnyx keys are
+    /// required only while a Telnyx-hosted provider is still selected.
+    fn missing_required_key(&self) -> Option<&'static str> {
+        self.missing_required_key_with(
+            self.assemblyai_api_key.as_deref(),
+            load_env_value("XAI_API_KEY").as_deref(),
         )
     }
 
-    fn llm_key(&self) -> Option<&str> {
-        self.litellm_key
-            .as_deref()
-            .filter(|key| !key.is_empty())
-            .or(Some(self.telnyx_api_key.as_str()))
+    /// Core of `missing_required_key` with the resolved provider keys passed
+    /// in, so key-presence logic can be tested without touching the
+    /// environment.
+    fn missing_required_key_with(
+        &self,
+        assemblyai_key: Option<&str>,
+        xai_key: Option<&str>,
+    ) -> Option<&'static str> {
+        let uses_assemblyai = self.stt_model.starts_with("assemblyai/")
+            || matches!(
+                self.streaming_stt,
+                Some(StreamingProvider::AssemblyAiDirect)
+            )
+            || self
+                .stt_fallbacks
+                .iter()
+                .any(|fallback| matches!(fallback, SttFallback::AssemblyAi(_)));
+        if uses_assemblyai && assemblyai_key.is_none() {
+            return Some("ASSEMBLYAI_API_KEY");
+        }
+        let uses_telnyx = !self.stt_model.starts_with("assemblyai/")
+            || matches!(
+                self.streaming_stt,
+                Some(StreamingProvider::AssemblyAi | StreamingProvider::Deepgram)
+            )
+            || self
+                .stt_fallbacks
+                .iter()
+                .any(|fallback| matches!(fallback, SttFallback::Telnyx(_)));
+        if uses_telnyx && self.telnyx_api_key.is_none() {
+            return Some("TELNYX_API_KEY");
+        }
+        if self
+            .stt_fallbacks
+            .iter()
+            .any(|fallback| matches!(fallback, SttFallback::Xai))
+            && xai_key.is_none()
+        {
+            return Some("XAI_API_KEY");
+        }
+        None
+    }
+
+    /// Resolved LLM target for cleanup and rewrite calls: which OpenAI-shaped
+    /// endpoint to hit, which key authenticates it, whether the key needs a
+    /// Bearer prefix, and whether the endpoint understands the Telnyx-only
+    /// `enable_thinking` flag. Precedence: `LITELLM_BASE` override, then the
+    /// `AssemblyAI` LLM Gateway on the same `ASSEMBLYAI_API_KEY`, then the
+    /// legacy Telnyx inference endpoint while a Telnyx key exists.
+    fn llm_endpoint(&self) -> Option<LlmEndpoint> {
+        if let Some(base) = self.litellm_base.as_ref() {
+            let trimmed = base.trim_end_matches('/');
+            let url = if trimmed.ends_with("/v1") {
+                format!("{trimmed}/chat/completions")
+            } else {
+                format!("{trimmed}/v1/chat/completions")
+            };
+            return Some(LlmEndpoint {
+                url,
+                key: self.litellm_key.clone().filter(|key| !key.is_empty()),
+                bearer: true,
+                legacy_qwen: false,
+            });
+        }
+        if let Some(key) = self.assemblyai_api_key.clone() {
+            // The gateway documents raw-key Authorization with no Bearer
+            // prefix (llm-gateway.assemblyai.com docs, 2026-10-01).
+            return Some(LlmEndpoint {
+                url: String::from(ASSEMBLYAI_LLM_GATEWAY_ENDPOINT),
+                key: Some(key),
+                bearer: false,
+                legacy_qwen: false,
+            });
+        }
+        // The Telnyx inference endpoint is only a fallback while a Telnyx key
+        // exists; without any OpenAI-compatible endpoint, LLM cleanup is off.
+        self.telnyx_api_key.as_ref().map(|key| LlmEndpoint {
+            url: String::from(TELNYX_LLM_ENDPOINT),
+            key: Some(key.clone()),
+            bearer: true,
+            legacy_qwen: true,
+        })
     }
 
     fn llm_model(&self) -> String {
@@ -3435,6 +3879,8 @@ impl Config {
         }
         if self.litellm_base.is_some() {
             String::from("Kimi-K2.5")
+        } else if self.assemblyai_api_key.is_some() {
+            String::from(ASSEMBLYAI_LLM_DEFAULT_MODEL)
         } else {
             String::from("Qwen/Qwen3-235B-A22B")
         }
@@ -3444,7 +3890,7 @@ impl Config {
 fn is_supported_hotkey(value: &str) -> bool {
     if matches!(
         value,
-        "right_option" | "right_control" | "right_shift" | "fn" | "caps_lock"
+        "left_option" | "right_option" | "right_control" | "right_shift" | "fn" | "caps_lock"
     ) {
         return true;
     }
@@ -3468,8 +3914,16 @@ impl SttFallback {
 impl StreamingProvider {
     const fn label(self) -> &'static str {
         match self {
+            Self::AssemblyAiDirect => "assemblyai_direct",
             Self::AssemblyAi => "telnyx_assemblyai",
             Self::Deepgram => "telnyx_deepgram",
+        }
+    }
+
+    const fn required_key_name(self) -> &'static str {
+        match self {
+            Self::AssemblyAiDirect => "ASSEMBLYAI_API_KEY",
+            Self::AssemblyAi | Self::Deepgram => "TELNYX_API_KEY",
         }
     }
 }
@@ -3605,6 +4059,7 @@ fn device_name(device: &cpal::Device) -> String {
 fn human_readable_hotkey(hotkey: &str) -> String {
     match hotkey {
         "right_option" => String::from("Right Option"),
+        "left_option" => String::from("Left Option"),
         "right_control" => String::from("Right Control"),
         "right_shift" => String::from("Right Shift"),
         "fn" => String::from("Fn"),
@@ -5940,22 +6395,31 @@ fn streaming_provider_from_config(
         .to_ascii_lowercase()
         .as_str()
     {
-        "assemblyai" | "assembly" | "on" | "true" | "1" => Some(StreamingProvider::AssemblyAi),
+        "assemblyai" | "assembly" | "on" | "true" | "1" => {
+            Some(StreamingProvider::AssemblyAiDirect)
+        }
+        "assemblyai-telnyx" | "assembly-telnyx" => Some(StreamingProvider::AssemblyAi),
         "deepgram" | "nova-3" | "nova3" => Some(StreamingProvider::Deepgram),
         _ => None,
     }
 }
 
-fn load_stt_fallbacks() -> Vec<SttFallback> {
+fn load_stt_fallbacks(stt_model: &str) -> Vec<SttFallback> {
     if let Some(value) = load_env_value("BOLO_STT_FALLBACKS") {
         return parse_stt_fallbacks(&value);
     }
     load_env_value("BOLO_STT_FALLBACK_MODEL")
         .as_deref()
-        .map_or_else(default_stt_fallbacks, parse_stt_fallbacks)
+        .map_or_else(|| default_stt_fallbacks(stt_model), parse_stt_fallbacks)
 }
 
-fn default_stt_fallbacks() -> Vec<SttFallback> {
+fn default_stt_fallbacks(primary_model: &str) -> Vec<SttFallback> {
+    if primary_model.starts_with("assemblyai/") {
+        // The AssemblyAI async upload+poll path is the same provider's
+        // fault-isolated fallback: sync and streaming outages rarely take the
+        // async endpoint down with them.
+        return vec![SttFallback::AssemblyAi(None)];
+    }
     vec![SttFallback::Telnyx(String::from(
         "openai/whisper-large-v3-turbo",
     ))]
@@ -7074,9 +7538,9 @@ fn retry_failed_primary<F>(
     wav: &[u8],
     error: AppError,
     attempt_started: Instant,
-) -> Result<String, AppError>
+) -> Result<SttResult, AppError>
 where
-    F: FnMut(&[u8]) -> Result<String, AppError>,
+    F: FnMut(&[u8]) -> Result<SttResult, AppError>,
 {
     match batch_retry_plan(&error, attempt_started.elapsed()) {
         BatchRetry::SamePayload => {
@@ -7240,24 +7704,26 @@ mod tests {
     #![allow(clippy::panic_in_result_fn)]
 
     use super::{
-        AccessibilityContext, AccessibilityTrust, App, AppError, AppState, BatchRetry, CleanupMode,
-        CleanupProfile, Config, DictationCommandKind, DictationWarmup, PreparedText, PromptBinding,
-        STREAMING_DRAIN_MIN, STT_RETRY_SAMPLE_RATE, StreamingConnectionState, StreamingProvider,
-        StreamingRecording, StreamingTranscript, SttFallback, TRANSCRIPT_HISTORY_LIMIT,
-        TextReplacement, TranscriptHistoryEntry, UpdateOutcome, apply_text_replacements,
-        apply_vocabulary_corrections_with_matches, batch_retry_plan, build_cleanup_user_content,
+        ASSEMBLYAI_STREAMING_MODEL, AccessibilityContext, AccessibilityTrust, App, AppError,
+        AppState, AssemblyDictationResponse, BatchRetry, CleanupMode, CleanupProfile, Config,
+        DictationCommandKind, DictationWarmup, PreparedText, PromptBinding, STREAMING_DRAIN_MIN,
+        STT_RETRY_SAMPLE_RATE, StreamingConnectionState, StreamingProvider, StreamingRecording,
+        StreamingTranscript, SttFallback, SttResult, TRANSCRIPT_HISTORY_LIMIT, TextReplacement,
+        TranscriptHistoryEntry, UpdateOutcome, apply_text_replacements,
+        apply_vocabulary_corrections_with_matches, assemblyai_direct_query_with,
+        assemblyai_language_code, batch_retry_plan, build_cleanup_user_content,
         build_rewrite_user_content, build_stt_prompt, canonicalize_known_terms, cleanup_decision,
         cleanup_max_tokens, cleanup_profile, downsample_wav_16k_mono, empty_transcript_error,
         final_streaming_result_is_ready_elapsed, handshake_with_deadline,
         is_known_no_speech_transcript, is_supported_hotkey, load_vocabulary_usage,
         non_empty_transcript, parse_accessibility_trust, parse_command, parse_replacements_json,
-        parse_stt_fallbacks, parse_u64_env_value, parse_update_outcome, read_vocabulary_file,
-        read_vocabulary_usage_file, remove_fillers, retry_failed_primary,
+        parse_stt_fallbacks, parse_u64_env_value, parse_update_outcome, parse_wav_pcm16,
+        read_vocabulary_file, read_vocabulary_usage_file, remove_fillers, retry_failed_primary,
         sanitize_transcript_history, speech_stats, stable_streaming_best_is_ready_elapsed,
         streaming_batch_fallback_reason, streaming_connection, streaming_preview_tail,
         streaming_provider_from_config, strip_reasoning_tags, stt_language_for_model,
         stt_model_config, telnyx_stream_query, transcript_log_value, transcript_menu_preview,
-        wav_bytes,
+        wav_bytes, wav_duration_ms,
     };
     use std::collections::{HashMap, VecDeque};
     use std::path::PathBuf;
@@ -7585,7 +8051,7 @@ mod tests {
         assert_eq!(corrected, "check Chargebee");
         assert_eq!(matched, vec![String::from("chargebee")]);
 
-        let prepared = app.prepare_text("check charge b", &DictationWarmup::default())?;
+        let prepared = app.prepare_text("check charge b", &DictationWarmup::default(), None)?;
         assert_eq!(prepared.text, "check Chargebee");
 
         let usage = match app.vocabulary_usage.lock() {
@@ -7739,7 +8205,8 @@ mod tests {
     #[test]
     fn litellm_cleanup_uses_kimi() {
         let config = Config {
-            telnyx_api_key: String::from("test"),
+            telnyx_api_key: Some(String::from("test")),
+            assemblyai_api_key: None,
             llm_cleanup: CleanupMode::On,
             litellm_base: Some(String::from("http://localhost:4000")),
             litellm_key: None,
@@ -7781,7 +8248,8 @@ mod tests {
     #[test]
     fn auto_cleanup_runs_for_long_or_messy_text() {
         let config = Config {
-            telnyx_api_key: String::from("test"),
+            telnyx_api_key: Some(String::from("test")),
+            assemblyai_api_key: None,
             llm_cleanup: CleanupMode::Auto,
             litellm_base: None,
             litellm_key: None,
@@ -7813,7 +8281,8 @@ mod tests {
     #[test]
     fn auto_cleanup_runs_for_short_text_without_terminal_punctuation() {
         let config = Config {
-            telnyx_api_key: String::from("test"),
+            telnyx_api_key: Some(String::from("test")),
+            assemblyai_api_key: None,
             llm_cleanup: CleanupMode::Auto,
             litellm_base: None,
             litellm_key: None,
@@ -7858,14 +8327,20 @@ mod tests {
     }
 
     #[test]
-    fn defaults_to_deepgram_streaming_for_the_default_stt_model() {
+    fn streaming_provider_resolution_matches_the_config_values() {
         assert_eq!(
             streaming_provider_from_config(None, "deepgram/nova-3"),
             Some(StreamingProvider::Deepgram)
         );
+        // The AssemblyAI-first default model runs the Dictation endpoint, so
+        // streaming is off unless it is explicitly selected.
         assert_eq!(
-            streaming_provider_from_config(None, "openai/whisper-large-v3-turbo"),
+            streaming_provider_from_config(None, "assemblyai/universal-3-5-pro"),
             None
+        );
+        assert_eq!(
+            streaming_provider_from_config(Some("assemblyai"), "assemblyai/universal-3-5-pro"),
+            Some(StreamingProvider::AssemblyAiDirect)
         );
         assert_eq!(
             streaming_provider_from_config(Some("off"), "deepgram/nova-3"),
@@ -7877,7 +8352,173 @@ mod tests {
         );
         assert_eq!(
             streaming_provider_from_config(Some("assemblyai"), "deepgram/nova-3"),
+            Some(StreamingProvider::AssemblyAiDirect)
+        );
+        assert_eq!(
+            streaming_provider_from_config(
+                Some("assemblyai-telnyx"),
+                "assemblyai/universal-3-5-pro"
+            ),
             Some(StreamingProvider::AssemblyAi)
+        );
+    }
+
+    #[test]
+    fn assemblyai_direct_query_builds_the_default_streaming_url() {
+        let vocabulary = vec![String::from("Telnyx"), String::from("Claude Code")];
+        let query = assemblyai_direct_query_with(ASSEMBLYAI_STREAMING_MODEL, "en-US", &vocabulary);
+
+        assert!(query.contains("sample_rate=48000"));
+        assert!(query.contains("speech_model=universal-streaming-english"));
+        // The dictation streaming models format final turns natively.
+        assert!(query.contains("format_turns=true"));
+        assert!(query.contains("keyterms_prompt=%5B%22Telnyx%22%2C%22Claude%20Code%22%5D"));
+        assert!(!query.contains("language_codes"));
+    }
+
+    #[test]
+    fn assemblyai_direct_query_with_pro_model_sends_language_codes() {
+        let query = assemblyai_direct_query_with("universal-3-6-pro", "en-IN", &[]);
+
+        assert!(query.contains("speech_model=universal-3-6-pro"));
+        assert!(query.contains("language_codes=%5B%22en%22%5D"));
+        assert!(!query.contains("format_turns"));
+    }
+
+    #[test]
+    fn assemblyai_language_code_maps_supported_languages() {
+        assert_eq!(assemblyai_language_code("en-IN").as_deref(), Some("en"));
+        assert_eq!(assemblyai_language_code("en").as_deref(), Some("en"));
+        assert_eq!(assemblyai_language_code("hi").as_deref(), Some("hi"));
+        assert_eq!(assemblyai_language_code("auto"), None);
+        assert_eq!(assemblyai_language_code("off"), None);
+        assert_eq!(assemblyai_language_code(""), None);
+        assert_eq!(assemblyai_language_code("zz-XX"), None);
+    }
+
+    #[test]
+    fn wav_duration_ms_measures_the_recorded_wav() -> Result<(), AppError> {
+        let samples = vec![0_i16; 48_000];
+        let wav = wav_bytes(&samples, 48_000)?;
+
+        let Some(parsed) = parse_wav_pcm16(&wav) else {
+            return Err(AppError::Transcription(String::from(
+                "wav_bytes output should parse as PCM16",
+            )));
+        };
+        assert_eq!(parsed.samples.len(), 48_000);
+        assert_eq!(parsed.sample_rate, 48_000);
+        assert_eq!(parsed.channels, 1);
+        // One second of mono 16-bit audio at 48 kHz.
+        assert_eq!(wav_duration_ms(&wav), Some(1_000));
+
+        assert_eq!(wav_duration_ms(b"not a wav"), None);
+        Ok(())
+    }
+
+    #[test]
+    fn assembly_dictation_response_parses_verbatim_and_cleaned_text() -> Result<(), AppError> {
+        let failed: AssemblyDictationResponse =
+            serde_json::from_str(r#"{"text":"hello","llm_response":null,"llm_error":"timeout"}"#)
+                .map_err(|error| AppError::Transcription(error.to_string()))?;
+        assert_eq!(failed.text.as_deref(), Some("hello"));
+        assert_eq!(failed.llm_response, None);
+        assert_eq!(failed.llm_error.as_deref(), Some("timeout"));
+
+        let cleaned: AssemblyDictationResponse = serde_json::from_str(
+            r#"{"text":"hi","llm_response":"Hi.","llm_error":null,"request_time_ms":123.4}"#,
+        )
+        .map_err(|error| AppError::Transcription(error.to_string()))?;
+        assert_eq!(cleaned.text.as_deref(), Some("hi"));
+        assert_eq!(cleaned.llm_response.as_deref(), Some("Hi."));
+        assert_eq!(cleaned.llm_error, None);
+        assert_eq!(cleaned.request_time_ms, Some(123.4));
+        Ok(())
+    }
+
+    fn missing_key_config(
+        telnyx_api_key: Option<&str>,
+        assemblyai_api_key: Option<&str>,
+        stt_model: &str,
+        streaming_stt: Option<StreamingProvider>,
+        stt_fallbacks: Vec<SttFallback>,
+    ) -> Config {
+        Config {
+            telnyx_api_key: telnyx_api_key.map(str::to_owned),
+            assemblyai_api_key: assemblyai_api_key.map(str::to_owned),
+            llm_cleanup: CleanupMode::Auto,
+            litellm_base: None,
+            litellm_key: None,
+            stt_model: String::from(stt_model),
+            stt_language: String::from("en-US"),
+            streaming_stt,
+            stt_fallbacks,
+            microphone: None,
+            replacements: Vec::new(),
+            root_dir: PathBuf::new(),
+            hotkey: String::from("right_option"),
+            paste_last_hotkey: None,
+            preserve_clipboard: true,
+            log_transcripts: false,
+            max_recording_seconds: 30,
+        }
+    }
+
+    #[test]
+    fn missing_required_key_reports_the_first_missing_provider_key() {
+        // The AssemblyAI-first default pipeline needs only the AssemblyAI key.
+        let assemblyai =
+            missing_key_config(None, None, "assemblyai/universal-3-5-pro", None, Vec::new());
+        assert_eq!(
+            assemblyai.missing_required_key_with(None, None),
+            Some("ASSEMBLYAI_API_KEY")
+        );
+        assert_eq!(
+            assemblyai.missing_required_key_with(Some("assemblyai-key"), None),
+            None
+        );
+
+        // Telnyx-hosted batch models still require the Telnyx key.
+        let deepgram = missing_key_config(
+            None,
+            None,
+            "deepgram/nova-3",
+            None,
+            vec![SttFallback::Telnyx(String::from(
+                "openai/whisper-large-v3-turbo",
+            ))],
+        );
+        assert_eq!(
+            deepgram.missing_required_key_with(None, None),
+            Some("TELNYX_API_KEY")
+        );
+
+        // The default fallback shape for an assemblyai primary: the assemblyai
+        // fallback keeps the AssemblyAI key required.
+        let default_fallback = missing_key_config(
+            None,
+            None,
+            "assemblyai/universal-3-5-pro",
+            None,
+            vec![SttFallback::AssemblyAi(None)],
+        );
+        assert_eq!(
+            default_fallback.missing_required_key_with(None, None),
+            Some("ASSEMBLYAI_API_KEY")
+        );
+
+        // An assemblyai fallback pulls the AssemblyAI key requirement in even
+        // when the primary batch model is hosted elsewhere.
+        let assemblyai_fallback = missing_key_config(
+            Some("telnyx-key"),
+            None,
+            "deepgram/nova-3",
+            None,
+            vec![SttFallback::AssemblyAi(None)],
+        );
+        assert_eq!(
+            assemblyai_fallback.missing_required_key_with(None, None),
+            Some("ASSEMBLYAI_API_KEY")
         );
     }
 
@@ -8374,7 +9015,8 @@ mod tests {
         let usage_path = temp_vocabulary_usage_path();
         let app = App {
             config: Config {
-                telnyx_api_key: String::from("test"),
+                telnyx_api_key: Some(String::from("test")),
+                assemblyai_api_key: None,
                 llm_cleanup: CleanupMode::Off,
                 litellm_base: None,
                 litellm_key: None,
@@ -8407,7 +9049,8 @@ mod tests {
     fn prepare_text_reports_when_llm_cleanup_did_not_run() -> Result<(), AppError> {
         let app = App {
             config: Config {
-                telnyx_api_key: String::from("test"),
+                telnyx_api_key: Some(String::from("test")),
+                assemblyai_api_key: None,
                 llm_cleanup: CleanupMode::Off,
                 litellm_base: None,
                 litellm_key: None,
@@ -8434,7 +9077,7 @@ mod tests {
             event_proxy: Mutex::new(None),
         };
 
-        let prepared = app.prepare_text("tenlex ships", &DictationWarmup::default())?;
+        let prepared = app.prepare_text("tenlex ships", &DictationWarmup::default(), None)?;
 
         assert_eq!(prepared.text, "Telnyx ships");
         assert!(!prepared.llm_cleanup_ran);
@@ -8446,7 +9089,8 @@ mod tests {
     fn rewrite_command_parses_when_llm_cleanup_is_skipped() -> Result<(), AppError> {
         let app = App {
             config: Config {
-                telnyx_api_key: String::from("test"),
+                telnyx_api_key: Some(String::from("test")),
+                assemblyai_api_key: None,
                 llm_cleanup: CleanupMode::Auto,
                 litellm_base: None,
                 litellm_key: None,
@@ -8479,6 +9123,7 @@ mod tests {
         let prepared = app.prepare_text(
             "Bolo, rewrite that make it formal.",
             &DictationWarmup::default(),
+            None,
         )?;
         assert!(!prepared.llm_cleanup_ran);
         assert!(!prepared.llm_cleanup_deferred);
@@ -8501,7 +9146,8 @@ mod tests {
     fn prepare_text_applies_local_corrections_on_short_text_without_llm() -> Result<(), AppError> {
         let app = App {
             config: Config {
-                telnyx_api_key: String::from("test"),
+                telnyx_api_key: Some(String::from("test")),
+                assemblyai_api_key: None,
                 llm_cleanup: CleanupMode::Auto,
                 litellm_base: None,
                 litellm_key: None,
@@ -8531,8 +9177,11 @@ mod tests {
             event_proxy: Mutex::new(None),
         };
 
-        let prepared =
-            app.prepare_text("tenlex can ship this quickly", &DictationWarmup::default())?;
+        let prepared = app.prepare_text(
+            "tenlex can ship this quickly",
+            &DictationWarmup::default(),
+            None,
+        )?;
 
         assert_eq!(prepared.text, "Telnyx can send this quickly");
         assert!(!prepared.llm_cleanup_ran);
@@ -8545,7 +9194,8 @@ mod tests {
     fn prepare_text_defers_llm_cleanup_for_long_text() -> Result<(), AppError> {
         let app = App {
             config: Config {
-                telnyx_api_key: String::from("test"),
+                telnyx_api_key: Some(String::from("test")),
+                assemblyai_api_key: None,
                 llm_cleanup: CleanupMode::Auto,
                 litellm_base: None,
                 litellm_key: None,
@@ -8575,6 +9225,7 @@ mod tests {
         let prepared = app.prepare_text(
             "this is a longer dictated sentence that should probably get grammar cleanup before insertion",
             &DictationWarmup::default(),
+            None,
         )?;
 
         assert_eq!(
@@ -8592,11 +9243,96 @@ mod tests {
         Ok(())
     }
 
+    fn provider_cleanup_test_app(llm_cleanup: CleanupMode) -> App {
+        App {
+            config: Config {
+                telnyx_api_key: Some(String::from("test")),
+                assemblyai_api_key: None,
+                llm_cleanup,
+                litellm_base: None,
+                litellm_key: None,
+                stt_model: String::from("assemblyai/universal-3-5-pro"),
+                stt_language: String::from("en-US"),
+                streaming_stt: None,
+                stt_fallbacks: Vec::new(),
+                microphone: None,
+                replacements: vec![TextReplacement {
+                    spoken: String::from("ship"),
+                    replacement: String::from("send"),
+                }],
+                root_dir: PathBuf::new(),
+                hotkey: String::from("right_option"),
+                paste_last_hotkey: None,
+                preserve_clipboard: true,
+                log_transcripts: false,
+                max_recording_seconds: 30,
+            },
+            http: reqwest::blocking::Client::new(),
+            vocabulary: Mutex::new(Vec::new()),
+            vocabulary_aliases: Mutex::new(vec![TextReplacement {
+                spoken: String::from("boloo"),
+                replacement: String::from("Bolo"),
+            }]),
+            prompt_bindings: Mutex::new(Vec::new()),
+            vocabulary_usage: Mutex::new(HashMap::new()),
+            vocabulary_usage_path: temp_vocabulary_usage_path(),
+            state: Mutex::new(AppState::default()),
+            event_proxy: Mutex::new(None),
+        }
+    }
+
+    #[test]
+    fn prepare_text_uses_provider_cleanup_and_still_applies_local_fixes() -> Result<(), AppError> {
+        let app = provider_cleanup_test_app(CleanupMode::Auto);
+
+        // The verbatim transcript still carries the filler; the provider
+        // cleaned text from AssemblyAI Dictation has already resolved it.
+        let prepared = app.prepare_text(
+            "um this is a longer dictated sentence that should probably ship the boloo draft",
+            &DictationWarmup::default(),
+            Some("this is a longer dictated sentence that should probably ship the boloo draft"),
+        )?;
+
+        // Local aliases (boloo -> Bolo) and replacements (ship -> send) still
+        // run on top of the provider cleaned text.
+        assert_eq!(
+            prepared.text,
+            "this is a longer dictated sentence that should probably send the Bolo draft"
+        );
+        assert!(prepared.llm_cleanup_ran);
+        assert!(!prepared.llm_cleanup_deferred);
+        assert_eq!(prepared.cleanup_input, None);
+        Ok(())
+    }
+
+    #[test]
+    fn prepare_text_off_mode_does_not_credit_provider_cleanup() -> Result<(), AppError> {
+        let app = provider_cleanup_test_app(CleanupMode::Off);
+
+        let prepared = app.prepare_text(
+            "um this is a longer dictated sentence that should probably ship the boloo draft",
+            &DictationWarmup::default(),
+            Some("this is a longer dictated sentence that should probably ship the boloo draft"),
+        )?;
+
+        // With cleanup off, the provider cleaned text earns no cleanup credit
+        // and the dictation flows through the verbatim path.
+        assert_eq!(
+            prepared.text,
+            "this is a longer dictated sentence that should probably send the Bolo draft"
+        );
+        assert!(!prepared.llm_cleanup_ran);
+        assert!(!prepared.llm_cleanup_deferred);
+        assert_eq!(prepared.cleanup_input, None);
+        Ok(())
+    }
+
     #[test]
     fn remember_result_keeps_dictation_in_internal_state() -> Result<(), AppError> {
         let app = App {
             config: Config {
-                telnyx_api_key: String::from("test"),
+                telnyx_api_key: Some(String::from("test")),
+                assemblyai_api_key: None,
                 llm_cleanup: CleanupMode::Off,
                 litellm_base: None,
                 litellm_key: None,
@@ -8642,7 +9378,8 @@ mod tests {
     fn post_insert_edit_marks_latest_history_without_text_logging() -> Result<(), AppError> {
         let app = App {
             config: Config {
-                telnyx_api_key: String::from("test"),
+                telnyx_api_key: Some(String::from("test")),
+                assemblyai_api_key: None,
                 llm_cleanup: CleanupMode::Off,
                 litellm_base: None,
                 litellm_key: None,
@@ -8691,7 +9428,8 @@ mod tests {
     fn latest_transcript_uses_history_before_current_state() {
         let app = App {
             config: Config {
-                telnyx_api_key: String::from("test"),
+                telnyx_api_key: Some(String::from("test")),
+                assemblyai_api_key: None,
                 llm_cleanup: CleanupMode::Off,
                 litellm_base: None,
                 litellm_key: None,
@@ -8730,7 +9468,8 @@ mod tests {
 
         let history_app = App {
             config: Config {
-                telnyx_api_key: String::from("test"),
+                telnyx_api_key: Some(String::from("test")),
+                assemblyai_api_key: None,
                 llm_cleanup: CleanupMode::Off,
                 litellm_base: None,
                 litellm_key: None,
@@ -9067,9 +9806,9 @@ mod tests {
         let source = wav_bytes(&samples, 48_000).unwrap_or_default();
         assert_eq!(wav_sample_rate(&source), 48_000);
         let mut attempts: Vec<Vec<u8>> = Vec::new();
-        let mut attempt = |wav: &[u8]| -> Result<String, AppError> {
+        let mut attempt = |wav: &[u8]| -> Result<SttResult, AppError> {
             attempts.push(wav.to_vec());
-            Ok(String::from("retried text"))
+            Ok(SttResult::verbatim(String::from("retried text")))
         };
         let first = AppError::TranscriptionStatus {
             status: 413,
@@ -9078,7 +9817,7 @@ mod tests {
 
         let outcome = retry_failed_primary(&mut attempt, &source, first, std::time::Instant::now());
 
-        assert_eq!(outcome.unwrap_or_default(), "retried text");
+        assert_eq!(outcome.unwrap_or_default().text, "retried text");
         // Exactly one retry, carrying the downsampled payload.
         assert_eq!(attempts.len(), 1);
         assert_eq!(wav_sample_rate(&attempts[0]), STT_RETRY_SAMPLE_RATE);
@@ -9090,7 +9829,7 @@ mod tests {
     fn a_413_fails_after_the_single_retry() {
         let source = wav_bytes(&[1, 2, 3], 48_000).unwrap_or_default();
         let mut attempts = 0;
-        let mut attempt = |_: &[u8]| -> Result<String, AppError> {
+        let mut attempt = |_: &[u8]| -> Result<SttResult, AppError> {
             attempts += 1;
             Err(AppError::TranscriptionStatus {
                 status: 413,
@@ -9118,9 +9857,9 @@ mod tests {
         // status retries too: a first attempt that burned the whole request
         // budget must not buy a second full wait.
         let mut attempts = 0;
-        let mut attempt = |_: &[u8]| -> Result<String, AppError> {
+        let mut attempt = |_: &[u8]| -> Result<SttResult, AppError> {
             attempts += 1;
-            Ok(String::from("must not happen"))
+            Ok(SttResult::verbatim(String::from("must not happen")))
         };
         let first = AppError::TranscriptionStatus {
             status: 413,
@@ -9153,9 +9892,9 @@ mod tests {
 
         assert!(matches!(first, AppError::Transcription(_)));
         let mut attempts = 0;
-        let mut attempt = |_: &[u8]| -> Result<String, AppError> {
+        let mut attempt = |_: &[u8]| -> Result<SttResult, AppError> {
             attempts += 1;
-            Ok(String::from("must not happen"))
+            Ok(SttResult::verbatim(String::from("must not happen")))
         };
 
         let outcome = retry_failed_primary(&mut attempt, &silent, first, std::time::Instant::now());
@@ -9175,9 +9914,9 @@ mod tests {
 
         assert!(matches!(first, AppError::Transcription(_)));
         let mut attempts = 0;
-        let mut attempt = |_: &[u8]| -> Result<String, AppError> {
+        let mut attempt = |_: &[u8]| -> Result<SttResult, AppError> {
             attempts += 1;
-            Ok(String::from("must not happen"))
+            Ok(SttResult::verbatim(String::from("must not happen")))
         };
 
         let outcome = retry_failed_primary(&mut attempt, &short, first, std::time::Instant::now());
@@ -9245,14 +9984,14 @@ mod tests {
             }
         ));
         let mut attempts: Vec<Vec<u8>> = Vec::new();
-        let mut attempt = |wav: &[u8]| -> Result<String, AppError> {
+        let mut attempt = |wav: &[u8]| -> Result<SttResult, AppError> {
             attempts.push(wav.to_vec());
-            Ok(String::from("retried text"))
+            Ok(SttResult::verbatim(String::from("retried text")))
         };
 
         let outcome = retry_failed_primary(&mut attempt, &source, first, std::time::Instant::now());
 
-        assert_eq!(outcome.unwrap_or_default(), "retried text");
+        assert_eq!(outcome.unwrap_or_default().text, "retried text");
         // Exactly one retry, carrying the same payload: the fault is not
         // size-related, so no downsample.
         assert_eq!(attempts.len(), 1);
@@ -9265,7 +10004,7 @@ mod tests {
         let source = wav_bytes(&samples, 48_000).unwrap_or_default();
         let first = empty_transcript_error(&source);
         let mut attempts = 0;
-        let mut attempt = |_: &[u8]| -> Result<String, AppError> {
+        let mut attempt = |_: &[u8]| -> Result<SttResult, AppError> {
             attempts += 1;
             Err(AppError::EmptyTranscriptWithAudio {
                 duration_ms: 1_250,
@@ -9295,9 +10034,9 @@ mod tests {
         let source = wav_bytes(&samples, 48_000).unwrap_or_default();
         let first = empty_transcript_error(&source);
         let mut attempts = 0;
-        let mut attempt = |_: &[u8]| -> Result<String, AppError> {
+        let mut attempt = |_: &[u8]| -> Result<SttResult, AppError> {
             attempts += 1;
-            Ok(String::from("must not happen"))
+            Ok(SttResult::verbatim(String::from("must not happen")))
         };
         let started = std::time::Instant::now()
             .checked_sub(super::STT_REQUEST_TIMEOUT)
@@ -9332,9 +10071,9 @@ mod tests {
             let first =
                 AppError::Transcription(format!("{provider} STT returned empty transcript"));
             let mut attempts = 0;
-            let mut attempt = |_: &[u8]| -> Result<String, AppError> {
+            let mut attempt = |_: &[u8]| -> Result<SttResult, AppError> {
                 attempts += 1;
-                Ok(String::from("must not happen"))
+                Ok(SttResult::verbatim(String::from("must not happen")))
             };
 
             let outcome = retry_failed_primary(&mut attempt, &[], first, std::time::Instant::now());
@@ -9348,9 +10087,9 @@ mod tests {
     fn a_5xx_retries_once_with_the_same_payload() {
         let source = wav_bytes(&[5, 6, 7], 48_000).unwrap_or_default();
         let mut attempts: Vec<Vec<u8>> = Vec::new();
-        let mut attempt = |wav: &[u8]| -> Result<String, AppError> {
+        let mut attempt = |wav: &[u8]| -> Result<SttResult, AppError> {
             attempts.push(wav.to_vec());
-            Ok(String::from("recovered"))
+            Ok(SttResult::verbatim(String::from("recovered")))
         };
         let first = AppError::TranscriptionStatus {
             status: 502,
@@ -9359,7 +10098,7 @@ mod tests {
 
         let outcome = retry_failed_primary(&mut attempt, &source, first, std::time::Instant::now());
 
-        assert_eq!(outcome.unwrap_or_default(), "recovered");
+        assert_eq!(outcome.unwrap_or_default().text, "recovered");
         // Exactly one retry; only the 413 retry downsamples, so a 5xx retries
         // the same bytes.
         assert_eq!(attempts.len(), 1);
@@ -9371,9 +10110,9 @@ mod tests {
         // The model-fallback chain lives in `transcribe`; the retry arm must
         // return 429 untouched and without any extra attempt.
         let mut attempts = 0;
-        let mut attempt = |_: &[u8]| -> Result<String, AppError> {
+        let mut attempt = |_: &[u8]| -> Result<SttResult, AppError> {
             attempts += 1;
-            Ok(String::from("must not happen"))
+            Ok(SttResult::verbatim(String::from("must not happen")))
         };
 
         let outcome = retry_failed_primary(

@@ -26,6 +26,7 @@ from Quartz import (
 
 if os.environ.get("BOLO_HOTKEY", "right_option") not in (
     "right_option",
+    "left_option",
     "right_control",
     "right_shift",
     "fn",
@@ -36,6 +37,7 @@ if os.environ.get("BOLO_HOTKEY", "right_option") not in (
 warnings.filterwarnings("ignore", category=ObjCPointerWarning)
 
 
+NX_DEVICELALTKEYMASK = 0x00000020
 NX_DEVICERALTKEYMASK = 0x00000040
 NX_DEVICERCTLKEYMASK = 0x00002000
 NX_DEVICERSHIFTKEYMASK = 0x00000020
@@ -69,10 +71,11 @@ KEYCODE_MAP = {
     "f18": 79,
     "f19": 80,
     "caps_lock": 57,
+    "left_option": 58,
 }
 
 TARGET_KEYCODE = KEYCODE_MAP.get(HOTKEY)
-USE_FLAGS_CHANGED = HOTKEY in ("right_option", "right_control", "right_shift", "fn")
+USE_FLAGS_CHANGED = HOTKEY in ("left_option", "right_option", "right_control", "right_shift", "fn")
 USE_KEY_EVENTS = TARGET_KEYCODE is not None and not USE_FLAGS_CHANGED
 
 state = False
@@ -195,6 +198,11 @@ if USE_FLAGS_CHANGED:
     def flags_changed(event):
         if HOTKEY == "right_option":
             set_state(bool(event.modifierFlags() & NX_DEVICERALTKEYMASK))
+        elif HOTKEY == "left_option":
+            set_state(
+                int(event.keyCode()) == TARGET_KEYCODE
+                and bool(event.modifierFlags() & NX_DEVICELALTKEYMASK)
+            )
         elif HOTKEY == "right_control":
             set_state(bool(event.modifierFlags() & NX_DEVICERCTLKEYMASK))
         elif HOTKEY == "right_shift":
