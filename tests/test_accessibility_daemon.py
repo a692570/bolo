@@ -11,10 +11,12 @@ select_before_caret) only run when BOLO_DAEMON_AX_TESTS=1 is set, because they
 perform a real Cmd+V into whatever is focused at the time.
 """
 
+import io
 import json
 import os
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -198,11 +200,220 @@ def test_exits_when_parent_pid_is_dead():
         session.close()
 
 
+# ---------------------------------------------------------------------------
+# In-process paste tests over the mocked pasteboard from test_insert_text.
+#
+# The AX-gated tests below prove the real protocol against the real
+# pasteboard; these drive the daemon's paste handler in-process with fakes,
+# so ordinary test runs prove the reply/finalize split and the cancellation
+# guard without posting a real Cmd+V into whatever app is focused.
+
+
+def _in_process_daemon():
+    """The daemon imported into this process; skips without local pyobjc."""
+    sys.path.insert(0, str(REPO_ROOT))
+    try:
+        import accessibility_daemon
+        import insert_text
+    except Exception as error:
+        pytest.skip(f"daemon cannot be imported in-process here: {error}")
+    return accessibility_daemon, insert_text
+
+
+def _fresh_daemon(monkeypatch):
+    """In-process daemon modules plus a pristine PasteRestoreCoordinator.
+
+    A fresh coordinator per test keeps worker thread names deterministic
+    (bolo-paste-restore-1, -2, ...) and the generation counter isolated.
+    """
+    daemon_module, insert_module = _in_process_daemon()
+    monkeypatch.setattr(
+        daemon_module, "PASTE_RESTORE", daemon_module.PasteRestoreCoordinator()
+    )
+    return daemon_module, insert_module
+
+
+def _restore_workers():
+    """Names of the daemon's paste-restore worker threads alive right now."""
+    return {
+        thread.name
+        for thread in threading.enumerate()
+        if thread.name.startswith("bolo-paste-restore-")
+    }
+
+
+def _wait_for_restore_worker(name, timeout=2.5):
+    """True once the named paste-restore worker thread has finished."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        worker = next(
+            (thread for thread in threading.enumerate() if thread.name == name),
+            None,
+        )
+        if worker is None:
+            return True
+        worker.join(max(0.05, deadline - time.monotonic()))
+        if not worker.is_alive():
+            return True
+    return name not in _restore_workers()
+
+
+def test_paste_reply_is_sent_before_the_restore_window_closes(monkeypatch):
+    """The point of the change: the reply must not wait out the restore.
+
+    The restore window is stretched to 1s; the reply must arrive well before
+    it while the finalize is provably still pending, and the background
+    restore must then put the pre-paste clipboard back without ever writing
+    to stdout, which is protocol-only.
+    """
+    from test_insert_text import install_mock_paste
+
+    daemon_module, _insert = _fresh_daemon(monkeypatch)
+    fake, _posted = install_mock_paste(
+        monkeypatch, initial_text="user data", restore_timeout=1.0
+    )
+    stdout_probe = io.StringIO()
+    monkeypatch.setattr(sys, "stdout", stdout_probe)
+
+    started = time.monotonic()
+    reply = daemon_module.handle_paste({"type": "paste", "text": "dictated words"})
+    elapsed = time.monotonic() - started
+
+    assert reply == {"type": "paste_done", "ok": True}
+    assert elapsed < 0.5, (
+        f"reply took {elapsed:.3f}s; the restore wait still blocks the reply"
+    )
+    assert fake.current_text() == "dictated words", "finalize should still be pending"
+
+    assert _wait_for_restore_worker("bolo-paste-restore-1")
+    assert fake.current_text() == "user data"
+    assert stdout_probe.getvalue() == ""
+
+
+def test_two_quick_pastes_the_first_finalize_never_restores_over_the_second(
+    monkeypatch,
+):
+    """Cancellation guard: the newer paste wins, the stale finalize may not
+    restore across the snapshot it no longer owns."""
+    from test_insert_text import install_mock_paste
+
+    daemon_module, insert_module = _fresh_daemon(monkeypatch)
+    fake, _posted = install_mock_paste(
+        monkeypatch, initial_text="user data", restore_timeout=1.0
+    )
+    real_start_paste = insert_module.start_paste
+    states = []
+
+    def spying_start_paste(text):
+        state = real_start_paste(text)
+        states.append(state)
+        return state
+
+    monkeypatch.setattr(insert_module, "start_paste", spying_start_paste)
+
+    assert (
+        daemon_module.handle_paste({"type": "paste", "text": "first"})
+        == {"type": "paste_done", "ok": True}
+    )
+    assert (
+        daemon_module.handle_paste({"type": "paste", "text": "second"})
+        == {"type": "paste_done", "ok": True}
+    )
+
+    # Once the first paste's finalize has exited (external change or skipped),
+    # the second paste's text must still be installed: the first finalize
+    # never restored its snapshot over it.
+    assert _wait_for_restore_worker("bolo-paste-restore-1", timeout=1.5)
+    assert fake.current_text() == "second"
+
+    # The owning finalize restores the second paste's own pre-paste snapshot.
+    assert _wait_for_restore_worker("bolo-paste-restore-2", timeout=2.5)
+    assert len(states) == 2
+    snapshot_text = next(
+        data.decode("utf-8")
+        for data_by_type in states[1]["snapshot"]
+        for item_type, data in data_by_type.items()
+        if item_type == insert_module.NSStringPboardType
+    )
+    assert fake.current_text() == snapshot_text
+
+
+def test_stale_finalize_is_skipped_and_the_owning_finalize_restores(monkeypatch):
+    """The guard at coordinator level, without thread-scheduling noise."""
+    from test_insert_text import install_mock_paste
+
+    daemon_module, _insert = _fresh_daemon(monkeypatch)
+    fake, _posted = install_mock_paste(
+        monkeypatch, initial_text="user data", restore_timeout=0.05
+    )
+
+    generation_one, state_one = daemon_module.PASTE_RESTORE.begin("first")
+    generation_two, state_two = daemon_module.PASTE_RESTORE.begin("second")
+    assert fake.current_text() == "second"
+
+    # Superseded: no wait, no restore over the newer paste's text.
+    assert daemon_module.PASTE_RESTORE.finalize(generation_one, state_one) == "skipped"
+    assert fake.current_text() == "second"
+
+    assert daemon_module.PASTE_RESTORE.finalize(generation_two, state_two) == "restored"
+    assert fake.current_text() == "first"
+
+
+def test_failed_pasteboard_write_replies_false_and_cancels_pending_finalize(
+    monkeypatch,
+):
+    from test_insert_text import install_mock_paste
+
+    daemon_module, _insert = _fresh_daemon(monkeypatch)
+    fake, _posted = install_mock_paste(
+        monkeypatch, initial_text="user data", restore_timeout=0.05
+    )
+
+    generation_one, state_one = daemon_module.PASTE_RESTORE.begin("first")
+    workers_before = _restore_workers()
+    fake.refuse_writes = True
+    assert (
+        daemon_module.handle_paste({"type": "paste", "text": "dictated"})
+        == {"type": "paste_done", "ok": False}
+    )
+    # No finalize worker was spawned for the refused write...
+    time.sleep(0.05)
+    assert _restore_workers() == workers_before
+    # ...and the failed begin cancelled the pending finalize for paste one.
+    assert daemon_module.PASTE_RESTORE.finalize(generation_one, state_one) == "skipped"
+
+
 @AX_GATE
 def test_paste_round_trip(daemon):
     reply = daemon.request({"type": "paste", "text": "bolo daemon ax test 9f8e7"})
     assert reply["type"] == "paste_done"
     assert reply["ok"] is True
+
+
+@AX_GATE
+def test_paste_reply_arrives_before_the_restore_window(monkeypatch):
+    """Real-pasteboard proof that the restore wait is off the reply path.
+
+    The restore window is stretched to 1s; the reply must land far sooner,
+    which only holds when the finalize runs in the daemon's background.
+    """
+    monkeypatch.setenv("BOLO_INSERT_RESTORE_TIMEOUT", "1.0")
+    session = DaemonSession(parent_pid=os.getpid())
+    try:
+        started = time.monotonic()
+        reply = session.request(
+            {"type": "paste", "text": "bolo daemon ax timing 8h7g6"}
+        )
+        elapsed = time.monotonic() - started
+        assert reply == {"type": "paste_done", "ok": True}
+        assert elapsed < 0.5, (
+            f"paste reply took {elapsed:.3f}s; the restore wait still blocks the reply"
+        )
+        # Let the daemon's background restore finish before closing stdin,
+        # so this test leaves the user's clipboard as it found it.
+        time.sleep(1.3)
+    finally:
+        session.close()
 
 
 @AX_GATE

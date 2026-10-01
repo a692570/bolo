@@ -210,29 +210,80 @@ def wait_for_pasteboard_to_change(pasteboard, temporary_change_count, text):
     return False
 
 
-def perform_paste(text: str) -> int:
-    """Paste ``text`` via the clipboard and Cmd+V, preserving its payload.
+def start_paste(text: str):
+    """Snapshot the pasteboard, install ``text``, and post Cmd+V.
 
-    Shared by the CLI helper (which reads the text from stdin) and the
-    persistent accessibility daemon (which receives it over its JSON
-    protocol). Returns 0 on success and 2 when the pasteboard write failed.
+    The synchronous half of a paste, split out of ``perform_paste`` so the
+    accessibility daemon can answer the moment the keystroke is posted
+    instead of waiting out the restore window. Returns the state that
+    ``finalize_paste`` consumes, or None when the pasteboard write failed.
     """
     pasteboard = NSPasteboard.generalPasteboard()
     snapshot = snapshot_pasteboard(pasteboard)
     pasteboard.clearContents()
     if not pasteboard.setString_forType_(text, NSStringPboardType):
-        return 2
+        return None
 
     temporary_change_count = pasteboard.changeCount()
     post_cmd_v()
+    return {
+        "pasteboard": pasteboard,
+        "snapshot": snapshot,
+        "change_count": temporary_change_count,
+        "text": text,
+    }
 
-    externally_changed = wait_for_pasteboard_to_change(
-        pasteboard,
-        temporary_change_count,
-        text,
+
+def pasteboard_matches_state(state) -> bool:
+    """Whether the pasteboard still holds exactly what ``start_paste`` set.
+
+    The ownership check a deferred restore must pass: any newer paste's
+    ``start_paste`` bumps the change count, so a finalize that lost the race
+    to a newer paste sees False here and must leave the pasteboard alone.
+    """
+    pasteboard = state["pasteboard"]
+    return (
+        pasteboard.changeCount() == state["change_count"]
+        and pasteboard.stringForType_(NSStringPboardType) == state["text"]
     )
-    if not externally_changed:
-        restore_pasteboard(pasteboard, snapshot)
+
+
+def finalize_paste(state, restore_decider=None) -> str:
+    """Wait out the restore window, then put the snapshot back if nothing did.
+
+    Returns "restored" when the pre-paste contents were written back and
+    "external_change" when the pasteboard changed on its own (the target app
+    consumed the paste), meaning no restore is needed. Callers whose finalize
+    can be superseded by a newer paste pass ``restore_decider``: invoked
+    instead of the unconditional restore, it receives the state, performs
+    any restore itself under whatever lock makes its ownership check
+    atomic, and returns the outcome to report ("restored", "skipped", ...).
+    """
+    externally_changed = wait_for_pasteboard_to_change(
+        state["pasteboard"],
+        state["change_count"],
+        state["text"],
+    )
+    if externally_changed:
+        return "external_change"
+    if restore_decider is None:
+        restore_pasteboard(state["pasteboard"], state["snapshot"])
+        return "restored"
+    return restore_decider(state)
+
+
+def perform_paste(text: str) -> int:
+    """Paste ``text`` via the clipboard and Cmd+V, preserving its payload.
+
+    Runs ``start_paste`` then ``finalize_paste`` back to back; the
+    accessibility daemon drives the two halves separately so its reply is
+    not delayed by the restore wait. Returns 0 on success and 2 when the
+    pasteboard write failed.
+    """
+    state = start_paste(text)
+    if state is None:
+        return 2
+    finalize_paste(state)
     return 0
 
 

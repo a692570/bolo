@@ -147,9 +147,10 @@ const MAX_SELECTED_TEXT_CHARS: usize = 8_000;
 /// reads). The daemon answers in well under a millisecond once warm; only a
 /// broken daemon hits this ceiling and falls back to the per-call spawn.
 const ACCESS_DAEMON_QUERY_TIMEOUT: Duration = Duration::from_millis(500);
-/// Round-trip budget for daemon actions that paste or move a selection. Paste
-/// includes the pasteboard change wait (up to `insert_text.py`'s 350ms restore
-/// timeout), so it needs more headroom than a plain query.
+/// Round-trip budget for daemon actions that paste or move a selection. The
+/// paste reply is sent the moment the keystroke is posted; the restore wait
+/// runs in the daemon's background, so the budget covers only the synchronous
+/// half plus scheduling slack.
 const ACCESS_DAEMON_ACTION_TIMEOUT: Duration = Duration::from_secs(2);
 /// Budget for the daemon's first pong. This covers interpreter start plus the
 /// pyobjc imports and only applies to the startup readiness ping.
