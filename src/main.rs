@@ -13,7 +13,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -143,6 +143,20 @@ const UPDATE_RESTART_EXIT_CODE: i32 = 42;
 const POST_INSERT_EDIT_MAX: Duration = Duration::from_secs(15);
 const POST_INSERT_OVERLAY_HOLD: Duration = Duration::from_millis(300);
 const MAX_SELECTED_TEXT_CHARS: usize = 8_000;
+/// Round-trip budget for cheap accessibility-daemon queries (trust, context
+/// reads). The daemon answers in well under a millisecond once warm; only a
+/// broken daemon hits this ceiling and falls back to the per-call spawn.
+const ACCESS_DAEMON_QUERY_TIMEOUT: Duration = Duration::from_millis(500);
+/// Round-trip budget for daemon actions that paste or move a selection. Paste
+/// includes the pasteboard change wait (up to `insert_text.py`'s 350ms restore
+/// timeout), so it needs more headroom than a plain query.
+const ACCESS_DAEMON_ACTION_TIMEOUT: Duration = Duration::from_secs(2);
+/// Budget for the daemon's first pong. This covers interpreter start plus the
+/// pyobjc imports and only applies to the startup readiness ping.
+const ACCESS_DAEMON_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
+/// Idle sweep interval of the daemon supervisor, which prunes dead daemons
+/// and restarts one so a mid-session crash costs at most one slow request.
+const ACCESS_DAEMON_SUPERVISOR_INTERVAL: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Error)]
 enum AppError {
@@ -1376,7 +1390,16 @@ fn main() -> Result<(), AppError> {
             human_readable_hotkey(hotkey)
         );
     }
+    start_accessibility_daemon(&app.config.root_dir);
     check_accessibility_at_startup(&app.config.root_dir);
+    let daemon_root_dir = app.config.root_dir.clone();
+    match std::thread::Builder::new()
+        .name(String::from("bolo-access-daemon-supervisor"))
+        .spawn(move || run_accessibility_daemon_supervisor(&daemon_root_dir))
+    {
+        Ok(handle) => drop(handle),
+        Err(error) => warn!("accessibility daemon supervisor failed to start: {error}"),
+    }
     run_app_event_loop(app)
 }
 
@@ -6599,6 +6622,11 @@ fn build_rewrite_user_content(
 }
 
 fn read_accessibility_context(root_dir: &Path) -> Option<AccessibilityContext> {
+    if let Some(reply) = request_accessibility_daemon(&AccessDaemonRequest::ReadContext)
+        && let Some(context) = parse_daemon_context_reply(&reply)
+    {
+        return Some(context);
+    }
     let script = root_dir.join("accessibility_context.py");
     if !script.exists() {
         return None;
@@ -6624,26 +6652,12 @@ fn read_accessibility_context(root_dir: &Path) -> Option<AccessibilityContext> {
             return None;
         }
     };
-    Some(AccessibilityContext {
-        app_name: context.app_name.trim().to_owned(),
-        bundle_id: context.bundle_id.trim().to_owned(),
-        text_before_cursor: context
-            .text_before_cursor
-            .trim()
-            .chars()
-            .rev()
-            .take(500)
-            .collect::<String>()
-            .chars()
-            .rev()
-            .collect(),
-        selected_text: context
-            .selected_text
-            .trim()
-            .chars()
-            .take(MAX_SELECTED_TEXT_CHARS)
-            .collect(),
-    })
+    Some(finalize_accessibility_context(
+        &context.app_name,
+        &context.bundle_id,
+        &context.text_before_cursor,
+        &context.selected_text,
+    ))
 }
 
 fn strip_reasoning_tags(text: &str) -> String {
@@ -7244,6 +7258,416 @@ fn copy_to_clipboard(text: &str) -> Result<(), AppError> {
     Ok(())
 }
 
+// ==== Persistent accessibility daemon ====
+//
+// The insert stage used to cost a constant ~740-850ms regardless of text
+// length because every dictation spawned two fresh CPython processes
+// (accessibility_trusted.py + insert_text.py), each paying interpreter
+// startup plus pyobjc import. accessibility_daemon.py does the same work in
+// one long-lived process, mirroring the hotkey.py helper pattern: started by
+// the Rust runtime, line-delimited JSON over pipes, killed on restart, and
+// it exits by itself when the runtime goes away.
+
+/// One line-delimited JSON request for the persistent accessibility daemon.
+#[derive(Debug)]
+enum AccessDaemonRequest {
+    Ping,
+    TrustCheck { prompt: bool },
+    Paste { text: String },
+    SelectBeforeCaret { text: String },
+    ReadContext,
+}
+
+impl AccessDaemonRequest {
+    const fn kind(&self) -> &'static str {
+        match self {
+            Self::Ping => "ping",
+            Self::TrustCheck { .. } => "trust_check",
+            Self::Paste { .. } => "paste",
+            Self::SelectBeforeCaret { .. } => "select_before_caret",
+            Self::ReadContext => "read_context",
+        }
+    }
+
+    /// The serialized request line. `serde_json` escapes embedded newlines,
+    /// so the payload is always exactly one line.
+    fn line(&self) -> String {
+        match self {
+            Self::Ping => serde_json::json!({"type": "ping"}).to_string(),
+            Self::TrustCheck { prompt } => {
+                serde_json::json!({"type": "trust_check", "prompt": prompt}).to_string()
+            }
+            Self::Paste { text } => serde_json::json!({"type": "paste", "text": text}).to_string(),
+            Self::SelectBeforeCaret { text } => {
+                serde_json::json!({"type": "select_before_caret", "text": text}).to_string()
+            }
+            Self::ReadContext => serde_json::json!({"type": "read_context"}).to_string(),
+        }
+    }
+
+    const fn timeout(&self) -> Duration {
+        match self {
+            Self::Ping => ACCESS_DAEMON_STARTUP_TIMEOUT,
+            Self::TrustCheck { .. } | Self::ReadContext => ACCESS_DAEMON_QUERY_TIMEOUT,
+            Self::Paste { .. } | Self::SelectBeforeCaret { .. } => ACCESS_DAEMON_ACTION_TIMEOUT,
+        }
+    }
+}
+
+/// Why a daemon round-trip failed; drives the `[helper] spawn_fallback` log.
+#[derive(Debug)]
+enum AccessDaemonFailure {
+    Timeout,
+    Exited,
+    Io(std::io::Error),
+    MalformedReply,
+}
+
+impl AccessDaemonFailure {
+    fn reason(&self) -> String {
+        match self {
+            Self::Timeout => String::from("daemon_timeout"),
+            Self::Exited => String::from("daemon_exit"),
+            Self::Io(error) => format!("daemon_io ({error})"),
+            Self::MalformedReply => String::from("daemon_malformed_reply"),
+        }
+    }
+}
+
+/// A live `accessibility_daemon.py` child plus the pipes to talk to it.
+struct AccessDaemon {
+    child: Child,
+    stdin: ChildStdin,
+    replies: Receiver<String>,
+}
+
+impl Drop for AccessDaemon {
+    fn drop(&mut self) {
+        // Kill first, then reap, so no zombie survives and the reader thread
+        // sees EOF even if the child was wedged mid-request.
+        let _kill_result = self.child.kill();
+        let _wait_result = self.child.wait();
+    }
+}
+
+impl AccessDaemon {
+    fn start(root_dir: &Path) -> Result<Self, String> {
+        let script = root_dir.join("accessibility_daemon.py");
+        if !script.exists() {
+            return Err(format!("{} is missing", script.display()));
+        }
+        let mut child = Command::new(python_helper_executable())
+            .arg(&script)
+            .env("BOLO_PARENT_PID", std::process::id().to_string())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .map_err(|error| format!("spawn failed: {error}"))?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| String::from("daemon stdin unavailable"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| String::from("daemon stdout unavailable"))?;
+        let (reply_sender, replies) = mpsc::channel();
+        let _reader_thread = std::thread::Builder::new()
+            .name(String::from("bolo-access-daemon"))
+            .spawn(move || {
+                // One reader thread owns stdout; the request path reads
+                // replies through the channel, so a blocking read can be
+                // bounded by recv_timeout instead of blocking forever.
+                let reader = BufReader::new(stdout);
+                for line in reader.lines() {
+                    match line {
+                        Ok(text) => {
+                            if reply_sender.send(text).is_err() {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            })
+            .map_err(|error| format!("reader thread failed: {error}"))?;
+        Ok(Self {
+            child,
+            stdin,
+            replies,
+        })
+    }
+
+    /// Whether the child has already terminated.
+    fn has_exited(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(Some(_)) | Err(_))
+    }
+
+    /// Send one request and return its parsed response.
+    fn exchange(
+        &mut self,
+        request: &AccessDaemonRequest,
+    ) -> Result<serde_json::Value, AccessDaemonFailure> {
+        let line = request.line();
+        if let Err(error) = self
+            .stdin
+            .write_all(line.as_bytes())
+            .and_then(|()| self.stdin.write_all(b"\n"))
+            .and_then(|()| self.stdin.flush())
+        {
+            return Err(AccessDaemonFailure::Io(error));
+        }
+        let reply = wait_for_daemon_reply(&self.replies, request.timeout())?;
+        serde_json::from_str(&reply).map_err(|_| AccessDaemonFailure::MalformedReply)
+    }
+}
+
+/// Wait for the daemon's next response line. Split from the daemon struct so
+/// the timeout and shutdown paths are testable without a real process.
+fn wait_for_daemon_reply(
+    replies: &Receiver<String>,
+    timeout: Duration,
+) -> Result<String, AccessDaemonFailure> {
+    match replies.recv_timeout(timeout) {
+        Ok(line) => Ok(line),
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(AccessDaemonFailure::Timeout),
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(AccessDaemonFailure::Exited),
+    }
+}
+
+static ACCESS_DAEMON: OnceLock<Mutex<Option<AccessDaemon>>> = OnceLock::new();
+
+/// The process-wide daemon slot. Only the supervisor (and startup) put a
+/// daemon here; every request path either uses it or falls back to spawns.
+fn access_daemon_cell() -> &'static Mutex<Option<AccessDaemon>> {
+    ACCESS_DAEMON.get_or_init(|| Mutex::new(None))
+}
+
+/// Perform one daemon round-trip. `Ok(value)` means the daemon served the
+/// request; `None` means the caller must use today's per-call spawn fallback,
+/// and the reason is logged either way.
+fn request_accessibility_daemon(request: &AccessDaemonRequest) -> Option<serde_json::Value> {
+    let mut cell = access_daemon_cell()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(daemon) = cell.as_mut() else {
+        info!(
+            "[helper] spawn_fallback kind={} reason=daemon_not_running",
+            request.kind()
+        );
+        return None;
+    };
+    if daemon.has_exited() {
+        *cell = None;
+        info!(
+            "[helper] spawn_fallback kind={} reason=daemon_exit",
+            request.kind()
+        );
+        return None;
+    }
+    match daemon.exchange(request) {
+        Ok(reply) => {
+            info!("[helper] daemon_served kind={}", request.kind());
+            Some(reply)
+        }
+        Err(failure) => {
+            info!(
+                "[helper] spawn_fallback kind={} reason={}",
+                request.kind(),
+                failure.reason()
+            );
+            // Drop the dead daemon under the lock: killing the child keeps a
+            // late reply from ever being matched to the next request.
+            *cell = None;
+            None
+        }
+    }
+}
+
+/// Spawn a daemon and confirm it answers before callers use it, so no request
+/// ever waits on interpreter startup. Returns the warm daemon.
+fn spawn_ready_access_daemon(root_dir: &Path) -> Result<AccessDaemon, String> {
+    let mut daemon = AccessDaemon::start(root_dir)?;
+    let pong = daemon
+        .exchange(&AccessDaemonRequest::Ping)
+        .map_err(|failure| format!("readiness ping failed: {}", failure.reason()))?;
+    let trusted = pong.get("trusted").and_then(serde_json::Value::as_bool);
+    if pong.get("type").and_then(serde_json::Value::as_str) == Some("pong")
+        && let Some(trusted) = trusted
+    {
+        info!("[helper] accessibility daemon ready (trusted={trusted})");
+        return Ok(daemon);
+    }
+    Err(String::from(
+        "readiness ping returned an unexpected response",
+    ))
+}
+
+/// Start the daemon at app startup, before the trust check, so that check
+/// itself exercises the daemon path. A failed start only logs: every request
+/// falls back to the per-call spawns until the supervisor recovers it.
+fn start_accessibility_daemon(root_dir: &Path) {
+    if access_daemon_is_running() {
+        return;
+    }
+    match spawn_ready_access_daemon(root_dir) {
+        Ok(daemon) => {
+            if !store_access_daemon(daemon) {
+                warn!(
+                    "[helper] accessibility daemon already running; discarding a duplicate start"
+                );
+            }
+        }
+        Err(reason) => {
+            warn!("[helper] accessibility daemon unavailable at startup: {reason}");
+        }
+    }
+}
+
+/// Whether the daemon slot is already occupied.
+fn access_daemon_is_running() -> bool {
+    let cell = access_daemon_cell()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    cell.is_some()
+}
+
+/// Store a freshly warmed daemon when the slot is free. Returns false (and
+/// kills the loser via `Drop`) when another start won the race, keeping the
+/// single-daemon invariant.
+fn store_access_daemon(daemon: AccessDaemon) -> bool {
+    let mut cell = access_daemon_cell()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if cell.is_some() {
+        return false;
+    }
+    *cell = Some(daemon);
+    true
+}
+
+/// Keep the daemon alive, mirroring the hotkey helper's supervisor loop: a
+/// daemon that dies mid-session is pruned and restarted, costing at most one
+/// request on the spawn fallback while it comes back.
+fn run_accessibility_daemon_supervisor(root_dir: &Path) {
+    loop {
+        std::thread::sleep(ACCESS_DAEMON_SUPERVISOR_INTERVAL);
+        let needs_start = {
+            let mut cell = access_daemon_cell()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(daemon) = cell.as_mut()
+                && daemon.has_exited()
+            {
+                warn!("[helper] accessibility daemon exited; restarting");
+                *cell = None;
+            }
+            cell.is_none()
+        };
+        if !needs_start {
+            continue;
+        }
+        // Warm the daemon outside the lock so requests fall back instead of
+        // blocking on interpreter startup.
+        match spawn_ready_access_daemon(root_dir) {
+            Ok(daemon) => {
+                if store_access_daemon(daemon) {
+                    info!("[helper] accessibility daemon restarted");
+                } else {
+                    // Another start won the race; ours was killed on drop.
+                    warn!(
+                        "[helper] accessibility daemon start raced with another; keeping the existing daemon"
+                    );
+                }
+            }
+            Err(reason) => {
+                warn!("[helper] accessibility daemon restart failed: {reason}");
+            }
+        }
+    }
+}
+
+/// `{"type":"trust","trusted":<bool>}` from the daemon, or None when the
+/// reply does not match the contract.
+fn parse_daemon_trust_reply(reply: &serde_json::Value) -> Option<bool> {
+    if reply.get("type").and_then(serde_json::Value::as_str) != Some("trust") {
+        return None;
+    }
+    reply.get("trusted").and_then(serde_json::Value::as_bool)
+}
+
+/// `{"type":"paste_done","ok":<bool>}` from the daemon.
+fn parse_daemon_paste_reply(reply: &serde_json::Value) -> Option<bool> {
+    if reply.get("type").and_then(serde_json::Value::as_str) != Some("paste_done") {
+        return None;
+    }
+    reply.get("ok").and_then(serde_json::Value::as_bool)
+}
+
+/// `{"type":"select_done","selected":<bool>}` from the daemon.
+fn parse_daemon_select_reply(reply: &serde_json::Value) -> Option<bool> {
+    if reply.get("type").and_then(serde_json::Value::as_str) != Some("select_done") {
+        return None;
+    }
+    reply.get("selected").and_then(serde_json::Value::as_bool)
+}
+
+/// `{"type":"context",...}` from the daemon. `"app": null` is the daemon's
+/// "the context read failed" signal, mapped to None so the caller falls back
+/// to the per-call helper exactly as it does when the daemon is unavailable.
+fn parse_daemon_context_reply(reply: &serde_json::Value) -> Option<AccessibilityContext> {
+    if reply.get("type").and_then(serde_json::Value::as_str) != Some("context") {
+        return None;
+    }
+    let app_name = reply.get("app")?;
+    if !app_name.is_string() {
+        return None;
+    }
+    Some(finalize_accessibility_context(
+        app_name.as_str()?,
+        reply
+            .get("bundle_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default(),
+        reply
+            .get("before_cursor")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default(),
+        reply
+            .get("selected_text")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default(),
+    ))
+}
+
+/// Normalize a freshly read context the same way whichever helper produced it.
+fn finalize_accessibility_context(
+    app_name: &str,
+    bundle_id: &str,
+    text_before_cursor: &str,
+    selected_text: &str,
+) -> AccessibilityContext {
+    AccessibilityContext {
+        app_name: app_name.trim().to_owned(),
+        bundle_id: bundle_id.trim().to_owned(),
+        text_before_cursor: text_before_cursor
+            .trim()
+            .chars()
+            .rev()
+            .take(500)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect(),
+        selected_text: selected_text
+            .trim()
+            .chars()
+            .take(MAX_SELECTED_TEXT_CHARS)
+            .collect(),
+    }
+}
+
 fn paste_text(root_dir: &Path, text: &str) -> Result<(), AppError> {
     match accessibility_trust(root_dir, false) {
         AccessibilityTrust::Trusted => {}
@@ -7271,6 +7695,20 @@ fn paste_text(root_dir: &Path, text: &str) -> Result<(), AppError> {
             return Err(AppError::AccessibilityNotGranted);
         }
     }
+    if let Some(reply) = request_accessibility_daemon(&AccessDaemonRequest::Paste {
+        text: text.to_owned(),
+    }) && let Some(ok) = parse_daemon_paste_reply(&reply)
+    {
+        if ok {
+            info!("pasted {} chars via insert helper", text.chars().count());
+            return Ok(());
+        }
+        // The daemon's paste logic refused (the pasteboard write failed),
+        // which is the spawned helper's failure mode too: go straight to the
+        // plain clipboard fallback rather than retrying the same paste.
+        warn!("insert helper reported paste failure; falling back to plain clipboard paste");
+        return paste_text_with_plain_clipboard(text);
+    }
     if run_insert_text_helper(root_dir, text).is_ok() {
         info!("pasted {} chars via insert helper", text.chars().count());
         return Ok(());
@@ -7281,6 +7719,15 @@ fn paste_text(root_dir: &Path, text: &str) -> Result<(), AppError> {
 
 /// Ask macOS whether Bolo's Python helper is trusted for Accessibility events.
 fn accessibility_trust(root_dir: &Path, prompt: bool) -> AccessibilityTrust {
+    if let Some(reply) = request_accessibility_daemon(&AccessDaemonRequest::TrustCheck { prompt })
+        && let Some(trusted) = parse_daemon_trust_reply(&reply)
+    {
+        return if trusted {
+            AccessibilityTrust::Trusted
+        } else {
+            AccessibilityTrust::Untrusted
+        };
+    }
     let script = root_dir.join("accessibility_trusted.py");
     if !script.exists() {
         warn!("[accessibility] helper missing at {}", script.display());
@@ -7356,6 +7803,12 @@ fn run_insert_text_helper(root_dir: &Path, text: &str) -> Result<(), AppError> {
 }
 
 fn select_text_before_caret(root_dir: &Path, text: &str) -> Result<bool, AppError> {
+    if let Some(reply) = request_accessibility_daemon(&AccessDaemonRequest::SelectBeforeCaret {
+        text: text.to_owned(),
+    }) && let Some(selected) = parse_daemon_select_reply(&reply)
+    {
+        return Ok(selected);
+    }
     let script = root_dir.join("accessibility_context.py");
     if !script.exists() {
         return Err(AppError::Io(std::io::Error::new(
@@ -7704,29 +8157,34 @@ mod tests {
     #![allow(clippy::panic_in_result_fn)]
 
     use super::{
-        ASSEMBLYAI_STREAMING_MODEL, AccessibilityContext, AccessibilityTrust, App, AppError,
-        AppState, AssemblyDictationResponse, BatchRetry, CleanupMode, CleanupProfile, Config,
-        DictationCommandKind, DictationWarmup, PreparedText, PromptBinding, STREAMING_DRAIN_MIN,
-        STT_RETRY_SAMPLE_RATE, StreamingConnectionState, StreamingProvider, StreamingRecording,
-        StreamingTranscript, SttFallback, SttResult, TRANSCRIPT_HISTORY_LIMIT, TextReplacement,
-        TranscriptHistoryEntry, UpdateOutcome, apply_text_replacements,
-        apply_vocabulary_corrections_with_matches, assemblyai_direct_query_with,
-        assemblyai_language_code, batch_retry_plan, build_cleanup_user_content,
-        build_rewrite_user_content, build_stt_prompt, canonicalize_known_terms, cleanup_decision,
-        cleanup_max_tokens, cleanup_profile, downsample_wav_16k_mono, empty_transcript_error,
-        final_streaming_result_is_ready_elapsed, handshake_with_deadline,
-        is_known_no_speech_transcript, is_supported_hotkey, load_vocabulary_usage,
-        non_empty_transcript, parse_accessibility_trust, parse_command, parse_replacements_json,
-        parse_stt_fallbacks, parse_u64_env_value, parse_update_outcome, parse_wav_pcm16,
-        read_vocabulary_file, read_vocabulary_usage_file, remove_fillers, retry_failed_primary,
-        sanitize_transcript_history, speech_stats, stable_streaming_best_is_ready_elapsed,
-        streaming_batch_fallback_reason, streaming_connection, streaming_preview_tail,
-        streaming_provider_from_config, strip_reasoning_tags, stt_language_for_model,
-        stt_model_config, telnyx_stream_query, transcript_log_value, transcript_menu_preview,
-        wav_bytes, wav_duration_ms,
+        ACCESS_DAEMON_ACTION_TIMEOUT, ACCESS_DAEMON_QUERY_TIMEOUT, ACCESS_DAEMON_STARTUP_TIMEOUT,
+        ASSEMBLYAI_STREAMING_MODEL, AccessDaemonFailure, AccessDaemonRequest, AccessibilityContext,
+        AccessibilityTrust, App, AppError, AppState, AssemblyDictationResponse, BatchRetry,
+        CleanupMode, CleanupProfile, Config, DictationCommandKind, DictationWarmup, PreparedText,
+        PromptBinding, STREAMING_DRAIN_MIN, STT_RETRY_SAMPLE_RATE, StreamingConnectionState,
+        StreamingProvider, StreamingRecording, StreamingTranscript, SttFallback, SttResult,
+        TRANSCRIPT_HISTORY_LIMIT, TextReplacement, TranscriptHistoryEntry, UpdateOutcome,
+        apply_text_replacements, apply_vocabulary_corrections_with_matches,
+        assemblyai_direct_query_with, assemblyai_language_code, batch_retry_plan,
+        build_cleanup_user_content, build_rewrite_user_content, build_stt_prompt,
+        canonicalize_known_terms, cleanup_decision, cleanup_max_tokens, cleanup_profile,
+        downsample_wav_16k_mono, empty_transcript_error, final_streaming_result_is_ready_elapsed,
+        finalize_accessibility_context, handshake_with_deadline, is_known_no_speech_transcript,
+        is_supported_hotkey, load_vocabulary_usage, non_empty_transcript,
+        parse_accessibility_trust, parse_command, parse_daemon_context_reply,
+        parse_daemon_paste_reply, parse_daemon_select_reply, parse_daemon_trust_reply,
+        parse_replacements_json, parse_stt_fallbacks, parse_u64_env_value, parse_update_outcome,
+        parse_wav_pcm16, read_vocabulary_file, read_vocabulary_usage_file, remove_fillers,
+        request_accessibility_daemon, retry_failed_primary, sanitize_transcript_history,
+        speech_stats, stable_streaming_best_is_ready_elapsed, streaming_batch_fallback_reason,
+        streaming_connection, streaming_preview_tail, streaming_provider_from_config,
+        strip_reasoning_tags, stt_language_for_model, stt_model_config, telnyx_stream_query,
+        transcript_log_value, transcript_menu_preview, wait_for_daemon_reply, wav_bytes,
+        wav_duration_ms,
     };
     use std::collections::{HashMap, VecDeque};
     use std::path::PathBuf;
+    use std::sync::mpsc;
     use std::sync::{Arc, Mutex};
     use std::{env, fs, process};
 
@@ -7774,6 +8232,215 @@ mod tests {
             parse_accessibility_trust(""),
             AccessibilityTrust::Unavailable
         );
+    }
+
+    #[test]
+    fn daemon_requests_are_single_line_json() {
+        // Single-key requests have an exact wire form.
+        assert_eq!(AccessDaemonRequest::Ping.line(), r#"{"type":"ping"}"#);
+        assert_eq!(
+            AccessDaemonRequest::ReadContext.line(),
+            r#"{"type":"read_context"}"#
+        );
+        // serde_json orders object keys by its map layout, so multi-key
+        // requests are checked semantically. The framing contract is that
+        // every request serializes to exactly one line.
+        for line in [
+            AccessDaemonRequest::TrustCheck { prompt: true }.line(),
+            AccessDaemonRequest::SelectBeforeCaret {
+                text: String::from("hi"),
+            }
+            .line(),
+            // Newlines inside the payload must stay escaped: one line per
+            // request is the whole framing contract with the daemon.
+            AccessDaemonRequest::Paste {
+                text: String::from("line one\nline two \"quoted\""),
+            }
+            .line(),
+        ] {
+            assert!(!line.contains('\n'));
+        }
+        let trust: serde_json::Value =
+            serde_json::from_str(&AccessDaemonRequest::TrustCheck { prompt: true }.line())
+                .unwrap_or_default();
+        assert_eq!(trust["type"], "trust_check");
+        assert_eq!(trust["prompt"], true);
+        let select: serde_json::Value = serde_json::from_str(
+            &AccessDaemonRequest::SelectBeforeCaret {
+                text: String::from("hi"),
+            }
+            .line(),
+        )
+        .unwrap_or_default();
+        assert_eq!(select["type"], "select_before_caret");
+        assert_eq!(select["text"], "hi");
+        let paste: serde_json::Value = serde_json::from_str(
+            &AccessDaemonRequest::Paste {
+                text: String::from("line one\nline two \"quoted\""),
+            }
+            .line(),
+        )
+        .unwrap_or_default();
+        assert_eq!(paste["text"], "line one\nline two \"quoted\"");
+    }
+
+    #[test]
+    fn daemon_requests_use_the_expected_timeouts() {
+        assert_eq!(
+            AccessDaemonRequest::Ping.timeout(),
+            ACCESS_DAEMON_STARTUP_TIMEOUT
+        );
+        assert_eq!(
+            AccessDaemonRequest::TrustCheck { prompt: false }.timeout(),
+            ACCESS_DAEMON_QUERY_TIMEOUT
+        );
+        assert_eq!(
+            AccessDaemonRequest::ReadContext.timeout(),
+            ACCESS_DAEMON_QUERY_TIMEOUT
+        );
+        assert_eq!(
+            AccessDaemonRequest::Paste {
+                text: String::new()
+            }
+            .timeout(),
+            ACCESS_DAEMON_ACTION_TIMEOUT
+        );
+        assert_eq!(
+            AccessDaemonRequest::SelectBeforeCaret {
+                text: String::new()
+            }
+            .timeout(),
+            ACCESS_DAEMON_ACTION_TIMEOUT
+        );
+    }
+
+    #[test]
+    fn daemon_replies_parse_or_signal_fallback() {
+        assert_eq!(
+            parse_daemon_trust_reply(&serde_json::json!({"type": "trust", "trusted": true})),
+            Some(true)
+        );
+        assert_eq!(
+            parse_daemon_trust_reply(&serde_json::json!({"type": "trust", "trusted": false})),
+            Some(false)
+        );
+        assert_eq!(
+            parse_daemon_trust_reply(&serde_json::json!({"type": "error", "message": "x"})),
+            None
+        );
+        assert_eq!(
+            parse_daemon_trust_reply(&serde_json::json!({"type": "trust"})),
+            None
+        );
+        assert_eq!(
+            parse_daemon_paste_reply(&serde_json::json!({"type": "paste_done", "ok": true})),
+            Some(true)
+        );
+        assert_eq!(
+            parse_daemon_paste_reply(&serde_json::json!({"type": "paste_done", "ok": false})),
+            Some(false)
+        );
+        assert_eq!(
+            parse_daemon_paste_reply(&serde_json::json!({"type": "trust", "trusted": true})),
+            None
+        );
+        assert_eq!(
+            parse_daemon_select_reply(
+                &serde_json::json!({"type": "select_done", "selected": true})
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            parse_daemon_select_reply(
+                &serde_json::json!({"type": "select_done", "selected": false})
+            ),
+            Some(false)
+        );
+        assert_eq!(
+            parse_daemon_select_reply(&serde_json::json!({"type": "select_done"})),
+            None
+        );
+    }
+
+    #[test]
+    fn daemon_context_reply_maps_to_accessibility_context() {
+        let reply = serde_json::json!({
+            "type": "context",
+            "app": "Notes",
+            "bundle_id": " com.apple.Notes ",
+            "before_cursor": "  hello world  ",
+            "selected_text": " kept selection  ",
+        });
+        let context = parse_daemon_context_reply(&reply).unwrap_or_default();
+        assert_eq!(context.app_name, "Notes");
+        assert_eq!(context.bundle_id, "com.apple.Notes");
+        assert_eq!(context.text_before_cursor, "hello world");
+        assert_eq!(context.selected_text, "kept selection");
+
+        // `app: null` is the daemon's failed-read signal, never a context.
+        assert_eq!(
+            parse_daemon_context_reply(&serde_json::json!({"type": "context", "app": null})),
+            None
+        );
+        // Error replies and mismatched types fall back to the spawn path.
+        assert_eq!(
+            parse_daemon_context_reply(&serde_json::json!({"type": "error", "message": "x"})),
+            None
+        );
+        // Long context is trimmed exactly like the per-call spawn path.
+        let trimmed = parse_daemon_context_reply(&serde_json::json!({
+            "type": "context",
+            "app": "x",
+            "bundle_id": "",
+            "before_cursor": "a".repeat(600),
+            "selected_text": "",
+        }))
+        .unwrap_or_default();
+        assert_eq!(trimmed.text_before_cursor.chars().count(), 500);
+    }
+
+    #[test]
+    fn daemon_reply_wait_times_out_and_detects_shutdown() {
+        let (sender, receiver) = mpsc::channel::<String>();
+        // Nothing is ever sent: the bounded wait gives up.
+        assert!(matches!(
+            wait_for_daemon_reply(&receiver, std::time::Duration::from_millis(20)),
+            Err(AccessDaemonFailure::Timeout)
+        ));
+        // A closed channel is a dead daemon.
+        drop(sender);
+        assert!(matches!(
+            wait_for_daemon_reply(&receiver, std::time::Duration::from_millis(20)),
+            Err(AccessDaemonFailure::Exited)
+        ));
+        // A queued reply is returned immediately.
+        let (sender2, receiver2) = mpsc::channel::<String>();
+        let _send_result = sender2.send(String::from(r#"{"type":"pong","trusted":true}"#));
+        assert!(matches!(
+            wait_for_daemon_reply(&receiver2, std::time::Duration::from_millis(20)),
+            Ok(text) if text == r#"{"type":"pong","trusted":true}"#
+        ));
+    }
+
+    #[test]
+    fn daemon_requests_fall_back_when_no_daemon_is_running() {
+        // No test starts the daemon, so the process-wide slot is empty and
+        // every request reports the per-call spawn fallback.
+        assert!(request_accessibility_daemon(&AccessDaemonRequest::ReadContext).is_none());
+    }
+
+    #[test]
+    fn finalized_context_trims_like_the_spawn_path() {
+        let context = finalize_accessibility_context(
+            "  Notes  ",
+            " com.apple.Notes ",
+            "  before cursor  ",
+            "  selected  ",
+        );
+        assert_eq!(context.app_name, "Notes");
+        assert_eq!(context.bundle_id, "com.apple.Notes");
+        assert_eq!(context.text_before_cursor, "before cursor");
+        assert_eq!(context.selected_text, "selected");
     }
 
     #[test]

@@ -210,11 +210,13 @@ def wait_for_pasteboard_to_change(pasteboard, temporary_change_count, text):
     return False
 
 
-def main():
-    text = sys.stdin.read()
-    if not text:
-        return 0
+def perform_paste(text: str) -> int:
+    """Paste ``text`` via the clipboard and Cmd+V, preserving its payload.
 
+    Shared by the CLI helper (which reads the text from stdin) and the
+    persistent accessibility daemon (which receives it over its JSON
+    protocol). Returns 0 on success and 2 when the pasteboard write failed.
+    """
     pasteboard = NSPasteboard.generalPasteboard()
     snapshot = snapshot_pasteboard(pasteboard)
     pasteboard.clearContents()
@@ -231,11 +233,20 @@ def main():
     )
     if not externally_changed:
         restore_pasteboard(pasteboard, snapshot)
+    return 0
+
+
+def main():
+    text = sys.stdin.read()
+    if not text:
+        return 0
+
+    status = perform_paste(text)
 
     ready, _, _ = select.select([sys.stdin], [], [], 0)
     if ready:
         sys.stdin.read()
-    return 0
+    return status
 
 
 if __name__ == "__main__":
