@@ -1,4 +1,5 @@
-"""Unit tests for keyboard-layout resolution in the insertion helper.
+"""Unit tests for keyboard-layout resolution and the paste split in the
+insertion helper.
 
 Run with: python3 -m pytest tests/
 No mic, pasteboard, accessibility, or API key needed.
@@ -7,6 +8,11 @@ Most of these drive Apple's stock keyboard layouts directly rather than only
 whichever layout this Mac happens to be set to, so a QWERTY machine still
 proves the Dvorak behaviour. Layouts ship with macOS, so they are present
 whether or not the user has enabled them; any that are missing are skipped.
+
+The mocked-pasteboard section at the bottom drives the real
+start_paste/finalize_paste code over fakes, no AX permission or real
+keystroke required. tests/test_accessibility_daemon.py imports those fakes
+for its daemon-side paste tests, so both files share one pasteboard model.
 """
 
 import ctypes
@@ -16,6 +22,9 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from AppKit import NSStringPboardType
+
+import insert_text
 from insert_text import (
     COMMAND_MODIFIER_STATE,
     QWERTY_V_KEYCODE,
@@ -147,3 +156,161 @@ def test_dvorak_qwerty_command_needs_the_command_modifier():
         return
     assert scan_layout_for_character(layout, "v", 0, SENTINEL) == 47
     assert scan_layout_for_character(layout, "v", COMMAND_MODIFIER_STATE, SENTINEL) == 9
+
+
+# ---------------------------------------------------------------------------
+# Mocked-pasteboard tests for the start_paste / finalize_paste split.
+#
+# perform_paste's CLI contract (install text, one Cmd+V, restore the snapshot
+# when nothing else took the paste) is exercised without AX permission, real
+# keystrokes, or the real pasteboard.
+
+
+class FakePasteboardItem:
+    """NSPasteboardItem stand-in: just the type/data pairs the helper uses."""
+
+    def __init__(self, data_by_type=None):
+        self._data_by_type = dict(data_by_type or {})
+
+    @classmethod
+    def alloc(cls):
+        return cls()
+
+    def init(self):
+        return self
+
+    def types(self):
+        return list(self._data_by_type)
+
+    def dataForType_(self, item_type):
+        return self._data_by_type.get(item_type)
+
+    def setData_forType_(self, data, item_type):
+        self._data_by_type[item_type] = data
+
+
+class FakePasteboard:
+    """String-level pasteboard whose changeCount bumps on every write."""
+
+    def __init__(self, initial_text=""):
+        self._items = (
+            [FakePasteboardItem({NSStringPboardType: initial_text.encode("utf-8")})]
+            if initial_text
+            else []
+        )
+        self._change_count = 0
+        self.refuse_writes = False
+
+    def current_text(self):
+        return self.stringForType_(NSStringPboardType)
+
+    # -- the NSPasteboard surface insert_text.py touches --
+
+    def pasteboardItems(self):
+        return list(self._items)
+
+    def changeCount(self):
+        return self._change_count
+
+    def clearContents(self):
+        self._items = []
+        self._change_count += 1
+
+    def setString_forType_(self, text, item_type):
+        if self.refuse_writes:
+            return False
+        self._items = [FakePasteboardItem({item_type: text.encode("utf-8")})]
+        self._change_count += 1
+        return True
+
+    def stringForType_(self, item_type):
+        for item in self._items:
+            data = item.dataForType_(item_type)
+            if data is not None:
+                return data.decode("utf-8")
+        return None
+
+    def writeObjects_(self, items):
+        self._items = list(items)
+        self._change_count += 1
+        return True
+
+    # -- test-side controls --
+
+    def set_string_externally(self, text):
+        """Simulate another process writing the pasteboard mid-restore-window."""
+        self.clearContents()
+        self.setString_forType_(text, NSStringPboardType)
+
+
+class FakeNSPasteboardModule:
+    """Stands in for the NSPasteboard class: one shared fake per test."""
+
+    def __init__(self, instance):
+        self._instance = instance
+
+    def generalPasteboard(self):
+        return self._instance
+
+
+def install_mock_paste(
+    monkeypatch, initial_text="original clipboard", restore_timeout=1.0
+):
+    """Point insert_text at a fake pasteboard and a recording Cmd+V.
+
+    Returns ``(fake, posted)``; ``posted`` grows by one per keystroke so a
+    test can prove whether the key was pressed at all. Shared with
+    tests/test_accessibility_daemon.py for its daemon-side paste tests.
+    """
+    fake = FakePasteboard(initial_text)
+    monkeypatch.setattr(insert_text, "NSPasteboard", FakeNSPasteboardModule(fake))
+    monkeypatch.setattr(insert_text, "NSPasteboardItem", FakePasteboardItem)
+    posted = []
+    monkeypatch.setattr(insert_text, "post_cmd_v", lambda: posted.append(True))
+    monkeypatch.setattr(insert_text, "RESTORE_TIMEOUT", restore_timeout)
+    return fake, posted
+
+
+def test_perform_paste_installs_text_presses_once_and_restores_the_snapshot(
+    monkeypatch,
+):
+    """The CLI contract, end to end over the mock: text installed, one
+    Cmd+V, and the pre-paste clipboard put back when nothing changed it."""
+    fake, posted = install_mock_paste(
+        monkeypatch, initial_text="user data", restore_timeout=0.05
+    )
+    assert insert_text.perform_paste("dictation") == 0
+    assert len(posted) == 1
+    assert fake.current_text() == "user data"
+
+
+def test_start_paste_reports_failure_and_perform_paste_keeps_it(monkeypatch):
+    """A refused pasteboard write: no keystroke, status 2, no restore."""
+    fake, posted = install_mock_paste(monkeypatch, initial_text="user data")
+    fake.refuse_writes = True
+    assert insert_text.start_paste("dictation") is None
+    assert posted == []
+    assert insert_text.perform_paste("dictation") == 2
+
+
+def test_finalize_paste_reports_external_change_and_leaves_the_board_alone(
+    monkeypatch,
+):
+    fake, posted = install_mock_paste(
+        monkeypatch, initial_text="user data", restore_timeout=0.05
+    )
+    state = insert_text.start_paste("dictation")
+    assert fake.current_text() == "dictation"
+    fake.set_string_externally("the app rewrote it")
+    assert insert_text.finalize_paste(state) == "external_change"
+    assert fake.current_text() == "the app rewrote it"
+    assert len(posted) == 1
+
+
+def test_pasteboard_matches_state_flips_false_once_a_newer_paste_writes(monkeypatch):
+    fake, _posted = install_mock_paste(monkeypatch, initial_text="user data")
+    first = insert_text.start_paste("first")
+    assert insert_text.pasteboard_matches_state(first) is True
+    insert_text.start_paste("second")
+    assert fake.current_text() == "second"
+    assert insert_text.pasteboard_matches_state(first) is False

@@ -28,11 +28,21 @@ protocol responses, nothing else may print there. The daemon never activates
 an application, so it cannot steal the paste target's focus. It exits when
 its parent Rust runtime goes away (``BOLO_PARENT_PID``, mirroring hotkey.py)
 or when stdin closes.
+
+The ``paste`` reply is sent as soon as Cmd+V is posted; the pasteboard
+restore wait (the 350ms window from ``insert_text.py``'s
+``BOLO_INSERT_RESTORE_TIMEOUT``) then runs on a background thread so the
+dictation critical path does not pay for it. The restore outcome is logged
+to stderr as ``[daemon] paste restore restored|external_change|skipped``;
+``skipped`` means a newer paste superseded the finalize and the pasteboard
+was left untouched. If a newer paste arrives while a finalize is pending,
+the pending finalize is cancelled and only the newest paste may restore.
 """
 
 import json
 import os
 import sys
+import threading
 import warnings
 
 import accessibility_context
@@ -67,6 +77,70 @@ def handle_trust_check(request):
     }
 
 
+class PasteRestoreCoordinator:
+    """Sequences pastes against the background restores of earlier pastes.
+
+    ``handle_paste`` answers as soon as Cmd+V is posted, so the restore wait
+    runs on a worker thread instead of the request loop. The lock makes the
+    worker's ownership check plus restore atomic against the next paste's
+    snapshot-plus-write, and the generation counter cancels any finalize
+    that a newer paste superseded: one pending finalize may act at most, and
+    only the newest paste's finalize may restore. A stale finalize must
+    never restore across a snapshot it does not own.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._generation = 0
+
+    def begin(self, text):
+        """Run ``insert_text.start_paste`` as one lock-held section.
+
+        Returns ``(generation, state)``; the generation identifies this paste
+        to the finalize step. ``state`` is None when the pasteboard refused
+        the write, which still cancels any pending finalize: the failed
+        attempt cleared the pasteboard, so an older snapshot is stale too.
+        """
+        with self._lock:
+            self._generation += 1
+            generation = self._generation
+            state = insert_text.start_paste(text)
+        return generation, state
+
+    def finalize(self, generation, state):
+        """Wait out the restore window, then restore only while this paste
+        still owns the pasteboard.
+
+        Returns "skipped" when a newer paste superseded this one, else the
+        outcome from ``insert_text.finalize_paste`` ("restored" or
+        "external_change").
+        """
+        with self._lock:
+            superseded = generation != self._generation
+        if superseded:
+            return "skipped"
+
+        def restore_if_still_owned(paste_state):
+            # The same lock begin() holds, so a newer paste cannot interleave
+            # between this ownership check and the restore write.
+            with self._lock:
+                if generation != self._generation or not (
+                    insert_text.pasteboard_matches_state(paste_state)
+                ):
+                    return "skipped"
+                insert_text.restore_pasteboard(
+                    paste_state["pasteboard"], paste_state["snapshot"]
+                )
+                return "restored"
+
+        return insert_text.finalize_paste(
+            state, restore_decider=restore_if_still_owned
+        )
+
+
+PASTE_RESTORE = PasteRestoreCoordinator()
+
+
 def handle_paste(request):
     text = request.get("text")
     if not isinstance(text, str):
@@ -74,7 +148,28 @@ def handle_paste(request):
     if not text:
         # Mirror insert_text.py: an empty payload is a successful no-op.
         return {"type": "paste_done", "ok": True}
-    return {"type": "paste_done", "ok": insert_text.perform_paste(text) == 0}
+    generation, state = PASTE_RESTORE.begin(text)
+    if state is None:
+        return {"type": "paste_done", "ok": False}
+    # Reply the moment Cmd+V is posted; the restore wait would otherwise sit
+    # on the dictation critical path for the whole restore window.
+    threading.Thread(
+        target=_finalize_paste_off_loop,
+        args=(generation, state),
+        daemon=True,
+        name=f"bolo-paste-restore-{generation}",
+    ).start()
+    return {"type": "paste_done", "ok": True}
+
+
+def _finalize_paste_off_loop(generation, state):
+    """Restore wait for one paste. Logs to stderr only, never stdout."""
+    try:
+        outcome = PASTE_RESTORE.finalize(generation, state)
+    except Exception as error:
+        print(f"[daemon] paste restore failed: {error}", file=sys.stderr, flush=True)
+        return
+    print(f"[daemon] paste restore {outcome}", file=sys.stderr, flush=True)
 
 
 def handle_select_before_caret(request):
