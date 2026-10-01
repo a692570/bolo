@@ -23,26 +23,69 @@ helper_python="$("$BOLO_DIR/ensure-python-env.sh" --sync)"
 echo "Building Rust binary..."
 cargo build --release
 
-existing_key="${TELNYX_API_KEY:-}"
-if [ -z "$existing_key" ] && [ -f "$HOME/.bolo/env" ]; then
-  existing_key="$(grep '^TELNYX_API_KEY=' "$HOME/.bolo/env" 2>/dev/null | head -1 | cut -d= -f2- | sed 's/^"//; s/"$//' || true)"
+# Provider selection precedence: explicit BOLO_PROVIDER, then whichever single
+# key is already present in the environment, then an interactive prompt that
+# defaults to AssemblyAI.
+provider="${BOLO_PROVIDER:-}"
+if [ -z "$provider" ]; then
+  if [ -n "${TELNYX_API_KEY:-}" ] && [ -z "${ASSEMBLYAI_API_KEY:-}" ]; then
+    provider="telnyx"
+  elif [ -n "${ASSEMBLYAI_API_KEY:-}" ] && [ -z "${TELNYX_API_KEY:-}" ]; then
+    provider="assemblyai"
+  fi
 fi
-if [ -z "$existing_key" ] && [ -f "$HOME/.codex/.env" ]; then
-  existing_key="$(grep '^TELNYX_API_KEY=' "$HOME/.codex/.env" 2>/dev/null | head -1 | cut -d= -f2- | sed 's/^"//; s/"$//' || true)"
+if [ -z "$provider" ]; then
+  echo ""
+  echo "Choose the speech provider Bolo will use:"
+  echo " 1. AssemblyAI (default). One key covers the dictation pipeline, optional"
+  echo "    streaming, and the LLM gateway for voice rewrites."
+  echo "    Get one at https://www.assemblyai.com/dashboard/home"
+  echo " 2. Telnyx. Telnyx-hosted Deepgram nova-3 and inference APIs."
+  echo "    Get one at https://telnyx.com"
+  while [ -z "$provider" ]; do
+    if ! IFS= read -r -p "Enter 1 or 2 [1]: " choice; then
+      echo ""
+      echo "Install cancelled. A provider choice is required."
+      exit 1
+    fi
+    case "$choice" in
+      1|"") provider="assemblyai" ;;
+      2) provider="telnyx" ;;
+      *) echo "Enter 1 or 2." ;;
+    esac
+  done
+fi
+
+existing_key="${TELNYX_API_KEY:-}"
+if [ "$provider" = "assemblyai" ]; then
+  existing_key="${ASSEMBLYAI_API_KEY:-}"
+  if [ -z "$existing_key" ] && [ -f "$HOME/.bolo/env" ]; then
+    existing_key="$(grep '^ASSEMBLYAI_API_KEY=' "$HOME/.bolo/env" 2>/dev/null | head -1 | cut -d= -f2- | sed 's/^"//; s/"$//' || true)"
+  fi
+else
+  if [ -z "$existing_key" ] && [ -f "$HOME/.bolo/env" ]; then
+    existing_key="$(grep '^TELNYX_API_KEY=' "$HOME/.bolo/env" 2>/dev/null | head -1 | cut -d= -f2- | sed 's/^"//; s/"$//' || true)"
+  fi
+  if [ -z "$existing_key" ] && [ -f "$HOME/.codex/.env" ]; then
+    existing_key="$(grep '^TELNYX_API_KEY=' "$HOME/.codex/.env" 2>/dev/null | head -1 | cut -d= -f2- | sed 's/^"//; s/"$//' || true)"
+  fi
 fi
 
 mkdir -p "$HOME/.bolo"
 chmod 700 "$HOME/.bolo"
 
+if [ "$provider" = "assemblyai" ]; then
+  key_name="ASSEMBLYAI_API_KEY"
+else
+  key_name="TELNYX_API_KEY"
+fi
 if [ -z "$existing_key" ]; then
   echo ""
-  echo "You need a Telnyx API key to use Bolo."
-  echo "Get one at https://telnyx.com"
-  echo ""
+  echo "You need a $key_name to use Bolo."
   while [ -z "$existing_key" ]; do
-    if ! IFS= read -r -s -p "Paste your TELNYX_API_KEY here: " key; then
+    if ! IFS= read -r -s -p "Paste your ${key_name} here: " key; then
       echo ""
-      echo "Install cancelled. A Telnyx API key is required."
+      echo "Install cancelled. An API key is required."
       exit 1
     fi
     echo ""
@@ -54,7 +97,7 @@ if [ -z "$existing_key" ]; then
   done
 fi
 
-echo "Writing TELNYX_API_KEY to ~/.bolo/env..."
+echo "Writing ${key_name} to ~/.bolo/env..."
 escaped_key="${existing_key//\\/\\\\}"
 escaped_key="${escaped_key//\"/\\\"}"
 env_file="$HOME/.bolo/env"
@@ -62,8 +105,8 @@ env_tmp="$(mktemp "$HOME/.bolo/env.tmp.XXXXXX")"
 key_written=false
 if [ -f "$env_file" ]; then
   while IFS= read -r line || [ -n "$line" ]; do
-    if [[ "$line" == TELNYX_API_KEY=* ]]; then
-      printf 'TELNYX_API_KEY="%s"\n' "$escaped_key" >> "$env_tmp"
+    if [[ "$line" == "$key_name="* ]]; then
+      printf '%s="%s"\n' "$key_name" "$escaped_key" >> "$env_tmp"
       key_written=true
     else
       printf '%s\n' "$line" >> "$env_tmp"
@@ -71,7 +114,7 @@ if [ -f "$env_file" ]; then
   done < "$env_file"
 fi
 if [ "$key_written" = false ]; then
-  printf 'TELNYX_API_KEY="%s"\n' "$escaped_key" >> "$env_tmp"
+  printf '%s="%s"\n' "$key_name" "$escaped_key" >> "$env_tmp"
 fi
 chmod 600 "$env_tmp"
 mv "$env_tmp" "$env_file"
@@ -121,6 +164,15 @@ fi
 echo ""
 echo "Done. Bolo is running from the Rust runtime."
 echo ""
+if [ "$provider" = "assemblyai" ]; then
+  echo "Provider: AssemblyAI. Dictation runs on AssemblyAI's Dictation API and the"
+  echo "same key powers optional streaming and the LLM gateway used for voice"
+  echo "rewrites (enable model providers under Data Controls in the AssemblyAI"
+  echo "dashboard if you use rewrites)."
+else
+  echo "Provider: Telnyx. Dictation runs on Telnyx-hosted Deepgram nova-3 and the"
+  echo "Telnyx inference API handles LLM cleanup."
+fi
 echo "Grant two permissions when prompted or in System Settings:"
 echo " 1. Accessibility for the Python interpreter Bolo uses:"
 echo "    $helper_python"
