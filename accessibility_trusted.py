@@ -6,7 +6,9 @@ otherwise. With ``--prompt`` the first untrusted call also opens the macOS
 System Settings prompt so the user knows where to grant the permission.
 
 Used by the Rust runtime to detect the silent-paste-failure state caused by
-missing or stale Accessibility permission.
+missing or stale Accessibility permission. ``is_trusted`` is also imported by
+accessibility_daemon.py so the persistent daemon reports the same state
+without paying interpreter startup per check.
 """
 
 import sys
@@ -14,17 +16,23 @@ import sys
 import ApplicationServices as AX
 
 
-def main() -> int:
-    prompt = "--prompt" in sys.argv
+def is_trusted(prompt: bool = False) -> bool:
+    """Return whether this process is trusted for Accessibility events.
+
+    With ``prompt`` an untrusted call also asks macOS to open the System
+    Settings Accessibility pane.
+    """
     if prompt:
-        trusted = bool(
+        return bool(
             AX.AXIsProcessTrustedWithOptions(
                 {AX.kAXTrustedCheckOptionPrompt: True}
             )
         )
-    else:
-        trusted = bool(AX.AXIsProcessTrusted())
-    print("true" if trusted else "false")
+    return bool(AX.AXIsProcessTrusted())
+
+
+def main() -> int:
+    print("true" if is_trusted("--prompt" in sys.argv) else "false")
     return 0
 
 

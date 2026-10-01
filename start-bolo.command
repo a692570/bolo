@@ -43,6 +43,7 @@ fi
 
 pkill -f "$BOLO_DIR/bolo.py" 2>/dev/null || true
 pkill -f "$BOLO_DIR/hotkey.py" 2>/dev/null || true
+pkill -f "$BOLO_DIR/accessibility_daemon.py" 2>/dev/null || true
 pkill -f "$BOLO_DIR/overlay.py" 2>/dev/null || true
 
 export BIN LOG LOCK_DIR PID_FILE RUNTIME_DIR
