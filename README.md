@@ -229,7 +229,7 @@ export BOLO_LLM_CLEANUP="on"
 
 To disable LLM cleanup entirely, set `BOLO_LLM_CLEANUP="off"`.
 
-LLM cleanup and rewrites go to `LITELLM_BASE` (any OpenAI-compatible endpoint) first, using `Kimi-K2.5` unless `BOLO_LLM_MODEL` is set. Without LiteLLM, the Telnyx inference endpoint (`Qwen/Qwen3-235B-A22B`, thinking disabled) is used only while `TELNYX_API_KEY` is set. With neither configured, LLM cleanup is disabled and local cleanup still runs on its own, and voice rewrites report missing configuration. MiniMax is intentionally not used for cleanup because it can leak reasoning text into the output.
+LLM cleanup and rewrites resolve their endpoint in this order: `LITELLM_BASE` (any OpenAI-compatible endpoint) first, using `Kimi-K2.5` unless `BOLO_LLM_MODEL` is set; then the AssemblyAI LLM Gateway (`https://llm-gateway.assemblyai.com/v1/chat/completions`), authenticated with the same `ASSEMBLYAI_API_KEY` and defaulting to `gemini-2.5-flash-lite` — the gateway's model providers must be enabled under Data Controls in the AssemblyAI dashboard; finally the Telnyx inference endpoint (`Qwen/Qwen3-235B-A22B`, thinking disabled) is used only while `TELNYX_API_KEY` is set. With no endpoint available at all, LLM cleanup is disabled and local cleanup still runs on its own, and voice rewrites report missing configuration. MiniMax is intentionally not used for cleanup because it can leak reasoning text into the output.
 
 When LLM cleanup runs, Bolo also reads the frontmost app and nearby cursor text through macOS Accessibility so cleanup can choose natural spacing, capitalization, and continuation. That context is used only for cleanup prompting.
 
