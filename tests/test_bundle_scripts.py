@@ -9,6 +9,7 @@ is verified by actually running it (scripts/build-dmg.sh), not here.
 """
 
 import os
+import importlib.util
 import re
 import stat
 import subprocess
@@ -18,6 +19,15 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 LAUNCHER = REPO_ROOT / "scripts" / "bundle-launcher.sh"
 BUILD_DMG = REPO_ROOT / "scripts" / "build-dmg.sh"
+DMG_BACKGROUND = REPO_ROOT / "scripts" / "make-dmg-background.py"
+
+
+def _load_dmg_background():
+    """Import the dashed-named background script as a module."""
+    spec = importlib.util.spec_from_file_location("make_dmg_background", DMG_BACKGROUND)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def _run_bash(script, env_extra=None):
@@ -211,6 +221,84 @@ def test_build_dmg_pins_python_runtimes_by_url_and_sha256():
         sha = re.search(rf"PBS_{arch}_SHA=\"([0-9a-f]+)\"", text)
         assert url is not None and "cpython-3.12" in url.group(1)
         assert sha is not None and len(sha.group(1)) == 64
+
+
+def test_build_dmg_stages_the_finder_presentation():
+    text = BUILD_DMG.read_text()
+    # The background render is a committed script, cached in build/dmg and
+    # only regenerated when missing.
+    assert "make-dmg-background.py" in text
+    assert re.search(r'if \[ ! -f "\$BG" \]', text)
+    # The layout lands via a read-write scratch volume whose .DS_Store is
+    # copied back into the staging root before the final DMG is created.
+    assert "-format UDRW" in text
+    assert ".DS_Store" in text
+    assert "set background picture" in text
+    assert 'set position of item "Applications" to {180, 220}' in text
+    assert re.search(r'set position of item "Bolo(\.app)?" to \{480, 220\}', text)
+    # The mounted DMG must carry both presentation artifacts.
+    assert '-e "$MOUNT/.background/background.png"' in text
+    assert '-s "$MOUNT/.DS_Store"' in text
+
+
+def test_make_dmg_background_layout_stays_inside_canvas():
+    bg = _load_dmg_background()
+
+    assert (bg.WIDTH, bg.HEIGHT) == (660, 400)
+    # Icon slots sit inside the canvas with room for labels below.
+    for slot in (bg.APPLICATIONS_POS, bg.BOLO_POS):
+        assert 0 < slot[0] and slot[0] + bg.ICON_SIZE <= bg.WIDTH
+        assert 0 < slot[1] and slot[1] + bg.ICON_SIZE <= bg.HEIGHT
+    # The arrow lives between the two icon slots and points left, from
+    # Bolo's slot toward Applications.
+    shaft, head = bg.arrow_pieces()
+    left_icon_right = bg.APPLICATIONS_POS[0] + bg.ICON_SIZE
+    right_icon_left = bg.BOLO_POS[0]
+    center_y = bg.arrow_center()[1]
+    assert left_icon_right < head[2][0] and shaft[0] + shaft[2] < right_icon_left
+    assert head[2][0] < head[0][0] and head[2][1] == center_y
+    assert abs((shaft[1] + shaft[3] / 2.0) - center_y) < 0.01
+    # Waveform bars are ordered left to right on the wordmark line.
+    rects = bg.wave_bar_rects(0.0)
+    assert len(rects) == len(bg.BAR_HEIGHTS)
+    for left, right in zip(rects, rects[1:]):
+        assert left[0] + left[2] <= right[0]
+    for _x, y, w, h in rects:
+        assert 0 < w and 0 < h
+        assert abs((y + h / 2.0) - bg.WORDMARK_CENTER_Y) < 0.01
+
+
+def test_make_dmg_background_reports_missing_pyobjc_cleanly(tmp_path):
+    # Under a python without pyobjc, render fails with a clear message and
+    # no output file is written. On interpreters that do have pyobjc (this
+    # machine's system python), the render simply succeeds.
+    probe = subprocess.run(
+        [sys.executable, "-c", "import AppKit"], capture_output=True, text=True
+    )
+    code = (
+        "import sys, importlib.util; "
+        "spec = importlib.util.spec_from_file_location('make_dmg_background', {!r}); "
+        "module = importlib.util.module_from_spec(spec); "
+        "spec.loader.exec_module(module); "
+        "sys.exit(module.main(['--output', {!r}]))"
+    ).format(
+        str(REPO_ROOT / "scripts" / "make-dmg-background.py"),
+        str(tmp_path / "out" / "background.png"),
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        cwd=str(REPO_ROOT / "scripts"),
+    )
+    if probe.returncode == 0:
+        assert result.returncode == 0
+        assert (tmp_path / "out" / "background.png").is_file()
+    else:
+        assert result.returncode == 1
+        assert "AppKit is unavailable" in result.stderr
+        assert not (tmp_path / "out" / "background.png").exists()
 
 
 def test_build_dmg_reads_version_from_cargo_toml():

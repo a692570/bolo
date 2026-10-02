@@ -37,7 +37,9 @@ use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
 use tracing::{error, info, warn};
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::EnvFilter;
-use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, Submenu};
+use tray_icon::menu::{
+    CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem, Submenu,
+};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
 use recording_fsm::{Command as RecordingCommand, Event as RecordingEvent, RecordingFsm};
@@ -1650,6 +1652,10 @@ struct App {
     vocabulary_usage_path: PathBuf,
     vocabulary_aliases: Mutex<Vec<TextReplacement>>,
     learned_aliases: Mutex<Vec<TextReplacement>>,
+    /// Mtime of the learned-vocabulary file at the last load, checked at each
+    /// recording start so deletions made in the learning window take effect
+    /// without a restart.
+    learned_vocabulary_mtime: Mutex<Option<SystemTime>>,
     /// Newest GitHub release found by the startup check, when it is newer
     /// than this build; surfaced in the status window.
     latest_release: Mutex<Option<UpdateNotice>>,
@@ -1687,6 +1693,7 @@ enum UserEvent {
     RecordingWatchdog,
     ShowOnboarding,
     ShowStatus,
+    ShowLearned,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1742,6 +1749,7 @@ struct TrayUi {
     add_vocabulary_item: MenuItem,
     add_vocabulary_alias_item: MenuItem,
     add_replacement_item: MenuItem,
+    learned_words_item: MenuItem,
     show_onboarding_item: MenuItem,
     quit_item: MenuItem,
 }
@@ -2174,6 +2182,7 @@ fn run_app_event_loop(app: Arc<App>) -> Result<(), AppError> {
     let mut native_overlay_phase: Option<OverlayPhase> = None;
     let mut onboarding_window: Option<AppWindow> = None;
     let mut status_window: Option<AppWindow> = None;
+    let mut learning_window: Option<AppWindow> = None;
     let mut onboarding_try_it_complete = false;
     let mut onboarding_try_it_snapshot: Option<u64> = None;
     let mut onboarding_key_pending = false;
@@ -2294,6 +2303,9 @@ fn run_app_event_loop(app: Arc<App>) -> Result<(), AppError> {
             TaoEvent::UserEvent(UserEvent::ShowStatus) => {
                 open_status_window(&app, &mut status_window);
             }
+            TaoEvent::UserEvent(UserEvent::ShowLearned) => {
+                open_learning_window(&app, &mut learning_window);
+            }
             TaoEvent::UserEvent(UserEvent::HistoryChanged) => {
                 if let Some(ui) = tray_ui.as_mut()
                     && let Err(error) = update_history_menu(&app, ui)
@@ -2383,6 +2395,9 @@ impl App {
         let vocabulary = load_vocabulary(&config.root_dir);
         let vocabulary_usage_path = home_path(".bolo/vocabulary_usage.json");
         let vocabulary_usage = load_vocabulary_usage(&vocabulary_usage_path);
+        let learned_vocabulary_mtime = fs::metadata(learned_vocabulary_path())
+            .and_then(|metadata| metadata.modified())
+            .ok();
         let prompt_bindings = load_prompt_bindings();
         let history = load_transcript_history();
         let http = Client::builder().timeout(STT_REQUEST_TIMEOUT).build()?;
@@ -2394,6 +2409,7 @@ impl App {
             vocabulary_usage_path,
             vocabulary_aliases: Mutex::new(vocabulary.aliases),
             learned_aliases: Mutex::new(vocabulary.learned_aliases),
+            learned_vocabulary_mtime: Mutex::new(learned_vocabulary_mtime),
             latest_release: Mutex::new(None),
             prompt_bindings: Mutex::new(prompt_bindings),
             state: Mutex::new(AppState {
@@ -2407,6 +2423,10 @@ impl App {
     }
 
     fn handle_press(&self) -> Result<(), AppError> {
+        // The learning window deletes pairs by rewriting the file behind the
+        // runtime's back, so each recording start re-checks it: unchanged
+        // mtime means the stat-only common case, a change reloads.
+        self.refresh_learned_vocabulary_at(&learned_vocabulary_path());
         let pressed_at = Instant::now();
         let selected_microphone = {
             let mut state = self.lock_state()?;
@@ -4063,7 +4083,11 @@ impl App {
                     self.log_text(&misheard),
                     self.log_text(&corrected)
                 );
-                self.learn_correction(&learned_vocabulary_path(), &misheard, &corrected);
+                // A brand-new pair gets one plain confirmation so learning is
+                // never invisible; count bumps of a known pair stay silent.
+                if self.learn_correction(&learned_vocabulary_path(), &misheard, &corrected) {
+                    show_notification("Bolo", &format!("Bolo learned: {misheard} -> {corrected}"));
+                }
             }
             CorrectionOutcome::Skipped { reason } => {
                 info!("[learning] skipped {reason}");
@@ -4420,19 +4444,20 @@ impl App {
     /// ranked by the existing usage mechanism, and the misheard->corrected
     /// pair becomes an alias applied after user configuration. A failed
     /// persist only logs: the in-memory engine still applies the correction
-    /// for this session.
-    fn learn_correction(&self, path: &Path, misheard: &str, corrected: &str) {
-        let saved = match record_learned_correction(path, misheard, corrected) {
-            Ok(file) => {
+    /// for this session. Returns whether a brand-new pair was learned, so
+    /// the caller can announce it; count bumps of a known pair stay silent.
+    fn learn_correction(&self, path: &Path, misheard: &str, corrected: &str) -> bool {
+        let (saved, is_new_pair) = match record_learned_correction(path, misheard, corrected) {
+            Ok((file, is_new_pair)) => {
                 let aliases = learned_aliases_from_file(&file);
                 if let Ok(mut learned) = self.learned_aliases.lock() {
                     *learned = aliases;
                 }
-                true
+                (true, is_new_pair)
             }
             Err(error) => {
                 warn!("[learning] save failed: {error}");
-                false
+                (false, false)
             }
         };
         if !saved && let Ok(mut learned) = self.learned_aliases.lock() {
@@ -4446,7 +4471,7 @@ impl App {
         }
         {
             let Ok(mut vocabulary) = self.vocabulary.lock() else {
-                return;
+                return is_new_pair;
             };
             let key = corrected.to_ascii_lowercase();
             if !vocabulary
@@ -4457,6 +4482,41 @@ impl App {
             }
         }
         self.record_vocabulary_usage(&[normalize_for_matching(corrected)]);
+        is_new_pair
+    }
+
+    /// Reload the learned pairs (and the vocabulary lists they feed) from
+    /// disk when the learned file changed since the last check. The full
+    /// reload is correct because every runtime vocabulary addition is
+    /// file-backed before it is in memory, so disk is always the source of
+    /// truth. A missing file (current mtime `None`) only reloads when the
+    /// cache saw a file before, which clears stale aliases after a manual
+    /// deletion of the file itself.
+    fn refresh_learned_vocabulary_at(&self, learned_path: &Path) {
+        let current = fs::metadata(learned_path)
+            .and_then(|metadata| metadata.modified())
+            .ok();
+        let previous = match self.learned_vocabulary_mtime.lock() {
+            Ok(mut cached) => std::mem::replace(&mut *cached, current),
+            Err(error) => {
+                warn!("learned vocabulary mtime lock poisoned: {error}");
+                return;
+            }
+        };
+        if previous == current {
+            return;
+        }
+        let loaded = load_vocabulary_with_learned(&self.config.root_dir, learned_path);
+        if let Ok(mut vocabulary) = self.vocabulary.lock() {
+            *vocabulary = loaded.terms;
+        }
+        if let Ok(mut aliases) = self.vocabulary_aliases.lock() {
+            *aliases = loaded.aliases;
+        }
+        if let Ok(mut learned) = self.learned_aliases.lock() {
+            *learned = loaded.learned_aliases;
+        }
+        info!("[learning] vocabulary_reloaded");
     }
 
     fn vocabulary_aliases_snapshot(&self) -> Vec<TextReplacement> {
@@ -4976,8 +5036,17 @@ fn human_readable_hotkey(hotkey: &str) -> String {
     }
 }
 
+/// Build the menu-bar menu. Item ids stay stable across label changes (menu
+/// events match on ids), labels are plain English a non-developer reads at
+/// a glance, separators group the menu into: everyday dictation actions,
+/// review surfaces, input choices, app info, and secondary actions nested
+/// under "More..." so the top level stays short.
 fn create_tray_ui(app: &App) -> Result<TrayUi, AppError> {
     let tray_menu = Menu::new();
+    let append_separator = |menu: &Menu| -> Result<(), AppError> {
+        menu.append(&PredefinedMenuItem::separator())
+            .map_err(|error| AppError::MenuBar(error.to_string()))
+    };
     let title = MenuItem::new(
         format!("Bolo - Hold {}", human_readable_hotkey(&app.config.hotkey)),
         false,
@@ -4988,7 +5057,7 @@ fn create_tray_ui(app: &App) -> Result<TrayUi, AppError> {
         .map_err(|error| AppError::MenuBar(error.to_string()))?;
 
     let copy_last_item =
-        MenuItem::with_id("copy-last-transcript", "Copy Last Transcript", true, None);
+        MenuItem::with_id("copy-last-transcript", "Copy Last Dictation", true, None);
     tray_menu
         .append(&copy_last_item)
         .map_err(|error| AppError::MenuBar(error.to_string()))?;
@@ -5013,33 +5082,58 @@ fn create_tray_ui(app: &App) -> Result<TrayUi, AppError> {
         .append(&bind_prompt_profile_item)
         .map_err(|error| AppError::MenuBar(error.to_string()))?;
 
+    append_separator(&tray_menu)?;
+
     let cleanup_status_item =
         MenuItem::with_id("cleanup-status", app.cleanup_status(), false, None);
     tray_menu
         .append(&cleanup_status_item)
         .map_err(|error| AppError::MenuBar(error.to_string()))?;
 
-    let history_menu = Submenu::new("Transcript History", true);
+    let history_menu = Submenu::new("Recent Dictations", true);
     tray_menu
         .append(&history_menu)
         .map_err(|error| AppError::MenuBar(error.to_string()))?;
 
+    let learned_words_item = MenuItem::with_id("show-learned-words", "Learned Words", true, None);
+    tray_menu
+        .append(&learned_words_item)
+        .map_err(|error| AppError::MenuBar(error.to_string()))?;
+
+    append_separator(&tray_menu)?;
+
     let clear_history_item = MenuItem::with_id(
         "clear-transcript-history",
-        "Clear Transcript History",
+        "Clear Recent Dictations",
         true,
         None,
     );
-    tray_menu
-        .append(&clear_history_item)
-        .map_err(|error| AppError::MenuBar(error.to_string()))?;
-
     let health_check_item = MenuItem::with_id("health-check", "Run Health Check", true, None);
+    let add_vocabulary_item =
+        MenuItem::with_id("add-vocabulary-term", "Teach Bolo a Word...", true, None);
+    let add_vocabulary_alias_item =
+        MenuItem::with_id("add-vocabulary-alias", "Fix a Misheard Word...", true, None);
+    let add_replacement_item =
+        MenuItem::with_id("add-replacement-rule", "Replace a Phrase...", true, None);
+    let show_onboarding_item = MenuItem::with_id("show-onboarding", "Set Up Bolo...", true, None);
+    let more_menu = Submenu::new("More...", true);
+    for item in [
+        &add_vocabulary_item,
+        &add_vocabulary_alias_item,
+        &add_replacement_item,
+        &clear_history_item,
+        &health_check_item,
+        &show_onboarding_item,
+    ] {
+        more_menu
+            .append(item)
+            .map_err(|error| AppError::MenuBar(error.to_string()))?;
+    }
     tray_menu
-        .append(&health_check_item)
+        .append(&more_menu)
         .map_err(|error| AppError::MenuBar(error.to_string()))?;
 
-    let status_item = MenuItem::with_id("status", "Status", true, None);
+    let status_item = MenuItem::with_id("status", "About Bolo", true, None);
     tray_menu
         .append(&status_item)
         .map_err(|error| AppError::MenuBar(error.to_string()))?;
@@ -5049,7 +5143,9 @@ fn create_tray_ui(app: &App) -> Result<TrayUi, AppError> {
         .append(&update_item)
         .map_err(|error| AppError::MenuBar(error.to_string()))?;
 
-    let language_menu = Submenu::new("Language", true);
+    append_separator(&tray_menu)?;
+
+    let language_menu = Submenu::new("Dictation Language", true);
     let selected_language = app.stt_language()?;
     let mut language_items = Vec::new();
     for (language, label) in [
@@ -5074,29 +5170,7 @@ fn create_tray_ui(app: &App) -> Result<TrayUi, AppError> {
         .append(&language_menu)
         .map_err(|error| AppError::MenuBar(error.to_string()))?;
 
-    let add_vocabulary_item =
-        MenuItem::with_id("add-vocabulary-term", "Add Vocabulary Term...", true, None);
-    tray_menu
-        .append(&add_vocabulary_item)
-        .map_err(|error| AppError::MenuBar(error.to_string()))?;
-
-    let add_vocabulary_alias_item = MenuItem::with_id(
-        "add-vocabulary-alias",
-        "Add Vocabulary Alias...",
-        true,
-        None,
-    );
-    tray_menu
-        .append(&add_vocabulary_alias_item)
-        .map_err(|error| AppError::MenuBar(error.to_string()))?;
-
-    let add_replacement_item =
-        MenuItem::with_id("add-replacement-rule", "Add Correction Rule...", true, None);
-    tray_menu
-        .append(&add_replacement_item)
-        .map_err(|error| AppError::MenuBar(error.to_string()))?;
-
-    let microphone_menu = Submenu::new("Microphone", true);
+    let microphone_menu = Submenu::new("Choose Microphone", true);
     let selected_microphone = app.selected_microphone()?;
     let devices = input_device_names()?;
     let mut microphone_items = Vec::new();
@@ -5128,10 +5202,7 @@ fn create_tray_ui(app: &App) -> Result<TrayUi, AppError> {
         .append(&microphone_menu)
         .map_err(|error| AppError::MenuBar(error.to_string()))?;
 
-    let show_onboarding_item = MenuItem::with_id("show-onboarding", "Show Onboarding", true, None);
-    tray_menu
-        .append(&show_onboarding_item)
-        .map_err(|error| AppError::MenuBar(error.to_string()))?;
+    append_separator(&tray_menu)?;
 
     let quit_item = MenuItem::with_id("quit", "Quit Bolo", true, None);
     tray_menu
@@ -5164,6 +5235,7 @@ fn create_tray_ui(app: &App) -> Result<TrayUi, AppError> {
         add_vocabulary_item,
         add_vocabulary_alias_item,
         add_replacement_item,
+        learned_words_item,
         show_onboarding_item,
         quit_item,
     };
@@ -5206,6 +5278,10 @@ fn handle_menu_event(
     }
     if event_id == tray_ui.status_item.id().as_ref() {
         app.send_user_event(UserEvent::ShowStatus);
+        return;
+    }
+    if event_id == tray_ui.learned_words_item.id().as_ref() {
+        app.send_user_event(UserEvent::ShowLearned);
         return;
     }
     if event_id == tray_ui.show_onboarding_item.id().as_ref() {
@@ -5791,6 +5867,10 @@ struct AppWindowPayload {
     #[serde(skip_serializing_if = "Option::is_none")]
     key_entry: Option<KeyEntrySpec>,
     write_marker: bool,
+    /// Learning-window spec; present only for mode "learning", which renders
+    /// its rows from the pairs instead of the generic `rows` list.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    learning: Option<LearningWindowSpec>,
 }
 
 /// Placement of the API-key entry field inside the onboarding window. The
@@ -5801,6 +5881,43 @@ struct KeyEntrySpec {
     index: usize,
     placeholder: String,
 }
+
+/// One learned pair listed in the learning window; `misheard` is the exact
+/// key in the corrections file so the window can delete it.
+#[derive(Debug, Serialize)]
+struct LearnedPairRow {
+    misheard: String,
+    corrected: String,
+}
+
+/// Learning-window spec: the file the window edits (deletions rewrite it),
+/// its copy lines, a plain error line when it is unreadable, and the pairs
+/// themselves, most recent first.
+#[derive(Debug, Serialize)]
+struct LearningWindowSpec {
+    file: String,
+    hint_welcome: String,
+    empty_welcome: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    pairs: Vec<LearnedPairRow>,
+}
+
+/// Welcome line shown at the top of the learning window when pairs exist.
+const LEARNING_HINT_WELCOME: &str =
+    "Tap a correction to remove it. Bolo stops using it in future dictations.";
+
+/// Empty state for the learning window, also used when the file does not
+/// exist yet.
+const LEARNING_EMPTY_WELCOME: &str =
+    "Bolo learns corrections when you edit them after dictation. Nothing learned yet.";
+
+/// Plain line appended to the learning window when the file exists but
+/// cannot be read or parsed.
+const LEARNING_UNREADABLE_LINE: &str = "Could not read the learned-words file.";
+
+/// Row cap for the learning window; the most recent pairs win.
+const LEARNING_WINDOW_ROWS: usize = 20;
 
 /// The one-line welcome shown at the top of the onboarding window.
 const fn onboarding_welcome() -> &'static str {
@@ -6137,6 +6254,7 @@ fn onboarding_window_payload(app: &App, write_marker: bool) -> Result<String, Ap
         try_it_hero,
         key_entry: key_entry_spec(missing),
         write_marker,
+        learning: None,
     };
     serde_json::to_string(&payload).map_err(|error| AppError::MenuBar(error.to_string()))
 }
@@ -6163,8 +6281,81 @@ fn status_window_payload(app: &App) -> Result<String, AppError> {
         try_it_hero: None,
         key_entry: None,
         write_marker: false,
+        learning: None,
     };
     serde_json::to_string(&payload).map_err(|error| AppError::MenuBar(error.to_string()))
+}
+
+/// The learning window lists the user's learned corrections so they can be
+/// reviewed and removed; most recent pairs first, capped, with the empty
+/// state (and a plain error line) when the file is missing or unreadable.
+fn learning_window_payload() -> Result<String, AppError> {
+    learning_window_payload_at(&learned_vocabulary_path())
+}
+
+/// Testable form of [`learning_window_payload`] over an explicit file.
+fn learning_window_payload_at(learned_path: &Path) -> Result<String, AppError> {
+    let (pairs, error) = learning_window_pairs(learned_path);
+    let payload = AppWindowPayload {
+        mode: String::from("learning"),
+        title: String::from("Bolo Learned Words"),
+        welcome: String::new(),
+        brand: Some(String::from("BOLO")),
+        rows: Vec::new(),
+        button: String::from("Done"),
+        try_it_index: None,
+        try_it_hero: None,
+        key_entry: None,
+        write_marker: false,
+        learning: Some(LearningWindowSpec {
+            file: learned_path.to_string_lossy().into_owned(),
+            hint_welcome: String::from(LEARNING_HINT_WELCOME),
+            empty_welcome: String::from(LEARNING_EMPTY_WELCOME),
+            error,
+            pairs,
+        }),
+    };
+    serde_json::to_string(&payload).map_err(|json_error| AppError::MenuBar(json_error.to_string()))
+}
+
+/// The learning window's pairs plus its error line. A missing file is the
+/// plain empty state; a file that exists but cannot be read or parsed keeps
+/// the empty state and adds one plain error line.
+fn learning_window_pairs(learned_path: &Path) -> (Vec<LearnedPairRow>, Option<String>) {
+    let text = match fs::read_to_string(learned_path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == ErrorKind::NotFound => return (Vec::new(), None),
+        Err(error) => {
+            warn!("learning window could not read the learned file: {error}");
+            return (Vec::new(), Some(String::from(LEARNING_UNREADABLE_LINE)));
+        }
+    };
+    let file = match serde_json::from_str::<LearnedVocabulary>(&text) {
+        Ok(file) => file,
+        Err(error) => {
+            warn!("learning window could not parse the learned file: {error}");
+            return (Vec::new(), Some(String::from(LEARNING_UNREADABLE_LINE)));
+        }
+    };
+    // Most recent first: newest last_used, ties by confirmations, then by
+    // key so the ordering is deterministic.
+    let mut entries: Vec<(String, LearnedCorrectionEntry)> = file.corrections.into_iter().collect();
+    entries.sort_by(|(left_key, left), (right_key, right)| {
+        right
+            .last_used
+            .cmp(&left.last_used)
+            .then_with(|| right.count.cmp(&left.count))
+            .then_with(|| left_key.cmp(right_key))
+    });
+    let pairs = entries
+        .into_iter()
+        .take(LEARNING_WINDOW_ROWS)
+        .map(|(misheard, entry)| LearnedPairRow {
+            misheard,
+            corrected: entry.corrected,
+        })
+        .collect();
+    (pairs, None)
 }
 
 /// Open (or ignore when already open) the onboarding window. `write_marker`
@@ -6222,6 +6413,29 @@ fn open_status_window(app: &App, window_slot: &mut Option<AppWindow>) {
         Ok(window) => {
             *window_slot = Some(window);
             info!("status window shown");
+        }
+        Err(error) => error!("{error}"),
+    }
+}
+
+/// Open (or ignore when already open) the learned-words window. Deletions
+/// happen in the helper against the file itself; the runtime picks them up
+/// at the next recording start through the learned-file mtime check.
+fn open_learning_window(app: &App, window_slot: &mut Option<AppWindow>) {
+    let already_running = window_slot
+        .as_mut()
+        .map_or(Ok(false), AppWindow::is_running)
+        .unwrap_or(false);
+    if already_running {
+        return;
+    }
+    drop(window_slot.take());
+    let result = learning_window_payload()
+        .and_then(|payload| spawn_app_window(&app.config.root_dir, &payload));
+    match result {
+        Ok(window) => {
+            *window_slot = Some(window);
+            info!("learning window shown");
         }
         Err(error) => error!("{error}"),
     }
@@ -8405,18 +8619,34 @@ fn write_learned_vocabulary_file(path: &Path, file: &LearnedVocabulary) -> Resul
     Ok(())
 }
 
+/// Whether `misheard -> corrected` is already stored as the exact same
+/// pair; a count bump of the same pair must not re-announce the learning.
+fn is_known_pair(file: &LearnedVocabulary, misheard: &str, corrected: &str) -> bool {
+    file.corrections
+        .get(&misheard.trim().to_ascii_lowercase())
+        .is_some_and(|entry| {
+            entry
+                .corrected
+                .trim()
+                .eq_ignore_ascii_case(corrected.trim())
+        })
+}
+
 /// Record one learned correction durably and return the saved state (after
-/// dedupe and eviction), so callers can mirror it in memory.
+/// dedupe and eviction) plus whether the user just learned a brand-new pair:
+/// a same-pair confirmation is a silent count bump, while a new key or a
+/// changed correction counts as new.
 fn record_learned_correction(
     path: &Path,
     misheard: &str,
     corrected: &str,
-) -> Result<LearnedVocabulary, AppError> {
+) -> Result<(LearnedVocabulary, bool), AppError> {
     let mut file = load_learned_vocabulary(path);
+    let is_new_pair = !is_known_pair(&file, misheard, corrected);
     upsert_learned_correction(&mut file, misheard, corrected, unix_time_secs());
     enforce_learned_vocabulary_cap(&mut file);
     write_learned_vocabulary_file(path, &file)?;
-    Ok(file)
+    Ok((file, is_new_pair))
 }
 
 /// Learned pairs as misheard->corrected aliases, in the file's sorted key
@@ -10064,11 +10294,12 @@ mod tests {
         AccessibilityTrust, App, AppError, AppState, AppWindowPayload, AssemblyDictationResponse,
         AudioHub, BatchRetry, CleanupMode, CleanupProfile, Config, CorrectionOutcome,
         DictationCommandKind, DictationUploadReader, DictationUploadRelease, DictationWarmup,
-        EditLearningClaim, KeyEntrySpec, LearnedVocabulary, OnboardingStatus, PreparedText,
-        PromptBinding, STREAMING_DRAIN_MIN, STT_RETRY_SAMPLE_RATE, StreamingConnectionState,
-        StreamingProvider, StreamingRecording, StreamingText, StreamingTranscript, SttFallback,
-        SttResult, TRANSCRIPT_HISTORY_LIMIT, TextReplacement, TranscriptHistoryEntry, UpdateNotice,
-        UpdateOutcome, WindowRow, accessibility_fix_detail, apply_text_replacements,
+        EditLearningClaim, KeyEntrySpec, LEARNING_UNREADABLE_LINE, LEARNING_WINDOW_ROWS,
+        LearnedVocabulary, OnboardingStatus, PreparedText, PromptBinding, STREAMING_DRAIN_MIN,
+        STT_RETRY_SAMPLE_RATE, StreamingConnectionState, StreamingProvider, StreamingRecording,
+        StreamingText, StreamingTranscript, SttFallback, SttResult, TRANSCRIPT_HISTORY_LIMIT,
+        TextReplacement, TranscriptHistoryEntry, UpdateNotice, UpdateOutcome, WindowRow,
+        accessibility_fix_detail, apply_text_replacements,
         apply_vocabulary_corrections_with_matches, assemblyai_direct_query_with,
         assemblyai_language_code, batch_retry_plan, build_cleanup_user_content,
         build_rewrite_user_content, build_stt_prompt, canonicalize_known_terms, chunk_samples_for,
@@ -10078,23 +10309,23 @@ mod tests {
         empty_transcript_error, enforce_learned_vocabulary_cap,
         final_streaming_result_is_ready_elapsed, finalize_accessibility_context,
         handshake_with_deadline, is_known_no_speech_transcript, is_supported_hotkey,
-        key_entry_row_detail, key_entry_spec, load_learned_vocabulary, load_vocabulary_usage,
-        load_vocabulary_with_learned, microphone_detail, non_empty_transcript,
-        onboarding_provider_key_detail, onboarding_status_at, onboarding_try_it_detail,
-        onboarding_try_it_done_detail, onboarding_try_it_hero, parse_accessibility_trust,
-        parse_command, parse_daemon_context_reply, parse_daemon_paste_reply,
-        parse_daemon_select_reply, parse_daemon_trust_reply, parse_latest_release,
-        parse_release_version, parse_replacements_json, parse_stt_fallbacks, parse_u64_env_value,
-        parse_update_outcome, parse_wav_pcm16, pcm_bytes, preview_only_streaming,
-        preview_release_stt, read_vocabulary_file, read_vocabulary_usage_file,
-        record_learned_correction, remove_fillers, request_accessibility_daemon,
-        retry_failed_primary, sanitize_transcript_history, speech_stats,
-        stable_streaming_best_is_ready_elapsed, status_rows, streaming_batch_fallback_reason,
-        streaming_connection, streaming_preview_tail, streaming_provider_from_config,
-        streaming_status_label, strip_reasoning_tags, stt_language_for_model, stt_model_config,
-        telnyx_stream_query, transcript_log_value, transcript_menu_preview,
-        upsert_learned_correction, version_is_newer, wait_for_daemon_reply, wav_bytes,
-        wav_duration_ms,
+        key_entry_row_detail, key_entry_spec, learning_window_payload_at, load_learned_vocabulary,
+        load_vocabulary_usage, load_vocabulary_with_learned, microphone_detail,
+        non_empty_transcript, onboarding_provider_key_detail, onboarding_status_at,
+        onboarding_try_it_detail, onboarding_try_it_done_detail, onboarding_try_it_hero,
+        parse_accessibility_trust, parse_command, parse_daemon_context_reply,
+        parse_daemon_paste_reply, parse_daemon_select_reply, parse_daemon_trust_reply,
+        parse_latest_release, parse_release_version, parse_replacements_json, parse_stt_fallbacks,
+        parse_u64_env_value, parse_update_outcome, parse_wav_pcm16, pcm_bytes,
+        preview_only_streaming, preview_release_stt, read_vocabulary_file,
+        read_vocabulary_usage_file, record_learned_correction, remove_fillers,
+        request_accessibility_daemon, retry_failed_primary, sanitize_transcript_history,
+        speech_stats, stable_streaming_best_is_ready_elapsed, status_rows,
+        streaming_batch_fallback_reason, streaming_connection, streaming_preview_tail,
+        streaming_provider_from_config, streaming_status_label, strip_reasoning_tags,
+        stt_language_for_model, stt_model_config, telnyx_stream_query, transcript_log_value,
+        transcript_menu_preview, upsert_learned_correction, upsert_replacement, version_is_newer,
+        wait_for_daemon_reply, wav_bytes, wav_duration_ms, write_learned_vocabulary_file,
     };
     use std::collections::{HashMap, VecDeque};
     use std::io::Read as _;
@@ -10290,6 +10521,7 @@ mod tests {
                 placeholder: String::from("Paste your AssemblyAI API key"),
             }),
             write_marker: true,
+            learning: None,
         };
         let json = serde_json::to_string(&payload).expect("payload json");
         assert!(json.contains("\"key_entry\":{\"index\":2"));
@@ -12107,6 +12339,7 @@ mod tests {
             vocabulary: Mutex::new(vocabulary),
             vocabulary_aliases: Mutex::new(Vec::new()),
             learned_aliases: Mutex::new(Vec::new()),
+            learned_vocabulary_mtime: Mutex::new(None),
             latest_release: Mutex::new(None),
             prompt_bindings: Mutex::new(Vec::new()),
             vocabulary_usage: Mutex::new(usage),
@@ -12143,6 +12376,7 @@ mod tests {
             vocabulary: Mutex::new(Vec::new()),
             vocabulary_aliases: Mutex::new(Vec::new()),
             learned_aliases: Mutex::new(Vec::new()),
+            learned_vocabulary_mtime: Mutex::new(None),
             latest_release: Mutex::new(None),
             prompt_bindings: Mutex::new(Vec::new()),
             vocabulary_usage: Mutex::new(HashMap::new()),
@@ -12185,6 +12419,7 @@ mod tests {
             vocabulary: Mutex::new(Vec::new()),
             vocabulary_aliases: Mutex::new(Vec::new()),
             learned_aliases: Mutex::new(Vec::new()),
+            learned_vocabulary_mtime: Mutex::new(None),
             latest_release: Mutex::new(None),
             prompt_bindings: Mutex::new(Vec::new()),
             vocabulary_usage: Mutex::new(HashMap::new()),
@@ -12247,6 +12482,7 @@ mod tests {
             vocabulary: Mutex::new(Vec::new()),
             vocabulary_aliases: Mutex::new(Vec::new()),
             learned_aliases: Mutex::new(Vec::new()),
+            learned_vocabulary_mtime: Mutex::new(None),
             latest_release: Mutex::new(None),
             prompt_bindings: Mutex::new(Vec::new()),
             vocabulary_usage: Mutex::new(HashMap::new()),
@@ -12294,6 +12530,7 @@ mod tests {
             vocabulary: Mutex::new(Vec::new()),
             vocabulary_aliases: Mutex::new(Vec::new()),
             learned_aliases: Mutex::new(Vec::new()),
+            learned_vocabulary_mtime: Mutex::new(None),
             latest_release: Mutex::new(None),
             prompt_bindings: Mutex::new(Vec::new()),
             vocabulary_usage: Mutex::new(HashMap::new()),
@@ -12354,6 +12591,7 @@ mod tests {
                 replacement: String::from("Bolo"),
             }]),
             learned_aliases: Mutex::new(Vec::new()),
+            learned_vocabulary_mtime: Mutex::new(None),
             latest_release: Mutex::new(None),
             prompt_bindings: Mutex::new(Vec::new()),
             vocabulary_usage: Mutex::new(HashMap::new()),
@@ -12435,6 +12673,7 @@ mod tests {
             vocabulary: Mutex::new(Vec::new()),
             vocabulary_aliases: Mutex::new(Vec::new()),
             learned_aliases: Mutex::new(Vec::new()),
+            learned_vocabulary_mtime: Mutex::new(None),
             latest_release: Mutex::new(None),
             prompt_bindings: Mutex::new(Vec::new()),
             vocabulary_usage: Mutex::new(HashMap::new()),
@@ -12484,6 +12723,7 @@ mod tests {
             vocabulary: Mutex::new(Vec::new()),
             vocabulary_aliases: Mutex::new(Vec::new()),
             learned_aliases: Mutex::new(Vec::new()),
+            learned_vocabulary_mtime: Mutex::new(None),
             latest_release: Mutex::new(None),
             prompt_bindings: Mutex::new(Vec::new()),
             vocabulary_usage: Mutex::new(HashMap::new()),
@@ -12536,6 +12776,7 @@ mod tests {
             vocabulary: Mutex::new(Vec::new()),
             vocabulary_aliases: Mutex::new(Vec::new()),
             learned_aliases: Mutex::new(Vec::new()),
+            learned_vocabulary_mtime: Mutex::new(None),
             latest_release: Mutex::new(None),
             prompt_bindings: Mutex::new(Vec::new()),
             vocabulary_usage: Mutex::new(HashMap::new()),
@@ -12578,6 +12819,7 @@ mod tests {
             vocabulary: Mutex::new(Vec::new()),
             vocabulary_aliases: Mutex::new(Vec::new()),
             learned_aliases: Mutex::new(Vec::new()),
+            learned_vocabulary_mtime: Mutex::new(None),
             latest_release: Mutex::new(None),
             prompt_bindings: Mutex::new(Vec::new()),
             vocabulary_usage: Mutex::new(HashMap::new()),
@@ -13545,6 +13787,20 @@ mod tests {
         vocabulary_aliases: Vec<TextReplacement>,
         learned_aliases: Vec<TextReplacement>,
     ) -> Arc<App> {
+        edit_learning_test_app_with_root(
+            PathBuf::new(),
+            replacements,
+            vocabulary_aliases,
+            learned_aliases,
+        )
+    }
+
+    fn edit_learning_test_app_with_root(
+        root_dir: PathBuf,
+        replacements: Vec<TextReplacement>,
+        vocabulary_aliases: Vec<TextReplacement>,
+        learned_aliases: Vec<TextReplacement>,
+    ) -> Arc<App> {
         Arc::new(App {
             config: Config {
                 telnyx_api_key: Some(String::from("test")),
@@ -13558,7 +13814,7 @@ mod tests {
                 stt_fallbacks: Vec::new(),
                 microphone: None,
                 replacements,
-                root_dir: PathBuf::new(),
+                root_dir,
                 hotkey: String::from("right_option"),
                 paste_last_hotkey: None,
                 preserve_clipboard: true,
@@ -13569,6 +13825,7 @@ mod tests {
             vocabulary: Mutex::new(Vec::new()),
             vocabulary_aliases: Mutex::new(vocabulary_aliases),
             learned_aliases: Mutex::new(learned_aliases),
+            learned_vocabulary_mtime: Mutex::new(None),
             prompt_bindings: Mutex::new(Vec::new()),
             vocabulary_usage: Mutex::new(HashMap::new()),
             vocabulary_usage_path: temp_vocabulary_usage_path(),
@@ -13710,7 +13967,8 @@ mod tests {
     #[test]
     fn learned_vocabulary_dedupes_pairs_and_bumps_counts() -> Result<(), AppError> {
         let path = temp_learned_vocabulary_path();
-        let first = record_learned_correction(&path, "Tim", "tom")?;
+        let (first, first_is_new) = record_learned_correction(&path, "Tim", "tom")?;
+        assert!(first_is_new);
         assert_eq!(first.corrections.len(), 1);
         assert_eq!(
             first
@@ -13724,8 +13982,10 @@ mod tests {
             Some(1)
         );
 
-        // The same pair again bumps the count instead of duplicating.
-        let bumped = record_learned_correction(&path, "Tim", "tom")?;
+        // The same pair again bumps the count instead of duplicating, and a
+        // count bump is not a new pair: the learning stays unannounced.
+        let (bumped, bumped_is_new) = record_learned_correction(&path, "Tim", "tom")?;
+        assert!(!bumped_is_new);
         assert_eq!(bumped.corrections.len(), 1);
         assert_eq!(
             bumped.corrections.get("tim").map(|entry| entry.count),
@@ -13733,8 +13993,10 @@ mod tests {
         );
 
         // A different correction for the same misheard word replaces the
-        // entry: the newest fix is the user's current intent.
-        let replaced = record_learned_correction(&path, "Tim", "thomas")?;
+        // entry: the newest fix is the user's current intent, and it counts
+        // as a newly learned pair.
+        let (replaced, replaced_is_new) = record_learned_correction(&path, "Tim", "thomas")?;
+        assert!(replaced_is_new);
         assert_eq!(replaced.corrections.len(), 1);
         assert_eq!(
             replaced
@@ -13788,7 +14050,7 @@ mod tests {
     #[test]
     fn learned_vocabulary_writes_atomically_and_round_trips() -> Result<(), AppError> {
         let path = temp_learned_vocabulary_path();
-        let saved = record_learned_correction(&path, "meting", "meeting")?;
+        let (saved, _is_new_pair) = record_learned_correction(&path, "meting", "meeting")?;
         assert_eq!(saved.corrections.len(), 1);
         // No temp file survives the atomic rename...
         assert!(!path.with_extension("json.tmp").exists());
@@ -13804,7 +14066,8 @@ mod tests {
         // A path inside a not-yet-existing directory is created on demand.
         let nested = env::temp_dir().join(format!("bolo-learned-nested-{}", process::id()));
         let nested_path = nested.join("learned.json");
-        let nested_saved = record_learned_correction(&nested_path, "zzmisheard", "zzlearnedterm")?;
+        let (nested_saved, _) =
+            record_learned_correction(&nested_path, "zzmisheard", "zzlearnedterm")?;
         assert!(!nested_saved.corrections.is_empty());
         assert!(nested_path.exists());
         Ok(())
@@ -13834,11 +14097,12 @@ mod tests {
             r#"[{"text": "UserTerm", "aliases": ["zzcollide"]}, "zzroottterm"]"#,
         )?;
         let learned_path = temp_learned_vocabulary_path();
-        let learned_file = record_learned_correction(&learned_path, "zzmishrd", "zzlearnedterm")?;
+        let (learned_file, _) =
+            record_learned_correction(&learned_path, "zzmishrd", "zzlearnedterm")?;
         assert_eq!(learned_file.corrections.len(), 1);
         // A learned pair for a source word the user also configured must not
         // win: explicit user configuration always has priority.
-        let clash_file = record_learned_correction(&learned_path, "zzcollide", "zzwrong")?;
+        let (clash_file, _) = record_learned_correction(&learned_path, "zzcollide", "zzwrong")?;
         assert_eq!(clash_file.corrections.len(), 2);
 
         let loaded = load_vocabulary_with_learned(&root, &learned_path);
@@ -13935,7 +14199,8 @@ mod tests {
     fn learn_correction_updates_engine_state_and_persists() -> Result<(), AppError> {
         let app = edit_learning_test_app(Vec::new(), Vec::new(), Vec::new());
         let learned_path = temp_learned_vocabulary_path();
-        app.learn_correction(&learned_path, "zzmishrd", "zzlearnedterm");
+        // A brand-new pair announces itself to the caller.
+        assert!(app.learn_correction(&learned_path, "zzmishrd", "zzlearnedterm"));
 
         // The corrected term joined the ranked vocabulary list.
         assert!(
@@ -13961,8 +14226,9 @@ mod tests {
             Some("zzlearnedterm")
         );
 
-        // Re-learning the same pair bumps the count instead of duplicating.
-        app.learn_correction(&learned_path, "zzmishrd", "zzlearnedterm");
+        // Re-learning the same pair bumps the count instead of duplicating,
+        // and the count bump stays unannounced.
+        assert!(!app.learn_correction(&learned_path, "zzmishrd", "zzlearnedterm"));
         let confirmed = load_learned_vocabulary(&learned_path);
         assert_eq!(confirmed.corrections.len(), 1);
         assert_eq!(
@@ -13971,6 +14237,137 @@ mod tests {
                 .get("zzmishrd")
                 .map(|entry| entry.count),
             Some(2)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn recording_start_reload_picks_up_learning_window_deletions() -> Result<(), AppError> {
+        let root = env::temp_dir().join(format!("bolo-refresh-{}", process::id()));
+        fs::create_dir_all(&root)?;
+        fs::write(root.join("vocabulary.json"), "[]")?;
+        let app = edit_learning_test_app_with_root(root, Vec::new(), Vec::new(), Vec::new());
+        let path = temp_learned_vocabulary_path();
+        let (file, _) = record_learned_correction(&path, "zzmishrd", "zzlearnedterm")?;
+        assert_eq!(file.corrections.len(), 1);
+
+        // The first check after startup sees a file on disk and loads it.
+        app.refresh_learned_vocabulary_at(&path);
+        assert_eq!(
+            app.learned_aliases_snapshot(),
+            vec![TextReplacement {
+                spoken: String::from("zzmishrd"),
+                replacement: String::from("zzlearnedterm")
+            }]
+        );
+
+        // The learning window deletes the pair by rewriting the file. A
+        // changed mtime is what production sees; forcing the cached mtime
+        // to "never seen" stands in for it without depending on timestamp
+        // granularity.
+        write_learned_vocabulary_file(&path, &LearnedVocabulary::default())?;
+        if let Ok(mut cached) = app.learned_vocabulary_mtime.lock() {
+            *cached = None;
+        }
+        app.refresh_learned_vocabulary_at(&path);
+        assert!(app.learned_aliases_snapshot().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn recording_start_reload_skips_unchanged_files() -> Result<(), AppError> {
+        let root = env::temp_dir().join(format!("bolo-refresh-skip-{}", process::id()));
+        fs::create_dir_all(&root)?;
+        fs::write(root.join("vocabulary.json"), "[]")?;
+        let app = edit_learning_test_app_with_root(root, Vec::new(), Vec::new(), Vec::new());
+        let path = temp_learned_vocabulary_path();
+        let (seeded, _) = record_learned_correction(&path, "zzmishrd", "zzlearnedterm")?;
+        drop(seeded);
+
+        // First check loads the file; the cache now holds its mtime.
+        app.refresh_learned_vocabulary_at(&path);
+        assert_eq!(app.learned_aliases_snapshot().len(), 1);
+
+        // An in-memory-only alias would be clobbered by a reload; an
+        // unchanged mtime must prevent the reload entirely.
+        if let Ok(mut learned) = app.learned_aliases.lock() {
+            upsert_replacement(
+                &mut learned,
+                TextReplacement {
+                    spoken: String::from("zzvolatile"),
+                    replacement: String::from("zzvolatilefix"),
+                },
+            );
+        }
+        app.refresh_learned_vocabulary_at(&path);
+        assert_eq!(app.learned_aliases_snapshot().len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn learning_window_payload_lists_recent_pairs_first_capped() -> Result<(), AppError> {
+        let path = temp_learned_vocabulary_path();
+        let mut file = LearnedVocabulary::default();
+        for index in 0..25u64 {
+            upsert_learned_correction(
+                &mut file,
+                &format!("zzmisheard{index:02}"),
+                &format!("zzfix{index:02}"),
+                1_000 + index,
+            );
+        }
+        write_learned_vocabulary_file(&path, &file)?;
+        let payload =
+            serde_json::from_str::<serde_json::Value>(&learning_window_payload_at(&path)?)?;
+        assert_eq!(payload["mode"], "learning");
+        assert_eq!(payload["title"], "Bolo Learned Words");
+        let learning = &payload["learning"];
+        assert_eq!(learning["error"], serde_json::Value::Null);
+        let pairs = learning["pairs"]
+            .as_array()
+            .ok_or(AppError::MenuBar(String::from(
+                "learning payload pairs are not a list",
+            )))?;
+        assert_eq!(pairs.len(), LEARNING_WINDOW_ROWS);
+        // Most recent first: the newest last_used wins, the oldest pairs
+        // fall off the cap.
+        assert_eq!(pairs[0]["misheard"], "zzmisheard24");
+        assert_eq!(pairs[0]["corrected"], "zzfix24");
+        assert_eq!(pairs[19]["misheard"], "zzmisheard05");
+        assert!(
+            learning["empty_welcome"]
+                .as_str()
+                .is_some_and(|text| text.contains("Nothing learned yet."))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn learning_window_payload_empty_state_and_unreadable_line() -> Result<(), AppError> {
+        // A missing file is the plain empty state, with no error line.
+        let missing = temp_learned_vocabulary_path();
+        let payload =
+            serde_json::from_str::<serde_json::Value>(&learning_window_payload_at(&missing)?)?;
+        assert!(
+            payload["learning"]["pairs"]
+                .as_array()
+                .is_some_and(Vec::is_empty)
+        );
+        assert_eq!(payload["learning"]["error"], serde_json::Value::Null);
+
+        // A file that exists but cannot be parsed keeps the empty state and
+        // appends one plain error line.
+        fs::write(&missing, "this is not json")?;
+        let unreadable =
+            serde_json::from_str::<serde_json::Value>(&learning_window_payload_at(&missing)?)?;
+        assert!(
+            unreadable["learning"]["pairs"]
+                .as_array()
+                .is_some_and(Vec::is_empty)
+        );
+        assert_eq!(
+            unreadable["learning"]["error"],
+            serde_json::json!(LEARNING_UNREADABLE_LINE)
         );
         Ok(())
     }

@@ -256,6 +256,120 @@ def test_plan_layout_brand_without_welcome_still_stacks_rows():
     )
 
 
+def test_plan_layout_skips_blank_detail_lines():
+    # Learning-window rows carry no detail text; they reserve zero detail
+    # lines so each tappable row stays a single tight line.
+    plan = app_window.plan_layout(
+        {
+            "rows": [
+                {"label": "tim -> tom", "detail": "", "state": "ok"},
+                {"label": "meting -> meeting", "detail": "", "state": "ok"},
+            ]
+        }
+    )
+
+    assert plan["rows"][0]["detail_lines"] == []
+    assert plan["rows"][0]["detail_y"] == plan["rows"][0]["label_y"] + app_window.LABEL_LINE_H + 2
+    assert plan["rows"][1]["label_y"] == (
+        plan["rows"][0]["detail_y"] + app_window.ROW_GAP
+    )
+
+
+def test_learning_display_payload_pairs_error_and_copy():
+    spec = {
+        "hint_welcome": "Tap a correction to remove it.",
+        "empty_welcome": "Nothing learned yet.",
+    }
+
+    display = app_window.learning_display_payload(
+        [{"misheard": "tim", "corrected": "tom"}, {"misheard": "meting", "corrected": "meeting"}],
+        None,
+        spec,
+    )
+
+    assert display["welcome"] == "Tap a correction to remove it."
+    assert display["rows"] == [
+        {"label": "tim -> tom", "detail": "", "state": "ok"},
+        {"label": "meting -> meeting", "detail": "", "state": "ok"},
+    ]
+
+    # No pairs left: the empty-state copy takes over and an error line, when
+    # present, renders as a warn row after the (empty) pair rows.
+    empty = app_window.learning_display_payload([], None, spec)
+    assert empty["welcome"] == "Nothing learned yet."
+    assert empty["rows"] == []
+
+    unreadable = app_window.learning_display_payload([], "Could not read the learned-words file.", spec)
+    assert unreadable["welcome"] == "Nothing learned yet."
+    assert unreadable["rows"] == [
+        {"label": "Could not read the learned-words file.", "detail": "", "state": "warn"}
+    ]
+
+
+def test_delete_learned_pair_removes_only_that_pair(tmp_path):
+    path = tmp_path / "learned_vocabulary.json"
+    path.write_text(
+        json.dumps(
+            {
+                "corrections": {
+                    "tim": {"corrected": "tom", "count": 2, "last_used": 10},
+                    "meting": {"corrected": "meeting", "count": 1, "last_used": 20},
+                }
+            }
+        )
+    )
+    path.chmod(0o600)
+
+    removed, error = app_window.delete_learned_pair(str(path), "tim")
+
+    assert removed is True
+    assert error is None
+    with open(path) as handle:
+        data = json.load(handle)
+    assert data["corrections"] == {
+        "meting": {"corrected": "meeting", "count": 1, "last_used": 20}
+    }
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert not (tmp_path / "learned_vocabulary.json.tmp").exists()
+
+
+def test_delete_learned_pair_reports_missing_key_and_file(tmp_path):
+    path = tmp_path / "learned_vocabulary.json"
+    path.write_text(
+        json.dumps({"corrections": {"tim": {"corrected": "tom", "count": 1, "last_used": 1}}})
+    )
+
+    removed, error = app_window.delete_learned_pair(str(path), "zzabsent")
+    assert removed is False
+    assert error
+
+    removed, error = app_window.delete_learned_pair(str(tmp_path / "nope.json"), "tim")
+    assert removed is False
+    assert error
+
+    # An unparsable file fails plainly rather than wiping it.
+    corrupt = tmp_path / "corrupt.json"
+    corrupt.write_text("this is not json")
+    removed, error = app_window.delete_learned_pair(str(corrupt), "tim")
+    assert removed is False
+    assert "Could not read" in error
+    assert corrupt.read_text() == "this is not json"
+
+
+def test_write_learned_file_matches_runtime_shape(tmp_path):
+    path = str(tmp_path / "nested" / "learned_vocabulary.json")
+    payload = {"corrections": {"tim": {"corrected": "tom", "count": 1, "last_used": 5}}}
+
+    app_window.write_learned_file(path, payload)
+
+    with open(path) as handle:
+        assert handle.read() == (
+            '{\n  "corrections": {\n    "tim": {\n      '
+            '"corrected": "tom",\n      "count": 1,\n      "last_used": 5\n    }\n  }\n}\n'
+        )
+    assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
+
+
 def test_try_it_hero_is_styling_only_not_geometry():
     # The hero line changes fonts and colors in build_ui, never the plan:
     # payloads with and without it must produce identical geometry.

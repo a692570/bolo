@@ -52,6 +52,11 @@ DONE_BUTTON_H = 26
 ASSEMBLYAI_LIST_URL = "https://api.assemblyai.com/v2/transcript?limit=1"
 KEY_VALIDATION_TIMEOUT_S = 6.0
 
+# Learned-corrections file the learning window edits. The Rust runtime owns
+# the file too (it reads pairs at startup and re-checks the mtime at each
+# recording start), so deletions here take effect without a restart.
+LEARNED_FILE = os.path.expanduser("~/.bolo/learned_vocabulary.json")
+
 
 def marker_payload(now_ms=None):
     """Marker document written when onboarding completes."""
@@ -88,6 +93,66 @@ def wrap_lines(text, width=DETAIL_WRAP_AT):
     if not text:
         return [""]
     return textwrap.wrap(text, width=width) or [""]
+
+
+def write_learned_file(path, payload):
+    """Atomic learned-vocabulary write mirroring the Rust runtime's writer:
+    indent 2 with a trailing newline, private permissions, rename into
+    place so a crash never leaves a half-written file."""
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2)
+        handle.write("\n")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+def delete_learned_pair(path, misheard):
+    """Remove one learned pair from the corrections file.
+
+    Returns ``(removed, error)`` where error is plain display text for the
+    window when something failed; both values are None-free: a successful
+    removal has ``error=None``.
+    """
+    try:
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+    except FileNotFoundError:
+        return False, "The learned-words file is gone."
+    except Exception:
+        return False, "Could not read the learned-words file."
+    corrections = data.get("corrections") if isinstance(data, dict) else None
+    if not isinstance(corrections, dict) or misheard not in corrections:
+        return False, "That correction is no longer saved."
+    del corrections[misheard]
+    try:
+        write_learned_file(path, data)
+    except Exception:
+        return False, "Could not save the learned-words file."
+    return True, None
+
+
+def learning_display_payload(pairs, error, spec):
+    """Pure display payload for the learning window: the welcome copy picked
+    from the spec (empty state when no pairs remain), one row per pair
+    showing ``misheard -> corrected``, and the plain error line last."""
+    rows = []
+    for pair in pairs:
+        misheard = pair.get("misheard") or ""
+        corrected = pair.get("corrected") or ""
+        rows.append(
+            {"label": "{0} -> {1}".format(misheard, corrected), "detail": "", "state": "ok"}
+        )
+    if error:
+        rows.append({"label": error, "detail": "", "state": "warn"})
+    if pairs:
+        welcome = spec.get("hint_welcome") or ""
+    else:
+        welcome = spec.get("empty_welcome") or ""
+    return {"brand": "BOLO", "welcome": welcome, "rows": rows}
 
 
 def key_entry_index(payload):
@@ -201,7 +266,10 @@ def plan_layout(payload):
     if welcome_lines:
         y += len(welcome_lines) * LABEL_LINE_H + WELCOME_GAP
     for index, row in enumerate(rows):
-        detail_lines = wrap_lines(row.get("detail") or "")
+        detail_text = row.get("detail") or ""
+        # Rows without detail text (learning-window pair rows) reserve no
+        # detail lines, so tappable rows stay a single tight line each.
+        detail_lines = wrap_lines(detail_text) if detail_text else []
         if key_index is not None and index == key_index:
             field_y = y + LABEL_LINE_H + 2
             detail_y = field_y + KEY_FIELD_H + 4
@@ -249,8 +317,16 @@ def read_payload():
 
 
 def build_ui(payload):
-    """Create the AppKit window; imports stay local so tests import safely."""
+    """Create the AppKit window; imports stay local so tests import safely.
+
+    Mode "learning" renders its rows from the pairs the runtime sends and
+    makes each pair a tappable button that removes it from the
+    learned-words file, re-rendering in place; every other mode renders
+    the generic label/detail rows from the payload.
+    """
     from AppKit import (
+        NSAttributedString,
+        NSMutableParagraphStyle,
         NSApplication,
         NSApplicationActivationPolicyAccessory,
         NSBezelStyleRounded,
@@ -265,6 +341,8 @@ def build_ui(payload):
         NSRunLoop,
         NSObject,
         NSSecureTextField,
+        NSTextAlignmentCenter,
+        NSTextAlignmentLeft,
         NSTextField,
         NSView,
         NSWindow,
@@ -301,9 +379,29 @@ def build_ui(payload):
                 # user closes the window without further edits.
                 field.setEnabled_(False)
 
+        def deleteLearned_(self, sender):
+            refs = STATE.get("learning") or {}
+            rerender = refs.get("rerender")
+            if not rerender:
+                return
+            try:
+                index = int(sender.tag())
+            except (TypeError, ValueError):
+                return
+            pairs = refs.get("pairs") or []
+            if not 0 <= index < len(pairs):
+                return
+            misheard = pairs[index].get("misheard")
+            removed, error = delete_learned_pair(refs.get("file") or LEARNED_FILE, misheard)
+            if removed:
+                refs["pairs"] = pairs[:index] + pairs[index + 1 :]
+                refs["error"] = None
+            else:
+                refs["error"] = error or "Could not remove that correction."
+            rerender()
+
         def windowWillClose_(self, notification):
             STATE["user_done"] = True
-
 
     colors = {
         "ok": NSColor.colorWithCalibratedRed_green_blue_alpha_(0.45, 0.88, 0.49, 1.0),
@@ -312,7 +410,17 @@ def build_ui(payload):
     }
     accent = NSColor.colorWithCalibratedRed_green_blue_alpha_(0.34, 0.86, 0.61, 1.0)
 
-    plan = plan_layout(payload)
+    learning_spec = payload.get("learning")
+    learning_spec = learning_spec if isinstance(learning_spec, dict) else None
+    is_learning = learning_spec is not None
+    raw_pairs = learning_spec.get("pairs") if learning_spec else None
+    learning_pairs = [pair for pair in (raw_pairs or []) if isinstance(pair, dict)]
+    learning_error = learning_spec.get("error") if learning_spec else None
+    if is_learning:
+        display = learning_display_payload(learning_pairs, learning_error, learning_spec)
+    else:
+        display = payload
+    plan = plan_layout(display)
     try_it_index = payload.get("try_it_index")
     try_it_index = try_it_index if isinstance(try_it_index, int) else None
     hero_line = payload.get("try_it_hero")
@@ -331,161 +439,238 @@ def build_ui(payload):
     window.setTitle_(payload.get("title") or "Bolo")
     window.setReleasedWhenClosed_(False)
 
-    content = FlippedView.alloc().initWithFrame_(NSMakeRect(0, 0, WIDTH, plan["height"]))
-    window.setContentView_(content)
-
-    def make_label(text, y, h, font, color, x=MARGIN):
-        label = NSTextField.labelWithString_(text)
-        label.setFrame_(NSMakeRect(x, y, WIDTH - MARGIN - x, h))
-        label.setFont_(font)
-        label.setTextColor_(color)
-        label.setEditable_(False)
-        label.setSelectable_(True)
-        label.setBezeled_(False)
-        label.setDrawsBackground_(False)
-        content.addSubview_(label)
-        return label
-
-    if plan["brand_y"] is not None:
-        # Brand row: small green waveform glyph plus the wordmark, matching
-        # the icon family (dark surface, green bars) at a subtle size. Bars
-        # sit on a shared baseline so the glyph reads as a waveform.
-        bar_x = float(MARGIN)
-        baseline = plan["brand_y"] + BRAND_ROW_H - 4.0
-        for bar_w, bar_h in BRAND_BARS:
-            bar = NSView.alloc().initWithFrame_(
-                NSMakeRect(bar_x, baseline - bar_h, bar_w, bar_h)
-            )
-            bar.setWantsLayer_(True)
-            bar.layer().setCornerRadius_(bar_w / 2.0)
-            bar.layer().setBackgroundColor_(accent.CGColor())
-            content.addSubview_(bar)
-            bar_x += bar_w + BRAND_BAR_GAP
-        bars_width = sum(w for w, _h in BRAND_BARS) + BRAND_BAR_GAP * (len(BRAND_BARS) - 1)
-        wordmark = make_label(
-            payload.get("brand") or "BOLO",
-            plan["brand_y"] + 5,
-            BRAND_ROW_H - 5,
-            NSFont.boldSystemFontOfSize_(BRAND_WORDMARK_SIZE),
-            NSColor.labelColor(),
-            x=MARGIN + bars_width + 10,
-        )
-        wordmark.setSelectable_(False)
-
-    if plan["welcome_y"] is not None:
-        make_label(
-            "\n".join(plan["welcome_lines"]),
-            plan["welcome_y"],
-            len(plan["welcome_lines"]) * LABEL_LINE_H,
-            NSFont.systemFontOfSize_weight_(13.0, NSFontWeightMedium),
-            NSColor.labelColor(),
-        )
-
     label_font = NSFont.systemFontOfSize_weight_(13.0, NSFontWeightMedium)
     detail_font = NSFont.systemFontOfSize_weight_(12.0, NSFontWeightRegular)
     hero_label_font = NSFont.systemFontOfSize_weight_(
         HERO_LABEL_SIZE, NSFontWeightMedium
     )
     controller = WindowController.alloc().init()
-    try_it_refs = None
-    key_refs = None
-    key_index = plan["key_index"]
-    for index, (row, row_plan) in enumerate(zip(payload.get("rows", []), plan["rows"])):
-        is_hero_row = (
-            try_it_index is not None
-            and index == try_it_index
-            and hero_line is not None
-            and row.get("state") == "pending"
+
+    def build_content(content_display, content_plan):
+        """Populate one content view from a display payload; reusable so the
+        learning window can re-render after a deletion."""
+        content = FlippedView.alloc().initWithFrame_(
+            NSMakeRect(0, 0, WIDTH, content_plan["height"])
         )
-        dot = NSView.alloc().initWithFrame_(NSMakeRect(MARGIN, row_plan["label_y"] + 5, 10, 10))
-        dot.setWantsLayer_(True)
-        dot.layer().setCornerRadius_(5)
-        dot.layer().setBackgroundColor_(
-            colors.get(row.get("state"), colors["pending"]).CGColor()
-        )
-        content.addSubview_(dot)
-        make_label(
-            row.get("label", ""),
-            row_plan["label_y"],
-            LABEL_LINE_H,
-            hero_label_font if is_hero_row else label_font,
-            NSColor.labelColor(),
-            x=TEXT_X,
-        )
-        if key_index is not None and index == key_index:
-            # Key-entry row: secure text field plus Validate button between
-            # the label and the detail line. The validation GET runs inline
-            # (bounded by KEY_VALIDATION_TIMEOUT_S), which briefly pauses
-            # the run loop on click; acceptable for a one-shot action.
-            field = NSSecureTextField.alloc().initWithFrame_(
-                NSMakeRect(TEXT_X, row_plan["field_y"], KEY_FIELD_W, KEY_FIELD_H)
-            )
-            field.cell().setPlaceholderString_(
-                (payload.get("key_entry") or {}).get("placeholder")
-                or "Paste your AssemblyAI API key"
-            )
-            content.addSubview_(field)
-            validate_button = NSButton.buttonWithTitle_target_action_(
-                "Validate", controller, "validateKey:"
-            )
-            validate_button.setBezelStyle_(NSBezelStyleRounded)
-            validate_button.setFrame_(
-                NSMakeRect(
-                    TEXT_X + KEY_FIELD_W + 10,
-                    row_plan["field_y"],
-                    VALIDATE_BUTTON_W,
-                    KEY_FIELD_H,
+
+        def make_label(text, y, h, font, color, x=MARGIN):
+            label = NSTextField.labelWithString_(text)
+            label.setFrame_(NSMakeRect(x, y, WIDTH - MARGIN - x, h))
+            label.setFont_(font)
+            label.setTextColor_(color)
+            label.setEditable_(False)
+            label.setSelectable_(True)
+            label.setBezeled_(False)
+            label.setDrawsBackground_(False)
+            content.addSubview_(label)
+            return label
+
+        if content_plan["brand_y"] is not None:
+            # Brand row: small green waveform glyph plus the wordmark, matching
+            # the icon family (dark surface, green bars) at a subtle size. Bars
+            # sit on a shared baseline so the glyph reads as a waveform.
+            bar_x = float(MARGIN)
+            baseline = content_plan["brand_y"] + BRAND_ROW_H - 4.0
+            for bar_w, bar_h in BRAND_BARS:
+                bar = NSView.alloc().initWithFrame_(
+                    NSMakeRect(bar_x, baseline - bar_h, bar_w, bar_h)
                 )
+                bar.setWantsLayer_(True)
+                bar.layer().setCornerRadius_(bar_w / 2.0)
+                bar.layer().setBackgroundColor_(accent.CGColor())
+                content.addSubview_(bar)
+                bar_x += bar_w + BRAND_BAR_GAP
+            bars_width = sum(w for w, _h in BRAND_BARS) + BRAND_BAR_GAP * (len(BRAND_BARS) - 1)
+            wordmark = make_label(
+                content_display.get("brand") or "BOLO",
+                content_plan["brand_y"] + 5,
+                BRAND_ROW_H - 5,
+                NSFont.boldSystemFontOfSize_(BRAND_WORDMARK_SIZE),
+                NSColor.labelColor(),
+                x=MARGIN + bars_width + 10,
             )
-            content.addSubview_(validate_button)
-        detail_label = make_label(
-            "\n".join(row_plan["detail_lines"]),
-            row_plan["detail_y"],
-            len(row_plan["detail_lines"]) * DETAIL_LINE_H,
-            detail_font,
-            NSColor.labelColor() if is_hero_row else NSColor.secondaryLabelColor(),
-            x=TEXT_X,
+            wordmark.setSelectable_(False)
+
+        if content_plan["welcome_y"] is not None:
+            make_label(
+                "\n".join(content_plan["welcome_lines"]),
+                content_plan["welcome_y"],
+                len(content_plan["welcome_lines"]) * LABEL_LINE_H,
+                NSFont.systemFontOfSize_weight_(13.0, NSFontWeightMedium),
+                NSColor.labelColor(),
+            )
+
+        try_it_refs = None
+        key_refs = None
+        key_index = content_plan["key_index"]
+        for index, (row, row_plan) in enumerate(
+            zip(content_display.get("rows", []), content_plan["rows"])
+        ):
+            is_hero_row = (
+                try_it_index is not None
+                and index == try_it_index
+                and hero_line is not None
+                and row.get("state") == "pending"
+            )
+            if is_learning and index < len(learning_pairs):
+                # Tappable pair row: a borderless button spanning the row
+                # width, left-aligned like the plain labels. Tapping it
+                # removes that learned pair and re-renders the window.
+                pair_button = NSButton.buttonWithTitle_target_action_(
+                    row.get("label", ""), controller, "deleteLearned:"
+                )
+                pair_button.setBordered_(False)
+                pair_button.setTag_(index)
+                pair_button.setFont_(label_font)
+                pair_button.setFrame_(
+                    NSMakeRect(
+                        MARGIN,
+                        row_plan["label_y"] - 3,
+                        WIDTH - 2 * MARGIN,
+                        LABEL_LINE_H + 6,
+                    )
+                )
+                pair_title = NSMutableParagraphStyle.alloc().init()
+                pair_title.setAlignment_(NSTextAlignmentLeft)
+                # NSAttributedString attribute keys are stable string
+                # constants ("NSFont", "NSColor", "NSParagraphStyle"), used
+                # as literals here.
+                pair_button.setAttributedTitle_(
+                    NSAttributedString.alloc().initWithString_attributes_(
+                        row.get("label", ""),
+                        {
+                            "NSFont": label_font,
+                            "NSColor": NSColor.labelColor(),
+                            "NSParagraphStyle": pair_title,
+                        },
+                    )
+                )
+                content.addSubview_(pair_button)
+                continue
+            dot = NSView.alloc().initWithFrame_(
+                NSMakeRect(MARGIN, row_plan["label_y"] + 5, 10, 10)
+            )
+            dot.setWantsLayer_(True)
+            dot.layer().setCornerRadius_(5)
+            dot.layer().setBackgroundColor_(
+                colors.get(row.get("state"), colors["pending"]).CGColor()
+            )
+            content.addSubview_(dot)
+            make_label(
+                row.get("label", ""),
+                row_plan["label_y"],
+                LABEL_LINE_H,
+                hero_label_font if is_hero_row else label_font,
+                NSColor.labelColor(),
+                x=TEXT_X,
+            )
+            if key_index is not None and index == key_index:
+                # Key-entry row: secure text field plus Validate button between
+                # the label and the detail line. The validation GET runs inline
+                # (bounded by KEY_VALIDATION_TIMEOUT_S), which briefly pauses
+                # the run loop on click; acceptable for a one-shot action.
+                field = NSSecureTextField.alloc().initWithFrame_(
+                    NSMakeRect(TEXT_X, row_plan["field_y"], KEY_FIELD_W, KEY_FIELD_H)
+                )
+                field.cell().setPlaceholderString_(
+                    (payload.get("key_entry") or {}).get("placeholder")
+                    or "Paste your AssemblyAI API key"
+                )
+                content.addSubview_(field)
+                validate_button = NSButton.buttonWithTitle_target_action_(
+                    "Validate", controller, "validateKey:"
+                )
+                validate_button.setBezelStyle_(NSBezelStyleRounded)
+                validate_button.setFrame_(
+                    NSMakeRect(
+                        TEXT_X + KEY_FIELD_W + 10,
+                        row_plan["field_y"],
+                        VALIDATE_BUTTON_W,
+                        KEY_FIELD_H,
+                    )
+                )
+                content.addSubview_(validate_button)
+            detail_label = make_label(
+                "\n".join(row_plan["detail_lines"]),
+                row_plan["detail_y"],
+                len(row_plan["detail_lines"]) * DETAIL_LINE_H,
+                detail_font,
+                NSColor.labelColor() if is_hero_row else NSColor.secondaryLabelColor(),
+                x=TEXT_X,
+            )
+            if try_it_index is not None and index == try_it_index:
+                try_it_refs = {"dot": dot, "detail_label": detail_label}
+            if key_index is not None and index == key_index:
+                key_refs = {"dot": dot, "field": field, "detail_label": detail_label}
+
+        # Done affordance: the brand-green accent background with white text,
+        # so the button reads as enabled against both light and dark windows
+        # instead of the washed-out default bezel. Return triggers it too.
+        button = NSButton.buttonWithTitle_target_action_(
+            payload.get("button") or "Close", controller, "finish:"
         )
-        if try_it_index is not None and index == try_it_index:
-            try_it_refs = {"dot": dot, "detail_label": detail_label}
-        if key_index is not None and index == key_index:
-            key_refs = {"dot": dot, "field": field, "detail_label": detail_label}
-
-    STATE["key_refs"] = key_refs
-
-    # Done affordance: the brand-green accent background with white text,
-    # so the button reads as enabled against both light and dark windows
-    # instead of the washed-out default bezel. Return triggers it too.
-    # NSAttributedString attribute keys are stable string constants
-    # ("NSFont", "NSColor", "NSParagraphStyle"), used as literals here.
-    from AppKit import NSMutableParagraphStyle, NSTextAlignmentCenter
-
-    button = NSButton.buttonWithTitle_target_action_(
-        payload.get("button") or "Close", controller, "finish:"
-    )
-    button.setBordered_(False)
-    button.setWantsLayer_(True)
-    button.layer().setBackgroundColor_(accent.CGColor())
-    button.layer().setCornerRadius_(13.0)
-    button.setKeyEquivalent_("\r")
-    paragraph = NSMutableParagraphStyle.alloc().init()
-    paragraph.setAlignment_(NSTextAlignmentCenter)
-    title_attributes = {
-        "NSFont": NSFont.systemFontOfSize_weight_(13.0, NSFontWeightMedium),
-        "NSColor": NSColor.whiteColor(),
-        "NSParagraphStyle": paragraph,
-    }
-    from Foundation import NSAttributedString
-
-    button.setAttributedTitle_(
-        NSAttributedString.alloc().initWithString_attributes_(
-            payload.get("button") or "Close", title_attributes
+        button.setBordered_(False)
+        button.setWantsLayer_(True)
+        button.layer().setBackgroundColor_(accent.CGColor())
+        button.layer().setCornerRadius_(13.0)
+        button.setKeyEquivalent_("\r")
+        paragraph = NSMutableParagraphStyle.alloc().init()
+        paragraph.setAlignment_(NSTextAlignmentCenter)
+        title_attributes = {
+            "NSFont": NSFont.systemFontOfSize_weight_(13.0, NSFontWeightMedium),
+            "NSColor": NSColor.whiteColor(),
+            "NSParagraphStyle": paragraph,
+        }
+        button.setAttributedTitle_(
+            NSAttributedString.alloc().initWithString_attributes_(
+                payload.get("button") or "Close", title_attributes
+            )
         )
-    )
-    button.setFrame_(
-        NSMakeRect(WIDTH - MARGIN - DONE_BUTTON_W, plan["button_y"], DONE_BUTTON_W, DONE_BUTTON_H)
-    )
-    content.addSubview_(button)
+        button.setFrame_(
+            NSMakeRect(
+                WIDTH - MARGIN - DONE_BUTTON_W,
+                content_plan["button_y"],
+                DONE_BUTTON_W,
+                DONE_BUTTON_H,
+            )
+        )
+        content.addSubview_(button)
+        return content, {"try_it_refs": try_it_refs, "key_refs": key_refs}
+
+    content, row_refs = build_content(display, plan)
+    window.setContentView_(content)
+    STATE["key_refs"] = row_refs["key_refs"]
+
+    if is_learning:
+        # The delete action re-renders in place: same window, fresh content,
+        # top-left corner pinned so the height change is not jumpy.
+        def learning_rerender():
+            learning_refs = STATE.get("learning") or {}
+            rerender_display = learning_display_payload(
+                learning_refs.get("pairs") or [],
+                learning_refs.get("error"),
+                learning_spec,
+            )
+            rerender_plan = plan_layout(rerender_display)
+            rerender_content, _ = build_content(rerender_display, rerender_plan)
+            frame = window.frame()
+            rerender_frame = NSMakeRect(
+                frame.origin.x,
+                frame.origin.y + frame.size.height - rerender_plan["height"],
+                WIDTH,
+                rerender_plan["height"],
+            )
+            window.setContentView_(rerender_content)
+            window.setFrame_display_(rerender_frame, True)
+
+        STATE["learning"] = {
+            "pairs": learning_pairs,
+            "error": learning_error,
+            "file": learning_spec.get("file") or LEARNED_FILE,
+            "rerender": learning_rerender,
+        }
+
+    try_it_refs = row_refs["try_it_refs"]
 
     window.setDelegate_(controller)
     window.center()

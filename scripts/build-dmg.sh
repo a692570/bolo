@@ -10,7 +10,9 @@
 #   4. app icon (scripts/make_icon.py under a build-time venv)
 #   5. Bolo.app staging (launcher, binary, helpers, runtimes, wheels, plist)
 #   6. ad-hoc codesign (no real identity, never notarized)
-#   7. DMG creation with an /Applications symlink
+#   6.5 Finder presentation: background image + icon positions via a
+#       read-write scratch volume whose .DS_Store lands in the staging root
+#   7. DMG creation with an /Applications symlink and the Finder layout
 #   8. verification: mount, structure, universal binary, codesign, size
 #
 # Artifacts land in build/ (cached across runs) and dist/Bolo-<version>.dmg.
@@ -293,6 +295,81 @@ ln -sfn /Applications "$STAGE/Applications"
 log "ad-hoc code signing the bundle"
 codesign --force --deep --sign - "$APP" || fail "ad-hoc codesign failed"
 
+# --- Phase 6.5: Finder presentation (background + icon layout) --------------------------
+
+# The volume ships a Finder layout: a dark brand background drawn by
+# scripts/make-dmg-background.py (cached in build/dmg, regenerated only when
+# missing), the Applications symlink on the left and Bolo.app on the right.
+# The layout is produced once on a read-write scratch volume whose .DS_Store
+# is copied back into the staging root, so the final DMG mounts already
+# arranged.
+DMG_ASSETS="$BUILD/dmg"
+BG="$DMG_ASSETS/background.png"
+if [ ! -f "$BG" ]; then
+    mkdir -p "$DMG_ASSETS"
+    log "rendering the DMG background"
+    "$ICON_VENV/bin/python3" "$ROOT/scripts/make-dmg-background.py" --output "$BG" \
+        || fail "DMG background render failed"
+fi
+[ -f "$BG" ] || fail "DMG background missing"
+mkdir -p "$STAGE/.background"
+cp "$BG" "$STAGE/.background/background.png"
+
+log "laying out the volume in Finder"
+LAYOUT_DMG="$BUILD/staging-layout.dmg"
+rm -f "$LAYOUT_DMG"
+if [ -e /Volumes/Bolo ]; then
+    fail "a volume named Bolo is already mounted at /Volumes/Bolo; eject it and rebuild"
+fi
+hdiutil create -volname Bolo -format UDRW -srcfolder "$STAGE" "$LAYOUT_DMG" \
+    >/dev/null || fail "could not create the layout DMG"
+# The layout volume mounts at /Volumes/Bolo: Finder's AppleScript can only
+# address disks at their standard mount points, so no -mountpoint here.
+hdiutil attach "$LAYOUT_DMG" >/dev/null || fail "could not mount the layout DMG"
+osascript <<APPLESCRIPT || fail "Finder layout failed"
+tell application "Finder"
+    delay 1
+    tell disk "Bolo"
+        open
+        set current view of container window to icon view
+        set toolbar visible of container window to false
+        set statusbar visible of container window to false
+        set the bounds of container window to {0, 0, 660, 400}
+        set theViewOptions to the icon view options of container window
+        set arrangement of theViewOptions to not arranged
+        set icon size of theViewOptions to 80
+        set background picture of theViewOptions to file ".background:background.png"
+        try
+            set position of item "Bolo.app" to {480, 220}
+        on error
+            set position of item "Bolo" to {480, 220}
+        end try
+        set position of item "Applications" to {180, 220}
+        update without registering applications
+        delay 2
+        close
+    end tell
+end tell
+APPLESCRIPT
+[ -e /Volumes/Bolo/.DS_Store ] || fail "Finder produced no .DS_Store"
+[ -s /Volumes/Bolo/.DS_Store ] || fail "Finder produced an empty .DS_Store"
+strings /Volumes/Bolo/.DS_Store | grep -q "icvp" \
+    || fail "Finder layout did not write icon view options into the .DS_Store"
+strings /Volumes/Bolo/.DS_Store | grep -q "background.png" \
+    || fail "Finder layout does not reference the background image"
+cp /Volumes/Bolo/.DS_Store "$STAGE/.DS_Store" \
+    || fail "could not copy the .DS_Store into staging"
+detached=false
+for _ in 1 2 3; do
+    if hdiutil detach /Volumes/Bolo >/dev/null 2>&1; then
+        detached=true
+        break
+    fi
+    sleep 2
+done
+[ "$detached" = true ] || fail "could not detach the layout DMG"
+rm -f "$LAYOUT_DMG"
+
 # --- Phase 7: DMG ------------------------------------------------------------------------
 
 DMG="$DIST/Bolo-$VERSION.dmg"
@@ -336,6 +413,9 @@ MOUNTED_ARCHS="$(lipo -archs "$MOUNTED_APP/Contents/MacOS/bolo-runtime")"
 [ "$MOUNTED_ARCHS" = "x86_64 arm64" ] || [ "$MOUNTED_ARCHS" = "arm64 x86_64" ] \
     || fail "mounted binary is not universal (got: $MOUNTED_ARCHS)"
 [ -e "$MOUNT/Applications" ] || fail "DMG is missing the /Applications symlink"
+[ -e "$MOUNT/.background/background.png" ] \
+    || fail "DMG is missing the Finder background"
+[ -s "$MOUNT/.DS_Store" ] || fail "DMG is missing the Finder layout (.DS_Store)"
 codesign --verify --deep "$MOUNTED_APP" >/dev/null 2>&1 \
     || fail "mounted bundle fails codesign verification"
 WHEEL_COUNT="$(find "$MOUNTED_APP/Contents/Resources/wheels" -name '*.whl' | wc -l | tr -d ' ')"
