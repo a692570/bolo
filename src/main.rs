@@ -1259,6 +1259,16 @@ fn best_streaming_text(result: &StreamingTranscript) -> Option<String> {
     }
 }
 
+/// The session-close frame each streaming provider expects, or None when the
+/// provider finalizes from socket teardown alone (Telnyx-routed `AssemblyAI`).
+const fn stream_close_frame(provider: StreamingProvider) -> Option<&'static str> {
+    match provider {
+        StreamingProvider::Deepgram => Some(r#"{"type":"CloseStream"}"#),
+        StreamingProvider::AssemblyAiDirect => Some(r#"{"type":"Terminate"}"#),
+        StreamingProvider::AssemblyAi => None,
+    }
+}
+
 async fn run_stt_stream(
     api_key: String,
     provider: StreamingProvider,
@@ -1301,6 +1311,7 @@ async fn run_stt_stream(
     info!("[stt] streaming_connected {}", provider.label());
     let (mut write, mut read) = socket.split();
     let mut input_closed = false;
+    let mut close_sent = false;
     let mut close_deadline = None;
     loop {
         loop {
@@ -1315,28 +1326,15 @@ async fn run_stt_stream(
                 Err(mpsc::TryRecvError::Disconnected) => {
                     input_closed = true;
                     close_deadline = Some(Instant::now() + Duration::from_millis(1_500));
-                    if provider == StreamingProvider::Deepgram {
-                        // CloseStream alone finalizes: it drains the server's
-                        // buffer before emitting the final, so it does not
-                        // depend on endpointing seeing trailing silence.
-                        if let Err(error) = write
-                            .send(Message::Text(
-                                String::from(r#"{"type":"CloseStream"}"#).into(),
-                            ))
-                            .await
+                    // Send the close exactly once: the outer loop revisits this
+                    // arm on every read iteration until the deadline, and
+                    // re-sending the close frame each time spams the server.
+                    if !close_sent {
+                        close_sent = true;
+                        if let Some(frame) = stream_close_frame(provider)
+                            && let Err(error) = write.send(Message::Text(frame.into())).await
                         {
                             warn!("streaming close failed: {error}");
-                        }
-                    } else if provider == StreamingProvider::AssemblyAiDirect {
-                        // AssemblyAI v3 requires an explicit Terminate to
-                        // finalize the in-flight turn before the server closes.
-                        if let Err(error) = write
-                            .send(Message::Text(
-                                String::from(r#"{"type":"Terminate"}"#).into(),
-                            ))
-                            .await
-                        {
-                            warn!("streaming terminate failed: {error}");
                         }
                     }
                     break;
@@ -5288,7 +5286,12 @@ where
     T: Sample + SizedSample,
     i16: FromSample<T>,
 {
-    let chunk_samples = usize::try_from(config.sample_rate / 50)
+    // AssemblyAI's v3 streaming spec requires 50-1000ms per binary chunk and
+    // rejects the final chunk at session teardown when it is shorter (observed
+    // 2026-10-02: a 20ms chunk drew "Input Duration Violation"). 60ms sits
+    // inside the accepted range with margin on either side; the same chunk size
+    // feeds the dictation upload, where byte framing is unrestricted.
+    let chunk_samples = usize::try_from(config.sample_rate * 3 / 50)
         .map_err(|error| AppError::AudioStream(error.to_string()))?
         .max(1);
     let mut streaming_chunker =
