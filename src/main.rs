@@ -6185,9 +6185,14 @@ fn strip_suffix_ignore_ascii_case<'a>(text: &'a str, suffix: &str) -> Option<&'a
         return None;
     }
     let start = text.len() - suffix.len();
-    text[start..]
-        .eq_ignore_ascii_case(suffix)
-        .then_some(&text[..start])
+    // Compare at the byte level: &text[start..] panics when `start` falls
+    // inside a multi-byte character, and transcripts routinely end in
+    // non-ASCII (en-IN). A byte match against an ASCII suffix guarantees
+    // `start` is a char boundary, so the prefix slice below is safe.
+    if !text.as_bytes()[start..].eq_ignore_ascii_case(suffix.as_bytes()) {
+        return None;
+    }
+    Some(&text[..start])
 }
 
 fn parse_correction_command(text: &str) -> Option<DictationCommand> {
@@ -6211,7 +6216,12 @@ fn parse_correction_command(text: &str) -> Option<DictationCommand> {
 }
 
 fn strip_command_word_ignore_ascii_case<'a>(text: &'a str, word: &str) -> Option<&'a str> {
-    if text.len() < word.len() || !text[..word.len()].eq_ignore_ascii_case(word) {
+    // Byte-level prefix compare: &text[..word.len()] panics when the prefix
+    // ends inside a multi-byte character. A byte match on an ASCII word makes
+    // `word.len()` a char boundary, so the slice below is safe.
+    if text.len() < word.len()
+        || !text.as_bytes()[..word.len()].eq_ignore_ascii_case(word.as_bytes())
+    {
         return None;
     }
     let rest = &text[word.len()..];
@@ -6226,7 +6236,12 @@ fn strip_command_word_ignore_ascii_case<'a>(text: &'a str, word: &str) -> Option
 }
 
 fn strip_phrase_ignore_ascii_case<'a>(text: &'a str, phrase: &str) -> Option<&'a str> {
-    if text.len() < phrase.len() || !text[..phrase.len()].eq_ignore_ascii_case(phrase) {
+    // Same byte-level guard as strip_command_word_ignore_ascii_case: slicing
+    // &text[..phrase.len()] panics on multi-byte text, the byte compare does
+    // not, and a byte match makes `phrase.len()` a char boundary.
+    if text.len() < phrase.len()
+        || !text.as_bytes()[..phrase.len()].eq_ignore_ascii_case(phrase.as_bytes())
+    {
         return None;
     }
     Some(trim_correction_delimiters(&text[phrase.len()..]))
@@ -12323,5 +12338,505 @@ mod tests {
             Some(StreamingConnectionState::Connected)
         );
         Ok(())
+    }
+
+    // ==== Edit learning (the edit-after-paste auto-dictionary) ====
+
+    fn temp_learned_vocabulary_path() -> PathBuf {
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut path = env::temp_dir();
+        path.push(format!("bolo-learned-vocab-{}-{id}.json", process::id()));
+        path
+    }
+
+    fn edit_learning_test_app(
+        replacements: Vec<TextReplacement>,
+        vocabulary_aliases: Vec<TextReplacement>,
+        learned_aliases: Vec<TextReplacement>,
+    ) -> Arc<App> {
+        Arc::new(App {
+            config: Config {
+                telnyx_api_key: Some(String::from("test")),
+                assemblyai_api_key: None,
+                llm_cleanup: CleanupMode::Off,
+                litellm_base: None,
+                litellm_key: None,
+                stt_model: String::from("deepgram/nova-3"),
+                stt_language: String::from("en-US"),
+                streaming_stt: None,
+                stt_fallbacks: Vec::new(),
+                microphone: None,
+                replacements,
+                root_dir: PathBuf::new(),
+                hotkey: String::from("right_option"),
+                paste_last_hotkey: None,
+                preserve_clipboard: true,
+                log_transcripts: false,
+                max_recording_seconds: 30,
+            },
+            http: reqwest::blocking::Client::new(),
+            vocabulary: Mutex::new(Vec::new()),
+            vocabulary_aliases: Mutex::new(vocabulary_aliases),
+            learned_aliases: Mutex::new(learned_aliases),
+            prompt_bindings: Mutex::new(Vec::new()),
+            vocabulary_usage: Mutex::new(HashMap::new()),
+            vocabulary_usage_path: temp_vocabulary_usage_path(),
+            state: Mutex::new(AppState::default()),
+            event_proxy: Mutex::new(None),
+        })
+    }
+
+    fn dictation_prepared_text(text: &str) -> PreparedText {
+        PreparedText {
+            text: text.to_owned(),
+            llm_cleanup_ran: false,
+            llm_cleanup_deferred: false,
+            cleanup_input: None,
+        }
+    }
+
+    #[test]
+    fn edit_learning_diff_learns_single_word_replacement() {
+        let outcome = derive_word_correction(
+            "please call Tim about the meeting",
+            "Hey, can you please call tom about the meeting",
+        );
+        // Exactly the changed word is extracted, never the whole tail.
+        assert_eq!(
+            outcome,
+            CorrectionOutcome::Learned {
+                misheard: String::from("Tim"),
+                corrected: String::from("tom"),
+            }
+        );
+        // A fix at the end of the insert aligns through the words before it.
+        assert_eq!(
+            derive_word_correction(
+                "please call about the meting",
+                "earlier today please call about the meeting"
+            ),
+            CorrectionOutcome::Learned {
+                misheard: String::from("meting"),
+                corrected: String::from("meeting"),
+            }
+        );
+    }
+
+    #[test]
+    fn edit_learning_diff_skips_multi_word_changes() {
+        // Two words replaced.
+        assert!(matches!(
+            derive_word_correction(
+                "please call Tim about the meting",
+                "please call tom regarding the meeting"
+            ),
+            CorrectionOutcome::Skipped { .. }
+        ));
+        // A deleted word must never borrow a neighbor as its replacement.
+        assert!(matches!(
+            derive_word_correction(
+                "please call Tim about the meeting",
+                "please call about the meeting"
+            ),
+            CorrectionOutcome::Skipped { .. }
+        ));
+    }
+
+    #[test]
+    fn edit_learning_diff_skips_trivial_word_variants() {
+        // A one-keystroke extension is not a mishearing.
+        assert_eq!(
+            derive_word_correction("ship the meeting notes", "ship the meetings notes"),
+            CorrectionOutcome::Skipped {
+                reason: "trivial_variant",
+            }
+        );
+        // Case-only and apostrophe-only rewrites are trivial too.
+        assert!(super::is_trivial_word_variant("Tim", "tim"));
+        assert!(super::is_trivial_word_variant("dont", "don't"));
+        assert!(super::is_trivial_word_variant("meeting", "meetings"));
+        assert!(!super::is_trivial_word_variant("Tim", "tom"));
+        assert!(!super::is_trivial_word_variant("meting", "meeting"));
+    }
+
+    #[test]
+    fn edit_learning_diff_skips_short_words_and_wordless_inserts() {
+        // The user paused mid-word: the replacement is a fragment.
+        assert_eq!(
+            derive_word_correction(
+                "please call Tim about the meeting",
+                "please call t about the meeting"
+            ),
+            CorrectionOutcome::Skipped { reason: "short_word" }
+        );
+        // A one- or two-character misheard word would alias a common word.
+        assert_eq!(
+            derive_word_correction("ship an order tomorrow", "ship the order tomorrow"),
+            CorrectionOutcome::Skipped {
+                reason: "short_misheard",
+            }
+        );
+        // A one-word dictation fixed by a full retype has no anchored words.
+        assert_eq!(
+            derive_word_correction("meeting", "minutes"),
+            CorrectionOutcome::Skipped {
+                reason: "single_word_insert",
+            }
+        );
+        // The pasted text untouched at the tail: nothing to learn.
+        assert_eq!(
+            derive_word_correction(
+                "please call Tim about the meeting",
+                "Hey, please call Tim about the meeting"
+            ),
+            CorrectionOutcome::Skipped { reason: "intact" }
+        );
+    }
+
+    #[test]
+    fn edit_learning_new_word_must_appear_verbatim_in_context() {
+        // The rule's helper, at the word boundary and case-sensitively.
+        assert!(contains_word_verbatim("please call tom about", "tom"));
+        assert!(!contains_word_verbatim("please call tom about", "Tom"));
+        assert!(!contains_word_verbatim("please call to m about", "tom"));
+        assert!(!contains_word_verbatim("", "tom"));
+        // Every learned outcome satisfies it by construction.
+        let outcome = derive_word_correction(
+            "please call Tim about the meeting",
+            "Hey, can you please call tom about the meeting",
+        );
+        let CorrectionOutcome::Learned { misheard, corrected } = outcome else {
+            panic!("expected a learned correction");
+        };
+        assert_ne!(misheard, corrected);
+        assert!(contains_word_verbatim(
+            "Hey, can you please call tom about the meeting",
+            &corrected
+        ));
+    }
+
+    #[test]
+    fn learned_vocabulary_dedupes_pairs_and_bumps_counts() {
+        let path = temp_learned_vocabulary_path();
+        let file = record_learned_correction(&path, "Tim", "tom").expect("first record succeeds");
+        assert_eq!(file.corrections.len(), 1);
+        let entry = file
+            .corrections
+            .get("tim")
+            .expect("the key is the lowercase misheard word");
+        assert_eq!(entry.corrected, "tom");
+        assert_eq!(entry.count, 1);
+
+        // The same pair again bumps the count instead of duplicating.
+        let file = record_learned_correction(&path, "Tim", "tom").expect("second record succeeds");
+        assert_eq!(file.corrections.len(), 1);
+        assert_eq!(
+            file.corrections.get("tim").expect("still one entry").count,
+            2
+        );
+
+        // A different correction for the same misheard word replaces the
+        // entry: the newest fix is the user's current intent.
+        let file =
+            record_learned_correction(&path, "Tim", "thomas").expect("replace record succeeds");
+        let entry = file.corrections.get("tim").expect("replaced entry");
+        assert_eq!(entry.corrected, "thomas");
+        assert_eq!(entry.count, 1);
+    }
+
+    #[test]
+    fn learned_vocabulary_caps_at_100_evicting_least_confirmed_first() {
+        let mut file = LearnedVocabulary::default();
+        for index in 0..100 {
+            upsert_learned_correction(
+                &mut file,
+                &format!("old{index}"),
+                &format!("new{index}"),
+                1_000,
+            );
+        }
+        for _ in 0..5 {
+            upsert_learned_correction(&mut file, "old42", "new42", 1_000);
+        }
+        upsert_learned_correction(&mut file, "rare", "precious", 500);
+        assert_eq!(file.corrections.len(), 101);
+        enforce_learned_vocabulary_cap(&mut file);
+        assert_eq!(file.corrections.len(), 100);
+        // The rare pair was evicted, the confirmed pair stayed.
+        assert!(!file.corrections.contains_key("rare"));
+        assert!(file.corrections.contains_key("old42"));
+
+        // Count ties break by age: the oldest confirmation goes first.
+        let mut tie = LearnedVocabulary::default();
+        for index in 0..99 {
+            upsert_learned_correction(&mut tie, &format!("filler{index}"), "filler", 999);
+        }
+        upsert_learned_correction(&mut tie, "older", "first", 100);
+        upsert_learned_correction(&mut tie, "newer", "second", 200);
+        assert_eq!(tie.corrections.len(), 101);
+        enforce_learned_vocabulary_cap(&mut tie);
+        assert!(!tie.corrections.contains_key("older"));
+        assert!(tie.corrections.contains_key("newer"));
+    }
+
+    #[test]
+    fn learned_vocabulary_writes_atomically_and_round_trips() {
+        let path = temp_learned_vocabulary_path();
+        record_learned_correction(&path, "meting", "meeting").expect("record succeeds");
+        // No temp file survives the atomic rename...
+        assert!(!path.with_extension("json.tmp").exists());
+        // ...and the file parses back to the same state.
+        let reloaded = load_learned_vocabulary(&path);
+        assert_eq!(
+            reloaded
+                .corrections
+                .get("meting")
+                .map(|entry| entry.corrected.as_str()),
+            Some("meeting")
+        );
+        // A path inside a not-yet-existing directory is created on demand.
+        let nested = env::temp_dir().join(format!("bolo-learned-nested-{}", process::id()));
+        let nested_path = nested.join("learned.json");
+        record_learned_correction(&nested_path, "zzmisheard", "zzlearnedterm")
+            .expect("nested record succeeds");
+        assert!(nested_path.exists());
+    }
+
+    #[test]
+    fn learned_vocabulary_tolerates_a_corrupt_file() {
+        let path = temp_learned_vocabulary_path();
+        let garbage = String::from("this is not json");
+        fs::write(&path, &garbage).expect("write garbage");
+        // A corrupt file loads as empty instead of panicking...
+        assert!(load_learned_vocabulary(&path).corrections.is_empty());
+        // ...and the load leaves the old file untouched on disk.
+        assert_eq!(fs::read_to_string(&path).as_deref(), Ok(garbage.as_str()));
+    }
+
+    #[test]
+    fn learned_pairs_become_aliases_and_vocabulary_terms_on_load() {
+        let root = env::temp_dir().join(format!("bolo-learned-load-{}", process::id()));
+        fs::create_dir_all(&root).expect("create root");
+        fs::write(
+            root.join("vocabulary.json"),
+            r#"[{"text": "UserTerm", "aliases": ["zzcollide"]}, "zzroottterm"]"#,
+        )
+        .expect("write vocabulary");
+        let learned_path = temp_learned_vocabulary_path();
+        record_learned_correction(&learned_path, "zzmishrd", "zzlearnedterm")
+            .expect("record learned pair");
+        // A learned pair for a source word the user also configured must not
+        // win: explicit user configuration always has priority.
+        record_learned_correction(&learned_path, "zzcollide", "zzwrong").expect("record clash");
+
+        let loaded = load_vocabulary_with_learned(&root, &learned_path);
+        // The corrected term joined the vocabulary list (and so the keyterms
+        // prompt), and the misheard word is not a term on its own.
+        assert!(loaded.terms.iter().any(|term| term == "zzlearnedterm"));
+        assert!(!loaded
+            .terms
+            .iter()
+            .any(|term| term.eq_ignore_ascii_case("zzmishrd")));
+        // The learned pairs live in their own alias set...
+        assert!(loaded
+            .learned_aliases
+            .iter()
+            .any(|alias| alias.spoken == "zzmishrd" && alias.replacement == "zzlearnedterm"));
+        assert!(loaded
+            .learned_aliases
+            .iter()
+            .any(|alias| alias.spoken == "zzcollide" && alias.replacement == "zzwrong"));
+        // ...while the user's alias is untouched in the configured set.
+        assert!(loaded
+            .aliases
+            .iter()
+            .any(|alias| alias.spoken == "zzcollide" && alias.replacement == "UserTerm"));
+        // The learned alias rewrites the misheard word...
+        assert_eq!(
+            apply_text_replacements("please fix zzmishrd now", &loaded.learned_aliases),
+            "please fix zzlearnedterm now"
+        );
+        // ...and applying the user's aliases first means the user's rewrite
+        // of the colliding source word wins.
+        assert_eq!(
+            apply_text_replacements(
+                &apply_text_replacements("say zzcollide twice", &loaded.aliases),
+                &loaded.learned_aliases,
+            ),
+            "say UserTerm twice"
+        );
+    }
+
+    #[test]
+    fn learned_aliases_yield_to_explicit_user_config_in_cleanup() -> Result<(), AppError> {
+        let app = edit_learning_test_app(
+            vec![TextReplacement {
+                spoken: String::from("zzcfg"),
+                replacement: String::from("ConfigWin"),
+            }],
+            vec![TextReplacement {
+                spoken: String::from("zzalias"),
+                replacement: String::from("AliasWin"),
+            }],
+            vec![
+                TextReplacement {
+                    spoken: String::from("zzcfg"),
+                    replacement: String::from("LearnedCfgWrong"),
+                },
+                TextReplacement {
+                    spoken: String::from("zzalias"),
+                    replacement: String::from("LearnedAliasWrong"),
+                },
+                TextReplacement {
+                    spoken: String::from("zzonly"),
+                    replacement: String::from("LearnedOnlyRight"),
+                },
+            ],
+        );
+        // Sources configured by the user, as an alias or a replacement, are
+        // excluded from the applicable learned set entirely.
+        let user_aliases = app.vocabulary_aliases_snapshot();
+        let effective = app.effective_learned_aliases(&user_aliases);
+        assert_eq!(effective.len(), 1);
+        assert_eq!(effective[0].spoken, "zzonly");
+
+        // The cleanup chain proves the priority end to end: the user's alias
+        // consumes its source word, the unconfigured learned pair applies.
+        let cleaned = app.local_cleanup_chain(
+            "meeting zzalias and zzonly done",
+            "meeting zzalias and zzonly done",
+        )?;
+        assert_eq!(cleaned, "meeting AliasWin and LearnedOnlyRight done");
+        Ok(())
+    }
+
+    #[test]
+    fn learn_correction_updates_engine_state_and_persists() -> Result<(), AppError> {
+        let app = edit_learning_test_app(Vec::new(), Vec::new(), Vec::new());
+        let learned_path = temp_learned_vocabulary_path();
+        app.learn_correction(&learned_path, "zzmishrd", "zzlearnedterm")?;
+
+        // The corrected term joined the ranked vocabulary list.
+        assert!(app
+            .vocabulary_snapshot()?
+            .iter()
+            .any(|term| term == "zzlearnedterm"));
+        // The alias rewrites the misheard word on the next dictation.
+        assert_eq!(
+            apply_text_replacements("fix zzmishrd here", &app.learned_aliases_snapshot()),
+            "fix zzlearnedterm here"
+        );
+        // The existing usage mechanism ranked the corrected term.
+        let usage = read_vocabulary_usage_file(&app.vocabulary_usage_path)?;
+        assert_eq!(usage.get("zzlearnedterm"), Some(&1));
+        // The pair persisted to the learned file.
+        let saved = load_learned_vocabulary(&learned_path);
+        assert_eq!(
+            saved
+                .corrections
+                .get("zzmishrd")
+                .map(|entry| entry.corrected.as_str()),
+            Some("zzlearnedterm")
+        );
+
+        // Re-learning the same pair bumps the count instead of duplicating.
+        app.learn_correction(&learned_path, "zzmishrd", "zzlearnedterm")?;
+        let saved = load_learned_vocabulary(&learned_path);
+        assert_eq!(saved.corrections.len(), 1);
+        assert_eq!(
+            saved.corrections.get("zzmishrd").map(|entry| entry.count),
+            Some(2)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn post_insert_backspaces_debounce_and_cmd_a_cancels_learning() -> Result<(), AppError> {
+        let app = edit_learning_test_app(Vec::new(), Vec::new(), Vec::new());
+        let pasted = "please call Tim about the meeting";
+        app.remember_result(pasted, pasted, Some(&dictation_prepared_text(pasted)))?;
+        {
+            let state = app.lock_state()?;
+            let learning = state.edit_learning.as_ref().expect("armed after paste");
+            assert_eq!(learning.pasted_text, pasted);
+            assert_eq!(learning.capture_at, None);
+        }
+
+        // The first backspace marks the quality flag and schedules a capture.
+        app.handle_post_insert_edit("backspace")?;
+        let first_deadline = {
+            let state = app.lock_state()?;
+            assert!(state.post_insert_watch.is_none());
+            assert_eq!(
+                state.history.front().map(|entry| entry.edited_after_insert),
+                Some(true)
+            );
+            let learning = state.edit_learning.as_ref().expect("still armed");
+            let deadline = learning.capture_at.expect("capture scheduled");
+            assert!(deadline > std::time::Instant::now());
+            deadline
+        };
+
+        // Consecutive backspaces push the deadline: one capture, not many.
+        app.handle_post_insert_edit("backspace")?;
+        {
+            let state = app.lock_state()?;
+            let learning = state.edit_learning.as_ref().expect("still armed");
+            let pushed = learning.capture_at.expect("capture still scheduled");
+            assert!(pushed >= first_deadline);
+        }
+
+        // Cmd+A cancels the observation: whole-selection retypes are too
+        // noisy to learn from.
+        app.handle_post_insert_edit("cmd_a")?;
+        assert_eq!(app.lock_state()?.edit_learning, None);
+        Ok(())
+    }
+
+    #[test]
+    fn a_newer_dictation_replaces_the_learning_observation() -> Result<(), AppError> {
+        let app = edit_learning_test_app(Vec::new(), Vec::new(), Vec::new());
+        app.remember_result("raw", "first dictation", Some(&dictation_prepared_text("first dictation")))?;
+        app.remember_result(
+            "raw",
+            "second dictation",
+            Some(&dictation_prepared_text("second dictation")),
+        )?;
+        {
+            let state = app.lock_state()?;
+            let learning = state.edit_learning.as_ref().expect("re-armed");
+            assert_eq!(learning.pasted_text, "second dictation");
+            assert_eq!(learning.capture_at, None);
+        }
+
+        // Command pastes reuse remember_result but never arm or replace the
+        // learning observation: only dictation inserts do.
+        app.remember_result("raw", "command text", None)?;
+        let state = app.lock_state()?;
+        assert_eq!(
+            state.edit_learning.as_ref().expect("unchanged").pasted_text,
+            "second dictation"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn edit_learning_capture_exercises_the_live_pipeline_when_gated() {
+        // The capture reads the real focused app through the accessibility
+        // helper, so it only runs when BOLO_DAEMON_AX_TESTS=1 opts in, the
+        // same gate the mutating daemon protocol tests use.
+        if env::var("BOLO_DAEMON_AX_TESTS").as_deref() != Ok("1") {
+            eprintln!("skipped: set BOLO_DAEMON_AX_TESTS=1 to exercise the live capture");
+            return;
+        }
+        let app = edit_learning_test_app(Vec::new(), Vec::new(), Vec::new());
+        // With nothing observed the debounce loop exits immediately.
+        app.run_edit_learning_capture(std::time::Instant::now());
+        // The full live pass: one context read, one diff, learn or skip.
+        app.finish_edit_learning_capture(EditLearningClaim {
+            pasted_text: String::from("zzbolo gate sentinel zzq with enough words to align"),
+            inserted_at: std::time::Instant::now(),
+        });
     }
 }
