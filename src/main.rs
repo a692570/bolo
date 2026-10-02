@@ -669,16 +669,26 @@ impl StreamingRecording {
                             vocabulary,
                             receiver,
                             thread_result,
-                            preview_proxy,
+                            preview_proxy.clone(),
                         )
                         .await
                         {
                             warn!("streaming STT failed: {error}");
+                            // Whatever failed, the overlay must not sit in
+                            // its connecting phase for a session that can
+                            // never produce transcripts; capture is live
+                            // either way, so the REC cue is honest.
+                            if let Some(proxy) = preview_proxy.as_ref() {
+                                drop(proxy.send_event(UserEvent::OverlayLive));
+                            }
                             set_streaming_error(&error_result, error);
                         }
                     }),
                     Err(error) => {
                         warn!("streaming runtime failed: {error}");
+                        if let Some(proxy) = preview_proxy.as_ref() {
+                            drop(proxy.send_event(UserEvent::OverlayLive));
+                        }
                         set_streaming_error(&error_result, error.to_string());
                     }
                 }
@@ -1357,6 +1367,13 @@ async fn run_stt_stream(
     let (socket, _response) =
         handshake_with_deadline(connect, STREAMING_HANDSHAKE_DEADLINE, &result).await?;
     info!("[stt] streaming_connected {}", provider.label());
+    // The overlay leaves its connecting phase once transcripts can
+    // actually flow; failure paths promote from the thread wrapper so the
+    // cue never hangs on a session that died before or during the
+    // handshake.
+    if let Some(proxy) = preview_proxy.as_ref() {
+        drop(proxy.send_event(UserEvent::OverlayLive));
+    }
     let (mut write, mut read) = socket.split();
     let mut input_closed = false;
     let mut close_sent = false;
@@ -1659,6 +1676,9 @@ impl std::fmt::Debug for App {
 enum UserEvent {
     Menu(MenuEvent),
     Overlay(OverlayPhase),
+    /// The streaming preview's handshake settled (connected or dead):
+    /// promote a connecting-phase overlay to the live REC cue.
+    OverlayLive,
     OverlayPreview(String),
     HideOverlay,
     HideOverlayAfter(Duration),
@@ -1671,6 +1691,10 @@ enum UserEvent {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum OverlayPhase {
+    /// Capture is live but the streaming preview WebSocket has not finished
+    /// its handshake: the overlay shows a dimmed connecting cue instead of
+    /// the REC dot, so the cue never claims audio the stream cannot transcribe.
+    Connecting,
     Dictating,
     Thinking,
     Inserting,
@@ -1681,7 +1705,7 @@ enum OverlayPhase {
 impl OverlayPhase {
     const fn tray_title(self) -> &'static str {
         match self {
-            Self::Dictating => "Bolo Dictating",
+            Self::Connecting | Self::Dictating => "Bolo Dictating",
             Self::Thinking => "Bolo Thinking",
             Self::Inserting => "Bolo Inserting",
             Self::Copied => "Bolo Copied",
@@ -1691,6 +1715,7 @@ impl OverlayPhase {
 
     const fn overlay_phase(self) -> &'static str {
         match self {
+            Self::Connecting => "connecting",
             Self::Dictating => "dictating",
             Self::Thinking => "thinking",
             Self::Inserting => "inserting",
@@ -2146,6 +2171,7 @@ fn run_app_event_loop(app: Arc<App>) -> Result<(), AppError> {
 
     let mut tray_ui: Option<TrayUi> = None;
     let mut native_overlay: Option<NativeOverlay> = None;
+    let mut native_overlay_phase: Option<OverlayPhase> = None;
     let mut onboarding_window: Option<AppWindow> = None;
     let mut status_window: Option<AppWindow> = None;
     let mut onboarding_try_it_complete = false;
@@ -2196,6 +2222,7 @@ fn run_app_event_loop(app: Arc<App>) -> Result<(), AppError> {
             TaoEvent::UserEvent(UserEvent::Overlay(phase)) => {
                 overlay_hide_at = None;
                 *control_flow = ControlFlow::Wait;
+                native_overlay_phase = Some(phase);
                 if let Err(error) =
                     show_native_overlay(&mut native_overlay, &app.config.root_dir, phase, None)
                 {
@@ -2205,9 +2232,32 @@ fn run_app_event_loop(app: Arc<App>) -> Result<(), AppError> {
                     ui.tray_icon.set_title(Some(phase.tray_title()));
                 }
             }
+            TaoEvent::UserEvent(UserEvent::OverlayLive) => {
+                // Promote only while the overlay still shows its connecting
+                // phase: a release (Thinking and after) or a later phase
+                // must never regress back to the REC cue.
+                if native_overlay_phase.is_some_and(|phase| phase == OverlayPhase::Connecting) {
+                    overlay_hide_at = None;
+                    *control_flow = ControlFlow::Wait;
+                    native_overlay_phase = Some(OverlayPhase::Dictating);
+                    if let Err(error) = show_native_overlay(
+                        &mut native_overlay,
+                        &app.config.root_dir,
+                        OverlayPhase::Dictating,
+                        None,
+                    ) {
+                        error!("{error}");
+                    }
+                    if let Some(ui) = tray_ui.as_ref() {
+                        ui.tray_icon
+                            .set_title(Some(OverlayPhase::Dictating.tray_title()));
+                    }
+                }
+            }
             TaoEvent::UserEvent(UserEvent::OverlayPreview(preview)) => {
                 overlay_hide_at = None;
                 *control_flow = ControlFlow::Wait;
+                native_overlay_phase = Some(OverlayPhase::Dictating);
                 if let Err(error) = show_native_overlay(
                     &mut native_overlay,
                     &app.config.root_dir,
@@ -2219,6 +2269,7 @@ fn run_app_event_loop(app: Arc<App>) -> Result<(), AppError> {
             }
             TaoEvent::UserEvent(UserEvent::HideOverlay) => {
                 overlay_hide_at = None;
+                native_overlay_phase = None;
                 *control_flow = ControlFlow::Wait;
                 hide_native_overlay(&mut native_overlay);
                 if let Some(ui) = tray_ui.as_ref() {
@@ -2356,6 +2407,7 @@ impl App {
     }
 
     fn handle_press(&self) -> Result<(), AppError> {
+        let pressed_at = Instant::now();
         let selected_microphone = {
             let mut state = self.lock_state()?;
             if state.recording_fsm.handle(RecordingEvent::Press) != RecordingCommand::StartRecording
@@ -2364,20 +2416,15 @@ impl App {
             }
             state.selected_microphone.clone()
         };
-        let streaming = self.start_streaming_recording();
-        let streaming_sender = streaming
-            .as_ref()
-            .and_then(|recording| recording.sender.as_ref().cloned());
-        // The upload feed opens before the capture stream is built so the
-        // audio callback tees chunks into the Dictation request body from
-        // the first captured buffer; the receiver waits for the capture
-        // sample rate before the upload thread can be spawned.
-        let (upload_sender, upload_receiver) = self.open_dictation_upload_feed();
-        let mut recording = match start_recording(
-            selected_microphone.as_deref(),
-            streaming_sender,
-            upload_sender,
-        ) {
+        // Capture is the first meaningful action at press: the measured gap
+        // from hotkey to first captured frame was ~220ms, and every wire
+        // consumer used to open before the input stream was built, so any
+        // of that setup directly delayed (or ate) the user's first word.
+        // The hub buffers every captured frame until the consumers attach,
+        // so all of the setup below runs after capture with nothing lost.
+        let hub = Arc::new(AudioHub::new(pressed_at));
+        let mut recording = match start_recording(selected_microphone.as_deref(), Arc::clone(&hub))
+        {
             Ok(recording) => recording,
             Err(error) => {
                 let mut state = self.lock_state()?;
@@ -2389,16 +2436,37 @@ impl App {
                 return Err(error);
             }
         };
-        recording.streaming = streaming;
+        let streaming = self.start_streaming_recording(&hub, recording.sample_rate);
+        // Whether the press handler can expect a promote event from the
+        // streaming thread once its handshake settles; decided here
+        // because `streaming` moves into the recording below.
+        let streaming_live = streaming.is_some();
+        let (upload_sender, upload_receiver) = self.open_dictation_upload_feed();
+        if let Some(sender) = upload_sender {
+            hub.attach("dictation_upload", sender, recording.sample_rate);
+        }
         recording.upload = self.start_dictation_upload(upload_receiver, recording.sample_rate);
+        hub.seal();
         recording.warmup = self.start_dictation_warmup();
+        recording.streaming = streaming;
         {
             let mut state = self.lock_state()?;
             state.active = Some(recording);
         }
         info!("recording started");
         play_sound("Tink");
-        self.send_user_event(UserEvent::Overlay(OverlayPhase::Dictating));
+        // With a live streaming preview, the overlay starts in its
+        // connecting phase and the streaming thread promotes it to the REC
+        // cue once the WebSocket handshake settles (connected or dead; the
+        // capture is live either way). No streaming session means no
+        // promote event is coming, so the overlay shows the REC cue
+        // directly.
+        let phase = if streaming_live {
+            OverlayPhase::Connecting
+        } else {
+            OverlayPhase::Dictating
+        };
+        self.send_user_event(UserEvent::Overlay(phase));
         Ok(())
     }
 
@@ -2750,7 +2818,11 @@ impl App {
         SttRequestParts::new(&self.config.stt_model, &language, &vocabulary)
     }
 
-    fn start_streaming_recording(&self) -> Option<StreamingRecording> {
+    fn start_streaming_recording(
+        &self,
+        hub: &AudioHub,
+        sample_rate: u32,
+    ) -> Option<StreamingRecording> {
         let provider = self.config.streaming_stt?;
         let api_key = match provider {
             StreamingProvider::AssemblyAiDirect => load_env_value("ASSEMBLYAI_API_KEY"),
@@ -2777,13 +2849,15 @@ impl App {
         if preview_only_streaming(&self.config.stt_model, self.config.streaming_stt) {
             info!("[stt] preview_stream_active");
         }
-        Some(StreamingRecording::start(
-            api_key,
-            provider,
-            language,
-            vocabulary,
-            preview_proxy,
-        ))
+        let recording =
+            StreamingRecording::start(api_key, provider, language, vocabulary, preview_proxy);
+        // The preview opens after capture is already live; the hub replays
+        // everything captured so far so the stream starts with the user's
+        // first word, not mid-sentence.
+        if let Some(sender) = recording.sender.as_ref().cloned() {
+            hub.attach("streaming_preview", sender, sample_rate);
+        }
+        Some(recording)
     }
 
     /// Whether the streamed Dictation upload runs alongside the preview
@@ -2795,13 +2869,14 @@ impl App {
             && load_env_value("ASSEMBLYAI_API_KEY").is_some()
     }
 
-    /// Open the feed channel for the streamed Dictation upload, ahead of the
-    /// capture stream being built, so the audio callback tees chunks into
-    /// the request body from the first captured buffer. Both halves are
-    /// None when the composition does not stream the upload. The sender
-    /// must reach `start_recording` before the receiver can be handed to the
-    /// upload thread, because only then is the capture sample rate known
-    /// for the PCM config.
+    /// Open the feed channel for the streamed Dictation upload. The feed
+    /// opens after capture is already live; the hub replays the buffered
+    /// backlog into the sink at attach, so the request body still carries
+    /// the recording from the first captured frame. Both halves are None
+    /// when the composition does not stream the upload. The sender must
+    /// reach the hub before the receiver can be handed to the upload
+    /// thread, because only then is the capture sample rate known for the
+    /// PCM config.
     fn open_dictation_upload_feed(&self) -> DictationUploadFeed {
         if !self.dictation_upload_enabled() {
             return (None, None);
@@ -4766,8 +4841,7 @@ impl StreamingProvider {
 
 fn start_recording(
     selected_microphone: Option<&str>,
-    streaming_sender: Option<mpsc::Sender<Vec<i16>>>,
-    upload_sender: Option<mpsc::Sender<Vec<i16>>>,
+    hub: Arc<AudioHub>,
 ) -> Result<ActiveRecording, AppError> {
     let host = cpal::default_host();
     let device = select_input_device(&host, selected_microphone)?;
@@ -4785,30 +4859,15 @@ fn start_recording(
         supported.sample_format()
     );
     let stream = match supported.sample_format() {
-        SampleFormat::I16 => build_stream::<i16>(
-            &device,
-            &config,
-            channels,
-            Arc::clone(&samples),
-            streaming_sender,
-            upload_sender,
-        )?,
-        SampleFormat::F32 => build_stream::<f32>(
-            &device,
-            &config,
-            channels,
-            Arc::clone(&samples),
-            streaming_sender,
-            upload_sender,
-        )?,
-        SampleFormat::U16 => build_stream::<u16>(
-            &device,
-            &config,
-            channels,
-            Arc::clone(&samples),
-            streaming_sender,
-            upload_sender,
-        )?,
+        SampleFormat::I16 => {
+            build_stream::<i16>(&device, &config, channels, Arc::clone(&samples), hub)?
+        }
+        SampleFormat::F32 => {
+            build_stream::<f32>(&device, &config, channels, Arc::clone(&samples), hub)?
+        }
+        SampleFormat::U16 => {
+            build_stream::<u16>(&device, &config, channels, Arc::clone(&samples), hub)?
+        }
         other @ (SampleFormat::I8
         | SampleFormat::I24
         | SampleFormat::I32
@@ -5717,10 +5776,18 @@ struct AppWindowPayload {
     title: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     welcome: String,
+    /// Brand row wordmark (for example "BOLO"); absent rows render without
+    /// the brand row, which keeps older helpers compatible.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    brand: Option<String>,
     rows: Vec<WindowRow>,
     button: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     try_it_index: Option<usize>,
+    /// Emphasized try-it instruction line, sent only when every earlier row
+    /// is already green so the try-it step is the one thing left to do.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    try_it_hero: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     key_entry: Option<KeyEntrySpec>,
     write_marker: bool,
@@ -5791,31 +5858,49 @@ fn key_entry_spec(missing: Option<&str>) -> Option<KeyEntrySpec> {
 }
 
 /// Detail text for the speech-to-text row while the key-entry field is
-/// visible; the row itself tells the user what to do with the field.
+/// visible; a plain line, the placeholder and the field itself carry the
+/// instruction.
 fn key_entry_row_detail() -> String {
-    String::from(
-        "Paste your AssemblyAI API key below, then click Validate. Get one at \
-         assemblyai.com/dashboard.",
-    )
+    String::from("Paste your AssemblyAI API key.")
 }
 
-/// Provider and key row text; `missing` comes from `Config::missing_required_key`
-/// and names the exact environment variable to add when absent. When the
-/// missing key is the `AssemblyAI` key, the window shows the entry field and
-/// this detail explains it instead of pointing at a file the user cannot
-/// edit without a terminal.
+/// Provider and key row detail; `missing` comes from
+/// `Config::missing_required_key` and names the exact environment variable
+/// to add when absent. The bundle flow defaults to the `AssemblyAI` key:
+/// present keys get the plain connected line, a missing `AssemblyAI` key
+/// gets the entry field with a plain instruction. Other missing keys (only
+/// possible on source installs) keep the file-path fix line because no
+/// entry field is shown for them.
 fn onboarding_provider_key_detail(missing: Option<&str>) -> String {
     if key_entry_spec(missing).is_some() {
         return key_entry_row_detail();
     }
     missing.map_or_else(
-        || String::from("Required API key present in ~/.bolo/env."),
+        || String::from("Connected to AssemblyAI."),
         |key| format!("Missing {key}. Add it to ~/.bolo/env, then run ./restart.sh."),
     )
 }
 
 fn onboarding_try_it_detail(hotkey: &str) -> String {
     format!("Hold {} and say a sentence.", human_readable_hotkey(hotkey))
+}
+
+/// Emphasized try-it instruction shown when every earlier row is green:
+/// the try-it step is the one thing left, so the window calls it out and
+/// tells the user what a completed capture looks like.
+fn onboarding_try_it_hero(hotkey: &str) -> String {
+    format!(
+        "Hold {} and say a sentence. This window will stay open, and the dot turns \
+         green when you're done.",
+        human_readable_hotkey(hotkey)
+    )
+}
+
+/// Try-it detail line after the first captured dictation; the user is set
+/// up at this point, so the line says so instead of restating the
+/// instruction.
+fn onboarding_try_it_done_detail() -> String {
+    String::from("First dictation captured. You're set.")
 }
 
 /// Rows for the status window: version, resolved provider and streaming
@@ -5993,7 +6078,7 @@ fn onboarding_window_payload(app: &App, write_marker: bool) -> Result<String, Ap
     let accessibility = match accessibility_trust(&app.config.root_dir, false) {
         AccessibilityTrust::Trusted => WindowRow::new(
             "Accessibility",
-            String::from("Granted for the paste helper."),
+            String::from("Bolo needs Accessibility to type for you."),
             "ok",
         ),
         AccessibilityTrust::Untrusted => WindowRow::new(
@@ -6018,28 +6103,38 @@ fn onboarding_window_payload(app: &App, write_marker: bool) -> Result<String, Ap
         if microphone_count == 0 { "warn" } else { "ok" },
     );
     let missing = app.config.missing_required_key();
-    let streaming = streaming_status_label(app.config.streaming_stt);
     let provider = WindowRow::new(
         "Speech to text",
-        format!("{streaming}. {}", onboarding_provider_key_detail(missing)),
+        onboarding_provider_key_detail(missing),
         if missing.is_some() { "warn" } else { "ok" },
     );
+    // The try-it step is the hero when everything above it is green: a
+    // bigger label and the brighter instruction line tell the user the one
+    // remaining action. Any warn row above keeps the plain detail so the
+    // fix instructions own the attention.
+    let earlier_rows_ok = [&accessibility, &microphones, &provider]
+        .iter()
+        .all(|row| row.state == "ok");
+    let try_it_detail = if earlier_rows_ok {
+        onboarding_try_it_hero(&app.config.hotkey)
+    } else {
+        onboarding_try_it_detail(&app.config.hotkey)
+    };
+    let try_it_hero = earlier_rows_ok.then(|| try_it_detail.clone());
     let payload = AppWindowPayload {
         mode: String::from("onboarding"),
         title: String::from("Set up Bolo"),
         welcome: String::from(onboarding_welcome()),
+        brand: Some(String::from("BOLO")),
         rows: vec![
             accessibility,
             microphones,
             provider,
-            WindowRow::new(
-                "Try it",
-                onboarding_try_it_detail(&app.config.hotkey),
-                "pending",
-            ),
+            WindowRow::new("Try it", try_it_detail, "pending"),
         ],
         button: String::from("Done"),
         try_it_index: Some(3),
+        try_it_hero,
         key_entry: key_entry_spec(missing),
         write_marker,
     };
@@ -6056,6 +6151,7 @@ fn status_window_payload(app: &App) -> Result<String, AppError> {
         mode: String::from("status"),
         title: String::from("Bolo status"),
         welcome: String::new(),
+        brand: Some(String::from("BOLO")),
         rows: status_rows(
             env!("CARGO_PKG_VERSION"),
             streaming_status_label(app.config.streaming_stt),
@@ -6064,6 +6160,7 @@ fn status_window_payload(app: &App) -> Result<String, AppError> {
         ),
         button: String::from("Close"),
         try_it_index: None,
+        try_it_hero: None,
         key_entry: None,
         write_marker: false,
     };
@@ -6158,7 +6255,7 @@ fn mark_onboarding_try_it_complete(
     *try_it_complete = true;
     let update = serde_json::json!({
         "try_it_complete": true,
-        "detail": "First dictation captured.",
+        "detail": onboarding_try_it_done_detail(),
     });
     if let Err(error) = window.send_line(&update.to_string()) {
         warn!("onboarding try-it update failed: {error}");
@@ -6196,25 +6293,15 @@ fn build_stream<T>(
     config: &StreamConfig,
     channels: usize,
     samples: Arc<Mutex<Vec<i16>>>,
-    streaming_sender: Option<mpsc::Sender<Vec<i16>>>,
-    upload_sender: Option<mpsc::Sender<Vec<i16>>>,
+    hub: Arc<AudioHub>,
 ) -> Result<Stream, AppError>
 where
     T: Sample + SizedSample,
     i16: FromSample<T>,
 {
-    // AssemblyAI's v3 streaming spec requires 50-1000ms per binary chunk and
-    // rejects the final chunk at session teardown when it is shorter (observed
-    // 2026-10-02: a 20ms chunk drew "Input Duration Violation"). 60ms sits
-    // inside the accepted range with margin on either side; the same chunk size
-    // feeds the dictation upload, where byte framing is unrestricted.
-    let chunk_samples = usize::try_from(config.sample_rate * 3 / 50)
-        .map_err(|error| AppError::AudioStream(error.to_string()))?
-        .max(1);
-    let mut streaming_chunker =
-        streaming_sender.map(|sender| StreamingAudioChunker::new(sender, chunk_samples));
-    let mut upload_chunker =
-        upload_sender.map(|sender| StreamingAudioChunker::new(sender, chunk_samples));
+    // The chunkers live inside the hub: capture starts before the wire
+    // consumers exist, and the hub replays the buffered backlog into each
+    // sink as it attaches (chunk size: see `chunk_samples_for`).
     device
         .build_input_stream(
             config,
@@ -6228,12 +6315,7 @@ where
                 if let Ok(mut guard) = samples.try_lock() {
                     guard.extend(mono.iter().copied());
                 }
-                if let Some(chunker) = streaming_chunker.as_mut() {
-                    chunker.push(&mono);
-                }
-                if let Some(chunker) = upload_chunker.as_mut() {
-                    chunker.push(&mono);
-                }
+                hub.on_audio(&mono);
             },
             |error| {
                 warn!("audio callback failed: {error}");
@@ -6280,6 +6362,122 @@ impl Drop for StreamingAudioChunker {
             let chunk = std::mem::take(&mut self.buffer);
             drop(self.sender.send(chunk));
         }
+    }
+}
+
+/// Wire chunk size shared by the streaming preview and the streamed
+/// Dictation upload: `AssemblyAI`'s v3 streaming spec requires 50-1000ms per
+/// binary chunk and rejects the final chunk at session teardown when it is
+/// shorter (observed 2026-10-02: a 20ms chunk drew "Input Duration
+/// Violation"). 60ms sits inside the accepted range with margin on either
+/// side; the same chunk size feeds the dictation upload, where byte
+/// framing is unrestricted.
+fn chunk_samples_for(sample_rate: u32) -> usize {
+    usize::try_from(sample_rate.max(1) * 3 / 50)
+        .unwrap_or(1)
+        .max(1)
+}
+
+/// Tee between the cpal audio callback and the wire consumers (the
+/// streaming preview WebSocket and the streamed Dictation upload).
+/// Capture starts before either consumer exists, so every frame captured
+/// before a sink attaches is buffered in the backlog and replayed into the
+/// sink at attach time: each consumer receives the whole recording from
+/// the first captured frame regardless of when it opens, which is what
+/// keeps the press-to-capture reorder from cutting the user's first word.
+struct AudioHub {
+    state: Mutex<HubState>,
+}
+
+struct HubState {
+    /// One chunker per attached consumer; each owns that consumer's wire
+    /// sender.
+    sinks: Vec<StreamingAudioChunker>,
+    /// Mono frames captured while `buffering`; replayed into each sink at
+    /// attach, freed once the press handler seals the hub.
+    backlog: Vec<i16>,
+    buffering: bool,
+    press_at: Instant,
+    first_frame_logged: bool,
+}
+
+impl AudioHub {
+    const fn new(press_at: Instant) -> Self {
+        Self {
+            state: Mutex::new(HubState {
+                sinks: Vec::new(),
+                backlog: Vec::new(),
+                buffering: true,
+                press_at,
+                first_frame_logged: false,
+            }),
+        }
+    }
+
+    /// Feed one mono callback buffer: log the first frame after the press,
+    /// keep buffering while sinks are still expected, and tee into every
+    /// attached sink. Called on the audio thread; the hub lock is only ever
+    /// held for channel sends and a Vec extend, matching the allocation
+    /// cost the callback already pays.
+    fn on_audio(&self, mono: &[i16]) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        if !state.first_frame_logged {
+            state.first_frame_logged = true;
+            info!(
+                "[warmup] press_to_first_frame_ms {}",
+                state.press_at.elapsed().as_millis()
+            );
+        }
+        if state.buffering {
+            state.backlog.extend_from_slice(mono);
+        }
+        for sink in &mut state.sinks {
+            sink.push(mono);
+        }
+    }
+
+    /// Attach one wire consumer. The backlog captured so far is replayed
+    /// through the fresh chunker under the same lock the callback tees
+    /// under, so the consumer sees the backlog in order followed by live
+    /// audio with no frame gaps or duplicates. `label` only names the sink
+    /// in the log line that records how much audio the consumer opened
+    /// late.
+    fn attach(&self, label: &str, sender: mpsc::Sender<Vec<i16>>, sample_rate: u32) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        // The backlog stays buffered for any later-attaching sink; this
+        // sink replays a copy, so every consumer sees the full recording
+        // from the first captured frame.
+        let backlog = state.backlog.clone();
+        let replay_ms = u64::try_from(backlog.len())
+            .unwrap_or(u64::MAX)
+            .saturating_mul(1_000)
+            .checked_div(u64::from(sample_rate.max(1)))
+            .unwrap_or_default();
+        let mut sink = StreamingAudioChunker::new(sender, chunk_samples_for(sample_rate));
+        sink.push(&backlog);
+        info!(
+            "[warmup] sink_attached {}",
+            serde_json::json!({
+                "sink": label,
+                "backlog_ms": replay_ms,
+                "backlog_samples": backlog.len(),
+            })
+        );
+        state.sinks.push(sink);
+    }
+
+    /// End the attach window: the press handler has attached every sink it
+    /// is going to attach, so stop buffering and free the backlog.
+    fn seal(&self) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        state.buffering = false;
+        state.backlog = Vec::new();
     }
 }
 
@@ -9864,37 +10062,39 @@ mod tests {
         ACCESS_DAEMON_ACTION_TIMEOUT, ACCESS_DAEMON_QUERY_TIMEOUT, ACCESS_DAEMON_STARTUP_TIMEOUT,
         ASSEMBLYAI_STREAMING_MODEL, AccessDaemonFailure, AccessDaemonRequest, AccessibilityContext,
         AccessibilityTrust, App, AppError, AppState, AppWindowPayload, AssemblyDictationResponse,
-        BatchRetry, CleanupMode, CleanupProfile, Config, CorrectionOutcome, DictationCommandKind,
-        DictationUploadReader, DictationUploadRelease, DictationWarmup, EditLearningClaim,
-        KeyEntrySpec, LearnedVocabulary, OnboardingStatus, PreparedText, PromptBinding,
-        STREAMING_DRAIN_MIN, STT_RETRY_SAMPLE_RATE, StreamingConnectionState, StreamingProvider,
-        StreamingRecording, StreamingText, StreamingTranscript, SttFallback, SttResult,
-        TRANSCRIPT_HISTORY_LIMIT, TextReplacement, TranscriptHistoryEntry, UpdateNotice,
+        AudioHub, BatchRetry, CleanupMode, CleanupProfile, Config, CorrectionOutcome,
+        DictationCommandKind, DictationUploadReader, DictationUploadRelease, DictationWarmup,
+        EditLearningClaim, KeyEntrySpec, LearnedVocabulary, OnboardingStatus, PreparedText,
+        PromptBinding, STREAMING_DRAIN_MIN, STT_RETRY_SAMPLE_RATE, StreamingConnectionState,
+        StreamingProvider, StreamingRecording, StreamingText, StreamingTranscript, SttFallback,
+        SttResult, TRANSCRIPT_HISTORY_LIMIT, TextReplacement, TranscriptHistoryEntry, UpdateNotice,
         UpdateOutcome, WindowRow, accessibility_fix_detail, apply_text_replacements,
         apply_vocabulary_corrections_with_matches, assemblyai_direct_query_with,
         assemblyai_language_code, batch_retry_plan, build_cleanup_user_content,
-        build_rewrite_user_content, build_stt_prompt, canonicalize_known_terms, cleanup_decision,
-        cleanup_max_tokens, cleanup_profile, contains_word_verbatim, derive_word_correction,
-        dictation_upload_config, dictation_upload_form, dictation_upload_release,
-        dictation_upload_request_timeout, downsample_wav_16k_mono, empty_transcript_error,
-        enforce_learned_vocabulary_cap, final_streaming_result_is_ready_elapsed,
-        finalize_accessibility_context, handshake_with_deadline, is_known_no_speech_transcript,
-        is_supported_hotkey, key_entry_spec, load_learned_vocabulary, load_vocabulary_usage,
+        build_rewrite_user_content, build_stt_prompt, canonicalize_known_terms, chunk_samples_for,
+        cleanup_decision, cleanup_max_tokens, cleanup_profile, contains_word_verbatim,
+        derive_word_correction, dictation_upload_config, dictation_upload_form,
+        dictation_upload_release, dictation_upload_request_timeout, downsample_wav_16k_mono,
+        empty_transcript_error, enforce_learned_vocabulary_cap,
+        final_streaming_result_is_ready_elapsed, finalize_accessibility_context,
+        handshake_with_deadline, is_known_no_speech_transcript, is_supported_hotkey,
+        key_entry_row_detail, key_entry_spec, load_learned_vocabulary, load_vocabulary_usage,
         load_vocabulary_with_learned, microphone_detail, non_empty_transcript,
         onboarding_provider_key_detail, onboarding_status_at, onboarding_try_it_detail,
-        parse_accessibility_trust, parse_command, parse_daemon_context_reply,
-        parse_daemon_paste_reply, parse_daemon_select_reply, parse_daemon_trust_reply,
-        parse_latest_release, parse_release_version, parse_replacements_json, parse_stt_fallbacks,
-        parse_u64_env_value, parse_update_outcome, parse_wav_pcm16, pcm_bytes,
-        preview_only_streaming, preview_release_stt, read_vocabulary_file,
-        read_vocabulary_usage_file, record_learned_correction, remove_fillers,
-        request_accessibility_daemon, retry_failed_primary, sanitize_transcript_history,
-        speech_stats, stable_streaming_best_is_ready_elapsed, status_rows,
-        streaming_batch_fallback_reason, streaming_connection, streaming_preview_tail,
-        streaming_provider_from_config, streaming_status_label, strip_reasoning_tags,
-        stt_language_for_model, stt_model_config, telnyx_stream_query, transcript_log_value,
-        transcript_menu_preview, upsert_learned_correction, version_is_newer,
-        wait_for_daemon_reply, wav_bytes, wav_duration_ms,
+        onboarding_try_it_done_detail, onboarding_try_it_hero, parse_accessibility_trust,
+        parse_command, parse_daemon_context_reply, parse_daemon_paste_reply,
+        parse_daemon_select_reply, parse_daemon_trust_reply, parse_latest_release,
+        parse_release_version, parse_replacements_json, parse_stt_fallbacks, parse_u64_env_value,
+        parse_update_outcome, parse_wav_pcm16, pcm_bytes, preview_only_streaming,
+        preview_release_stt, read_vocabulary_file, read_vocabulary_usage_file,
+        record_learned_correction, remove_fillers, request_accessibility_daemon,
+        retry_failed_primary, sanitize_transcript_history, speech_stats,
+        stable_streaming_best_is_ready_elapsed, status_rows, streaming_batch_fallback_reason,
+        streaming_connection, streaming_preview_tail, streaming_provider_from_config,
+        streaming_status_label, strip_reasoning_tags, stt_language_for_model, stt_model_config,
+        telnyx_stream_query, transcript_log_value, transcript_menu_preview,
+        upsert_learned_correction, version_is_newer, wait_for_daemon_reply, wav_bytes,
+        wav_duration_ms,
     };
     use std::collections::{HashMap, VecDeque};
     use std::io::Read as _;
@@ -9971,11 +10171,10 @@ mod tests {
     #[test]
     fn onboarding_provider_key_row_names_the_exact_missing_var() {
         // The missing AssemblyAI key gets the in-window entry field instead
-        // of a file instruction.
+        // of a file instruction, with a plain one-line ask.
         assert_eq!(
             onboarding_provider_key_detail(Some("ASSEMBLYAI_API_KEY")),
-            "Paste your AssemblyAI API key below, then click Validate. Get one at \
-             assemblyai.com/dashboard."
+            "Paste your AssemblyAI API key."
         );
         assert_eq!(
             onboarding_provider_key_detail(Some("TELNYX_API_KEY")),
@@ -9983,7 +10182,7 @@ mod tests {
         );
         assert_eq!(
             onboarding_provider_key_detail(None),
-            "Required API key present in ~/.bolo/env."
+            "Connected to AssemblyAI."
         );
     }
 
@@ -10081,9 +10280,11 @@ mod tests {
             mode: String::from("onboarding"),
             title: String::from("Set up Bolo"),
             welcome: String::new(),
+            brand: None,
             rows,
             button: String::from("Done"),
             try_it_index: None,
+            try_it_hero: None,
             key_entry: Some(KeyEntrySpec {
                 index: 2,
                 placeholder: String::from("Paste your AssemblyAI API key"),
@@ -10094,6 +10295,8 @@ mod tests {
         assert!(json.contains("\"key_entry\":{\"index\":2"));
         assert!(json.contains("\"write_marker\":true"));
         assert!(!json.contains("\"try_it_index\""));
+        assert!(!json.contains("\"brand\""));
+        assert!(!json.contains("\"try_it_hero\""));
 
         payload.key_entry = None;
         let json_without_entry = serde_json::to_string(&payload).expect("payload json");
@@ -10111,14 +10314,36 @@ mod tests {
 
     #[test]
     fn onboarding_provider_key_detail_switches_for_key_entry() {
-        assert!(onboarding_provider_key_detail(Some("ASSEMBLYAI_API_KEY")).contains("Validate"));
+        assert!(onboarding_provider_key_detail(Some("ASSEMBLYAI_API_KEY")).contains("Paste"));
         assert_eq!(
             onboarding_provider_key_detail(Some("TELNYX_API_KEY")),
             "Missing TELNYX_API_KEY. Add it to ~/.bolo/env, then run ./restart.sh."
         );
         assert_eq!(
             onboarding_provider_key_detail(None),
-            "Required API key present in ~/.bolo/env."
+            "Connected to AssemblyAI."
+        );
+    }
+
+    #[test]
+    fn key_entry_row_detail_is_the_plain_paste_line() {
+        assert_eq!(key_entry_row_detail(), "Paste your AssemblyAI API key.");
+    }
+
+    #[test]
+    fn onboarding_try_it_lines_cover_hero_and_done() {
+        assert_eq!(
+            onboarding_try_it_detail("left_option"),
+            "Hold Left Option and say a sentence."
+        );
+        let hero = onboarding_try_it_hero("left_option");
+        assert!(
+            hero.starts_with("Hold Left Option and say a sentence. This window will stay open")
+        );
+        assert!(hero.contains("the dot turns green when you're done."));
+        assert_eq!(
+            onboarding_try_it_done_detail(),
+            "First dictation captured. You're set."
         );
     }
 
@@ -13174,6 +13399,77 @@ mod tests {
         assert_eq!(text, "final streaming text");
         assert_eq!(source, "final");
         assert!(started.elapsed() >= STREAMING_DRAIN_MIN);
+    }
+
+    // ==== Audio hub (press-to-capture backlog replay) ====
+
+    fn hub_samples(receiver: &mpsc::Receiver<Vec<i16>>) -> Vec<i16> {
+        let mut all = Vec::new();
+        while let Ok(chunk) = receiver.try_recv() {
+            all.extend(chunk);
+        }
+        all
+    }
+
+    #[test]
+    fn audio_hub_replays_the_backlog_into_a_late_sink() {
+        // Capture starts before the wire consumers exist: everything the
+        // callback captured while the sink was pending must reach the sink
+        // in order, ahead of the frames captured after it attached.
+        let hub = AudioHub::new(std::time::Instant::now());
+        hub.on_audio(&(1..=60).collect::<Vec<_>>());
+        let (sender, receiver) = mpsc::channel();
+        hub.attach("streaming_preview", sender, 1_000);
+        hub.on_audio(&(61..=90).collect::<Vec<_>>());
+        drop(hub); // flushes the chunker's partial chunk
+
+        assert_eq!(
+            hub_samples(&receiver),
+            (1..=90).collect::<Vec<_>>(),
+            "late sink must see the backlog then live audio, in order"
+        );
+    }
+
+    #[test]
+    fn audio_hub_tees_the_full_recording_to_every_sink() {
+        let hub = AudioHub::new(std::time::Instant::now());
+        hub.on_audio(&[1; 60]);
+        let (preview_sender, preview_receiver) = mpsc::channel();
+        hub.attach("streaming_preview", preview_sender, 1_000);
+        let (upload_sender, upload_receiver) = mpsc::channel();
+        hub.attach("dictation_upload", upload_sender, 1_000);
+        hub.seal();
+        hub.on_audio(&[2; 60]);
+
+        let expected = [vec![1; 60], vec![2; 60]].concat();
+        assert_eq!(hub_samples(&preview_receiver), expected);
+        assert_eq!(hub_samples(&upload_receiver), expected);
+    }
+
+    #[test]
+    fn audio_hub_stops_buffering_after_seal() {
+        let hub = AudioHub::new(std::time::Instant::now());
+        hub.on_audio(&[7; 30]);
+        hub.seal();
+        hub.on_audio(&[9; 30]);
+        let (sender, receiver) = mpsc::channel();
+        hub.attach("streaming_preview", sender, 1_000);
+        hub.on_audio(&[5; 10]);
+        drop(hub);
+
+        // The press handler seals only after every sink has attached, so
+        // audio captured between the seal and this late attach is not
+        // replayed; the test pins that contract so a future reorder cannot
+        // silently reintroduce the lost-audio bug. Post-attach audio flows
+        // to the sink live.
+        assert_eq!(hub_samples(&receiver), vec![5; 10]);
+    }
+
+    #[test]
+    fn wire_chunks_are_60ms_at_every_sample_rate() {
+        assert_eq!(chunk_samples_for(48_000), 2_880);
+        assert_eq!(chunk_samples_for(16_000), 960);
+        assert_eq!(chunk_samples_for(1), 1);
     }
 
     #[test]

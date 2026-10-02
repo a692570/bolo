@@ -52,6 +52,7 @@ def color(red, green, blue, alpha=1.0):
 PHASES = {
     "dictating": ("Dictating", color(0.34, 0.86, 0.61)),
     "listening": ("Dictating", color(0.34, 0.86, 0.61)),
+    "connecting": ("Connecting…", color(0.55, 0.57, 0.60)),
     "thinking": ("Thinking", color(0.58, 0.65, 1.0)),
     "transcribing": ("Thinking", color(0.58, 0.65, 1.0)),
     "processing": ("Thinking", color(0.58, 0.65, 1.0)),
