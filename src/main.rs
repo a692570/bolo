@@ -146,6 +146,19 @@ const EMPTY_RETRY_MIN_DURATION_MS: u64 = 1_200;
 const UPDATE_RESTART_EXIT_CODE: i32 = 42;
 const POST_INSERT_EDIT_MAX: Duration = Duration::from_secs(15);
 const POST_INSERT_OVERLAY_HOLD: Duration = Duration::from_millis(300);
+/// Quiet time after the last backspace before the edit-learning capture reads
+/// the caret context once, so a burst of consecutive backspaces collapses
+/// into a single diff instead of one diff per keystroke.
+const EDIT_LEARNING_QUIET: Duration = Duration::from_millis(1_500);
+/// Cap on learned corrections persisted in `~/.bolo/learned_vocabulary.json`.
+/// Beyond it the least-confirmed pairs (lowest count, then oldest) are evicted.
+const LEARNED_VOCABULARY_CAP: usize = 100;
+/// Shortest word a learned correction will accept as either side. The
+/// replacement has to be at least this long to be a deliberate retyping
+/// rather than a half-typed fragment, and the misheard word has to be too
+/// because aliasing a one- or two-character word ("a", "or", "to") would
+/// rewrite every future occurrence of a common word.
+const LEARNED_MIN_WORD_CHARS: usize = 3;
 const MAX_SELECTED_TEXT_CHARS: usize = 8_000;
 /// Round-trip budget for cheap accessibility-daemon queries (trust, context
 /// reads). The daemon answers in well under a millisecond once warm; only a
@@ -240,6 +253,9 @@ struct TextReplacement {
 struct LoadedVocabulary {
     terms: Vec<String>,
     aliases: Vec<TextReplacement>,
+    /// Corrections learned from post-paste edits. Kept apart from `aliases` so
+    /// explicit user configuration always wins and can never be overwritten.
+    learned_aliases: Vec<TextReplacement>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -362,6 +378,37 @@ impl PostInsertWatch {
     }
 }
 
+/// One armed edit-learning observation: the text Bolo just pasted, held for
+/// `POST_INSERT_EDIT_MAX` so a user correction right after the paste can be
+/// diffed against the caret context and learned. A newer dictation replaces
+/// the observation; Cmd+A cancels it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct EditLearningWatch {
+    pasted_text: String,
+    inserted_at: Instant,
+    /// Debounce deadline of the pending diff capture, pushed forward by every
+    /// backspace. `None` while no burst is pending.
+    capture_at: Option<Instant>,
+}
+
+impl EditLearningWatch {
+    fn new(pasted_text: &str) -> Self {
+        Self {
+            pasted_text: pasted_text.to_owned(),
+            inserted_at: Instant::now(),
+            capture_at: None,
+        }
+    }
+}
+
+/// The observation a capture thread claimed: the pasted text to diff against
+/// and the paste moment the window is anchored to.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct EditLearningClaim {
+    pasted_text: String,
+    inserted_at: Instant,
+}
+
 #[derive(Debug, Default)]
 struct AppState {
     active: Option<ActiveRecording>,
@@ -373,6 +420,7 @@ struct AppState {
     selected_language: Option<String>,
     cleanup_status: Option<String>,
     post_insert_watch: Option<PostInsertWatch>,
+    edit_learning: Option<EditLearningWatch>,
 }
 
 struct ActiveRecording {
@@ -1584,6 +1632,7 @@ struct App {
     vocabulary_usage: Mutex<HashMap<String, u64>>,
     vocabulary_usage_path: PathBuf,
     vocabulary_aliases: Mutex<Vec<TextReplacement>>,
+    learned_aliases: Mutex<Vec<TextReplacement>>,
     prompt_bindings: Mutex<Vec<PromptBinding>>,
     state: Mutex<AppState>,
     event_proxy: Mutex<Option<EventLoopProxy<UserEvent>>>,
@@ -2210,6 +2259,7 @@ impl App {
             vocabulary_usage: Mutex::new(vocabulary_usage),
             vocabulary_usage_path,
             vocabulary_aliases: Mutex::new(vocabulary.aliases),
+            learned_aliases: Mutex::new(vocabulary.learned_aliases),
             prompt_bindings: Mutex::new(prompt_bindings),
             state: Mutex::new(AppState {
                 history,
@@ -3201,9 +3251,14 @@ impl App {
         let normalized = canonicalize_known_terms(&whitespace_normalized);
         let vocabulary_aliases = self.vocabulary_aliases_snapshot();
         let alias_normalized = apply_text_replacements(&normalized, &vocabulary_aliases);
+        // Learned corrections run after the user's aliases and never for
+        // source words the user configured anywhere, so explicit user
+        // configuration always wins.
+        let learned_aliases = self.effective_learned_aliases(&vocabulary_aliases);
+        let learned_normalized = apply_text_replacements(&alias_normalized, &learned_aliases);
         let vocabulary = self.vocabulary_snapshot().unwrap_or_default();
         let (vocabulary_normalized, matched_vocabulary) =
-            apply_vocabulary_corrections_with_matches(&alias_normalized, &vocabulary);
+            apply_vocabulary_corrections_with_matches(&learned_normalized, &vocabulary);
         self.record_vocabulary_usage(&matched_vocabulary);
         info!(
             "[cleanup] canonicalize_terms {}",
@@ -3212,6 +3267,7 @@ impl App {
                 "after": self.log_text(&vocabulary_normalized),
                 "vocabulary_count": vocabulary.len(),
                 "alias_count": vocabulary_aliases.len(),
+                "learned_alias_count": learned_aliases.len(),
             })
         );
         let stripped = remove_fillers(&vocabulary_normalized)?;
@@ -3660,11 +3716,16 @@ impl App {
         }
         let post_insert_watch =
             prepared.map(|prepared| PostInsertWatch::new(&entry.text, prepared));
+        // Dictation inserts arm the learning observation for the pasted text;
+        // command and rewrite pastes reuse `remember_result` but carry no
+        // `prepared`, so they leave the current observation alone.
+        let edit_learning = prepared.map(|_| EditLearningWatch::new(&entry.text));
         let history = {
             let mut state = self.lock_state()?;
             state.last_result = Some(entry.text.clone());
             state.correction_until = Some(Instant::now() + CORRECTION_WINDOW);
             state.post_insert_watch = post_insert_watch;
+            state.edit_learning = edit_learning;
             state.history.push_front(entry.clone());
             state.history.truncate(TRANSCRIPT_HISTORY_LIMIT);
             state.history.iter().cloned().collect::<Vec<_>>()
@@ -3686,44 +3747,170 @@ impl App {
         Ok(())
     }
 
-    fn handle_post_insert_edit(&self, action: &str) -> Result<(), AppError> {
+    /// React to a `post_insert_edit` event from the hotkey helper: keep the
+    /// quality telemetry (first edit within the window marks the history
+    /// entry) and drive the edit-learning observation. A backspace inside the
+    /// observation window schedules one diff capture after
+    /// `EDIT_LEARNING_QUIET` of backspace quiet, pushing the deadline forward
+    /// on every further backspace; Cmd+A cancels the observation because a
+    /// whole-selection retype is too noisy to learn from.
+    fn handle_post_insert_edit(self: &Arc<Self>, action: &str) -> Result<(), AppError> {
+        let mut capture_deadline: Option<Instant> = None;
         let history = {
             let mut state = self.lock_state()?;
-            let Some(watch) = state.post_insert_watch.clone() else {
-                return Ok(());
+            let history = if let Some(watch) = state.post_insert_watch.clone() {
+                let elapsed = watch.completed_at.elapsed();
+                if elapsed > POST_INSERT_EDIT_MAX {
+                    state.post_insert_watch = None;
+                    Vec::new()
+                } else if let Some(first) = state.history.front_mut() {
+                    first.edited_after_insert = true;
+                    info!(
+                        "[quality] post_insert_edit {}",
+                        serde_json::json!({
+                            "action": action,
+                            "elapsed_ms": elapsed.as_millis(),
+                            "words_bucket": watch.words_bucket,
+                            "cleanup_status": watch.cleanup_status,
+                        })
+                    );
+                    state.post_insert_watch = None;
+                    state.history.iter().cloned().collect::<Vec<_>>()
+                } else {
+                    state.post_insert_watch = None;
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
             };
-            let elapsed = watch.completed_at.elapsed();
-            if elapsed > POST_INSERT_EDIT_MAX {
-                state.post_insert_watch = None;
-                return Ok(());
+            let mut clear_learning = false;
+            if let Some(learning) = state.edit_learning.as_mut() {
+                if learning.inserted_at.elapsed() > POST_INSERT_EDIT_MAX {
+                    clear_learning = true;
+                } else if action == "cmd_a" {
+                    clear_learning = true;
+                } else if action == "backspace" {
+                    let deadline = Instant::now() + EDIT_LEARNING_QUIET;
+                    if learning.capture_at.is_none() {
+                        capture_deadline = Some(deadline);
+                    }
+                    learning.capture_at = Some(deadline);
+                }
             }
-            let Some(first) = state.history.front_mut() else {
-                state.post_insert_watch = None;
-                return Ok(());
-            };
-            first.edited_after_insert = true;
-            info!(
-                "[quality] post_insert_edit {}",
-                serde_json::json!({
-                    "action": action,
-                    "elapsed_ms": elapsed.as_millis(),
-                    "words_bucket": watch.words_bucket,
-                    "cleanup_status": watch.cleanup_status,
-                })
-            );
-            state.post_insert_watch = None;
-            state.history.iter().cloned().collect::<Vec<_>>()
+            if clear_learning {
+                state.edit_learning = None;
+            }
+            history
         };
         #[cfg(not(test))]
         {
-            if let Err(error) = save_transcript_history(&history) {
+            if !history.is_empty()
+                && let Err(error) = save_transcript_history(&history)
+            {
                 warn!("transcript history save failed: {error}");
             }
         }
         #[cfg(test)]
         drop(history);
-        self.send_user_event(UserEvent::HistoryChanged);
+        if let Some(deadline) = capture_deadline {
+            #[cfg(not(test))]
+            {
+                let app = Arc::clone(self);
+                if let Err(error) = std::thread::Builder::new()
+                    .name(String::from("bolo-edit-learning"))
+                    .spawn(move || app.run_edit_learning_capture(deadline))
+                {
+                    warn!("[learning] capture thread failed to start: {error}");
+                }
+            }
+            #[cfg(test)]
+            let _ = deadline;
+        }
         Ok(())
+    }
+
+    /// Debounce loop for one backspace burst. Sleeps until the current
+    /// deadline, re-sleeping while later backspaces push it forward, and
+    /// finishes once the quiet period elapses. Only the thread spawned when
+    /// the burst started runs here; later backspaces in the same burst only
+    /// move `capture_at`.
+    fn run_edit_learning_capture(self: &Arc<Self>, mut deadline: Instant) {
+        loop {
+            std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+            let claim = match self.lock_state() {
+                Ok(mut state) => match state.edit_learning.as_mut() {
+                    None => None,
+                    Some(learning) => match learning.capture_at {
+                        None => None,
+                        Some(current) if current > Instant::now() => {
+                            deadline = current;
+                            None
+                        }
+                        Some(current) => {
+                            deadline = current;
+                            learning.capture_at = None;
+                            Some(EditLearningClaim {
+                                pasted_text: learning.pasted_text.clone(),
+                                inserted_at: learning.inserted_at,
+                            })
+                        }
+                    },
+                },
+                Err(error) => {
+                    warn!("edit learning state lock poisoned: {error}");
+                    None
+                },
+            };
+            let Some(claim) = claim else {
+                // The observation was cancelled, replaced, or its deadline is
+                // still in the future. A pushed-forward deadline loops around
+                // and keeps sleeping; everything else ends the thread.
+                if let Ok(state) = self.lock_state()
+                    && let Some(learning) = &state.edit_learning
+                    && learning.capture_at.is_some_and(|current| current >= deadline)
+                {
+                    continue;
+                }
+                return;
+            };
+            self.finish_edit_learning_capture(claim);
+            return;
+        }
+    }
+
+    /// Run the diff capture for a claimed observation: one caret-context read,
+    /// one alignment against the pasted text, and either a learned pair or a
+    /// logged skip.
+    fn finish_edit_learning_capture(&self, claim: EditLearningClaim) {
+        let Some(context) = read_accessibility_context(&self.config.root_dir) else {
+            info!("[learning] skipped context_unavailable");
+            return;
+        };
+        info!(
+            "[learning] edit_observed {}",
+            serde_json::json!({
+                "elapsed_ms": claim.inserted_at.elapsed().as_millis(),
+                "pasted_words": claim.pasted_text.split_whitespace().count(),
+                "context_words": context.text_before_cursor.split_whitespace().count(),
+            })
+        );
+        match derive_word_correction(&claim.pasted_text, &context.text_before_cursor) {
+            CorrectionOutcome::Learned { misheard, corrected } => {
+                info!(
+                    "[learning] learned_pair {} -> {}",
+                    self.log_text(&misheard),
+                    self.log_text(&corrected)
+                );
+                if let Err(error) =
+                    self.learn_correction(&learned_vocabulary_path(), &misheard, &corrected)
+                {
+                    warn!("[learning] persist failed: {error}");
+                }
+            }
+            CorrectionOutcome::Skipped { reason } => {
+                info!("[learning] skipped {reason}");
+            }
+        }
     }
 
     fn replace_latest_history_entry(
@@ -4077,10 +4264,75 @@ impl App {
         }
     }
 
+    /// Persist one learned correction and fold it into the in-memory engine:
+    /// the corrected term joins the vocabulary list (and the keyterms prompt)
+    /// ranked by the existing usage mechanism, and the misheard->corrected
+    /// pair becomes an alias applied after user configuration.
+    fn learn_correction(&self, path: &Path, misheard: &str, corrected: &str) -> Result<(), AppError> {
+        let saved = match record_learned_correction(path, misheard, corrected) {
+            Ok(file) => {
+                let aliases = learned_aliases_from_file(&file);
+                if let Ok(mut learned) = self.learned_aliases.lock() {
+                    *learned = aliases;
+                }
+                true
+            }
+            Err(error) => {
+                warn!("[learning] save failed: {error}");
+                false
+            }
+        };
+        if !saved
+            && let Ok(mut learned) = self.learned_aliases.lock()
+        {
+            upsert_replacement(
+                &mut learned,
+                TextReplacement {
+                    spoken: misheard.to_owned(),
+                    replacement: corrected.to_owned(),
+                },
+            );
+        }
+        {
+            let Ok(mut vocabulary) = self.vocabulary.lock() else {
+                return Ok(());
+            };
+            let key = corrected.to_ascii_lowercase();
+            if !vocabulary
+                .iter()
+                .any(|term| term.to_ascii_lowercase() == key)
+            {
+                vocabulary.push(corrected.to_owned());
+            }
+        }
+        self.record_vocabulary_usage(&[normalize_for_matching(corrected)]);
+        Ok(())
+    }
+
     fn vocabulary_aliases_snapshot(&self) -> Vec<TextReplacement> {
         self.vocabulary_aliases
             .lock()
             .map_or_else(|_| Vec::new(), |aliases| aliases.clone())
+    }
+
+    fn learned_aliases_snapshot(&self) -> Vec<TextReplacement> {
+        self.learned_aliases
+            .lock()
+            .map_or_else(|_| Vec::new(), |aliases| aliases.clone())
+    }
+
+    /// Learned aliases that are actually applicable: any source word the user
+    /// explicitly configured, as a vocabulary alias or a text replacement, is
+    /// theirs and the learned alias yields.
+    fn effective_learned_aliases(&self, user_aliases: &[TextReplacement]) -> Vec<TextReplacement> {
+        let mut user_spoken = HashSet::new();
+        for replacement in user_aliases.iter().chain(self.replacements_snapshot().iter()) {
+            let _ = user_spoken.insert(normalize_for_matching(&replacement.spoken));
+        }
+        self.learned_aliases_snapshot()
+            .into_iter()
+            .filter(|alias| !user_spoken.contains(&normalize_for_matching(&alias.spoken)))
+            .collect()
     }
 
     fn prompt_bindings_snapshot(&self) -> Vec<PromptBinding> {
@@ -7168,7 +7420,264 @@ fn strip_reasoning_tags(text: &str) -> String {
     before_reasoning.trim().to_owned()
 }
 
+// ==== Learned vocabulary (edit-after-paste corrections) ====
+//
+// After a dictation paste, a backspace burst followed by quiet signals that
+// the user is fixing a misheard word. One caret-context read is diffed
+// against the pasted text; a single-word, unambiguous replacement becomes a
+// learned pair stored in ~/.bolo/learned_vocabulary.json (never in the repo),
+// applied on future dictations at lower priority than user configuration.
+
+/// Path of the learned-corrections file. User data under ~/.bolo, never in
+/// the repo.
+fn learned_vocabulary_path() -> PathBuf {
+    home_path(".bolo/learned_vocabulary.json")
+}
+
+/// The learned-corrections file: `{"corrections": {"<misheard-lowercase>":
+/// {"corrected": ..., "count": ..., "last_used": <unix secs>}}}`. A BTreeMap
+/// keeps the serialized keys sorted and the file diffable.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+struct LearnedVocabulary {
+    #[serde(default)]
+    corrections: BTreeMap<String, LearnedCorrectionEntry>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct LearnedCorrectionEntry {
+    corrected: String,
+    count: u64,
+    /// Unix seconds of the last confirmation, so eviction can break count
+    /// ties by age.
+    last_used: u64,
+}
+
+fn load_learned_vocabulary(path: &Path) -> LearnedVocabulary {
+    match fs::read_to_string(path) {
+        Ok(text) => serde_json::from_str::<LearnedVocabulary>(&text).unwrap_or_else(|error| {
+            // A corrupt file never takes the feature down and is preserved
+            // on disk: the load only warns, and the next successful save
+            // rewrites the file from the in-memory state.
+            warn!("learned vocabulary file ignored: {error}");
+            LearnedVocabulary::default()
+        }),
+        Err(error) if error.kind() == ErrorKind::NotFound => LearnedVocabulary::default(),
+        Err(error) => {
+            warn!("learned vocabulary file ignored: {error}");
+            LearnedVocabulary::default()
+        }
+    }
+}
+
+/// Upsert one correction. The same misheard->corrected pair bumps count and
+/// last_used; a different correction for the same misheard word replaces the
+/// entry and restarts the count at one confirmation of the new fix.
+fn upsert_learned_correction(
+    file: &mut LearnedVocabulary,
+    misheard: &str,
+    corrected: &str,
+    now_unix_secs: u64,
+) {
+    let key = misheard.trim().to_ascii_lowercase();
+    let entry = file
+        .corrections
+        .entry(key)
+        .or_insert(LearnedCorrectionEntry {
+            corrected: corrected.trim().to_owned(),
+            count: 0,
+            last_used: now_unix_secs,
+        });
+    if entry
+        .corrected
+        .trim()
+        .eq_ignore_ascii_case(corrected.trim())
+    {
+        entry.count = entry.count.saturating_add(1);
+        entry.last_used = now_unix_secs;
+    } else {
+        entry.corrected = corrected.trim().to_owned();
+        entry.count = 1;
+        entry.last_used = now_unix_secs;
+    }
+}
+
+/// Evict down to the cap, dropping the least-confirmed pairs first: lowest
+/// count, and on ties the oldest last_used.
+fn enforce_learned_vocabulary_cap(file: &mut LearnedVocabulary) {
+    while file.corrections.len() > LEARNED_VOCABULARY_CAP {
+        let Some(least) = file
+            .corrections
+            .iter()
+            .min_by_key(|(_, entry)| (entry.count, entry.last_used))
+            .map(|(key, _)| key.clone())
+        else {
+            return;
+        };
+        drop(file.corrections.remove(&least));
+    }
+}
+
+fn write_learned_vocabulary_file(path: &Path, file: &LearnedVocabulary) -> Result<(), AppError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    let text = serde_json::to_string_pretty(file)?;
+    fs::write(&tmp, format!("{text}\n"))?;
+    #[cfg(unix)]
+    fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))?;
+    fs::rename(tmp, path)?;
+    Ok(())
+}
+
+/// Record one learned correction durably and return the saved state (after
+/// dedupe and eviction), so callers can mirror it in memory.
+fn record_learned_correction(
+    path: &Path,
+    misheard: &str,
+    corrected: &str,
+) -> Result<LearnedVocabulary, AppError> {
+    let mut file = load_learned_vocabulary(path);
+    upsert_learned_correction(&mut file, misheard, corrected, unix_time_secs());
+    enforce_learned_vocabulary_cap(&mut file);
+    write_learned_vocabulary_file(path, &file)?;
+    Ok(file)
+}
+
+/// Learned pairs as misheard->corrected aliases, in the file's sorted key
+/// order.
+fn learned_aliases_from_file(file: &LearnedVocabulary) -> Vec<TextReplacement> {
+    file.corrections
+        .iter()
+        .map(|(misheard, entry)| TextReplacement {
+            spoken: misheard.clone(),
+            replacement: entry.corrected.clone(),
+        })
+        .collect()
+}
+
+fn unix_time_secs() -> u64 {
+    unix_time_ms() / 1_000
+}
+
+/// The result of diffing the pasted text against the edited caret context.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum CorrectionOutcome {
+    Learned {
+        misheard: String,
+        corrected: String,
+    },
+    Skipped {
+        reason: &'static str,
+    },
+}
+
+/// Word tokens of `text` in order, on the same alphanumeric-plus-apostrophe
+/// rule the vocabulary matcher uses.
+fn word_tokens(text: &str) -> Vec<&str> {
+    word_pieces(text)
+        .into_iter()
+        .map(|piece| &text[piece.start..piece.end])
+        .collect()
+}
+
+/// Whether `word` occurs in `text` as a standalone, case-sensitive word. This
+/// is the "the user typed it" proof for the replacement.
+fn contains_word_verbatim(text: &str, word: &str) -> bool {
+    !word.is_empty()
+        && word_pieces(text)
+            .into_iter()
+            .any(|piece| &text[piece.start..piece.end] == word)
+}
+
+/// Derive a single-word correction from the pasted text and the caret context
+/// read after the user's edit. The inserted text's tail is aligned against
+/// the context tail: every word after the changed one must match, the words
+/// before the changed word must match immediately before the replacement, and
+/// exactly one word may differ. Anything ambiguous is skipped with a reason
+/// and never learned.
+fn derive_word_correction(inserted: &str, context_tail: &str) -> CorrectionOutcome {
+    let observed = word_tokens(inserted);
+    let context = word_tokens(context_tail);
+    // A one-word dictation fixed by a full retype has no anchored words on
+    // either side of the change, so nothing proves where the paste sat.
+    if observed.len() < 2 {
+        return CorrectionOutcome::Skipped {
+            reason: "single_word_insert",
+        };
+    }
+    let mut suffix = 0;
+    while suffix < observed.len()
+        && suffix < context.len()
+        && observed[observed.len() - 1 - suffix].eq_ignore_ascii_case(
+            context[context.len() - 1 - suffix],
+        )
+    {
+        suffix += 1;
+    }
+    if suffix == observed.len() {
+        // The pasted text still sits intact at the context tail.
+        return CorrectionOutcome::Skipped { reason: "intact" };
+    }
+    let old_index = observed.len() - 1 - suffix;
+    let Some(new_index) = context.len().checked_sub(1 + suffix) else {
+        return CorrectionOutcome::Skipped { reason: "unaligned" };
+    };
+    let old_word = observed[old_index];
+    let new_word = context[new_index];
+    // The words before the changed word must line up immediately before the
+    // replacement, proving the change sits inside the pasted text rather
+    // than in pre-existing text around it. Multi-word rewrites and pure
+    // deletions both fail here.
+    if new_index < old_index
+        || observed[..old_index]
+            .iter()
+            .rev()
+            .zip(context[..new_index].iter().rev())
+            .any(|(observed_word, context_word)| {
+                !observed_word.eq_ignore_ascii_case(context_word)
+            })
+    {
+        return CorrectionOutcome::Skipped { reason: "unaligned" };
+    }
+    // The replacement must appear verbatim in the context tail. By
+    // construction it is read out of the context, but the rule stays explicit
+    // so it can never silently regress.
+    if !contains_word_verbatim(context_tail, new_word) {
+        return CorrectionOutcome::Skipped { reason: "not_typed" };
+    }
+    if old_word.chars().count() < LEARNED_MIN_WORD_CHARS {
+        return CorrectionOutcome::Skipped { reason: "short_misheard" };
+    }
+    if new_word.chars().count() < LEARNED_MIN_WORD_CHARS {
+        return CorrectionOutcome::Skipped { reason: "short_word" };
+    }
+    if is_trivial_word_variant(old_word, new_word) {
+        return CorrectionOutcome::Skipped { reason: "trivial_variant" };
+    }
+    CorrectionOutcome::Learned {
+        misheard: old_word.to_owned(),
+        corrected: new_word.to_owned(),
+    }
+}
+
+/// Case-only, punctuation-only, and prefix-only rewrites are not mishearings:
+/// "Tim" -> "tim" only capitalizes, "dont" -> "don't" only adds an
+/// apostrophe, and "meeting" -> "meetings" is one keystroke apart, so none of
+/// them are safe aliases to apply to every future dictation.
+fn is_trivial_word_variant(old_word: &str, new_word: &str) -> bool {
+    let old_normalized = normalize_for_matching(old_word);
+    let new_normalized = normalize_for_matching(new_word);
+    old_normalized == new_normalized
+        || old_normalized.starts_with(&new_normalized)
+        || new_normalized.starts_with(&old_normalized)
+}
+
 fn load_vocabulary(root_dir: &Path) -> LoadedVocabulary {
+    load_vocabulary_with_learned(root_dir, &learned_vocabulary_path())
+}
+
+fn load_vocabulary_with_learned(root_dir: &Path, learned_path: &Path) -> LoadedVocabulary {
     let mut loaded = LoadedVocabulary::default();
     let mut seen = Vec::<String>::new();
     for path in [
@@ -7188,7 +7697,26 @@ fn load_vocabulary(root_dir: &Path) -> LoadedVocabulary {
             }
         }
     }
+    // Learned corrections load last, with the same term dedupe rules. The
+    // corrected terms join the vocabulary list (and so the keyterms prompt),
+    // and the pairs become aliases in their own set so explicit user
+    // configuration always wins.
+    for (misheard, entry) in load_learned_vocabulary(learned_path).corrections {
+        let key = entry.corrected.to_ascii_lowercase();
+        if !seen.contains(&key) {
+            seen.push(key);
+            loaded.terms.push(entry.corrected.clone());
+        }
+        upsert_replacement(
+            &mut loaded.learned_aliases,
+            TextReplacement {
+                spoken: misheard,
+                replacement: entry.corrected,
+            },
+        );
+    }
     sort_replacements(&mut loaded.aliases);
+    sort_replacements(&mut loaded.learned_aliases);
     loaded
 }
 
@@ -8657,30 +9185,34 @@ mod tests {
         ACCESS_DAEMON_ACTION_TIMEOUT, ACCESS_DAEMON_QUERY_TIMEOUT, ACCESS_DAEMON_STARTUP_TIMEOUT,
         ASSEMBLYAI_STREAMING_MODEL, AccessDaemonFailure, AccessDaemonRequest, AccessibilityContext,
         AccessibilityTrust, App, AppError, AppState, AssemblyDictationResponse, BatchRetry,
-        CleanupMode, CleanupProfile, Config, DictationCommandKind, DictationUploadReader,
-        DictationUploadRelease, DictationWarmup, PreparedText, PromptBinding, STREAMING_DRAIN_MIN,
-        STT_RETRY_SAMPLE_RATE, StreamingConnectionState, StreamingProvider, StreamingRecording,
-        StreamingText, StreamingTranscript, SttFallback, SttResult, TRANSCRIPT_HISTORY_LIMIT,
-        TextReplacement, TranscriptHistoryEntry, UpdateOutcome, apply_text_replacements,
-        apply_vocabulary_corrections_with_matches, assemblyai_direct_query_with,
-        assemblyai_language_code, batch_retry_plan, build_cleanup_user_content,
-        build_rewrite_user_content, build_stt_prompt, canonicalize_known_terms, cleanup_decision,
-        cleanup_max_tokens, cleanup_profile, dictation_upload_config, dictation_upload_form,
-        dictation_upload_release, dictation_upload_request_timeout, downsample_wav_16k_mono,
-        empty_transcript_error, final_streaming_result_is_ready_elapsed,
-        finalize_accessibility_context, handshake_with_deadline, is_known_no_speech_transcript,
-        is_supported_hotkey, load_vocabulary_usage, non_empty_transcript,
-        parse_accessibility_trust, parse_command, parse_daemon_context_reply,
-        parse_daemon_paste_reply, parse_daemon_select_reply, parse_daemon_trust_reply,
-        parse_replacements_json, parse_stt_fallbacks, parse_u64_env_value, parse_update_outcome,
-        parse_wav_pcm16, pcm_bytes, preview_only_streaming, preview_release_stt,
-        read_vocabulary_file, read_vocabulary_usage_file, remove_fillers,
+        CleanupMode, CleanupProfile, Config, CorrectionOutcome, DictationCommandKind,
+        DictationUploadReader, DictationUploadRelease, DictationWarmup, EditLearningClaim,
+        LearnedCorrectionEntry, LearnedVocabulary, PreparedText, PromptBinding,
+        STREAMING_DRAIN_MIN, STT_RETRY_SAMPLE_RATE, StreamingConnectionState, StreamingProvider,
+        StreamingRecording, StreamingText, StreamingTranscript, SttFallback, SttResult,
+        TRANSCRIPT_HISTORY_LIMIT, TextReplacement, TranscriptHistoryEntry, UpdateOutcome,
+        apply_text_replacements, apply_vocabulary_corrections_with_matches,
+        assemblyai_direct_query_with, assemblyai_language_code, batch_retry_plan,
+        build_cleanup_user_content, build_rewrite_user_content, build_stt_prompt,
+        canonicalize_known_terms, cleanup_decision, cleanup_max_tokens, cleanup_profile,
+        contains_word_verbatim, derive_word_correction, dictation_upload_config,
+        dictation_upload_form, dictation_upload_release, dictation_upload_request_timeout,
+        downsample_wav_16k_mono, empty_transcript_error, enforce_learned_vocabulary_cap,
+        final_streaming_result_is_ready_elapsed, finalize_accessibility_context,
+        handshake_with_deadline, is_known_no_speech_transcript, is_supported_hotkey,
+        load_learned_vocabulary, load_vocabulary_usage, load_vocabulary_with_learned,
+        non_empty_transcript, parse_accessibility_trust, parse_command,
+        parse_daemon_context_reply, parse_daemon_paste_reply, parse_daemon_select_reply,
+        parse_daemon_trust_reply, parse_replacements_json, parse_stt_fallbacks,
+        parse_u64_env_value, parse_update_outcome, parse_wav_pcm16, pcm_bytes,
+        preview_only_streaming, preview_release_stt, read_vocabulary_file,
+        read_vocabulary_usage_file, record_learned_correction, remove_fillers,
         request_accessibility_daemon, retry_failed_primary, sanitize_transcript_history,
         speech_stats, stable_streaming_best_is_ready_elapsed, streaming_batch_fallback_reason,
         streaming_connection, streaming_preview_tail, streaming_provider_from_config,
         strip_reasoning_tags, stt_language_for_model, stt_model_config, telnyx_stream_query,
-        transcript_log_value, transcript_menu_preview, wait_for_daemon_reply, wav_bytes,
-        wav_duration_ms,
+        transcript_log_value, transcript_menu_preview, upsert_learned_correction,
+        wait_for_daemon_reply, wav_bytes, wav_duration_ms,
     };
     use std::collections::{HashMap, VecDeque};
     use std::io::Read as _;
@@ -10450,6 +10982,7 @@ mod tests {
             http: reqwest::blocking::Client::new(),
             vocabulary: Mutex::new(vocabulary),
             vocabulary_aliases: Mutex::new(Vec::new()),
+            learned_aliases: Mutex::new(Vec::new()),
             prompt_bindings: Mutex::new(Vec::new()),
             vocabulary_usage: Mutex::new(usage),
             vocabulary_usage_path: usage_path.clone(),
@@ -10484,6 +11017,7 @@ mod tests {
             http: reqwest::blocking::Client::new(),
             vocabulary: Mutex::new(Vec::new()),
             vocabulary_aliases: Mutex::new(Vec::new()),
+            learned_aliases: Mutex::new(Vec::new()),
             prompt_bindings: Mutex::new(Vec::new()),
             vocabulary_usage: Mutex::new(HashMap::new()),
             vocabulary_usage_path: temp_vocabulary_usage_path(),
@@ -10524,6 +11058,7 @@ mod tests {
             http: reqwest::blocking::Client::new(),
             vocabulary: Mutex::new(Vec::new()),
             vocabulary_aliases: Mutex::new(Vec::new()),
+            learned_aliases: Mutex::new(Vec::new()),
             prompt_bindings: Mutex::new(Vec::new()),
             vocabulary_usage: Mutex::new(HashMap::new()),
             vocabulary_usage_path: temp_vocabulary_usage_path(),
@@ -10584,6 +11119,7 @@ mod tests {
             http: reqwest::blocking::Client::new(),
             vocabulary: Mutex::new(Vec::new()),
             vocabulary_aliases: Mutex::new(Vec::new()),
+            learned_aliases: Mutex::new(Vec::new()),
             prompt_bindings: Mutex::new(Vec::new()),
             vocabulary_usage: Mutex::new(HashMap::new()),
             vocabulary_usage_path: temp_vocabulary_usage_path(),
@@ -10629,6 +11165,7 @@ mod tests {
             http: reqwest::blocking::Client::new(),
             vocabulary: Mutex::new(Vec::new()),
             vocabulary_aliases: Mutex::new(Vec::new()),
+            learned_aliases: Mutex::new(Vec::new()),
             prompt_bindings: Mutex::new(Vec::new()),
             vocabulary_usage: Mutex::new(HashMap::new()),
             vocabulary_usage_path: temp_vocabulary_usage_path(),
@@ -10687,6 +11224,7 @@ mod tests {
                 spoken: String::from("boloo"),
                 replacement: String::from("Bolo"),
             }]),
+            learned_aliases: Mutex::new(Vec::new()),
             prompt_bindings: Mutex::new(Vec::new()),
             vocabulary_usage: Mutex::new(HashMap::new()),
             vocabulary_usage_path: temp_vocabulary_usage_path(),
@@ -10766,6 +11304,7 @@ mod tests {
             http: reqwest::blocking::Client::new(),
             vocabulary: Mutex::new(Vec::new()),
             vocabulary_aliases: Mutex::new(Vec::new()),
+            learned_aliases: Mutex::new(Vec::new()),
             prompt_bindings: Mutex::new(Vec::new()),
             vocabulary_usage: Mutex::new(HashMap::new()),
             vocabulary_usage_path: temp_vocabulary_usage_path(),
@@ -10790,7 +11329,7 @@ mod tests {
 
     #[test]
     fn post_insert_edit_marks_latest_history_without_text_logging() -> Result<(), AppError> {
-        let app = App {
+        let app = Arc::new(App {
             config: Config {
                 telnyx_api_key: Some(String::from("test")),
                 assemblyai_api_key: None,
@@ -10813,12 +11352,13 @@ mod tests {
             http: reqwest::blocking::Client::new(),
             vocabulary: Mutex::new(Vec::new()),
             vocabulary_aliases: Mutex::new(Vec::new()),
+            learned_aliases: Mutex::new(Vec::new()),
             prompt_bindings: Mutex::new(Vec::new()),
             vocabulary_usage: Mutex::new(HashMap::new()),
             vocabulary_usage_path: temp_vocabulary_usage_path(),
             state: Mutex::new(AppState::default()),
             event_proxy: Mutex::new(None),
-        };
+        });
         let prepared = PreparedText {
             text: String::from("dictated text"),
             llm_cleanup_ran: false,
@@ -10863,6 +11403,7 @@ mod tests {
             http: reqwest::blocking::Client::new(),
             vocabulary: Mutex::new(Vec::new()),
             vocabulary_aliases: Mutex::new(Vec::new()),
+            learned_aliases: Mutex::new(Vec::new()),
             prompt_bindings: Mutex::new(Vec::new()),
             vocabulary_usage: Mutex::new(HashMap::new()),
             vocabulary_usage_path: temp_vocabulary_usage_path(),
@@ -10903,6 +11444,7 @@ mod tests {
             http: reqwest::blocking::Client::new(),
             vocabulary: Mutex::new(Vec::new()),
             vocabulary_aliases: Mutex::new(Vec::new()),
+            learned_aliases: Mutex::new(Vec::new()),
             prompt_bindings: Mutex::new(Vec::new()),
             vocabulary_usage: Mutex::new(HashMap::new()),
             vocabulary_usage_path: temp_vocabulary_usage_path(),
