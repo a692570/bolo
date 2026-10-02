@@ -15,6 +15,8 @@ import textwrap
 import time
 import warnings
 
+import bolo_env
+
 MARKER_VERSION = 1
 MARKER_FILE = os.path.expanduser("~/.bolo/onboarding.json")
 WIDTH = 560
@@ -27,6 +29,13 @@ ROW_GAP = 12
 WELCOME_GAP = 8
 BUTTON_AREA_H = 58
 DETAIL_WRAP_AT = 64
+KEY_FIELD_W = 330
+KEY_FIELD_H = 24
+VALIDATE_BUTTON_W = 100
+KEY_ENTRY_NAME = "ASSEMBLYAI_API_KEY"
+
+ASSEMBLYAI_LIST_URL = "https://api.assemblyai.com/v2/transcript?limit=1"
+KEY_VALIDATION_TIMEOUT_S = 6.0
 
 
 def marker_payload(now_ms=None):
@@ -66,36 +75,134 @@ def wrap_lines(text, width=DETAIL_WRAP_AT):
     return textwrap.wrap(text, width=width) or [""]
 
 
+def key_entry_index(payload):
+    """Row index of the API-key entry field, or None when it is not shown."""
+    spec = payload.get("key_entry")
+    if not isinstance(spec, dict):
+        return None
+    index = spec.get("index")
+    rows = payload.get("rows")
+    if (
+        isinstance(index, int)
+        and isinstance(rows, list)
+        and 0 <= index < len(rows)
+    ):
+        return index
+    return None
+
+
+def classify_key_response(status):
+    """Map one AssemblyAI HTTP status to a validation verdict.
+
+    A 200 from the transcript-list endpoint proves the key authenticates
+    without spending any audio on transcription; 401 is a definite reject.
+    Anything else is treated as a transient error rather than a rejection.
+    """
+    if status == 200:
+        return "valid"
+    if status == 401:
+        return "invalid"
+    return "error"
+
+
+def fetch_assemblyai_status(key, url=ASSEMBLYAI_LIST_URL, timeout=KEY_VALIDATION_TIMEOUT_S):
+    """Return the HTTP status code for a key probe; raise on network failure."""
+    import urllib.error
+    import urllib.request
+
+    request = urllib.request.Request(url, headers={"Authorization": key})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return response.getcode()
+    except urllib.error.HTTPError as error:
+        return error.code
+
+
+def validate_and_save_key(
+    key,
+    env_path=None,
+    fetch=fetch_assemblyai_status,
+):
+    """Validate one API key and persist it when AssemblyAI accepts it.
+
+    Returns ``(verdict, detail)`` where detail is display text for the
+    onboarding row. `fetch` is injectable so tests cover the 200/401/other
+    branches without network access; it must raise on transport errors.
+    """
+    key = (key or "").strip()
+    if not key:
+        return "empty", "Paste your AssemblyAI API key first, then click Validate."
+    if env_path is None:
+        env_path = bolo_env.default_env_path()
+    try:
+        status = fetch(key)
+    except Exception:
+        return (
+            "unreachable",
+            "Could not reach api.assemblyai.com. Check your internet "
+            "connection and try again.",
+        )
+    verdict = classify_key_response(status)
+    if verdict == "valid":
+        bolo_env.write_env_value(env_path, KEY_ENTRY_NAME, key)
+        print("[app-window] key validation: valid", file=sys.stderr, flush=True)
+        return (
+            "valid",
+            "Key saved. Click Done and Bolo restarts with it in a few seconds.",
+        )
+    if verdict == "invalid":
+        return (
+            "invalid",
+            "AssemblyAI rejected that key. Double-check it and try again.",
+        )
+    return (
+        "error",
+        "AssemblyAI returned an unexpected response. Try again in a moment.",
+    )
+
+
+
 def plan_layout(payload):
     """Pure geometry pass: line wrapping and vertical placement.
 
     Returns a plan with the content height, the button's y position, and
-    per-row y positions for the label and wrapped detail lines, all in
-    flipped-content coordinates (origin top-left).
+    per-row y positions for the label, optional key-entry field, and
+    wrapped detail lines, all in flipped-content coordinates (origin
+    top-left). The row named by ``payload["key_entry"]["index"]`` reserves
+    extra vertical space for the text field plus Validate button.
     """
     rows = payload.get("rows", [])
     welcome = payload.get("welcome") or ""
     welcome_lines = wrap_lines(welcome) if welcome else []
+    key_index = key_entry_index(payload)
     row_plans = []
     y = float(TOP_PAD)
     if welcome_lines:
         y += len(welcome_lines) * LABEL_LINE_H + WELCOME_GAP
-    for row in rows:
+    for index, row in enumerate(rows):
         detail_lines = wrap_lines(row.get("detail") or "")
+        if key_index is not None and index == key_index:
+            field_y = y + LABEL_LINE_H + 2
+            detail_y = field_y + KEY_FIELD_H + 4
+        else:
+            field_y = None
+            detail_y = y + LABEL_LINE_H + 2
         row_plans.append(
             {
                 "label_y": y,
-                "detail_y": y + LABEL_LINE_H + 2,
+                "field_y": field_y,
+                "detail_y": detail_y,
                 "detail_lines": detail_lines,
             }
         )
-        y += LABEL_LINE_H + 2 + len(detail_lines) * DETAIL_LINE_H + ROW_GAP
+        y = detail_y + len(detail_lines) * DETAIL_LINE_H + ROW_GAP
     button_y = y + 6
     height = button_y + BUTTON_AREA_H
     return {
         "welcome_lines": welcome_lines,
         "welcome_y": TOP_PAD if welcome_lines else None,
         "rows": row_plans,
+        "key_index": key_index,
         "button_y": button_y,
         "height": height,
     }
@@ -131,6 +238,7 @@ def build_ui(payload):
         NSMakeRect,
         NSRunLoop,
         NSObject,
+        NSSecureTextField,
         NSTextField,
         NSView,
         NSWindow,
@@ -149,8 +257,27 @@ def build_ui(payload):
         def finish_(self, sender):
             STATE["user_done"] = True
 
+        def validateKey_(self, sender):
+            refs = STATE.get("key_refs")
+            if not refs:
+                return
+            field = refs["field"]
+            key = str(field.stringValue())
+            verdict, detail = validate_and_save_key(key)
+            dot_color = {
+                "valid": colors["ok"],
+                "error": colors["pending"],
+            }.get(verdict, colors["warn"])
+            refs["dot"].layer().setBackgroundColor_(dot_color.CGColor())
+            refs["detail_label"].setStringValue_("\n".join(wrap_lines(detail)))
+            if verdict == "valid":
+                # Stop the field from reporting a stale pending row if the
+                # user closes the window without further edits.
+                field.setEnabled_(False)
+
         def windowWillClose_(self, notification):
             STATE["user_done"] = True
+
 
     colors = {
         "ok": NSColor.colorWithCalibratedRed_green_blue_alpha_(0.45, 0.88, 0.49, 1.0),
@@ -201,7 +328,10 @@ def build_ui(payload):
 
     label_font = NSFont.systemFontOfSize_weight_(13.0, NSFontWeightMedium)
     detail_font = NSFont.systemFontOfSize_weight_(12.0, NSFontWeightRegular)
+    controller = WindowController.alloc().init()
     try_it_refs = None
+    key_refs = None
+    key_index = plan["key_index"]
     for index, (row, row_plan) in enumerate(zip(payload.get("rows", []), plan["rows"])):
         dot = NSView.alloc().initWithFrame_(NSMakeRect(MARGIN, row_plan["label_y"] + 5, 10, 10))
         dot.setWantsLayer_(True)
@@ -218,6 +348,32 @@ def build_ui(payload):
             NSColor.labelColor(),
             x=TEXT_X,
         )
+        if key_index is not None and index == key_index:
+            # Key-entry row: secure text field plus Validate button between
+            # the label and the detail line. The validation GET runs inline
+            # (bounded by KEY_VALIDATION_TIMEOUT_S), which briefly pauses
+            # the run loop on click; acceptable for a one-shot action.
+            field = NSSecureTextField.alloc().initWithFrame_(
+                NSMakeRect(TEXT_X, row_plan["field_y"], KEY_FIELD_W, KEY_FIELD_H)
+            )
+            field.cell().setPlaceholderString_(
+                (payload.get("key_entry") or {}).get("placeholder")
+                or "Paste your AssemblyAI API key"
+            )
+            content.addSubview_(field)
+            validate_button = NSButton.buttonWithTitle_target_action_(
+                "Validate", controller, "validateKey:"
+            )
+            validate_button.setBezelStyle_(NSBezelStyleRounded)
+            validate_button.setFrame_(
+                NSMakeRect(
+                    TEXT_X + KEY_FIELD_W + 10,
+                    row_plan["field_y"],
+                    VALIDATE_BUTTON_W,
+                    KEY_FIELD_H,
+                )
+            )
+            content.addSubview_(validate_button)
         detail_label = make_label(
             "\n".join(row_plan["detail_lines"]),
             row_plan["detail_y"],
@@ -228,8 +384,11 @@ def build_ui(payload):
         )
         if try_it_index is not None and index == try_it_index:
             try_it_refs = {"dot": dot, "detail_label": detail_label}
+        if key_index is not None and index == key_index:
+            key_refs = {"dot": dot, "field": field, "detail_label": detail_label}
 
-    controller = WindowController.alloc().init()
+    STATE["key_refs"] = key_refs
+
     button = NSButton.buttonWithTitle_target_action_(
         payload.get("button") or "Close", controller, "finish:"
     )
