@@ -1633,6 +1633,9 @@ struct App {
     vocabulary_usage_path: PathBuf,
     vocabulary_aliases: Mutex<Vec<TextReplacement>>,
     learned_aliases: Mutex<Vec<TextReplacement>>,
+    /// Newest GitHub release found by the startup check, when it is newer
+    /// than this build; surfaced in the status window.
+    latest_release: Mutex<Option<UpdateNotice>>,
     prompt_bindings: Mutex<Vec<PromptBinding>>,
     state: Mutex<AppState>,
     event_proxy: Mutex<Option<EventLoopProxy<UserEvent>>>,
@@ -1838,6 +1841,7 @@ fn main() -> Result<(), AppError> {
     }
     start_accessibility_daemon(&app.config.root_dir);
     check_accessibility_at_startup(&app.config.root_dir);
+    spawn_release_check(Arc::clone(&app));
     let daemon_root_dir = app.config.root_dir.clone();
     match std::thread::Builder::new()
         .name(String::from("bolo-access-daemon-supervisor"))
@@ -1847,6 +1851,26 @@ fn main() -> Result<(), AppError> {
         Err(error) => warn!("accessibility daemon supervisor failed to start: {error}"),
     }
     run_app_event_loop(app)
+}
+
+/// Ask GitHub whether a newer release exists, off the critical path. The
+/// result lands in `app.latest_release` for the status window; every
+/// failure mode is logged and ignored so startup never depends on it.
+fn spawn_release_check(app: Arc<App>) {
+    let join_handle = std::thread::Builder::new()
+        .name(String::from("bolo-release-check"))
+        .spawn(move || {
+            if let Some(notice) = fetch_latest_release()
+                && let Ok(mut guard) = app.latest_release.lock()
+            {
+                *guard = Some(notice);
+            } else {
+                info!("no newer release found by the startup check");
+            }
+        });
+    if let Err(error) = join_handle {
+        warn!("failed to start release check thread: {error}");
+    }
 }
 
 fn ensure_python_helpers_at_startup() -> Result<(), AppError> {
@@ -1871,35 +1895,38 @@ fn ensure_python_helpers_at_startup() -> Result<(), AppError> {
 /// notification when missing. The macOS prompt only fires when the toggle is
 /// genuinely off; subsequent restarts after granting will pass silently.
 fn check_accessibility_at_startup(root_dir: &Path) {
+    let bundle = bundle_mode();
     match accessibility_trust(root_dir, true) {
         AccessibilityTrust::Trusted => {
             info!("[accessibility] trusted at startup");
         }
         AccessibilityTrust::Untrusted => {
             let python3 = python3_executable_path();
-            warn!(
-                "[accessibility] NOT TRUSTED at startup. Text will not paste. \
-                 The paste keystroke is sent by a Python helper process, so macOS \
-                 needs Accessibility trust for this interpreter: {python3}. \
-                 Add it in System Settings > Privacy & Security > Accessibility, \
-                 then run ./restart.sh."
-            );
-            show_notification(
-                "Bolo needs Accessibility",
-                &format!(
-                    "Add this Python interpreter in System Settings > Privacy & Security > \
-                     Accessibility, then run ./restart.sh: {python3}"
-                ),
-            );
+            let fix = accessibility_fix_detail(bundle, &python3);
+            warn!("[accessibility] NOT TRUSTED at startup. Text will not paste. {fix}");
+            if !bundle {
+                warn!(
+                    "The paste keystroke is sent by a Python helper process, so macOS \
+                     needs Accessibility trust for this interpreter: {python3}."
+                );
+            }
+            show_notification("Bolo needs Accessibility", &fix);
         }
         AccessibilityTrust::Unavailable => {
-            warn!(
-                "[accessibility] helper unavailable at startup. Run ./install.sh, then ./restart.sh."
-            );
-            show_notification(
-                "Bolo helper needs repair",
-                "Run ./install.sh, then ./restart.sh. Bolo will not paste until the helper is ready.",
-            );
+            warn!("[accessibility] helper unavailable at startup.");
+            if bundle {
+                warn!("Reinstall Bolo by downloading the latest Bolo DMG again.");
+                show_notification(
+                    "Bolo helper needs repair",
+                    "Reinstall Bolo by downloading the latest Bolo DMG again.",
+                );
+            } else {
+                warn!("Run ./install.sh, then ./restart.sh.");
+                show_notification(
+                    "Bolo helper needs repair",
+                    "Run ./install.sh, then ./restart.sh. Bolo will not paste until the helper is ready.",
+                );
+            }
         }
     }
 }
@@ -2123,6 +2150,7 @@ fn run_app_event_loop(app: Arc<App>) -> Result<(), AppError> {
     let mut status_window: Option<AppWindow> = None;
     let mut onboarding_try_it_complete = false;
     let mut onboarding_try_it_snapshot: Option<u64> = None;
+    let mut onboarding_key_pending = false;
     let mut overlay_hide_at: Option<Instant> = None;
     let mut recording_check_at: Option<Instant> = None;
     event_loop.run(move |event, _event_loop_target, control_flow| {
@@ -2156,6 +2184,7 @@ fn run_app_event_loop(app: Arc<App>) -> Result<(), AppError> {
                         &mut onboarding_window,
                         &mut onboarding_try_it_complete,
                         &mut onboarding_try_it_snapshot,
+                        &mut onboarding_key_pending,
                     );
                 }
             }
@@ -2208,6 +2237,7 @@ fn run_app_event_loop(app: Arc<App>) -> Result<(), AppError> {
                     &mut onboarding_window,
                     &mut onboarding_try_it_complete,
                     &mut onboarding_try_it_snapshot,
+                    &mut onboarding_key_pending,
                 );
             }
             TaoEvent::UserEvent(UserEvent::ShowStatus) => {
@@ -2246,6 +2276,21 @@ fn run_app_event_loop(app: Arc<App>) -> Result<(), AppError> {
                     if let Err(error) = app.force_release() {
                         error!("{error}");
                     }
+                }
+                // The runtime loads ~/.bolo/env once at startup, so a key
+                // entered in the onboarding window needs a restart to take
+                // effect. Once that window has closed and the key is on
+                // disk, exit with the supervisor's restart code; the user
+                // sees Bolo pick the key up a few seconds later.
+                if onboarding_key_pending
+                    && load_env_value("ASSEMBLYAI_API_KEY").is_some()
+                    && !onboarding_window
+                        .as_mut()
+                        .map_or(Ok(false), AppWindow::is_running)
+                        .unwrap_or(false)
+                {
+                    info!("API key saved during onboarding; restarting the runtime to load it");
+                    std::process::exit(UPDATE_RESTART_EXIT_CODE);
                 }
             }
             TaoEvent::NewEvents(StartCause::ResumeTimeReached { .. }) => {
@@ -2298,6 +2343,7 @@ impl App {
             vocabulary_usage_path,
             vocabulary_aliases: Mutex::new(vocabulary.aliases),
             learned_aliases: Mutex::new(vocabulary.learned_aliases),
+            latest_release: Mutex::new(None),
             prompt_bindings: Mutex::new(prompt_bindings),
             state: Mutex::new(AppState {
                 history,
@@ -4559,7 +4605,12 @@ impl Config {
             ),
         };
         if let Some(missing) = config.missing_required_key() {
-            return Err(AppError::MissingConfig(missing));
+            // A missing key is no longer fatal: the onboarding window shows
+            // an entry field for the AssemblyAI key and dictation attempts
+            // already fail per-request with a clean error. This keeps the
+            // first-run flow (bundle or source) alive long enough to
+            // collect the key in the UI.
+            warn!("required API key missing at startup: {missing}");
         }
         Ok(config)
     }
@@ -5262,7 +5313,34 @@ fn rewrite_selected_from_menu(app: Arc<App>) {
 }
 
 #[allow(clippy::exit)]
-fn check_for_updates_from_menu(app: &App) {
+fn check_for_updates_from_menu(app: &Arc<App>) {
+    if bundle_mode() {
+        // The bundle has no git checkout; the GitHub releases check is the
+        // only update signal, surfaced the same way the startup check does.
+        show_notification("Bolo Update", "Checking for updates.");
+        let app = Arc::clone(app);
+        let join_handle = std::thread::Builder::new()
+            .name(String::from("bolo-release-check"))
+            .spawn(move || match fetch_latest_release() {
+                Some(notice) => {
+                    if let Ok(mut guard) = app.latest_release.lock() {
+                        *guard = Some(notice.clone());
+                    }
+                    show_notification(
+                        "Bolo update available",
+                        &format!(
+                            "Download Bolo v{} from {} and replace Bolo in Applications.",
+                            notice.version, notice.url
+                        ),
+                    );
+                }
+                None => show_notification("Bolo Update", "Bolo is up to date."),
+            });
+        if let Err(error) = join_handle {
+            warn!("failed to start the update check thread: {error}");
+        }
+        return;
+    }
     let root_dir = app.config.root_dir.clone();
     show_notification("Bolo Update", "Checking for updates.");
     let join_handle = std::thread::Builder::new()
@@ -5643,7 +5721,18 @@ struct AppWindowPayload {
     button: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     try_it_index: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    key_entry: Option<KeyEntrySpec>,
     write_marker: bool,
+}
+
+/// Placement of the API-key entry field inside the onboarding window. The
+/// bundle flow defaults to `AssemblyAI` and has no provider picker, so the
+/// entry is shown whenever the resolved pipeline is missing that one key.
+#[derive(Debug, Serialize)]
+struct KeyEntrySpec {
+    index: usize,
+    placeholder: String,
 }
 
 /// The one-line welcome shown at the top of the onboarding window.
@@ -5651,13 +5740,30 @@ const fn onboarding_welcome() -> &'static str {
     "Bolo listens while you hold a key and pastes what you said when you let go."
 }
 
+/// Whether Bolo is running as the distributed `Bolo.app` bundle. The
+/// launcher inside the bundle sets `BOLO_BUNDLE_MODE=1`; a source checkout
+/// leaves it unset. In bundle mode macOS attributes Accessibility trust to
+/// the app bundle, so instructions name "Bolo" rather than the Python
+/// interpreter the runtime spawned.
+fn bundle_mode() -> bool {
+    load_bool_env("BOLO_BUNDLE_MODE", false)
+}
+
 /// Accessibility fix, matching the text the startup notification and the
-/// paste path already surface, naming the exact interpreter to trust.
-fn accessibility_fix_detail(python: &str) -> String {
-    format!(
-        "Add this Python interpreter in System Settings > Privacy & Security > \
-         Accessibility, then run ./restart.sh: {python}"
-    )
+/// paste path already surface. In bundle mode the instruction names Bolo
+/// itself; from source it names the exact interpreter to trust.
+fn accessibility_fix_detail(bundle: bool, python: &str) -> String {
+    if bundle {
+        String::from(
+            "Open System Settings > Privacy & Security > Accessibility and enable Bolo, \
+             then quit Bolo from its menu bar and open Bolo again.",
+        )
+    } else {
+        format!(
+            "Add this Python interpreter in System Settings > Privacy & Security > \
+             Accessibility, then run ./restart.sh: {python}"
+        )
+    }
 }
 
 fn microphone_detail(device_count: usize) -> String {
@@ -5673,9 +5779,35 @@ fn microphone_detail(device_count: usize) -> String {
     }
 }
 
+/// The onboarding row's key-entry placement, shown only for the missing
+/// `AssemblyAI` key: the bundle flow defaults to `AssemblyAI` with no provider
+/// picker, and a Telnyx key never gets an entry field, so source installs
+/// that picked Telnyx keep the plain file instruction.
+fn key_entry_spec(missing: Option<&str>) -> Option<KeyEntrySpec> {
+    (missing == Some("ASSEMBLYAI_API_KEY")).then(|| KeyEntrySpec {
+        index: 2,
+        placeholder: String::from("Paste your AssemblyAI API key"),
+    })
+}
+
+/// Detail text for the speech-to-text row while the key-entry field is
+/// visible; the row itself tells the user what to do with the field.
+fn key_entry_row_detail() -> String {
+    String::from(
+        "Paste your AssemblyAI API key below, then click Validate. Get one at \
+         assemblyai.com/dashboard.",
+    )
+}
+
 /// Provider and key row text; `missing` comes from `Config::missing_required_key`
-/// and names the exact environment variable to add when absent.
+/// and names the exact environment variable to add when absent. When the
+/// missing key is the `AssemblyAI` key, the window shows the entry field and
+/// this detail explains it instead of pointing at a file the user cannot
+/// edit without a terminal.
 fn onboarding_provider_key_detail(missing: Option<&str>) -> String {
+    if key_entry_spec(missing).is_some() {
+        return key_entry_row_detail();
+    }
     missing.map_or_else(
         || String::from("Required API key present in ~/.bolo/env."),
         |key| format!("Missing {key}. Add it to ~/.bolo/env, then run ./restart.sh."),
@@ -5687,13 +5819,121 @@ fn onboarding_try_it_detail(hotkey: &str) -> String {
 }
 
 /// Rows for the status window: version, resolved provider and streaming
-/// mode, and the log path.
-fn status_rows(version: &str, streaming: &str, log_path: &str) -> Vec<WindowRow> {
-    vec![
+/// mode, the log path, and an optional newer-release row.
+fn status_rows(
+    version: &str,
+    streaming: &str,
+    log_path: &str,
+    update: Option<&UpdateNotice>,
+) -> Vec<WindowRow> {
+    let mut rows = vec![
         WindowRow::new("Version", String::from(version), "ok"),
         WindowRow::new("Speech to text", String::from(streaming), "ok"),
         WindowRow::new("Log", String::from(log_path), "ok"),
-    ]
+    ];
+    if let Some(notice) = update {
+        rows.push(WindowRow::new(
+            "Update",
+            format!(
+                "Update available: v{}. Download at {}",
+                notice.version, notice.url
+            ),
+            "warn",
+        ));
+    }
+    rows
+}
+
+/// A newer GitHub release discovered by the startup check.
+#[derive(Clone, Debug)]
+struct UpdateNotice {
+    version: String,
+    url: String,
+}
+
+/// GitHub API endpoint for the repo's latest published release.
+const RELEASES_LATEST_URL: &str = "https://api.github.com/repos/a692570/bolo/releases/latest";
+
+/// Strip the leading "v" from a release tag, keeping only tags that look
+/// like plain dotted versions; anything else is not comparable.
+fn parse_release_version(tag: &str) -> Option<String> {
+    let version = tag.strip_prefix('v').unwrap_or(tag);
+    let mut parts = version.split('.');
+    let mut numeric = [0u64; 3];
+    for slot in &mut numeric {
+        let Some(part) = parts.next() else {
+            break;
+        };
+        let Ok(value) = part.parse::<u64>() else {
+            return None;
+        };
+        *slot = value;
+    }
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(version.to_owned())
+}
+
+/// Numeric comparison of two dotted versions; true when `latest` is strictly
+/// greater than `current`. Pre-release suffixes compare as their base.
+fn version_is_newer(current: &str, latest: &str) -> bool {
+    let parse = |text: &str| {
+        text.split('.')
+            .map(<str>::parse::<u64>)
+            .collect::<Result<Vec<_>, _>>()
+            .ok()
+    };
+    match (parse(current), parse(latest)) {
+        (Some(current), Some(latest)) => current < latest,
+        _ => false,
+    }
+}
+
+/// Extract the tag and page URL from a GitHub `releases/latest` payload.
+fn parse_latest_release(payload: &serde_json::Value) -> Option<UpdateNotice> {
+    let tag = payload.get("tag_name")?.as_str()?;
+    let url = payload.get("html_url")?.as_str()?;
+    let version = parse_release_version(tag)?;
+    Some(UpdateNotice {
+        version,
+        url: String::from(url),
+    })
+}
+
+/// Ask GitHub for the latest published release and keep it only when it is
+/// newer than the running build. Network failures are logged and dropped;
+/// the caller never treats the check as fatal.
+fn fetch_latest_release() -> Option<UpdateNotice> {
+    let client = Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .ok()?;
+    let request = client
+        .get(RELEASES_LATEST_URL)
+        .header("User-Agent", format!("bolo/{}", env!("CARGO_PKG_VERSION")))
+        .header("Accept", "application/vnd.github+json")
+        .build()
+        .ok()?;
+    let response = client.execute(request).ok()?;
+    let status = response.status();
+    if !status.is_success() {
+        warn!("release check returned status {status}; skipping");
+        return None;
+    }
+    let payload: serde_json::Value = response.json().ok()?;
+    let notice = parse_latest_release(&payload);
+    match &notice {
+        Some(found) if version_is_newer(env!("CARGO_PKG_VERSION"), &found.version) => {
+            info!(
+                "newer release available: v{} at {}",
+                found.version, found.url
+            );
+        }
+        Some(found) => info!("latest release v{} is not newer", found.version),
+        None => warn!("latest release payload did not include a comparable tag"),
+    }
+    notice.filter(|found| version_is_newer(env!("CARGO_PKG_VERSION"), &found.version))
 }
 
 /// A spawned `app_window.py` helper process.
@@ -5758,12 +5998,16 @@ fn onboarding_window_payload(app: &App, write_marker: bool) -> Result<String, Ap
         ),
         AccessibilityTrust::Untrusted => WindowRow::new(
             "Accessibility",
-            accessibility_fix_detail(&python3_executable_path()),
+            accessibility_fix_detail(bundle_mode(), &python3_executable_path()),
             "warn",
         ),
         AccessibilityTrust::Unavailable => WindowRow::new(
             "Accessibility",
-            String::from("Helper unavailable. Run ./install.sh, then ./restart.sh."),
+            if bundle_mode() {
+                String::from("Reinstall Bolo by downloading the latest Bolo DMG again.")
+            } else {
+                String::from("Helper unavailable. Run ./install.sh, then ./restart.sh.")
+            },
             "warn",
         ),
     };
@@ -5796,12 +6040,18 @@ fn onboarding_window_payload(app: &App, write_marker: bool) -> Result<String, Ap
         ],
         button: String::from("Done"),
         try_it_index: Some(3),
+        key_entry: key_entry_spec(missing),
         write_marker,
     };
     serde_json::to_string(&payload).map_err(|error| AppError::MenuBar(error.to_string()))
 }
 
 fn status_window_payload(app: &App) -> Result<String, AppError> {
+    let update = app
+        .latest_release
+        .lock()
+        .ok()
+        .and_then(|guard| guard.as_ref().cloned());
     let payload = AppWindowPayload {
         mode: String::from("status"),
         title: String::from("Bolo status"),
@@ -5810,9 +6060,11 @@ fn status_window_payload(app: &App) -> Result<String, AppError> {
             env!("CARGO_PKG_VERSION"),
             streaming_status_label(app.config.streaming_stt),
             LOG_FILE,
+            update.as_ref(),
         ),
         button: String::from("Close"),
         try_it_index: None,
+        key_entry: None,
         write_marker: false,
     };
     serde_json::to_string(&payload).map_err(|error| AppError::MenuBar(error.to_string()))
@@ -5821,11 +6073,15 @@ fn status_window_payload(app: &App) -> Result<String, AppError> {
 /// Open (or ignore when already open) the onboarding window. `write_marker`
 /// comes from the marker state at open time, so a manual reopen after
 /// completion never rewrites it, while an unfinished first run still can.
+/// `key_pending` records whether this window was opened while the
+/// `AssemblyAI` key was missing, so the event loop can restart the runtime
+/// after the window closes with the key saved.
 fn open_onboarding_window(
     app: &App,
     window_slot: &mut Option<AppWindow>,
     try_it_complete: &mut bool,
     try_it_snapshot: &mut Option<u64>,
+    key_pending: &mut bool,
 ) {
     let already_running = window_slot
         .as_mut()
@@ -5846,6 +6102,7 @@ fn open_onboarding_window(
         .and_then(|payload| spawn_app_window(&app.config.root_dir, &payload));
     match result {
         Ok(window) => {
+            *key_pending = key_entry_spec(app.config.missing_required_key()).is_some();
             *window_slot = Some(window);
             info!("onboarding window shown");
         }
@@ -9121,26 +9378,24 @@ fn paste_text(root_dir: &Path, text: &str) -> Result<(), AppError> {
     match accessibility_trust(root_dir, false) {
         AccessibilityTrust::Trusted => {}
         AccessibilityTrust::Untrusted => {
-            let python3 = python3_executable_path();
-            warn!(
-                "[accessibility] NOT TRUSTED at paste time. Add {python3} in System \
-                 Settings > Privacy & Security > Accessibility, then run ./restart.sh."
-            );
-            show_notification(
-                "Bolo cannot paste",
-                &format!(
-                    "Add this Python interpreter in System Settings > Privacy & Security > \
-                     Accessibility, then run ./restart.sh: {python3}"
-                ),
-            );
+            let fix = accessibility_fix_detail(bundle_mode(), &python3_executable_path());
+            warn!("[accessibility] NOT TRUSTED at paste time. {fix}");
+            show_notification("Bolo cannot paste", &fix);
             return Err(AppError::AccessibilityNotGranted);
         }
         AccessibilityTrust::Unavailable => {
             warn!("[accessibility] helper unavailable at paste time");
-            show_notification(
-                "Bolo cannot paste",
-                "Run ./install.sh, then ./restart.sh to repair Bolo's Python helper.",
-            );
+            if bundle_mode() {
+                show_notification(
+                    "Bolo cannot paste",
+                    "Reinstall Bolo by downloading the latest Bolo DMG again.",
+                );
+            } else {
+                show_notification(
+                    "Bolo cannot paste",
+                    "Run ./install.sh, then ./restart.sh to repair Bolo's Python helper.",
+                );
+            }
             return Err(AppError::AccessibilityNotGranted);
         }
     }
@@ -9608,27 +9863,28 @@ mod tests {
     use super::{
         ACCESS_DAEMON_ACTION_TIMEOUT, ACCESS_DAEMON_QUERY_TIMEOUT, ACCESS_DAEMON_STARTUP_TIMEOUT,
         ASSEMBLYAI_STREAMING_MODEL, AccessDaemonFailure, AccessDaemonRequest, AccessibilityContext,
-        AccessibilityTrust, App, AppError, AppState, AssemblyDictationResponse, BatchRetry,
-        CleanupMode, CleanupProfile, Config, CorrectionOutcome, DictationCommandKind,
+        AccessibilityTrust, App, AppError, AppState, AppWindowPayload, AssemblyDictationResponse,
+        BatchRetry, CleanupMode, CleanupProfile, Config, CorrectionOutcome, DictationCommandKind,
         DictationUploadReader, DictationUploadRelease, DictationWarmup, EditLearningClaim,
-        LearnedVocabulary, OnboardingStatus, PreparedText, PromptBinding, STREAMING_DRAIN_MIN,
-        STT_RETRY_SAMPLE_RATE, StreamingConnectionState, StreamingProvider, StreamingRecording,
-        StreamingText, StreamingTranscript, SttFallback, SttResult, TRANSCRIPT_HISTORY_LIMIT,
-        TextReplacement, TranscriptHistoryEntry, UpdateOutcome, accessibility_fix_detail,
-        apply_text_replacements, apply_vocabulary_corrections_with_matches,
-        assemblyai_direct_query_with, assemblyai_language_code, batch_retry_plan,
-        build_cleanup_user_content, build_rewrite_user_content, build_stt_prompt,
-        canonicalize_known_terms, cleanup_decision, cleanup_max_tokens, cleanup_profile,
-        contains_word_verbatim, derive_word_correction, dictation_upload_config,
-        dictation_upload_form, dictation_upload_release, dictation_upload_request_timeout,
-        downsample_wav_16k_mono, empty_transcript_error, enforce_learned_vocabulary_cap,
-        final_streaming_result_is_ready_elapsed, finalize_accessibility_context,
-        handshake_with_deadline, is_known_no_speech_transcript, is_supported_hotkey,
-        load_learned_vocabulary, load_vocabulary_usage, load_vocabulary_with_learned,
-        microphone_detail, non_empty_transcript, onboarding_provider_key_detail,
-        onboarding_status_at, onboarding_try_it_detail, parse_accessibility_trust, parse_command,
-        parse_daemon_context_reply, parse_daemon_paste_reply, parse_daemon_select_reply,
-        parse_daemon_trust_reply, parse_replacements_json, parse_stt_fallbacks,
+        KeyEntrySpec, LearnedVocabulary, OnboardingStatus, PreparedText, PromptBinding,
+        STREAMING_DRAIN_MIN, STT_RETRY_SAMPLE_RATE, StreamingConnectionState, StreamingProvider,
+        StreamingRecording, StreamingText, StreamingTranscript, SttFallback, SttResult,
+        TRANSCRIPT_HISTORY_LIMIT, TextReplacement, TranscriptHistoryEntry, UpdateNotice,
+        UpdateOutcome, WindowRow, accessibility_fix_detail, apply_text_replacements,
+        apply_vocabulary_corrections_with_matches, assemblyai_direct_query_with,
+        assemblyai_language_code, batch_retry_plan, build_cleanup_user_content,
+        build_rewrite_user_content, build_stt_prompt, canonicalize_known_terms, cleanup_decision,
+        cleanup_max_tokens, cleanup_profile, contains_word_verbatim, derive_word_correction,
+        dictation_upload_config, dictation_upload_form, dictation_upload_release,
+        dictation_upload_request_timeout, downsample_wav_16k_mono, empty_transcript_error,
+        enforce_learned_vocabulary_cap, final_streaming_result_is_ready_elapsed,
+        finalize_accessibility_context, handshake_with_deadline, is_known_no_speech_transcript,
+        is_supported_hotkey, key_entry_spec, load_learned_vocabulary, load_vocabulary_usage,
+        load_vocabulary_with_learned, microphone_detail, non_empty_transcript,
+        onboarding_provider_key_detail, onboarding_status_at, onboarding_try_it_detail,
+        parse_accessibility_trust, parse_command, parse_daemon_context_reply,
+        parse_daemon_paste_reply, parse_daemon_select_reply, parse_daemon_trust_reply,
+        parse_latest_release, parse_release_version, parse_replacements_json, parse_stt_fallbacks,
         parse_u64_env_value, parse_update_outcome, parse_wav_pcm16, pcm_bytes,
         preview_only_streaming, preview_release_stt, read_vocabulary_file,
         read_vocabulary_usage_file, record_learned_correction, remove_fillers,
@@ -9637,8 +9893,8 @@ mod tests {
         streaming_batch_fallback_reason, streaming_connection, streaming_preview_tail,
         streaming_provider_from_config, streaming_status_label, strip_reasoning_tags,
         stt_language_for_model, stt_model_config, telnyx_stream_query, transcript_log_value,
-        transcript_menu_preview, upsert_learned_correction, wait_for_daemon_reply, wav_bytes,
-        wav_duration_ms,
+        transcript_menu_preview, upsert_learned_correction, version_is_newer,
+        wait_for_daemon_reply, wav_bytes, wav_duration_ms,
     };
     use std::collections::{HashMap, VecDeque};
     use std::io::Read as _;
@@ -9714,9 +9970,12 @@ mod tests {
 
     #[test]
     fn onboarding_provider_key_row_names_the_exact_missing_var() {
+        // The missing AssemblyAI key gets the in-window entry field instead
+        // of a file instruction.
         assert_eq!(
             onboarding_provider_key_detail(Some("ASSEMBLYAI_API_KEY")),
-            "Missing ASSEMBLYAI_API_KEY. Add it to ~/.bolo/env, then run ./restart.sh."
+            "Paste your AssemblyAI API key below, then click Validate. Get one at \
+             assemblyai.com/dashboard."
         );
         assert_eq!(
             onboarding_provider_key_detail(Some("TELNYX_API_KEY")),
@@ -9741,11 +10000,126 @@ mod tests {
     }
 
     #[test]
-    fn accessibility_fix_names_the_interpreter_and_restart() {
-        let detail = accessibility_fix_detail("/Users/demo/.bolo/venv/bin/python3");
+    fn accessibility_fix_names_the_interpreter_and_restart_from_source() {
+        let detail = accessibility_fix_detail(false, "/Users/demo/.bolo/venv/bin/python3");
         assert!(detail.contains("System Settings > Privacy & Security > Accessibility"));
         assert!(detail.contains("/Users/demo/.bolo/venv/bin/python3"));
         assert!(detail.contains("./restart.sh"));
+    }
+
+    #[test]
+    fn accessibility_fix_in_bundle_mode_names_bolo_not_the_interpreter() {
+        let detail = accessibility_fix_detail(true, "/Users/demo/.bolo/venv/bin/python3");
+        assert!(detail.contains("enable Bolo"));
+        assert!(!detail.contains("python3"));
+        assert!(!detail.contains("restart.sh"));
+    }
+
+    #[test]
+    fn status_rows_append_the_update_row_when_a_newer_release_exists() {
+        let notice = UpdateNotice {
+            version: String::from("1.7.0"),
+            url: String::from("https://github.com/a692570/bolo/releases/tag/v1.7.0"),
+        };
+        let rows = status_rows("1.6.0", "Batch STT", "/tmp/bolo.log", Some(&notice));
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[3].label, "Update");
+        assert_eq!(
+            rows[3].detail,
+            "Update available: v1.7.0. Download at https://github.com/a692570/bolo/releases/tag/v1.7.0"
+        );
+    }
+
+    #[test]
+    fn release_tags_parse_to_comparable_versions() {
+        assert_eq!(parse_release_version("v1.7.0").as_deref(), Some("1.7.0"));
+        assert_eq!(parse_release_version("1.8.2").as_deref(), Some("1.8.2"));
+        assert_eq!(parse_release_version("v2.0").as_deref(), Some("2.0"));
+        assert_eq!(parse_release_version("not-a-version"), None);
+        assert_eq!(parse_release_version("v1.7.0-beta"), None);
+        assert_eq!(parse_release_version(""), None);
+    }
+
+    #[test]
+    fn version_is_newer_compares_numerically() {
+        assert!(version_is_newer("1.6.0", "1.6.1"));
+        assert!(version_is_newer("1.6.0", "1.7.0"));
+        assert!(version_is_newer("1.9.0", "2.0.0"));
+        assert!(version_is_newer("1.9", "1.10.0"));
+        assert!(!version_is_newer("1.6.0", "1.6.0"));
+        assert!(!version_is_newer("1.7.0", "1.6.9"));
+        // Unparseable candidates never claim to be newer.
+        assert!(!version_is_newer("1.6.0", "banana"));
+    }
+
+    #[test]
+    fn parse_latest_release_keeps_tag_and_url() {
+        let payload = serde_json::json!({
+            "tag_name": "v1.7.0",
+            "html_url": "https://github.com/a692570/bolo/releases/tag/v1.7.0"
+        });
+        let notice = parse_latest_release(&payload).expect("notice");
+        assert_eq!(notice.version, "1.7.0");
+        assert_eq!(
+            notice.url,
+            "https://github.com/a692570/bolo/releases/tag/v1.7.0"
+        );
+
+        // Missing fields or odd tags yield nothing.
+        assert!(parse_latest_release(&serde_json::json!({})).is_none());
+        assert!(parse_latest_release(&serde_json::json!({"tag_name": "v"})).is_none());
+    }
+
+    #[test]
+    fn app_window_payload_serializes_key_entry_only_when_present() {
+        let rows = vec![WindowRow::new(
+            "Speech to text",
+            String::from("missing"),
+            "warn",
+        )];
+        let mut payload = AppWindowPayload {
+            mode: String::from("onboarding"),
+            title: String::from("Set up Bolo"),
+            welcome: String::new(),
+            rows,
+            button: String::from("Done"),
+            try_it_index: None,
+            key_entry: Some(KeyEntrySpec {
+                index: 2,
+                placeholder: String::from("Paste your AssemblyAI API key"),
+            }),
+            write_marker: true,
+        };
+        let json = serde_json::to_string(&payload).expect("payload json");
+        assert!(json.contains("\"key_entry\":{\"index\":2"));
+        assert!(json.contains("\"write_marker\":true"));
+        assert!(!json.contains("\"try_it_index\""));
+
+        payload.key_entry = None;
+        let json_without_entry = serde_json::to_string(&payload).expect("payload json");
+        assert!(!json_without_entry.contains("key_entry"));
+    }
+
+    #[test]
+    fn key_entry_spec_shows_only_for_missing_assemblyai_key() {
+        let spec = key_entry_spec(Some("ASSEMBLYAI_API_KEY")).expect("spec");
+        assert_eq!(spec.index, 2);
+        assert_eq!(spec.placeholder, "Paste your AssemblyAI API key");
+        assert!(key_entry_spec(Some("TELNYX_API_KEY")).is_none());
+        assert!(key_entry_spec(None).is_none());
+    }
+
+    #[test]
+    fn onboarding_provider_key_detail_switches_for_key_entry() {
+        assert!(onboarding_provider_key_detail(Some("ASSEMBLYAI_API_KEY")).contains("Validate"));
+        assert_eq!(
+            onboarding_provider_key_detail(Some("TELNYX_API_KEY")),
+            "Missing TELNYX_API_KEY. Add it to ~/.bolo/env, then run ./restart.sh."
+        );
+        assert_eq!(
+            onboarding_provider_key_detail(None),
+            "Required API key present in ~/.bolo/env."
+        );
     }
 
     #[test]
@@ -9757,7 +10131,12 @@ mod tests {
 
     #[test]
     fn status_rows_list_version_streaming_and_log_path() {
-        let rows = status_rows("1.6.0", "Deepgram streaming via Telnyx", "/tmp/bolo.log");
+        let rows = status_rows(
+            "1.6.0",
+            "Deepgram streaming via Telnyx",
+            "/tmp/bolo.log",
+            None,
+        );
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0].label, "Version");
         assert_eq!(rows[0].detail, "1.6.0");
@@ -11503,6 +11882,7 @@ mod tests {
             vocabulary: Mutex::new(vocabulary),
             vocabulary_aliases: Mutex::new(Vec::new()),
             learned_aliases: Mutex::new(Vec::new()),
+            latest_release: Mutex::new(None),
             prompt_bindings: Mutex::new(Vec::new()),
             vocabulary_usage: Mutex::new(usage),
             vocabulary_usage_path: usage_path.clone(),
@@ -11538,6 +11918,7 @@ mod tests {
             vocabulary: Mutex::new(Vec::new()),
             vocabulary_aliases: Mutex::new(Vec::new()),
             learned_aliases: Mutex::new(Vec::new()),
+            latest_release: Mutex::new(None),
             prompt_bindings: Mutex::new(Vec::new()),
             vocabulary_usage: Mutex::new(HashMap::new()),
             vocabulary_usage_path: temp_vocabulary_usage_path(),
@@ -11579,6 +11960,7 @@ mod tests {
             vocabulary: Mutex::new(Vec::new()),
             vocabulary_aliases: Mutex::new(Vec::new()),
             learned_aliases: Mutex::new(Vec::new()),
+            latest_release: Mutex::new(None),
             prompt_bindings: Mutex::new(Vec::new()),
             vocabulary_usage: Mutex::new(HashMap::new()),
             vocabulary_usage_path: temp_vocabulary_usage_path(),
@@ -11640,6 +12022,7 @@ mod tests {
             vocabulary: Mutex::new(Vec::new()),
             vocabulary_aliases: Mutex::new(Vec::new()),
             learned_aliases: Mutex::new(Vec::new()),
+            latest_release: Mutex::new(None),
             prompt_bindings: Mutex::new(Vec::new()),
             vocabulary_usage: Mutex::new(HashMap::new()),
             vocabulary_usage_path: temp_vocabulary_usage_path(),
@@ -11686,6 +12069,7 @@ mod tests {
             vocabulary: Mutex::new(Vec::new()),
             vocabulary_aliases: Mutex::new(Vec::new()),
             learned_aliases: Mutex::new(Vec::new()),
+            latest_release: Mutex::new(None),
             prompt_bindings: Mutex::new(Vec::new()),
             vocabulary_usage: Mutex::new(HashMap::new()),
             vocabulary_usage_path: temp_vocabulary_usage_path(),
@@ -11745,6 +12129,7 @@ mod tests {
                 replacement: String::from("Bolo"),
             }]),
             learned_aliases: Mutex::new(Vec::new()),
+            latest_release: Mutex::new(None),
             prompt_bindings: Mutex::new(Vec::new()),
             vocabulary_usage: Mutex::new(HashMap::new()),
             vocabulary_usage_path: temp_vocabulary_usage_path(),
@@ -11825,6 +12210,7 @@ mod tests {
             vocabulary: Mutex::new(Vec::new()),
             vocabulary_aliases: Mutex::new(Vec::new()),
             learned_aliases: Mutex::new(Vec::new()),
+            latest_release: Mutex::new(None),
             prompt_bindings: Mutex::new(Vec::new()),
             vocabulary_usage: Mutex::new(HashMap::new()),
             vocabulary_usage_path: temp_vocabulary_usage_path(),
@@ -11873,6 +12259,7 @@ mod tests {
             vocabulary: Mutex::new(Vec::new()),
             vocabulary_aliases: Mutex::new(Vec::new()),
             learned_aliases: Mutex::new(Vec::new()),
+            latest_release: Mutex::new(None),
             prompt_bindings: Mutex::new(Vec::new()),
             vocabulary_usage: Mutex::new(HashMap::new()),
             vocabulary_usage_path: temp_vocabulary_usage_path(),
@@ -11924,6 +12311,7 @@ mod tests {
             vocabulary: Mutex::new(Vec::new()),
             vocabulary_aliases: Mutex::new(Vec::new()),
             learned_aliases: Mutex::new(Vec::new()),
+            latest_release: Mutex::new(None),
             prompt_bindings: Mutex::new(Vec::new()),
             vocabulary_usage: Mutex::new(HashMap::new()),
             vocabulary_usage_path: temp_vocabulary_usage_path(),
@@ -11965,6 +12353,7 @@ mod tests {
             vocabulary: Mutex::new(Vec::new()),
             vocabulary_aliases: Mutex::new(Vec::new()),
             learned_aliases: Mutex::new(Vec::new()),
+            latest_release: Mutex::new(None),
             prompt_bindings: Mutex::new(Vec::new()),
             vocabulary_usage: Mutex::new(HashMap::new()),
             vocabulary_usage_path: temp_vocabulary_usage_path(),
@@ -12889,6 +13278,7 @@ mod tests {
             vocabulary_usage_path: temp_vocabulary_usage_path(),
             state: Mutex::new(AppState::default()),
             event_proxy: Mutex::new(None),
+            latest_release: Mutex::new(None),
         })
     }
 

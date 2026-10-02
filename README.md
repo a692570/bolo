@@ -22,6 +22,23 @@ macOS 12+ · Rust 1.88+ · MIT · [Website](https://a692570.github.io/bolo/)
 git clone https://github.com/a692570/bolo.git && cd bolo && ./install.sh
 ```
 
+## Install without a terminal (DMG)
+
+If a `Bolo-<version>.dmg` is attached to a [GitHub release](https://github.com/a692570/bolo/releases), open it, drag Bolo into Applications, and launch it. No Rust, no Python setup, no terminal. The app bundles a CPython runtime for both Intel and Apple Silicon Macs, creates its helper environment from wheels inside the bundle on first launch, registers itself as a login item, and collects your AssemblyAI API key in its onboarding window (paste the key and click Validate; nothing is transcribed for the check). One Accessibility grant covers Bolo and all of its helpers because macOS attributes them to the app bundle.
+
+Two macOS caveats, both consequences of shipping without a paid Developer ID:
+
+- Bolo is ad-hoc signed, not notarized. The first launch on macOS 15 is blocked by Gatekeeper; allow it under System Settings > Privacy & Security > Open Anyway.
+- Downloads from the releases page are the only supported install; a DMG built on your machine is for testing.
+
+## Build the DMG yourself
+
+```bash
+scripts/build-dmg.sh
+```
+
+The script builds the universal Rust binary (bootstrapping a private rustup toolchain inside `build/` when the system rust cannot cross-compile for x86_64), downloads the pinned python-build-standalone runtimes, resolves the pyobjc wheels, renders the app icon, stages `Bolo.app`, ad-hoc signs it, packs `dist/Bolo-<version>.dmg`, and verifies the mounted result. Artifacts are cached in `build/` and the DMG lands in `dist/`; both are gitignored.
+
 > **AI agent prompt:** Copy and paste this into Claude Code, ChatGPT, Cursor, or any coding agent:
 >
 > *"Install Bolo from github.com/a692570/bolo on my Mac. It needs Rust, Python 3, and a Telnyx API key. Run install.sh, then help me grant Microphone and Accessibility permissions."*

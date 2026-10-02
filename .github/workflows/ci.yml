@@ -30,7 +30,7 @@ jobs:
           .venv-ci/bin/python -m pip install --disable-pip-version-check -r requirements.txt pytest
           BOLO_PYTHON_BOOTSTRAP=python BOLO_VENV_DIR="$RUNNER_TEMP/bolo-helper-venv" ./ensure-python-env.sh --sync
       - name: Check shell scripts
-        run: bash -n install.sh ensure-python-env.sh update.sh restart.sh start-bolo.command start-bolo.sh
+        run: bash -n install.sh ensure-python-env.sh update.sh restart.sh start-bolo.command start-bolo.sh scripts/build-dmg.sh scripts/bundle-launcher.sh
       - name: Check Rust formatting
         run: cargo fmt --all -- --check
       - name: Test Rust runtime
