@@ -1662,6 +1662,8 @@ enum UserEvent {
     HistoryChanged,
     CleanupStatusChanged,
     RecordingWatchdog,
+    ShowOnboarding,
+    ShowStatus,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1707,10 +1709,12 @@ struct TrayUi {
     clear_history_item: MenuItem,
     language_items: Vec<(String, CheckMenuItem)>,
     health_check_item: MenuItem,
+    status_item: MenuItem,
     update_item: MenuItem,
     add_vocabulary_item: MenuItem,
     add_vocabulary_alias_item: MenuItem,
     add_replacement_item: MenuItem,
+    show_onboarding_item: MenuItem,
     quit_item: MenuItem,
 }
 
@@ -2115,6 +2119,10 @@ fn run_app_event_loop(app: Arc<App>) -> Result<(), AppError> {
 
     let mut tray_ui: Option<TrayUi> = None;
     let mut native_overlay: Option<NativeOverlay> = None;
+    let mut onboarding_window: Option<AppWindow> = None;
+    let mut status_window: Option<AppWindow> = None;
+    let mut onboarding_try_it_complete = false;
+    let mut onboarding_try_it_snapshot: Option<u64> = None;
     let mut overlay_hide_at: Option<Instant> = None;
     let mut recording_check_at: Option<Instant> = None;
     event_loop.run(move |event, _event_loop_target, control_flow| {
@@ -2136,6 +2144,19 @@ fn run_app_event_loop(app: Arc<App>) -> Result<(), AppError> {
                         info!("menu bar icon ready");
                     }
                     Err(error) => error!("{error}"),
+                }
+                let marker_status = onboarding_status_at(&onboarding_marker_path());
+                if marker_status == OnboardingStatus::Corrupt {
+                    warn!("onboarding marker is unreadable; onboarding will run again");
+                }
+                if marker_status != OnboardingStatus::Complete {
+                    info!("first run: opening onboarding window");
+                    open_onboarding_window(
+                        &app,
+                        &mut onboarding_window,
+                        &mut onboarding_try_it_complete,
+                        &mut onboarding_try_it_snapshot,
+                    );
                 }
             }
             TaoEvent::UserEvent(UserEvent::Menu(menu_event)) => {
@@ -2181,12 +2202,29 @@ fn run_app_event_loop(app: Arc<App>) -> Result<(), AppError> {
                 overlay_hide_at = Some(deadline);
                 *control_flow = ControlFlow::WaitUntil(deadline);
             }
+            TaoEvent::UserEvent(UserEvent::ShowOnboarding) => {
+                open_onboarding_window(
+                    &app,
+                    &mut onboarding_window,
+                    &mut onboarding_try_it_complete,
+                    &mut onboarding_try_it_snapshot,
+                );
+            }
+            TaoEvent::UserEvent(UserEvent::ShowStatus) => {
+                open_status_window(&app, &mut status_window);
+            }
             TaoEvent::UserEvent(UserEvent::HistoryChanged) => {
                 if let Some(ui) = tray_ui.as_mut()
                     && let Err(error) = update_history_menu(&app, ui)
                 {
                     error!("{error}");
                 }
+                mark_onboarding_try_it_complete(
+                    &app,
+                    &mut onboarding_window,
+                    &mut onboarding_try_it_complete,
+                    onboarding_try_it_snapshot,
+                );
             }
             TaoEvent::UserEvent(UserEvent::CleanupStatusChanged) => {
                 if let Some(ui) = tray_ui.as_ref() {
@@ -4163,14 +4201,7 @@ impl App {
             .stt_language()
             .unwrap_or_else(|_| self.config.stt_language.clone());
         let history_count = self.history_entries().map_or(0, |history| history.len());
-        let streaming_status = match self.config.streaming_stt {
-            Some(StreamingProvider::AssemblyAiDirect) => {
-                "AssemblyAI streaming (dictation model, direct)"
-            }
-            Some(StreamingProvider::AssemblyAi) => "AssemblyAI streaming via Telnyx",
-            Some(StreamingProvider::Deepgram) => "Deepgram streaming via Telnyx",
-            None => "Batch STT",
-        };
+        let streaming_status = streaming_status_label(self.config.streaming_stt);
         let message = format!(
             "{microphone_status}. Language: {language}. STT: {streaming_status}. History: {history_count}."
         );
@@ -4898,6 +4929,11 @@ fn create_tray_ui(app: &App) -> Result<TrayUi, AppError> {
         .append(&health_check_item)
         .map_err(|error| AppError::MenuBar(error.to_string()))?;
 
+    let status_item = MenuItem::with_id("status", "Status", true, None);
+    tray_menu
+        .append(&status_item)
+        .map_err(|error| AppError::MenuBar(error.to_string()))?;
+
     let update_item = MenuItem::with_id("check-for-updates", "Check for Updates", true, None);
     tray_menu
         .append(&update_item)
@@ -4982,6 +5018,11 @@ fn create_tray_ui(app: &App) -> Result<TrayUi, AppError> {
         .append(&microphone_menu)
         .map_err(|error| AppError::MenuBar(error.to_string()))?;
 
+    let show_onboarding_item = MenuItem::with_id("show-onboarding", "Show Onboarding", true, None);
+    tray_menu
+        .append(&show_onboarding_item)
+        .map_err(|error| AppError::MenuBar(error.to_string()))?;
+
     let quit_item = MenuItem::with_id("quit", "Quit Bolo", true, None);
     tray_menu
         .append(&quit_item)
@@ -5008,10 +5049,12 @@ fn create_tray_ui(app: &App) -> Result<TrayUi, AppError> {
         clear_history_item,
         language_items,
         health_check_item,
+        status_item,
         update_item,
         add_vocabulary_item,
         add_vocabulary_alias_item,
         add_replacement_item,
+        show_onboarding_item,
         quit_item,
     };
     update_history_menu(app, &mut ui)?;
@@ -5049,6 +5092,14 @@ fn handle_menu_event(
     }
     if event_id == tray_ui.health_check_item.id().as_ref() {
         app.run_health_check();
+        return;
+    }
+    if event_id == tray_ui.status_item.id().as_ref() {
+        app.send_user_event(UserEvent::ShowStatus);
+        return;
+    }
+    if event_id == tray_ui.show_onboarding_item.id().as_ref() {
+        app.send_user_event(UserEvent::ShowOnboarding);
         return;
     }
     if event_id == tray_ui.update_item.id().as_ref() {
@@ -5501,6 +5552,362 @@ impl NativeOverlay {
         self.stdin.flush()?;
         Ok(())
     }
+}
+
+// ==== First-run onboarding and status window ====
+//
+// The runtime owns no windowing of its own: like the recording overlay, the
+// onboarding and status windows are Python AppKit helper processes spawned
+// by the Rust runtime, fed one JSON payload line on stdin plus optional
+// update lines (app_window.py). Onboarding completion is persisted by the
+// helper itself, mirroring how onboarding.py writes the hotkey choice.
+
+/// Schema version of the onboarding completion marker.
+const ONBOARDING_MARKER_VERSION: u8 = 1;
+
+/// Completion marker for the in-app onboarding: `~/.bolo/onboarding.json`.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+struct OnboardingMarker {
+    version: u8,
+    #[serde(default)]
+    completed_at_ms: u64,
+}
+
+/// State of the onboarding completion marker on disk.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OnboardingStatus {
+    /// Marker parses and matches the current schema.
+    Complete,
+    /// Marker absent: the onboarding window should be shown.
+    Needed,
+    /// Marker exists but is unreadable or from a different schema: show the
+    /// window again so the next completion rewrites it.
+    Corrupt,
+}
+
+fn onboarding_marker_path() -> PathBuf {
+    home_path(".bolo/onboarding.json")
+}
+
+fn onboarding_status_at(path: &Path) -> OnboardingStatus {
+    match fs::read_to_string(path) {
+        Err(error) if error.kind() == ErrorKind::NotFound => OnboardingStatus::Needed,
+        Err(_) => OnboardingStatus::Corrupt,
+        Ok(text) => match serde_json::from_str::<OnboardingMarker>(&text) {
+            Ok(marker) if marker.version == ONBOARDING_MARKER_VERSION => OnboardingStatus::Complete,
+            Ok(_) | Err(_) => OnboardingStatus::Corrupt,
+        },
+    }
+}
+
+/// Resolved streaming mode label, shared by the health notification and the
+/// status window.
+const fn streaming_status_label(streaming: Option<StreamingProvider>) -> &'static str {
+    match streaming {
+        Some(StreamingProvider::AssemblyAiDirect) => {
+            "AssemblyAI streaming (dictation model, direct)"
+        }
+        Some(StreamingProvider::AssemblyAi) => "AssemblyAI streaming via Telnyx",
+        Some(StreamingProvider::Deepgram) => "Deepgram streaming via Telnyx",
+        None => "Batch STT",
+    }
+}
+
+/// One rendered line pair in the onboarding and status windows.
+#[derive(Debug, Serialize)]
+struct WindowRow {
+    label: String,
+    detail: String,
+    /// `ok`, `warn`, or `pending`; the helper maps it to a dot color.
+    state: String,
+}
+
+impl WindowRow {
+    fn new(label: &str, detail: String, state: &str) -> Self {
+        Self {
+            label: String::from(label),
+            detail,
+            state: String::from(state),
+        }
+    }
+}
+
+/// Payload for one `app_window.py` helper process.
+#[derive(Debug, Serialize)]
+struct AppWindowPayload {
+    mode: String,
+    title: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    welcome: String,
+    rows: Vec<WindowRow>,
+    button: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    try_it_index: Option<usize>,
+    write_marker: bool,
+}
+
+/// The one-line welcome shown at the top of the onboarding window.
+const fn onboarding_welcome() -> &'static str {
+    "Bolo listens while you hold a key and pastes what you said when you let go."
+}
+
+/// Accessibility fix, matching the text the startup notification and the
+/// paste path already surface, naming the exact interpreter to trust.
+fn accessibility_fix_detail(python: &str) -> String {
+    format!(
+        "Add this Python interpreter in System Settings > Privacy & Security > \
+         Accessibility, then run ./restart.sh: {python}"
+    )
+}
+
+fn microphone_detail(device_count: usize) -> String {
+    if device_count == 0 {
+        String::from(
+            "No microphone found. Allow microphone access for Bolo in System Settings > \
+             Privacy & Security > Microphone, then run ./restart.sh.",
+        )
+    } else if device_count == 1 {
+        String::from("1 microphone found.")
+    } else {
+        format!("{device_count} microphones found.")
+    }
+}
+
+/// Provider and key row text; `missing` comes from `Config::missing_required_key`
+/// and names the exact environment variable to add when absent.
+fn onboarding_provider_key_detail(missing: Option<&str>) -> String {
+    missing.map_or_else(
+        || String::from("Required API key present in ~/.bolo/env."),
+        |key| format!("Missing {key}. Add it to ~/.bolo/env, then run ./restart.sh."),
+    )
+}
+
+fn onboarding_try_it_detail(hotkey: &str) -> String {
+    format!("Hold {} and say a sentence.", human_readable_hotkey(hotkey))
+}
+
+/// Rows for the status window: version, resolved provider and streaming
+/// mode, and the log path.
+fn status_rows(version: &str, streaming: &str, log_path: &str) -> Vec<WindowRow> {
+    vec![
+        WindowRow::new("Version", String::from(version), "ok"),
+        WindowRow::new("Speech to text", String::from(streaming), "ok"),
+        WindowRow::new("Log", String::from(log_path), "ok"),
+    ]
+}
+
+/// A spawned `app_window.py` helper process.
+struct AppWindow {
+    child: Child,
+    stdin: ChildStdin,
+}
+
+impl std::fmt::Debug for AppWindow {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AppWindow")
+            .field("child_id", &self.child.id())
+            .finish_non_exhaustive()
+    }
+}
+
+impl AppWindow {
+    fn is_running(&mut self) -> Result<bool, AppError> {
+        self.child
+            .try_wait()
+            .map(|status| status.is_none())
+            .map_err(AppError::Io)
+    }
+
+    fn send_line(&mut self, line: &str) -> Result<(), AppError> {
+        writeln!(self.stdin, "{line}")?;
+        self.stdin.flush()?;
+        Ok(())
+    }
+}
+
+fn spawn_app_window(root_dir: &Path, payload: &str) -> Result<AppWindow, AppError> {
+    let script = root_dir.join("app_window.py");
+    if !script.exists() {
+        return Err(AppError::MenuBar(String::from(
+            "app_window.py missing from the install directory",
+        )));
+    }
+    let mut child = Command::new(python_helper_executable())
+        .arg(script)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(|error| AppError::MenuBar(format!("app window launch failed: {error}")))?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| AppError::MenuBar(String::from("app window stdin unavailable")))?;
+    let mut window = AppWindow { child, stdin };
+    window.send_line(payload)?;
+    Ok(window)
+}
+
+fn onboarding_window_payload(app: &App, write_marker: bool) -> Result<String, AppError> {
+    let accessibility = match accessibility_trust(&app.config.root_dir, false) {
+        AccessibilityTrust::Trusted => WindowRow::new(
+            "Accessibility",
+            String::from("Granted for the paste helper."),
+            "ok",
+        ),
+        AccessibilityTrust::Untrusted => WindowRow::new(
+            "Accessibility",
+            accessibility_fix_detail(&python3_executable_path()),
+            "warn",
+        ),
+        AccessibilityTrust::Unavailable => WindowRow::new(
+            "Accessibility",
+            String::from("Helper unavailable. Run ./install.sh, then ./restart.sh."),
+            "warn",
+        ),
+    };
+    let microphone_count = input_device_names().map_or(0, |devices| devices.len());
+    let microphones = WindowRow::new(
+        "Microphone",
+        microphone_detail(microphone_count),
+        if microphone_count == 0 { "warn" } else { "ok" },
+    );
+    let missing = app.config.missing_required_key();
+    let streaming = streaming_status_label(app.config.streaming_stt);
+    let provider = WindowRow::new(
+        "Speech to text",
+        format!("{streaming}. {}", onboarding_provider_key_detail(missing)),
+        if missing.is_some() { "warn" } else { "ok" },
+    );
+    let payload = AppWindowPayload {
+        mode: String::from("onboarding"),
+        title: String::from("Set up Bolo"),
+        welcome: String::from(onboarding_welcome()),
+        rows: vec![
+            accessibility,
+            microphones,
+            provider,
+            WindowRow::new(
+                "Try it",
+                onboarding_try_it_detail(&app.config.hotkey),
+                "pending",
+            ),
+        ],
+        button: String::from("Done"),
+        try_it_index: Some(3),
+        write_marker,
+    };
+    serde_json::to_string(&payload).map_err(|error| AppError::MenuBar(error.to_string()))
+}
+
+fn status_window_payload(app: &App) -> Result<String, AppError> {
+    let payload = AppWindowPayload {
+        mode: String::from("status"),
+        title: String::from("Bolo status"),
+        welcome: String::new(),
+        rows: status_rows(
+            env!("CARGO_PKG_VERSION"),
+            streaming_status_label(app.config.streaming_stt),
+            LOG_FILE,
+        ),
+        button: String::from("Close"),
+        try_it_index: None,
+        write_marker: false,
+    };
+    serde_json::to_string(&payload).map_err(|error| AppError::MenuBar(error.to_string()))
+}
+
+/// Open (or ignore when already open) the onboarding window. `write_marker`
+/// comes from the marker state at open time, so a manual reopen after
+/// completion never rewrites it, while an unfinished first run still can.
+fn open_onboarding_window(
+    app: &App,
+    window_slot: &mut Option<AppWindow>,
+    try_it_complete: &mut bool,
+    try_it_snapshot: &mut Option<u64>,
+) {
+    let already_running = window_slot
+        .as_mut()
+        .map_or(Ok(false), AppWindow::is_running)
+        .unwrap_or(false);
+    if already_running {
+        return;
+    }
+    drop(window_slot.take());
+    let write_marker =
+        onboarding_status_at(&onboarding_marker_path()) != OnboardingStatus::Complete;
+    *try_it_complete = false;
+    *try_it_snapshot = app
+        .history_entries()
+        .ok()
+        .and_then(|entries| entries.first().map(|entry| entry.created_at_ms));
+    let result = onboarding_window_payload(app, write_marker)
+        .and_then(|payload| spawn_app_window(&app.config.root_dir, &payload));
+    match result {
+        Ok(window) => {
+            *window_slot = Some(window);
+            info!("onboarding window shown");
+        }
+        Err(error) => error!("{error}"),
+    }
+}
+
+fn open_status_window(app: &App, window_slot: &mut Option<AppWindow>) {
+    let already_running = window_slot
+        .as_mut()
+        .map_or(Ok(false), AppWindow::is_running)
+        .unwrap_or(false);
+    if already_running {
+        return;
+    }
+    drop(window_slot.take());
+    let result = status_window_payload(app)
+        .and_then(|payload| spawn_app_window(&app.config.root_dir, &payload));
+    match result {
+        Ok(window) => {
+            *window_slot = Some(window);
+            info!("status window shown");
+        }
+        Err(error) => error!("{error}"),
+    }
+}
+
+/// Turn the try-it row green once a dictation produced a transcript newer
+/// than the newest one captured when the window opened; the event fires for
+/// every successful dictation, so this needs no pipeline-side hook.
+fn mark_onboarding_try_it_complete(
+    app: &App,
+    window_slot: &mut Option<AppWindow>,
+    try_it_complete: &mut bool,
+    try_it_snapshot: Option<u64>,
+) {
+    if *try_it_complete {
+        return;
+    }
+    let Some(window) = window_slot.as_mut() else {
+        return;
+    };
+    let Some(newest) = app
+        .history_entries()
+        .ok()
+        .and_then(|entries| entries.first().cloned())
+    else {
+        return;
+    };
+    if try_it_snapshot.is_some_and(|snapshot| newest.created_at_ms <= snapshot) {
+        return;
+    }
+    *try_it_complete = true;
+    let update = serde_json::json!({
+        "try_it_complete": true,
+        "detail": "First dictation captured.",
+    });
+    if let Err(error) = window.send_line(&update.to_string()) {
+        warn!("onboarding try-it update failed: {error}");
+        return;
+    }
+    info!("onboarding try-it step complete");
 }
 
 fn tray_icon_image() -> Result<Icon, AppError> {
@@ -9204,31 +9611,34 @@ mod tests {
         AccessibilityTrust, App, AppError, AppState, AssemblyDictationResponse, BatchRetry,
         CleanupMode, CleanupProfile, Config, CorrectionOutcome, DictationCommandKind,
         DictationUploadReader, DictationUploadRelease, DictationWarmup, EditLearningClaim,
-        LearnedVocabulary, PreparedText, PromptBinding, STREAMING_DRAIN_MIN, STT_RETRY_SAMPLE_RATE,
-        StreamingConnectionState, StreamingProvider, StreamingRecording, StreamingText,
-        StreamingTranscript, SttFallback, SttResult, TRANSCRIPT_HISTORY_LIMIT, TextReplacement,
-        TranscriptHistoryEntry, UpdateOutcome, apply_text_replacements,
-        apply_vocabulary_corrections_with_matches, assemblyai_direct_query_with,
-        assemblyai_language_code, batch_retry_plan, build_cleanup_user_content,
-        build_rewrite_user_content, build_stt_prompt, canonicalize_known_terms, cleanup_decision,
-        cleanup_max_tokens, cleanup_profile, contains_word_verbatim, derive_word_correction,
-        dictation_upload_config, dictation_upload_form, dictation_upload_release,
-        dictation_upload_request_timeout, downsample_wav_16k_mono, empty_transcript_error,
-        enforce_learned_vocabulary_cap, final_streaming_result_is_ready_elapsed,
-        finalize_accessibility_context, handshake_with_deadline, is_known_no_speech_transcript,
-        is_supported_hotkey, load_learned_vocabulary, load_vocabulary_usage,
-        load_vocabulary_with_learned, non_empty_transcript, parse_accessibility_trust,
-        parse_command, parse_daemon_context_reply, parse_daemon_paste_reply,
-        parse_daemon_select_reply, parse_daemon_trust_reply, parse_replacements_json,
-        parse_stt_fallbacks, parse_u64_env_value, parse_update_outcome, parse_wav_pcm16, pcm_bytes,
+        LearnedVocabulary, OnboardingStatus, PreparedText, PromptBinding, STREAMING_DRAIN_MIN,
+        STT_RETRY_SAMPLE_RATE, StreamingConnectionState, StreamingProvider, StreamingRecording,
+        StreamingText, StreamingTranscript, SttFallback, SttResult, TRANSCRIPT_HISTORY_LIMIT,
+        TextReplacement, TranscriptHistoryEntry, UpdateOutcome, accessibility_fix_detail,
+        apply_text_replacements, apply_vocabulary_corrections_with_matches,
+        assemblyai_direct_query_with, assemblyai_language_code, batch_retry_plan,
+        build_cleanup_user_content, build_rewrite_user_content, build_stt_prompt,
+        canonicalize_known_terms, cleanup_decision, cleanup_max_tokens, cleanup_profile,
+        contains_word_verbatim, derive_word_correction, dictation_upload_config,
+        dictation_upload_form, dictation_upload_release, dictation_upload_request_timeout,
+        downsample_wav_16k_mono, empty_transcript_error, enforce_learned_vocabulary_cap,
+        final_streaming_result_is_ready_elapsed, finalize_accessibility_context,
+        handshake_with_deadline, is_known_no_speech_transcript, is_supported_hotkey,
+        load_learned_vocabulary, load_vocabulary_usage, load_vocabulary_with_learned,
+        microphone_detail, non_empty_transcript, onboarding_provider_key_detail,
+        onboarding_status_at, onboarding_try_it_detail, parse_accessibility_trust, parse_command,
+        parse_daemon_context_reply, parse_daemon_paste_reply, parse_daemon_select_reply,
+        parse_daemon_trust_reply, parse_replacements_json, parse_stt_fallbacks,
+        parse_u64_env_value, parse_update_outcome, parse_wav_pcm16, pcm_bytes,
         preview_only_streaming, preview_release_stt, read_vocabulary_file,
         read_vocabulary_usage_file, record_learned_correction, remove_fillers,
         request_accessibility_daemon, retry_failed_primary, sanitize_transcript_history,
-        speech_stats, stable_streaming_best_is_ready_elapsed, streaming_batch_fallback_reason,
-        streaming_connection, streaming_preview_tail, streaming_provider_from_config,
-        strip_reasoning_tags, stt_language_for_model, stt_model_config, telnyx_stream_query,
-        transcript_log_value, transcript_menu_preview, upsert_learned_correction,
-        wait_for_daemon_reply, wav_bytes, wav_duration_ms,
+        speech_stats, stable_streaming_best_is_ready_elapsed, status_rows,
+        streaming_batch_fallback_reason, streaming_connection, streaming_preview_tail,
+        streaming_provider_from_config, streaming_status_label, strip_reasoning_tags,
+        stt_language_for_model, stt_model_config, telnyx_stream_query, transcript_log_value,
+        transcript_menu_preview, upsert_learned_correction, wait_for_daemon_reply, wav_bytes,
+        wav_duration_ms,
     };
     use std::collections::{HashMap, VecDeque};
     use std::io::Read as _;
@@ -9261,6 +9671,100 @@ mod tests {
         assert!(!is_supported_hotkey("f0"));
         assert!(!is_supported_hotkey("f20"));
         assert!(!is_supported_hotkey("banana"));
+    }
+
+    #[test]
+    fn detects_onboarding_marker_states() -> Result<(), AppError> {
+        let mut path = env::temp_dir();
+        path.push(format!("bolo-onboarding-marker-{}.json", process::id()));
+
+        fs::write(&path, r#"{"version":1,"completed_at_ms":123}"#)?;
+        assert_eq!(onboarding_status_at(&path), OnboardingStatus::Complete);
+
+        fs::write(&path, "not json")?;
+        assert_eq!(onboarding_status_at(&path), OnboardingStatus::Corrupt);
+
+        fs::write(&path, r#"{"version":2,"completed_at_ms":123}"#)?;
+        assert_eq!(onboarding_status_at(&path), OnboardingStatus::Corrupt);
+
+        fs::write(&path, "")?;
+        assert_eq!(onboarding_status_at(&path), OnboardingStatus::Corrupt);
+
+        fs::remove_file(&path)?;
+        assert_eq!(onboarding_status_at(&path), OnboardingStatus::Needed);
+        Ok(())
+    }
+
+    #[test]
+    fn streaming_status_labels_match_health_check_strings() {
+        assert_eq!(streaming_status_label(None), "Batch STT");
+        assert_eq!(
+            streaming_status_label(Some(StreamingProvider::AssemblyAiDirect)),
+            "AssemblyAI streaming (dictation model, direct)"
+        );
+        assert_eq!(
+            streaming_status_label(Some(StreamingProvider::AssemblyAi)),
+            "AssemblyAI streaming via Telnyx"
+        );
+        assert_eq!(
+            streaming_status_label(Some(StreamingProvider::Deepgram)),
+            "Deepgram streaming via Telnyx"
+        );
+    }
+
+    #[test]
+    fn onboarding_provider_key_row_names_the_exact_missing_var() {
+        assert_eq!(
+            onboarding_provider_key_detail(Some("ASSEMBLYAI_API_KEY")),
+            "Missing ASSEMBLYAI_API_KEY. Add it to ~/.bolo/env, then run ./restart.sh."
+        );
+        assert_eq!(
+            onboarding_provider_key_detail(Some("TELNYX_API_KEY")),
+            "Missing TELNYX_API_KEY. Add it to ~/.bolo/env, then run ./restart.sh."
+        );
+        assert_eq!(
+            onboarding_provider_key_detail(None),
+            "Required API key present in ~/.bolo/env."
+        );
+    }
+
+    #[test]
+    fn onboarding_details_use_human_hotkey_names() {
+        assert_eq!(
+            onboarding_try_it_detail("right_option"),
+            "Hold Right Option and say a sentence."
+        );
+        assert_eq!(
+            onboarding_try_it_detail("f5"),
+            "Hold F5 and say a sentence."
+        );
+    }
+
+    #[test]
+    fn accessibility_fix_names_the_interpreter_and_restart() {
+        let detail = accessibility_fix_detail("/Users/demo/.bolo/venv/bin/python3");
+        assert!(detail.contains("System Settings > Privacy & Security > Accessibility"));
+        assert!(detail.contains("/Users/demo/.bolo/venv/bin/python3"));
+        assert!(detail.contains("./restart.sh"));
+    }
+
+    #[test]
+    fn microphone_detail_reports_counts_and_fix() {
+        assert!(microphone_detail(0).starts_with("No microphone found."));
+        assert_eq!(microphone_detail(1), "1 microphone found.");
+        assert_eq!(microphone_detail(3), "3 microphones found.");
+    }
+
+    #[test]
+    fn status_rows_list_version_streaming_and_log_path() {
+        let rows = status_rows("1.6.0", "Deepgram streaming via Telnyx", "/tmp/bolo.log");
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].label, "Version");
+        assert_eq!(rows[0].detail, "1.6.0");
+        assert_eq!(rows[1].label, "Speech to text");
+        assert_eq!(rows[1].detail, "Deepgram streaming via Telnyx");
+        assert_eq!(rows[2].label, "Log");
+        assert_eq!(rows[2].detail, "/tmp/bolo.log");
     }
 
     #[test]

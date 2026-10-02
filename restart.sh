@@ -20,6 +20,7 @@ pkill -f "$DIR/bolo.py" 2>/dev/null || true
 pkill -f "$DIR/hotkey.py" 2>/dev/null || true
 pkill -f "$DIR/accessibility_daemon.py" 2>/dev/null || true
 pkill -f "$DIR/overlay.py" 2>/dev/null || true
+pkill -f "$DIR/app_window.py" 2>/dev/null || true
 rm -f "$RUNTIME_DIR/bolo.pid" 2>/dev/null || true
 rm -rf "$LOCK_DIR" /tmp/bolo-instance.lock 2>/dev/null || true
 
