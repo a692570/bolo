@@ -851,6 +851,48 @@ fn streaming_batch_fallback_reason(
     }
 }
 
+/// Whether a release should run the preview-only streaming composition: the
+/// stream exists to render live partials on the overlay while the Dictation
+/// call is the only insert source. True only for an `assemblyai/*` primary
+/// model on the direct `AssemblyAI` stream.
+fn preview_only_streaming(stt_model: &str, streaming_stt: Option<StreamingProvider>) -> bool {
+    streaming_stt == Some(StreamingProvider::AssemblyAiDirect)
+        && stt_model.starts_with("assemblyai/")
+}
+
+/// Fold a failed Dictation call into the drained streaming text, which is
+/// what the preview already rendered on the overlay. A barren stream maps to
+/// the empty result so the pipeline's shared empty-transcript handling
+/// (`save_failed_audio` plus the STT error) takes over.
+fn preview_release_stt(
+    dictation: Result<SttResult, AppError>,
+    streaming_fallback: Option<StreamingText>,
+) -> SttResult {
+    match dictation {
+        Ok(result) => result,
+        Err(error) => {
+            let Some(text) = streaming_fallback
+                .map(|streaming| streaming.text)
+                .filter(|text| !text.trim().is_empty())
+            else {
+                warn!(
+                    "[stt] preview_stream_fallback_empty {}",
+                    serde_json::json!({ "error": error.to_string() })
+                );
+                return SttResult::verbatim(String::new());
+            };
+            warn!(
+                "[stt] preview_stream_fallback {}",
+                serde_json::json!({
+                    "error": error.to_string(),
+                    "streaming_chars": text.chars().count(),
+                })
+            );
+            SttResult::verbatim(text)
+        }
+    }
+}
+
 fn best_streaming_text(result: &StreamingTranscript) -> Option<String> {
     let final_text = result.latest_final.as_deref().unwrap_or_default().trim();
     let partial_text = result.latest_partial.as_deref().unwrap_or_default().trim();
@@ -1976,20 +2018,24 @@ impl App {
         metrics.outcome = "stt_failed";
         let stt_started = Instant::now();
         let stt = if let Some(streaming) = recording.streaming {
-            match streaming.finish() {
-                Some(streaming_text) => SttResult::verbatim(self.recheck_streaming_transcript(
-                    streaming_text,
-                    &wav,
-                    elapsed,
-                    &recording.warmup,
-                )),
-                None => {
-                    warn!("[stt] streaming_empty_fallback");
-                    self.transcribe(&wav, &recording.warmup)
-                        .unwrap_or_else(|error| {
-                            warn!("batch fallback after streaming failed: {error}");
-                            SttResult::verbatim(String::new())
-                        })
+            if preview_only_streaming(&self.config.stt_model, self.config.streaming_stt) {
+                self.preview_stt_result(streaming, &wav, &recording.warmup)
+            } else {
+                match streaming.finish() {
+                    Some(streaming_text) => SttResult::verbatim(self.recheck_streaming_transcript(
+                        streaming_text,
+                        &wav,
+                        elapsed,
+                        &recording.warmup,
+                    )),
+                    None => {
+                        warn!("[stt] streaming_empty_fallback");
+                        self.transcribe(&wav, &recording.warmup)
+                            .unwrap_or_else(|error| {
+                                warn!("batch fallback after streaming failed: {error}");
+                                SttResult::verbatim(String::new())
+                            })
+                    }
                 }
             }
         } else {
@@ -2068,6 +2114,27 @@ impl App {
         self.send_user_event(UserEvent::Overlay(OverlayPhase::Copied));
         self.send_user_event(UserEvent::HideOverlayAfter(POST_INSERT_OVERLAY_HOLD));
         Ok(())
+    }
+
+    /// Resolve the transcript for the preview-only streaming composition
+    /// (assemblyai/* primary model on the direct `AssemblyAI` stream): the
+    /// streaming session exists to render live partials on the overlay while
+    /// the Dictation call is the only insert source, so the inserted text
+    /// can never disagree with the batch transcript the pipeline trusts.
+    /// The stream is drained before the Dictation call so the fallback text
+    /// is the finalized preview already on screen and the socket has
+    /// finished emitting before the insert sequence starts.
+    fn preview_stt_result(
+        &self,
+        streaming: StreamingRecording,
+        wav: &[u8],
+        warmup: &DictationWarmup,
+    ) -> SttResult {
+        let streaming_text = streaming.finish();
+        match self.transcribe(wav, warmup) {
+            Ok(result) => result,
+            Err(error) => preview_release_stt(Err(error), streaming_text),
+        }
     }
 
     fn recheck_streaming_transcript(
@@ -2201,6 +2268,9 @@ impl App {
             .lock()
             .ok()
             .and_then(|proxy| proxy.as_ref().cloned());
+        if preview_only_streaming(&self.config.stt_model, self.config.streaming_stt) {
+            info!("[stt] preview_stream_active");
+        }
         Some(StreamingRecording::start(
             api_key,
             provider,
@@ -8163,9 +8233,9 @@ mod tests {
         AccessibilityTrust, App, AppError, AppState, AssemblyDictationResponse, BatchRetry,
         CleanupMode, CleanupProfile, Config, DictationCommandKind, DictationWarmup, PreparedText,
         PromptBinding, STREAMING_DRAIN_MIN, STT_RETRY_SAMPLE_RATE, StreamingConnectionState,
-        StreamingProvider, StreamingRecording, StreamingTranscript, SttFallback, SttResult,
-        TRANSCRIPT_HISTORY_LIMIT, TextReplacement, TranscriptHistoryEntry, UpdateOutcome,
-        apply_text_replacements, apply_vocabulary_corrections_with_matches,
+        StreamingProvider, StreamingRecording, StreamingText, StreamingTranscript, SttFallback,
+        SttResult, TRANSCRIPT_HISTORY_LIMIT, TextReplacement, TranscriptHistoryEntry,
+        UpdateOutcome, apply_text_replacements, apply_vocabulary_corrections_with_matches,
         assemblyai_direct_query_with, assemblyai_language_code, batch_retry_plan,
         build_cleanup_user_content, build_rewrite_user_content, build_stt_prompt,
         canonicalize_known_terms, cleanup_decision, cleanup_max_tokens, cleanup_profile,
@@ -8175,9 +8245,10 @@ mod tests {
         parse_accessibility_trust, parse_command, parse_daemon_context_reply,
         parse_daemon_paste_reply, parse_daemon_select_reply, parse_daemon_trust_reply,
         parse_replacements_json, parse_stt_fallbacks, parse_u64_env_value, parse_update_outcome,
-        parse_wav_pcm16, read_vocabulary_file, read_vocabulary_usage_file, remove_fillers,
-        request_accessibility_daemon, retry_failed_primary, sanitize_transcript_history,
-        speech_stats, stable_streaming_best_is_ready_elapsed, streaming_batch_fallback_reason,
+        parse_wav_pcm16, preview_only_streaming, preview_release_stt, read_vocabulary_file,
+        read_vocabulary_usage_file, remove_fillers, request_accessibility_daemon,
+        retry_failed_primary, sanitize_transcript_history, speech_stats,
+        stable_streaming_best_is_ready_elapsed, streaming_batch_fallback_reason,
         streaming_connection, streaming_preview_tail, streaming_provider_from_config,
         strip_reasoning_tags, stt_language_for_model, stt_model_config, telnyx_stream_query,
         transcript_log_value, transcript_menu_preview, wait_for_daemon_reply, wav_bytes,
@@ -9302,6 +9373,89 @@ mod tests {
     #[test]
     fn streaming_batch_verification_has_a_short_deadline() {
         assert!(super::STREAMING_BATCH_VERIFY_TIMEOUT <= std::time::Duration::from_secs(2));
+    }
+
+    #[test]
+    fn preview_streaming_needs_both_the_assemblyai_model_and_the_direct_stream() {
+        // Preview-only composition: an assemblyai/* primary model on the
+        // direct AssemblyAI stream.
+        assert!(preview_only_streaming(
+            "assemblyai/universal-3-5-pro",
+            Some(StreamingProvider::AssemblyAiDirect)
+        ));
+        // The Telnyx-hosted AssemblyAI stream keeps the legacy composition.
+        assert!(!preview_only_streaming(
+            "assemblyai/universal-3-5-pro",
+            Some(StreamingProvider::AssemblyAi)
+        ));
+        // Any other primary model keeps streaming-as-result.
+        assert!(!preview_only_streaming(
+            "deepgram/nova-3",
+            Some(StreamingProvider::AssemblyAiDirect)
+        ));
+        assert!(!preview_only_streaming(
+            "deepgram/nova-3",
+            Some(StreamingProvider::Deepgram)
+        ));
+        // Without a streaming provider the pipeline is batch dictation only.
+        assert!(!preview_only_streaming(
+            "assemblyai/universal-3-5-pro",
+            None
+        ));
+        assert!(!preview_only_streaming("deepgram/nova-3", None));
+    }
+
+    #[test]
+    fn preview_release_uses_the_dictation_result_over_a_healthy_streaming_final() {
+        let dictation = SttResult {
+            text: String::from("the batch transcript"),
+            llm_cleaned: None,
+        };
+        let streaming_final = StreamingText {
+            text: String::from("the streaming transcript"),
+            source: "final",
+        };
+
+        let outcome = preview_release_stt(Ok(dictation), Some(streaming_final));
+
+        // A healthy streaming final never wins in preview-only mode.
+        assert_eq!(outcome.text, "the batch transcript");
+        assert!(outcome.llm_cleaned.is_none());
+    }
+
+    #[test]
+    fn preview_release_falls_back_to_the_stream_preview_when_dictation_fails() {
+        let error = AppError::Transcription(String::from("dictation unavailable"));
+        let streaming_final = StreamingText {
+            text: String::from("matches the preview on screen"),
+            source: "final",
+        };
+
+        let outcome = preview_release_stt(Err(error), Some(streaming_final));
+
+        assert_eq!(outcome.text, "matches the preview on screen");
+        assert!(outcome.llm_cleaned.is_none());
+    }
+
+    #[test]
+    fn preview_release_maps_a_barren_stream_to_the_failed_audio_path() {
+        let error = AppError::Transcription(String::from("dictation unavailable"));
+
+        // A barren stream yields the empty result, which the pipeline's
+        // shared empty-transcript check turns into save_failed_audio.
+        let no_stream = preview_release_stt(Err(error), None);
+        assert!(no_stream.text.trim().is_empty());
+
+        let whitespace_stream = preview_release_stt(
+            Err(AppError::Transcription(String::from(
+                "dictation unavailable",
+            ))),
+            Some(StreamingText {
+                text: String::from("   "),
+                source: "best_available",
+            }),
+        );
+        assert!(whitespace_stream.text.trim().is_empty());
     }
 
     #[test]
