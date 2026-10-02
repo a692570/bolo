@@ -50,14 +50,6 @@ def _stage_fake_bundle(tmp_path, machine_arch="aarch64"):
     return app
 
 
-def _launcher_env(tmp_path, app_dir, runtime_dir=None, venv_dir=None):
-    return {
-        "BOLO_RUNTIME_DIR": str(runtime_dir or tmp_path / "runtime"),
-        "BOLO_VENV_DIR": str(venv_dir or tmp_path / "venv"),
-        "APP_DIR_OVERRIDE": "",
-    }, {"APP_DIR": str(app_dir)}
-
-
 def _print_state(app_dir, env_extra):
     # The launcher derives everything from its own path; copy it into the
     # fake bundle so $0 resolution finds the staged layout.
