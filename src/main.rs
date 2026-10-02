@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs::{self, File};
 use std::future::Future;
-use std::io::{BufRead, BufReader, ErrorKind, Write};
+use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -123,6 +123,10 @@ const STREAMING_HANDSHAKE_DEADLINE: Duration = Duration::from_secs(3);
 const STREAMING_BATCH_VERIFY_TIMEOUT: Duration = Duration::from_secs(2);
 const STREAMING_SAMPLE_RATE: u32 = 48_000;
 const STT_REQUEST_TIMEOUT: Duration = Duration::from_secs(12);
+/// Connection and TLS handshake slack added on top of the recorded audio
+/// window in the streamed Dictation request's hard ceiling. See
+/// `dictation_upload_request_timeout`.
+const DICTATION_UPLOAD_REQUEST_SLACK: Duration = Duration::from_secs(2);
 /// Sample rate of the payload-reduced batch retry. A 16 kHz re-encode passed
 /// live replay during the 2026-09-09 gateway incident while the captured
 /// 48 kHz WAV was rejected nondeterministically with 413.
@@ -378,6 +382,9 @@ struct ActiveRecording {
     sample_rate: u32,
     warmup: DictationWarmup,
     streaming: Option<StreamingRecording>,
+    /// Streamed Dictation upload for the preview-only composition, started
+    /// at press so release only has to read the response.
+    upload: Option<DictationUpload>,
 }
 
 #[derive(Debug)]
@@ -730,6 +737,351 @@ impl StreamingRecording {
                 text: best,
                 source: "best_available",
             })
+        }
+    }
+}
+
+/// Request-body reader for the streamed Dictation upload: pulls captured
+/// i16 chunks from the audio-callback feed, converts them to little-endian
+/// PCM bytes, and reports EOF once the feed's last sender has dropped,
+/// which is what tells the server to finalize the transcript. `read` blocks
+/// waiting for the next chunk, but only on this request's own thread: the
+/// audio callback sends into an unbounded channel and never blocks on the
+/// upload.
+struct DictationUploadReader {
+    receiver: Receiver<Vec<i16>>,
+    buffer: Vec<u8>,
+}
+
+impl Read for DictationUploadReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        while self.buffer.is_empty() {
+            match self.receiver.recv() {
+                Ok(chunk) => self.buffer = pcm_bytes(&chunk),
+                Err(_) => return Ok(0),
+            }
+        }
+        let len = buf.len().min(self.buffer.len());
+        buf[..len].copy_from_slice(&self.buffer[..len]);
+        self.buffer = self.buffer.split_off(len);
+        Ok(len)
+    }
+}
+
+/// Config JSON for the streamed Dictation upload: the batch request's
+/// `language_codes` and `keyterms_prompt` semantics plus the
+/// `sample_rate`/`channels` pair the endpoint requires when the audio part
+/// is raw 16-bit PCM rather than a WAV (contract:
+/// <https://www.assemblyai.com/docs/dictation>, config parameters, checked
+/// 2026-10-01).
+fn dictation_upload_config(
+    sample_rate: u32,
+    language: &str,
+    vocabulary: &[String],
+) -> serde_json::Value {
+    let mut config = serde_json::json!({
+        "sample_rate": sample_rate,
+        "channels": 1,
+    });
+    if let Some(code) = assemblyai_language_code(language) {
+        config["language_codes"] = serde_json::json!([code]);
+    }
+    if !vocabulary.is_empty() {
+        config["keyterms_prompt"] =
+            serde_json::json!(vocabulary.iter().take(50).collect::<Vec<_>>());
+    }
+    config
+}
+
+/// Multipart body for the streamed Dictation upload: the `config` part is
+/// added before the `audio` part because the endpoint starts decoding as
+/// bytes arrive and rejects audio that arrives before config. reqwest's
+/// blocking multipart writes parts in insertion order: `Form::part` appends
+/// to the `FormParts` fields `Vec` (reqwest 0.12.28,
+/// `src/async_impl/multipart.rs`) and the blocking wire reader consumes that
+/// `Vec` front-first (`Reader::next_reader` in `src/blocking/multipart.rs`),
+/// so wire order equals build order.
+fn dictation_upload_form(
+    config: String,
+    reader: DictationUploadReader,
+) -> Result<multipart::Form, AppError> {
+    Ok(multipart::Form::new()
+        .part(
+            "config",
+            multipart::Part::text(config).mime_str("application/json")?,
+        )
+        .part(
+            "audio",
+            multipart::Part::reader(reader).mime_str("audio/pcm")?,
+        ))
+}
+
+/// Reject a non-success Dictation response with the same error mapping for
+/// the batch and streamed upload paths, so the retry and fallback arms see
+/// identical variants: rate limits map to `RateLimited`, auth failures to
+/// `Transcription`, and other statuses to `TranscriptionStatus` with the
+/// body truncated. A success passes the response through untouched.
+fn dictation_status_checked(
+    status: reqwest::StatusCode,
+    response: reqwest::blocking::Response,
+) -> Result<reqwest::blocking::Response, AppError> {
+    if status.is_success() {
+        return Ok(response);
+    }
+    if status.as_u16() == 429 {
+        return Err(AppError::RateLimited);
+    }
+    if status.as_u16() == 401 {
+        return Err(AppError::Transcription(String::from(
+            "401 Unauthorized: check ASSEMBLYAI_API_KEY",
+        )));
+    }
+    let body = response.text().unwrap_or_default();
+    Err(AppError::TranscriptionStatus {
+        status: status.as_u16(),
+        message: body.chars().take(200).collect::<String>(),
+    })
+}
+
+/// Verbatim transcript plus the provider-side cleanup from a Dictation
+/// response, shared by the batch and streamed upload paths so the cleanup
+/// semantics cannot drift: the cleaned text only counts when it is
+/// non-empty and actually differs from the verbatim transcript.
+fn dictation_verbatim_and_cleaned(parsed: &AssemblyDictationResponse) -> (String, Option<String>) {
+    let verbatim = parsed.text.clone().unwrap_or_default();
+    let cleaned = parsed
+        .llm_response
+        .as_deref()
+        .map(str::trim)
+        .filter(|cleaned| !cleaned.is_empty() && *cleaned != verbatim.trim())
+        .map(str::to_owned);
+    (verbatim, cleaned)
+}
+
+/// Release decision for the streamed Dictation upload.
+enum DictationUploadRelease {
+    /// The uploaded request produced its transcript; use it as the STT
+    /// result with no further upload work.
+    Uploaded(SttResult),
+    /// The upload failed or missed the release budget; retry once with the
+    /// release-time batch transcribe of the buffered WAV.
+    UploadFailed,
+    /// No upload ran (batch mode, a legacy primary model, or no key); the
+    /// release-time batch transcribe is the only source, exactly as before
+    /// the streamed upload existed.
+    NotUploaded,
+}
+
+/// Classify the streamed upload's release outcome. The failure log carries
+/// the reason so a degraded upload path is visible in the log next to the
+/// batch fallback that follows it.
+fn dictation_upload_release(
+    uploaded: Option<Result<SttResult, AppError>>,
+) -> DictationUploadRelease {
+    match uploaded {
+        Some(Ok(result)) => DictationUploadRelease::Uploaded(result),
+        Some(Err(error)) => {
+            warn!(
+                "[stt] dictation_upload_stream_failed {}",
+                serde_json::json!({ "error": error.to_string() })
+            );
+            DictationUploadRelease::UploadFailed
+        }
+        None => DictationUploadRelease::NotUploaded,
+    }
+}
+
+/// Hard ceiling on the streamed Dictation request, measured from press,
+/// when the request thread calls `send`. Release abandons the upload after
+/// `STT_REQUEST_TIMEOUT` and falls back to the batch transcribe, so this
+/// ceiling only exists to reap an abandoned thread's connection. It must
+/// cover the longest recording plus its trailing capture, the release-side
+/// websocket drain, and the response budget, so the ceiling never fires
+/// before release's own decision does.
+const fn dictation_upload_request_timeout(max_recording_seconds: u64) -> Duration {
+    STT_REQUEST_TIMEOUT
+        .saturating_add(Duration::from_secs(max_recording_seconds))
+        .saturating_add(TRAILING_CAPTURE_CAP)
+        .saturating_add(STREAMING_DRAIN_MAX)
+        .saturating_add(DICTATION_UPLOAD_REQUEST_SLACK)
+}
+
+/// Feed halves for the streamed Dictation upload: the sender the audio
+/// callback tees chunks into, and the receiver the request body reads. Both
+/// are None when the composition does not stream the upload.
+type DictationUploadFeed = (Option<mpsc::Sender<Vec<i16>>>, Option<Receiver<Vec<i16>>>);
+
+/// One streamed Dictation upload, opened at press: captured PCM flows into
+/// the request body while recording continues, so release only has to wait
+/// for the response the server already computed instead of uploading the
+/// whole WAV after the fact.
+#[derive(Debug)]
+struct DictationUpload {
+    outcome: Arc<Mutex<Option<Result<SttResult, AppError>>>>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl DictationUpload {
+    /// Open the streamed Dictation request on a dedicated thread. The feed
+    /// receiver is already wired to the capture stream by the caller, so
+    /// chunks are flowing into the request body by the time this returns,
+    /// and the response lands in the shared outcome slot for release to
+    /// collect. The blocking client drives the streaming body from the
+    /// calling thread of `send`, which is this thread: a blocked `recv`
+    /// inside the reader delays only the upload, never the runtime that
+    /// serves other requests.
+    fn start(
+        http: Client,
+        api_key: String,
+        language: String,
+        vocabulary: Vec<String>,
+        sample_rate: u32,
+        request_timeout: Duration,
+        receiver: Receiver<Vec<i16>>,
+    ) -> Self {
+        let outcome = Arc::new(Mutex::new(None));
+        let thread_outcome = Arc::clone(&outcome);
+        let failure_outcome = Arc::clone(&outcome);
+        let thread = std::thread::Builder::new()
+            .name(String::from("bolo-dictation-upload"))
+            .spawn(move || {
+                let result = Self::request(
+                    &http,
+                    &api_key,
+                    &language,
+                    &vocabulary,
+                    sample_rate,
+                    request_timeout,
+                    receiver,
+                );
+                if let Ok(mut slot) = thread_outcome.lock() {
+                    *slot = Some(result);
+                }
+            })
+            .unwrap_or_else(|error| {
+                warn!("dictation upload thread failed to start: {error}");
+                if let Ok(mut slot) = failure_outcome.lock() {
+                    *slot = Some(Err(AppError::Transcription(format!(
+                        "dictation upload thread failed to start: {error}"
+                    ))));
+                }
+                std::thread::spawn(|| {})
+            });
+        Self {
+            outcome,
+            thread: Some(thread),
+        }
+    }
+
+    /// Open the streamed Dictation request and block until its single JSON
+    /// response arrives. Errors are results, never panics: release always
+    /// has the batch transcribe of the buffered WAV behind it. The response
+    /// text is not logged here because the sanitizing `log_text` helper
+    /// lives on `App`; the pipeline logs the transcript after release.
+    fn request(
+        http: &Client,
+        api_key: &str,
+        language: &str,
+        vocabulary: &[String],
+        sample_rate: u32,
+        request_timeout: Duration,
+        receiver: Receiver<Vec<i16>>,
+    ) -> Result<SttResult, AppError> {
+        let reader = DictationUploadReader {
+            receiver,
+            buffer: Vec::new(),
+        };
+        let config = dictation_upload_config(sample_rate, language, vocabulary).to_string();
+        let form = dictation_upload_form(config, reader)?;
+        info!(
+            "[stt] dictation_upload_stream_started {}",
+            serde_json::json!({
+                "endpoint": ASSEMBLYAI_DICTATION_ENDPOINT,
+                "provider": "assemblyai_dictation_upload",
+                "audio_mime": "audio/pcm",
+                "sample_rate": sample_rate,
+                "language": language,
+            })
+        );
+        let response = http
+            .post(ASSEMBLYAI_DICTATION_ENDPOINT)
+            .header("Authorization", api_key)
+            .multipart(form)
+            .timeout(request_timeout)
+            .send()?;
+        let status = response.status();
+        info!(
+            "[stt] response_status {}",
+            serde_json::json!({
+                "endpoint": ASSEMBLYAI_DICTATION_ENDPOINT,
+                "provider": "assemblyai_dictation_upload",
+                "status": status.as_u16(),
+            })
+        );
+        let response = dictation_status_checked(status, response)?;
+        let parsed: AssemblyDictationResponse = response.json()?;
+        let (verbatim, cleaned) = dictation_verbatim_and_cleaned(&parsed);
+        info!(
+            "[stt] response_text {}",
+            serde_json::json!({
+                "endpoint": ASSEMBLYAI_DICTATION_ENDPOINT,
+                "provider": "assemblyai_dictation_upload",
+                "provider_cleanup": cleaned.is_some(),
+                "llm_error": &parsed.llm_error,
+                "request_time_ms": &parsed.request_time_ms,
+            })
+        );
+        if verbatim.trim().is_empty() {
+            return Err(AppError::Transcription(String::from(
+                "STT returned empty transcript",
+            )));
+        }
+        Ok(SttResult {
+            text: verbatim,
+            llm_cleaned: cleaned,
+        })
+    }
+
+    /// Wait within `budget` for the streamed request to produce its result
+    /// and report it. The capture stream must already have been dropped so
+    /// the request body reached EOF; without that this just burns the
+    /// budget. An outcome that never arrives falls back at release, and the
+    /// thread unwinds later under its own request ceiling.
+    fn finish(mut self, budget: Duration) -> Result<SttResult, AppError> {
+        let deadline = Instant::now() + budget;
+        loop {
+            match self.outcome.lock() {
+                Ok(mut slot) => {
+                    if let Some(result) = slot.take() {
+                        if let Some(thread) = self.thread.take() {
+                            drop(thread.join());
+                        }
+                        return result;
+                    }
+                }
+                Err(error) => return Err(AppError::PoisonedMutex(error.to_string())),
+            }
+            if self.thread.as_ref().is_some_and(JoinHandle::is_finished) {
+                // The thread ended without publishing an outcome, which a
+                // plain error never does: fail fast instead of waiting out
+                // the whole budget.
+                if let Some(thread) = self.thread.take() {
+                    drop(thread.join());
+                }
+                return Err(AppError::Transcription(String::from(
+                    "dictation upload thread ended without a result",
+                )));
+            }
+            if Instant::now() >= deadline {
+                return Err(AppError::Transcription(format!(
+                    "dictation upload did not finish within {} ms",
+                    budget.as_millis()
+                )));
+            }
+            std::thread::sleep(Duration::from_millis(25));
         }
     }
 }
@@ -1884,8 +2236,16 @@ impl App {
         let streaming_sender = streaming
             .as_ref()
             .and_then(|recording| recording.sender.as_ref().cloned());
-        let mut recording = match start_recording(selected_microphone.as_deref(), streaming_sender)
-        {
+        // The upload feed opens before the capture stream is built so the
+        // audio callback tees chunks into the Dictation request body from
+        // the first captured buffer; the receiver waits for the capture
+        // sample rate before the upload thread can be spawned.
+        let (upload_sender, upload_receiver) = self.open_dictation_upload_feed();
+        let mut recording = match start_recording(
+            selected_microphone.as_deref(),
+            streaming_sender,
+            upload_sender,
+        ) {
             Ok(recording) => recording,
             Err(error) => {
                 let mut state = self.lock_state()?;
@@ -1898,6 +2258,7 @@ impl App {
             }
         };
         recording.streaming = streaming;
+        recording.upload = self.start_dictation_upload(upload_receiver, recording.sample_rate);
         recording.warmup = self.start_dictation_warmup();
         {
             let mut state = self.lock_state()?;
@@ -1947,7 +2308,7 @@ impl App {
 
     fn finish_recording(
         self: &Arc<Self>,
-        recording: ActiveRecording,
+        mut recording: ActiveRecording,
         released_at: Instant,
     ) -> Result<(), AppError> {
         let trailing = capture_trailing_audio(&recording)?;
@@ -2019,7 +2380,7 @@ impl App {
         let stt_started = Instant::now();
         let stt = if let Some(streaming) = recording.streaming {
             if preview_only_streaming(&self.config.stt_model, self.config.streaming_stt) {
-                self.preview_stt_result(streaming, &wav, &recording.warmup)
+                self.preview_stt_result(streaming, recording.upload.take(), &wav, &recording.warmup)
             } else {
                 match streaming.finish() {
                     Some(streaming_text) => SttResult::verbatim(self.recheck_streaming_transcript(
@@ -2121,17 +2482,30 @@ impl App {
     /// streaming session exists to render live partials on the overlay while
     /// the Dictation call is the only insert source, so the inserted text
     /// can never disagree with the batch transcript the pipeline trusts.
-    /// The stream is drained before the Dictation call so the fallback text
-    /// is the finalized preview already on screen and the socket has
-    /// finished emitting before the insert sequence starts.
+    /// When the streamed upload ran, release waits for its response within
+    /// the STT budget and only re-uploads the buffered WAV when the upload
+    /// failed. The stream is drained before the insert sequence starts so
+    /// the fallback text is the finalized preview already on screen and the
+    /// socket has finished emitting.
     fn preview_stt_result(
         &self,
         streaming: StreamingRecording,
+        upload: Option<DictationUpload>,
         wav: &[u8],
         warmup: &DictationWarmup,
     ) -> SttResult {
         let streaming_text = streaming.finish();
-        match self.transcribe(wav, warmup) {
+        let uploaded = upload.map(|upload| upload.finish(STT_REQUEST_TIMEOUT));
+        let dictation = match dictation_upload_release(uploaded) {
+            DictationUploadRelease::Uploaded(result) => {
+                info!("[stt] dictation_upload_stream_completed");
+                Ok(result)
+            }
+            DictationUploadRelease::UploadFailed | DictationUploadRelease::NotUploaded => {
+                self.transcribe(wav, warmup)
+            }
+        };
+        match dictation {
             Ok(result) => result,
             Err(error) => preview_release_stt(Err(error), streaming_text),
         }
@@ -2277,6 +2651,61 @@ impl App {
             language,
             vocabulary,
             preview_proxy,
+        ))
+    }
+
+    /// Whether the streamed Dictation upload runs alongside the preview
+    /// WebSocket: only the preview-only composition (assemblyai/* primary on
+    /// the direct `AssemblyAI` stream) with the `AssemblyAI` key configured.
+    /// Batch mode and legacy primary models never stream the upload.
+    fn dictation_upload_enabled(&self) -> bool {
+        preview_only_streaming(&self.config.stt_model, self.config.streaming_stt)
+            && load_env_value("ASSEMBLYAI_API_KEY").is_some()
+    }
+
+    /// Open the feed channel for the streamed Dictation upload, ahead of the
+    /// capture stream being built, so the audio callback tees chunks into
+    /// the request body from the first captured buffer. Both halves are
+    /// None when the composition does not stream the upload. The sender
+    /// must reach `start_recording` before the receiver can be handed to the
+    /// upload thread, because only then is the capture sample rate known
+    /// for the PCM config.
+    fn open_dictation_upload_feed(&self) -> DictationUploadFeed {
+        if !self.dictation_upload_enabled() {
+            return (None, None);
+        }
+        let (sender, receiver) = mpsc::channel();
+        (Some(sender), Some(receiver))
+    }
+
+    /// Spawn the streamed Dictation upload for a recording that just
+    /// started. The feed receiver is None when no upload should run, and
+    /// this only returns None when the `AssemblyAI` key disappeared between
+    /// the feed opening and the spawn; release then falls back to the batch
+    /// transcribe exactly as before.
+    fn start_dictation_upload(
+        &self,
+        receiver: Option<Receiver<Vec<i16>>>,
+        sample_rate: u32,
+    ) -> Option<DictationUpload> {
+        let receiver = receiver?;
+        let Some(api_key) = load_env_value("ASSEMBLYAI_API_KEY") else {
+            warn!("[stt] dictation upload skipped: ASSEMBLYAI_API_KEY is not configured");
+            return None;
+        };
+        let language = self
+            .stt_language()
+            .unwrap_or_else(|_| self.config.stt_language.clone());
+        let vocabulary = self.vocabulary_snapshot().unwrap_or_default();
+        let request_timeout = dictation_upload_request_timeout(self.config.max_recording_seconds);
+        Some(DictationUpload::start(
+            self.http.clone(),
+            api_key,
+            language,
+            vocabulary,
+            sample_rate,
+            request_timeout,
+            receiver,
         ))
     }
 
@@ -2627,29 +3056,9 @@ impl App {
                 "status": status.as_u16(),
             })
         );
-        if status.as_u16() == 429 {
-            return Err(AppError::RateLimited);
-        }
-        if status.as_u16() == 401 {
-            return Err(AppError::Transcription(String::from(
-                "401 Unauthorized: check ASSEMBLYAI_API_KEY",
-            )));
-        }
-        if !status.is_success() {
-            let body = response.text().unwrap_or_default();
-            return Err(AppError::TranscriptionStatus {
-                status: status.as_u16(),
-                message: body.chars().take(200).collect::<String>(),
-            });
-        }
+        let response = dictation_status_checked(status, response)?;
         let parsed: AssemblyDictationResponse = response.json()?;
-        let verbatim = parsed.text.unwrap_or_default();
-        let cleaned = parsed
-            .llm_response
-            .as_deref()
-            .map(str::trim)
-            .filter(|cleaned| !cleaned.is_empty() && *cleaned != verbatim.trim())
-            .map(str::to_owned);
+        let (verbatim, cleaned) = dictation_verbatim_and_cleaned(&parsed);
         info!(
             "[stt] response_text {}",
             serde_json::json!({
@@ -4025,6 +4434,7 @@ impl StreamingProvider {
 fn start_recording(
     selected_microphone: Option<&str>,
     streaming_sender: Option<mpsc::Sender<Vec<i16>>>,
+    upload_sender: Option<mpsc::Sender<Vec<i16>>>,
 ) -> Result<ActiveRecording, AppError> {
     let host = cpal::default_host();
     let device = select_input_device(&host, selected_microphone)?;
@@ -4048,6 +4458,7 @@ fn start_recording(
             channels,
             Arc::clone(&samples),
             streaming_sender,
+            upload_sender,
         )?,
         SampleFormat::F32 => build_stream::<f32>(
             &device,
@@ -4055,6 +4466,7 @@ fn start_recording(
             channels,
             Arc::clone(&samples),
             streaming_sender,
+            upload_sender,
         )?,
         SampleFormat::U16 => build_stream::<u16>(
             &device,
@@ -4062,6 +4474,7 @@ fn start_recording(
             channels,
             Arc::clone(&samples),
             streaming_sender,
+            upload_sender,
         )?,
         other @ (SampleFormat::I8
         | SampleFormat::I24
@@ -4091,6 +4504,7 @@ fn start_recording(
         sample_rate: config.sample_rate,
         warmup: DictationWarmup::default(),
         streaming: None,
+        upload: None,
     })
 }
 
@@ -4868,6 +5282,7 @@ fn build_stream<T>(
     channels: usize,
     samples: Arc<Mutex<Vec<i16>>>,
     streaming_sender: Option<mpsc::Sender<Vec<i16>>>,
+    upload_sender: Option<mpsc::Sender<Vec<i16>>>,
 ) -> Result<Stream, AppError>
 where
     T: Sample + SizedSample,
@@ -4878,6 +5293,8 @@ where
         .max(1);
     let mut streaming_chunker =
         streaming_sender.map(|sender| StreamingAudioChunker::new(sender, chunk_samples));
+    let mut upload_chunker =
+        upload_sender.map(|sender| StreamingAudioChunker::new(sender, chunk_samples));
     device
         .build_input_stream(
             config,
@@ -4892,7 +5309,10 @@ where
                     guard.extend(mono.iter().copied());
                 }
                 if let Some(chunker) = streaming_chunker.as_mut() {
-                    chunker.push(mono);
+                    chunker.push(&mono);
+                }
+                if let Some(chunker) = upload_chunker.as_mut() {
+                    chunker.push(&mono);
                 }
             },
             |error| {
@@ -4918,8 +5338,11 @@ impl StreamingAudioChunker {
         }
     }
 
-    fn push(&mut self, samples: Vec<i16>) {
-        self.buffer.extend(samples);
+    /// Append captured samples, cutting them into fixed-size chunks for the
+    /// wire. Partial chunks stay buffered until enough samples arrive, so
+    /// consumers never see chunk-size drift.
+    fn push(&mut self, samples: &[i16]) {
+        self.buffer.extend_from_slice(samples);
         while self.buffer.len() >= self.chunk_samples {
             let remainder = self.buffer.split_off(self.chunk_samples);
             let chunk = std::mem::replace(&mut self.buffer, remainder);
@@ -8231,30 +8654,33 @@ mod tests {
         ACCESS_DAEMON_ACTION_TIMEOUT, ACCESS_DAEMON_QUERY_TIMEOUT, ACCESS_DAEMON_STARTUP_TIMEOUT,
         ASSEMBLYAI_STREAMING_MODEL, AccessDaemonFailure, AccessDaemonRequest, AccessibilityContext,
         AccessibilityTrust, App, AppError, AppState, AssemblyDictationResponse, BatchRetry,
-        CleanupMode, CleanupProfile, Config, DictationCommandKind, DictationWarmup, PreparedText,
-        PromptBinding, STREAMING_DRAIN_MIN, STT_RETRY_SAMPLE_RATE, StreamingConnectionState,
-        StreamingProvider, StreamingRecording, StreamingText, StreamingTranscript, SttFallback,
-        SttResult, TRANSCRIPT_HISTORY_LIMIT, TextReplacement, TranscriptHistoryEntry,
-        UpdateOutcome, apply_text_replacements, apply_vocabulary_corrections_with_matches,
-        assemblyai_direct_query_with, assemblyai_language_code, batch_retry_plan,
-        build_cleanup_user_content, build_rewrite_user_content, build_stt_prompt,
-        canonicalize_known_terms, cleanup_decision, cleanup_max_tokens, cleanup_profile,
-        downsample_wav_16k_mono, empty_transcript_error, final_streaming_result_is_ready_elapsed,
+        CleanupMode, CleanupProfile, Config, DictationCommandKind, DictationUploadReader,
+        DictationUploadRelease, DictationWarmup, PreparedText, PromptBinding, STREAMING_DRAIN_MIN,
+        STT_RETRY_SAMPLE_RATE, StreamingConnectionState, StreamingProvider, StreamingRecording,
+        StreamingText, StreamingTranscript, SttFallback, SttResult, TRANSCRIPT_HISTORY_LIMIT,
+        TextReplacement, TranscriptHistoryEntry, UpdateOutcome, apply_text_replacements,
+        apply_vocabulary_corrections_with_matches, assemblyai_direct_query_with,
+        assemblyai_language_code, batch_retry_plan, build_cleanup_user_content,
+        build_rewrite_user_content, build_stt_prompt, canonicalize_known_terms, cleanup_decision,
+        cleanup_max_tokens, cleanup_profile, dictation_upload_config, dictation_upload_form,
+        dictation_upload_release, dictation_upload_request_timeout, downsample_wav_16k_mono,
+        empty_transcript_error, final_streaming_result_is_ready_elapsed,
         finalize_accessibility_context, handshake_with_deadline, is_known_no_speech_transcript,
         is_supported_hotkey, load_vocabulary_usage, non_empty_transcript,
         parse_accessibility_trust, parse_command, parse_daemon_context_reply,
         parse_daemon_paste_reply, parse_daemon_select_reply, parse_daemon_trust_reply,
         parse_replacements_json, parse_stt_fallbacks, parse_u64_env_value, parse_update_outcome,
-        parse_wav_pcm16, preview_only_streaming, preview_release_stt, read_vocabulary_file,
-        read_vocabulary_usage_file, remove_fillers, request_accessibility_daemon,
-        retry_failed_primary, sanitize_transcript_history, speech_stats,
-        stable_streaming_best_is_ready_elapsed, streaming_batch_fallback_reason,
+        parse_wav_pcm16, pcm_bytes, preview_only_streaming, preview_release_stt,
+        read_vocabulary_file, read_vocabulary_usage_file, remove_fillers,
+        request_accessibility_daemon, retry_failed_primary, sanitize_transcript_history,
+        speech_stats, stable_streaming_best_is_ready_elapsed, streaming_batch_fallback_reason,
         streaming_connection, streaming_preview_tail, streaming_provider_from_config,
         strip_reasoning_tags, stt_language_for_model, stt_model_config, telnyx_stream_query,
         transcript_log_value, transcript_menu_preview, wait_for_daemon_reply, wav_bytes,
         wav_duration_ms,
     };
     use std::collections::{HashMap, VecDeque};
+    use std::io::Read as _;
     use std::path::PathBuf;
     use std::sync::mpsc;
     use std::sync::{Arc, Mutex};
@@ -9456,6 +9882,169 @@ mod tests {
             }),
         );
         assert!(whitespace_stream.text.trim().is_empty());
+    }
+
+    #[test]
+    fn dictation_upload_config_carries_raw_pcm_metadata() {
+        let english = dictation_upload_config(48_000, "en-IN", &[]);
+        assert_eq!(english["sample_rate"], serde_json::json!(48_000));
+        assert_eq!(english["channels"], serde_json::json!(1));
+        assert_eq!(english["language_codes"], serde_json::json!(["en"]));
+        assert!(english.get("keyterms_prompt").is_none());
+
+        let auto_with_terms = dictation_upload_config(44_100, "auto", &[String::from("Telnyx")]);
+        assert_eq!(auto_with_terms["sample_rate"], serde_json::json!(44_100));
+        assert!(auto_with_terms.get("language_codes").is_none());
+        assert_eq!(
+            auto_with_terms["keyterms_prompt"],
+            serde_json::json!(["Telnyx"])
+        );
+    }
+
+    #[test]
+    fn dictation_upload_form_writes_config_before_audio_and_ends_at_feed_eof()
+    -> Result<(), AppError> {
+        let (sender, receiver) = mpsc::channel::<Vec<i16>>();
+        sender
+            .send(vec![1_i16, -2, 3])
+            .map_err(|error| AppError::Transcription(error.to_string()))?;
+        sender
+            .send(vec![4_i16])
+            .map_err(|error| AppError::Transcription(error.to_string()))?;
+        // Dropping the last sender is what release does by dropping the
+        // capture stream: the reader must serve the queued chunks and then
+        // end the request body.
+        drop(sender);
+        let config = dictation_upload_config(48_000, "en-US", &[]).to_string();
+        let form = dictation_upload_form(
+            config,
+            DictationUploadReader {
+                receiver,
+                buffer: Vec::new(),
+            },
+        )?;
+        let mut body = Vec::new();
+        let _ = form
+            .into_reader()
+            .read_to_end(&mut body)
+            .map_err(|error| AppError::Transcription(error.to_string()))?;
+
+        let headers = String::from_utf8_lossy(&body);
+        // The endpoint rejects audio that arrives before config, so the
+        // wire order is the contract: config part first, audio second.
+        let config_at = headers
+            .find("name=\"config\"")
+            .ok_or_else(|| AppError::Transcription(String::from("config part missing")))?;
+        let audio_at = headers
+            .find("name=\"audio\"")
+            .ok_or_else(|| AppError::Transcription(String::from("audio part missing")))?;
+        assert!(
+            config_at < audio_at,
+            "config part at {config_at} must precede the audio part at {audio_at}"
+        );
+        assert!(headers.contains("Content-Type: audio/pcm"));
+        assert!(headers.contains("\"sample_rate\":48000"));
+        // The terminating boundary only appears once every part is served,
+        // which proves the body ends when the feed drops instead of hanging.
+        assert!(body.ends_with(b"--\r\n"));
+
+        let expected_pcm = pcm_bytes(&[1_i16, -2, 3, 4]);
+        let Some(pcm_at) = body
+            .windows(expected_pcm.len())
+            .position(|window| window == expected_pcm.as_slice())
+        else {
+            return Err(AppError::Transcription(String::from(
+                "streamed chunks must arrive as little-endian PCM in order",
+            )));
+        };
+        assert!(
+            pcm_at > audio_at,
+            "PCM data must sit inside the audio part, after its headers"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn dictation_upload_reader_serves_partial_reads_and_ends_at_eof() -> Result<(), AppError> {
+        let (sender, receiver) = mpsc::channel::<Vec<i16>>();
+        sender
+            .send(vec![7_i16, 8, 9])
+            .map_err(|error| AppError::Transcription(error.to_string()))?;
+        drop(sender);
+        let mut reader = DictationUploadReader {
+            receiver,
+            buffer: Vec::new(),
+        };
+        // One byte per read forces the reader to split buffered chunks
+        // across many calls instead of stalling on the buffer boundary.
+        let mut served = Vec::new();
+        let mut one = [0_u8; 1];
+        while reader
+            .read(&mut one)
+            .map_err(|error| AppError::Transcription(error.to_string()))?
+            > 0
+        {
+            served.push(one[0]);
+        }
+        assert_eq!(served, pcm_bytes(&[7_i16, 8, 9]));
+        // After EOF another read still reports EOF, not a stall.
+        assert_eq!(
+            reader
+                .read(&mut one)
+                .map_err(|error| AppError::Transcription(error.to_string()))?,
+            0
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn dictation_upload_release_uses_the_uploaded_result_over_batch() -> Result<(), AppError> {
+        let uploaded = SttResult {
+            text: String::from("streamed transcript"),
+            llm_cleaned: None,
+        };
+        match dictation_upload_release(Some(Ok(uploaded))) {
+            DictationUploadRelease::Uploaded(result) => {
+                assert_eq!(result.text, "streamed transcript");
+            }
+            DictationUploadRelease::UploadFailed | DictationUploadRelease::NotUploaded => {
+                return Err(AppError::Transcription(String::from(
+                    "a completed upload must release as Uploaded",
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn dictation_upload_release_falls_back_to_the_buffered_wav_batch() {
+        // A failed upload (network error, 4xx/5xx, missed budget) releases
+        // as UploadFailed, which preview_stt_result answers with exactly one
+        // batch transcribe of the buffered WAV; no upload at all releases
+        // as NotUploaded with the same batch path as before.
+        assert!(matches!(
+            dictation_upload_release(Some(Err(AppError::RateLimited))),
+            DictationUploadRelease::UploadFailed
+        ));
+        assert!(matches!(
+            dictation_upload_release(Some(Err(AppError::TranscriptionStatus {
+                status: 413,
+                message: String::new(),
+            }))),
+            DictationUploadRelease::UploadFailed
+        ));
+        assert!(matches!(
+            dictation_upload_release(None),
+            DictationUploadRelease::NotUploaded
+        ));
+    }
+
+    #[test]
+    fn dictation_upload_request_timeout_covers_the_recording_window() {
+        let timeout = dictation_upload_request_timeout(30);
+        assert!(
+            timeout > super::STT_REQUEST_TIMEOUT.saturating_add(std::time::Duration::from_secs(30))
+        );
     }
 
     #[test]
