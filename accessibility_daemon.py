@@ -45,6 +45,19 @@ import sys
 import threading
 import warnings
 
+from AppKit import (
+    NSApplication,
+    NSApplicationActivationPolicyAccessory,
+)
+
+# This helper runs from the Xcode CLT interpreter whose executable lives
+# inside Python.app, so macOS registers the process as a Dock app named
+# "Python" the moment it spawns. hotkey.py suppresses the same thing; do it
+# before any local module imports AppKit work so the Dock icon never shows.
+NSApplication.sharedApplication().setActivationPolicy_(
+    NSApplicationActivationPolicyAccessory
+)
+
 import accessibility_context
 import accessibility_trusted
 import insert_text
