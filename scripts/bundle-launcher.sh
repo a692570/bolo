@@ -52,9 +52,26 @@ verify_helpers() {
 
 ARCH_DIR="$(bolo_pick_arch "$(uname -m)")" || ARCH_DIR="unsupported"
 BUNDLED_PYTHON_BIN="$RESOURCES/python/$ARCH_DIR/bin"
-if [ "$ARCH_DIR" = "unsupported" ] || [ ! -x "$BUNDLED_PYTHON_BIN/python3.12" ]; then
-    echo "[bolo] ERROR: no bundled python for this machine ($ARCH_DIR)." >> "$LOG" 2>/dev/null || true
-    osascript -e 'display notification "This Mac is not supported by Bolo. Contact support." with title "Bolo"' >/dev/null 2>&1 || true
+ARCH_DIR_OK=0
+if [ "$ARCH_DIR" != "unsupported" ] && [ -x "$BUNDLED_PYTHON_BIN/python3.12" ]; then
+    ARCH_DIR_OK=1
+else
+    # One retry before declaring failure: the app can be launched while its
+    # copy is still in flight (drag mid-transfer) or while the DMG volume is
+    # detaching, and both surface here as a missing binary that exists a
+    # second later.
+    sleep 2
+    if [ "$ARCH_DIR" != "unsupported" ] && [ -x "$BUNDLED_PYTHON_BIN/python3.12" ]; then
+        ARCH_DIR_OK=1
+    fi
+fi
+if [ "$ARCH_DIR_OK" != 1 ]; then
+    echo "[bolo] ERROR: bundled helper runtime unusable ($ARCH_DIR, $BUNDLED_PYTHON_BIN/python3.12)." >> "$LOG" 2>/dev/null || true
+    if [ "$ARCH_DIR" = "unsupported" ]; then
+        osascript -e 'display notification "Bolo does not support this Mac architecture yet." with title "Bolo"' >/dev/null 2>&1 || true
+    else
+        osascript -e 'display notification "Bolo'\''s helper runtime is missing from this copy. Reinstall from the latest Bolo DMG." with title "Bolo"' >/dev/null 2>&1 || true
+    fi
     exit 1
 fi
 

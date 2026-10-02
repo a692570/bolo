@@ -229,7 +229,7 @@ fi
 
 # --- Phase 5: stage Bolo.app ----------------------------------------------------------
 
-STAGE="$BUILD/staging"
+STAGE="$BUILD/staging.noindex"
 rm -rf "$STAGE"
 APP="$STAGE/Bolo.app"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
@@ -375,7 +375,10 @@ rm -f "$LAYOUT_DMG"
 DMG="$DIST/Bolo-$VERSION.dmg"
 rm -f "$DMG"
 log "creating $DMG"
-hdiutil create -volname Bolo -srcfolder "$STAGE" -format UDZO -ov "$DMG" \
+# LZMA-compressed DMG: roughly half the size of the classic UDZO image,
+# which matters for a 90MB artifact on flaky home networks. Readable on
+# macOS 10.15+, the minimum version the Info.plist already requires.
+hdiutil create -volname Bolo -srcfolder "$STAGE" -format ULMO -ov "$DMG" \
     >/dev/null || fail "hdiutil could not create the DMG"
 [ -f "$DMG" ] || fail "DMG missing after hdiutil"
 
