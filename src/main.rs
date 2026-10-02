@@ -5826,6 +5826,15 @@ const fn streaming_status_label(streaming: Option<StreamingProvider>) -> &'stati
     }
 }
 
+/// Tappable row action: `kind` drives the window behavior (`open_settings`
+/// opens the macOS Accessibility pane, `restart` relaunches the runtime)
+/// and `title` is the button label.
+#[derive(Debug, Serialize)]
+struct RowAction {
+    kind: String,
+    title: String,
+}
+
 /// One rendered line pair in the onboarding and status windows.
 #[derive(Debug, Serialize)]
 struct WindowRow {
@@ -5833,6 +5842,10 @@ struct WindowRow {
     detail: String,
     /// `ok`, `warn`, or `pending`; the helper maps it to a dot color.
     state: String,
+    /// Optional tappable button rendered inside the row. Absent rows
+    /// render exactly as before, so older helpers ignore it safely.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    action: Option<RowAction>,
 }
 
 impl WindowRow {
@@ -5841,7 +5854,19 @@ impl WindowRow {
             label: String::from(label),
             detail,
             state: String::from(state),
+            action: None,
         }
+    }
+
+    /// Attach the Open Accessibility Settings button, used by the
+    /// onboarding Accessibility warn row so the user can jump straight to
+    /// the pane Apple never prompts for.
+    fn open_settings(mut self) -> Self {
+        self.action = Some(RowAction {
+            kind: String::from("open_settings"),
+            title: String::from("Open Accessibility Settings"),
+        });
+        self
     }
 }
 
@@ -5946,6 +5971,23 @@ fn accessibility_fix_detail(bundle: bool, python: &str) -> String {
         format!(
             "Add this Python interpreter in System Settings > Privacy & Security > \
              Accessibility, then run ./restart.sh: {python}"
+        )
+    }
+}
+
+/// Onboarding Accessibility warn-row copy: points at the row's Open
+/// Accessibility Settings button, then names the exact list item to
+/// enable (Bolo in bundle mode, the helper interpreter from source).
+fn accessibility_row_detail(bundle: bool, python: &str) -> String {
+    if bundle {
+        String::from(
+            "Bolo needs Accessibility to type for you. Click the button, then \
+             enable Bolo in the list.",
+        )
+    } else {
+        format!(
+            "Bolo needs Accessibility to type for you. Click the button, then \
+             enable this interpreter in the list: {python}"
         )
     }
 }
@@ -6200,9 +6242,10 @@ fn onboarding_window_payload(app: &App, write_marker: bool) -> Result<String, Ap
         ),
         AccessibilityTrust::Untrusted => WindowRow::new(
             "Accessibility",
-            accessibility_fix_detail(bundle_mode(), &python3_executable_path()),
+            accessibility_row_detail(bundle_mode(), &python3_executable_path()),
             "warn",
-        ),
+        )
+        .open_settings(),
         AccessibilityTrust::Unavailable => WindowRow::new(
             "Accessibility",
             if bundle_mode() {
@@ -10299,7 +10342,7 @@ mod tests {
         STT_RETRY_SAMPLE_RATE, StreamingConnectionState, StreamingProvider, StreamingRecording,
         StreamingText, StreamingTranscript, SttFallback, SttResult, TRANSCRIPT_HISTORY_LIMIT,
         TextReplacement, TranscriptHistoryEntry, UpdateNotice, UpdateOutcome, WindowRow,
-        accessibility_fix_detail, apply_text_replacements,
+        accessibility_fix_detail, accessibility_row_detail, apply_text_replacements,
         apply_vocabulary_corrections_with_matches, assemblyai_direct_query_with,
         assemblyai_language_code, batch_retry_plan, build_cleanup_user_content,
         build_rewrite_user_content, build_stt_prompt, canonicalize_known_terms, chunk_samples_for,
@@ -10443,6 +10486,36 @@ mod tests {
         assert!(detail.contains("enable Bolo"));
         assert!(!detail.contains("python3"));
         assert!(!detail.contains("restart.sh"));
+    }
+
+    #[test]
+    fn accessibility_row_detail_points_at_the_button_per_mode() {
+        assert_eq!(
+            accessibility_row_detail(true, "/Users/demo/.bolo/venv/bin/python3"),
+            "Bolo needs Accessibility to type for you. Click the button, then \
+             enable Bolo in the list."
+        );
+        let source = accessibility_row_detail(false, "/Users/demo/.bolo/venv/bin/python3");
+        assert!(source.contains("Click the button"));
+        assert!(source.contains("/Users/demo/.bolo/venv/bin/python3"));
+    }
+
+    #[test]
+    fn window_rows_serialize_the_action_only_when_present() -> Result<(), serde_json::Error> {
+        let plain = serde_json::to_string(&WindowRow::new(
+            "Accessibility",
+            String::from("Bolo needs Accessibility to type for you."),
+            "ok",
+        ))?;
+        assert!(!plain.contains("action"));
+
+        let button = serde_json::to_string(
+            &WindowRow::new("Accessibility", String::from("Enable Bolo."), "warn").open_settings(),
+        )?;
+        assert!(button.contains(
+            "\"action\":{\"kind\":\"open_settings\",\"title\":\"Open Accessibility Settings\"}"
+        ));
+        Ok(())
     }
 
     #[test]

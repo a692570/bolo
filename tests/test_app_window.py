@@ -405,3 +405,121 @@ def test_appkit_action_selectors_have_single_colons():
     assert bad == [], "pyobjc would read these as multi-colon selectors: {0}".format(bad)
     assert "validateKey_" in source
     assert '"validateKey:"' in source
+    assert "openAccessibility_" in source
+    assert '"openAccessibility:"' in source
+    assert "restartBolo_" in source
+    assert '"restartBolo:"' in source
+
+
+def test_accessibility_settings_url_targets_privacy_accessibility():
+    assert app_window.ACCESSIBILITY_SETTINGS_URL == (
+        "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
+    )
+    assert app_window.open_settings_command() == ["open", app_window.ACCESSIBILITY_SETTINGS_URL]
+
+
+def test_restart_command_only_exists_in_bundle_mode():
+    assert app_window.restart_command(True) == ["pkill", "-USR1", "-f", "Bolo.app/Contents/MacOS"]
+    # Source mode has no supervised relaunch: the window keeps the
+    # ./restart.sh instruction instead of a restart button.
+    assert app_window.restart_command(False) is None
+
+
+def test_row_action_kind_accepts_only_known_kinds():
+    warn = {
+        "label": "Accessibility",
+        "detail": "Enable Bolo in the list.",
+        "state": "warn",
+        "action": {"kind": "open_settings", "title": "Open Accessibility Settings"},
+    }
+    assert app_window.row_action_kind(warn) == "open_settings"
+    assert app_window.row_action_kind({"action": {"kind": "restart"}}) == "restart"
+    assert app_window.row_action_kind({}) is None
+    assert app_window.row_action_kind({"action": None}) is None
+    assert app_window.row_action_kind({"action": {"kind": "self_destruct"}}) is None
+    assert app_window.row_action_kind({"action": "open_settings"}) is None
+    assert app_window.row_action_kind("not a row") is None
+
+
+def test_action_button_title_prefers_payload_then_kind_default():
+    titled = {"action": {"kind": "restart", "title": "Relaunch now"}}
+    assert app_window.action_button_title(titled) == "Relaunch now"
+    assert (
+        app_window.action_button_title({"action": {"kind": "open_settings"}})
+        == "Open Accessibility Settings"
+    )
+    assert app_window.action_button_title({"action": {"kind": "restart"}}) == "Restart Bolo"
+    assert app_window.action_button_title({"action": {"title": ""}}) == "Open Accessibility Settings"
+
+
+def test_plan_layout_reserves_space_for_the_row_action_button():
+    payload = {
+        "brand": "BOLO",
+        "welcome": "hello",
+        "rows": [
+            {
+                "label": "Accessibility",
+                "detail": "Click the button, then enable Bolo.",
+                "state": "warn",
+                "action": {"kind": "open_settings"},
+            },
+            {"label": "Try it", "detail": "Hold Right Option.", "state": "pending"},
+        ],
+    }
+    plan = app_window.plan_layout(payload)
+
+    row, following = plan["rows"]
+    assert row["action_y"] is not None
+    assert row["action_y"] > row["detail_y"]
+    assert following["action_y"] is None
+    assert following["label_y"] >= row["action_y"] + app_window.ACTION_BUTTON_H
+
+    plain = app_window.plan_layout(
+        {**payload, "rows": [dict(payload["rows"][0], action=None), payload["rows"][1]]}
+    )
+    assert plan["height"] == (
+        plain["height"] + app_window.ACTION_BUTTON_H + app_window.ACTION_BUTTON_GAP
+    )
+
+
+def test_accessibility_flip_swaps_button_in_bundle_mode():
+    warn = {
+        "label": "Accessibility",
+        "detail": "Bolo needs Accessibility to type for you.",
+        "state": "warn",
+        "action": {"kind": "open_settings", "title": "Open Accessibility Settings"},
+    }
+    # Still untrusted (or the check failed): no change at all.
+    assert app_window.accessibility_flip(warn, False, True) is None
+    assert app_window.accessibility_flip(warn, None, True) is None
+
+    flipped = app_window.accessibility_flip(warn, True, True)
+    assert flipped == {
+        "label": "Accessibility",
+        "detail": "Granted.",
+        "state": "ok",
+        "action": {"kind": "restart", "title": "Restart Bolo"},
+    }
+    # An already-green row never flips again.
+    assert app_window.accessibility_flip(flipped, True, True) is None
+
+
+def test_accessibility_flip_source_mode_keeps_restart_instruction_and_drops_button():
+    warn = {
+        "label": "Accessibility",
+        "detail": "Bolo needs Accessibility to type for you.",
+        "state": "warn",
+        "action": {"kind": "open_settings", "title": "Open Accessibility Settings"},
+    }
+    flipped = app_window.accessibility_flip(warn, True, False)
+
+    assert flipped["state"] == "ok"
+    assert "restart.sh" in flipped["detail"]
+    assert app_window.row_action_kind(flipped) is None
+    # Only the Accessibility row rides this path.
+    assert (
+        app_window.accessibility_flip(
+            {"label": "Microphone", "detail": "None found.", "state": "warn"}, True, True
+        )
+        is None
+    )

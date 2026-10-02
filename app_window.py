@@ -5,11 +5,17 @@ The Rust runtime spawns this script and writes one JSON payload line to
 stdin; further lines update the onboarding try-it row. Closing the window
 (button or close box) exits 0, and a first-run onboarding session writes
 ~/.bolo/onboarding.json so the window is shown once per install.
+
+The onboarding Accessibility warn row carries a tappable action: an
+Open Accessibility Settings button deep-links System Settings, a 2s trust
+poll flips the row green once the user grants, and bundle mode then swaps
+in a Restart Bolo button (source mode keeps the ./restart.sh line).
 """
 
 import json
 import os
 import select
+import subprocess
 import sys
 import textwrap
 import time
@@ -52,6 +58,27 @@ DONE_BUTTON_H = 26
 ASSEMBLYAI_LIST_URL = "https://api.assemblyai.com/v2/transcript?limit=1"
 KEY_VALIDATION_TIMEOUT_S = 6.0
 
+# Accessibility grant flow: the onboarding warn row carries a button that
+# deep-links System Settings to the Accessibility list (Apple never prompts
+# for this permission, so the row must send the user there itself), the
+# window polls trust while that row is showing, and a granted flip turns
+# the row green. Bundle mode then swaps in a Restart Bolo button; source
+# mode has no supervised relaunch, so the granted detail keeps the
+# ./restart.sh instruction instead of a button.
+ACCESSIBILITY_SETTINGS_URL = (
+    "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
+)
+ACCESSIBILITY_LABEL = "Accessibility"
+OPEN_SETTINGS_TITLE = "Open Accessibility Settings"
+RESTART_TITLE = "Restart Bolo"
+GRANTED_DETAIL = "Granted."
+SOURCE_GRANTED_DETAIL = "Granted. Run ./restart.sh so Bolo picks up the grant."
+TRUST_POLL_INTERVAL_S = 2.0
+ACTION_KINDS = ("open_settings", "restart")
+ACTION_BUTTON_W = 210
+ACTION_BUTTON_H = 24
+ACTION_BUTTON_GAP = 6
+
 # Learned-corrections file the learning window edits. The Rust runtime owns
 # the file too (it reads pairs at startup and re-checks the mtime at each
 # recording start), so deletions here take effect without a restart.
@@ -93,6 +120,99 @@ def wrap_lines(text, width=DETAIL_WRAP_AT):
     if not text:
         return [""]
     return textwrap.wrap(text, width=width) or [""]
+
+
+def is_bundle_mode():
+    """Whether this window runs under the distributed Bolo.app bundle.
+
+    The bundle launcher exports BOLO_BUNDLE_MODE=1 for the runtime, which
+    its helper children (this window included) inherit.
+    """
+    return os.environ.get("BOLO_BUNDLE_MODE") == "1"
+
+
+def row_action_kind(row):
+    """Validated action kind carried by a row, or None when it has none."""
+    action = row.get("action") if isinstance(row, dict) else None
+    if not isinstance(action, dict):
+        return None
+    kind = action.get("kind")
+    return kind if kind in ACTION_KINDS else None
+
+
+def action_button_title(row):
+    """Button label for a row action: the payload title when it carries
+    one, else the default title for the kind."""
+    action = row.get("action")
+    if isinstance(action, dict) and isinstance(action.get("title"), str) and action["title"]:
+        return action["title"]
+    defaults = {"open_settings": OPEN_SETTINGS_TITLE, "restart": RESTART_TITLE}
+    return defaults.get(row_action_kind(row)) or OPEN_SETTINGS_TITLE
+
+
+def open_settings_command():
+    """Shell argv that opens System Settings on the Accessibility list."""
+    return ["open", ACCESSIBILITY_SETTINGS_URL]
+
+
+def restart_command(bundle):
+    """Shell argv that restarts the supervised runtime, or None from source.
+
+    Bundle mode stops the runtime with SIGUSR1: the bundle's supervisor
+    relaunches it a few seconds later (it restarts on any exit code
+    outside 0/1/137/143, while SIGTERM's 143 is its deliberate
+    quit-and-stay-dead code), which reopens this window with fresh rows.
+    Source mode has no matching supervised relaunch, so the window keeps
+    the ./restart.sh instruction instead of offering a button.
+    """
+    if not bundle:
+        return None
+    return ["pkill", "-USR1", "-f", "Bolo.app/Contents/MacOS"]
+
+
+def accessibility_self_trusted():
+    """Whether macOS trusts this helper process for Accessibility.
+
+    Mirrors accessibility_trusted.py's non-prompt check: this window runs
+    under the same interpreter as the paste helpers, so its reading
+    matches the row the runtime rendered. Returns None when the check
+    itself fails, so the poll keeps waiting instead of flipping on a lie.
+    """
+    try:
+        import ApplicationServices as ax
+
+        return bool(ax.AXIsProcessTrusted())
+    except Exception:
+        return None
+
+
+def accessibility_flip(row, trusted_now, bundle):
+    """Row update after one Accessibility trust poll; None when unchanged.
+
+    `row` is the row as last displayed, `trusted_now` the fresh reading
+    from `accessibility_self_trusted`, and `bundle` whether the window
+    runs under Bolo.app. Flipping to granted turns the row green with a
+    "Granted." line: bundle mode swaps the settings button for a Restart
+    Bolo action, source mode drops the button and keeps the ./restart.sh
+    instruction in the detail.
+    """
+    if trusted_now is not True:
+        return None
+    if row.get("label") != ACCESSIBILITY_LABEL or row.get("state") == "ok":
+        return None
+    if bundle:
+        return {
+            "label": ACCESSIBILITY_LABEL,
+            "detail": GRANTED_DETAIL,
+            "state": "ok",
+            "action": {"kind": "restart", "title": RESTART_TITLE},
+        }
+    return {
+        "label": ACCESSIBILITY_LABEL,
+        "detail": SOURCE_GRANTED_DETAIL,
+        "state": "ok",
+        "action": None,
+    }
 
 
 def write_learned_file(path, payload):
@@ -251,6 +371,8 @@ def plan_layout(payload):
     top-left). The row named by ``payload["key_entry"]["index"]`` reserves
     extra vertical space for the text field plus Validate button. A truthy
     ``payload["brand"]`` reserves the brand row above the welcome lines.
+    A row carrying a valid ``action`` reserves one button line under its
+    detail for the row's tappable action.
     """
     rows = payload.get("rows", [])
     brand = bool(payload.get("brand"))
@@ -276,15 +398,22 @@ def plan_layout(payload):
         else:
             field_y = None
             detail_y = y + LABEL_LINE_H + 2
+        # A row carrying an action reserves a button line under the detail.
+        action_y = None
+        if row_action_kind(row) is not None:
+            action_y = detail_y + len(detail_lines) * DETAIL_LINE_H + ACTION_BUTTON_GAP
         row_plans.append(
             {
                 "label_y": y,
                 "field_y": field_y,
                 "detail_y": detail_y,
                 "detail_lines": detail_lines,
+                "action_y": action_y,
             }
         )
         y = detail_y + len(detail_lines) * DETAIL_LINE_H + ROW_GAP
+        if action_y is not None:
+            y = action_y + ACTION_BUTTON_H + ROW_GAP
     button_y = y + 6
     height = button_y + BUTTON_AREA_H
     welcome_y = None
@@ -400,6 +529,25 @@ def build_ui(payload):
                 refs["error"] = error or "Could not remove that correction."
             rerender()
 
+        def openAccessibility_(self, sender):
+            print(
+                "[app-window] opening Accessibility settings",
+                file=sys.stderr,
+                flush=True,
+            )
+            subprocess.Popen(open_settings_command())
+
+        def restartBolo_(self, sender):
+            command = restart_command(is_bundle_mode())
+            if command is None:
+                return
+            print(
+                "[app-window] restarting Bolo: {0}".format(" ".join(command)),
+                file=sys.stderr,
+                flush=True,
+            )
+            subprocess.Popen(command)
+
         def windowWillClose_(self, notification):
             STATE["user_done"] = True
 
@@ -502,6 +650,7 @@ def build_ui(payload):
 
         try_it_refs = None
         key_refs = None
+        accessibility_refs = None
         key_index = content_plan["key_index"]
         for index, (row, row_plan) in enumerate(
             zip(content_display.get("rows", []), content_plan["rows"])
@@ -598,6 +747,38 @@ def build_ui(payload):
                 NSColor.labelColor() if is_hero_row else NSColor.secondaryLabelColor(),
                 x=TEXT_X,
             )
+            action_kind = row_action_kind(row)
+            if action_kind is not None:
+                # Row action button (the Accessibility warn row's deep
+                # link, or the granted row's restart): same target-action
+                # mechanism the Validate button and the learning window's
+                # tappable rows already use.
+                action_button = NSButton.buttonWithTitle_target_action_(
+                    action_button_title(row),
+                    controller,
+                    "openAccessibility:" if action_kind == "open_settings" else "restartBolo:",
+                )
+                action_button.setBezelStyle_(NSBezelStyleRounded)
+                action_button.setFrame_(
+                    NSMakeRect(
+                        TEXT_X,
+                        row_plan["action_y"],
+                        ACTION_BUTTON_W,
+                        ACTION_BUTTON_H,
+                    )
+                )
+                content.addSubview_(action_button)
+                if (
+                    not is_learning
+                    and action_kind == "open_settings"
+                    and row.get("label") == ACCESSIBILITY_LABEL
+                ):
+                    accessibility_refs = {
+                        "row": row,
+                        "dot": dot,
+                        "detail_label": detail_label,
+                        "button": action_button,
+                    }
             if try_it_index is not None and index == try_it_index:
                 try_it_refs = {"dot": dot, "detail_label": detail_label}
             if key_index is not None and index == key_index:
@@ -635,11 +816,46 @@ def build_ui(payload):
             )
         )
         content.addSubview_(button)
-        return content, {"try_it_refs": try_it_refs, "key_refs": key_refs}
+        return content, {
+            "try_it_refs": try_it_refs,
+            "key_refs": key_refs,
+            "accessibility_refs": accessibility_refs,
+        }
 
     content, row_refs = build_content(display, plan)
     window.setContentView_(content)
     STATE["key_refs"] = row_refs["key_refs"]
+
+    # Accessibility trust polling: runs while the onboarding window shows
+    # the untrusted Accessibility warn row, so the row flips green within
+    # one poll interval of the user enabling Bolo.
+    accessibility = None
+    accessibility_refs = row_refs["accessibility_refs"]
+    if accessibility_refs is not None and accessibility_refs["row"].get("state") == "warn":
+        bundle = is_bundle_mode()
+
+        def apply_accessibility_granted(refs=accessibility_refs, bundle=bundle):
+            """Flip the row green in place and swap the button: Restart
+            Bolo in bundle mode, no button from source (the granted
+            detail's ./restart.sh line carries the instruction)."""
+            new_row = accessibility_flip(refs["row"], True, bundle)
+            if new_row is None:
+                return
+            print("[app-window] accessibility granted", file=sys.stderr, flush=True)
+            refs["dot"].layer().setBackgroundColor_(colors["ok"].CGColor())
+            refs["detail_label"].setStringValue_("\n".join(wrap_lines(new_row["detail"])))
+            if row_action_kind(new_row) == "restart":
+                # Keep the button's target; only the action moves.
+                refs["button"].setTitle_(RESTART_TITLE)
+                refs["button"].setAction_("restartBolo:")
+            else:
+                refs["button"].removeFromSuperview()
+
+        accessibility = {
+            "active": True,
+            "next_check": time.monotonic() + TRUST_POLL_INTERVAL_S,
+            "apply": apply_accessibility_granted,
+        }
 
     if is_learning:
         # The delete action re-renders in place: same window, fresh content,
@@ -681,6 +897,7 @@ def build_ui(payload):
         "window": window,
         "app": app,
         "try_it_refs": try_it_refs,
+        "accessibility": accessibility,
         "run_loop": (NSRunLoop, NSDate, NSDefaultRunLoopMode),
     }
 
@@ -706,9 +923,14 @@ def run_event_loop(ui):
     Returns True when the user closed the window (button or close box);
     False when stdin closed first, meaning the runtime went away and the
     onboarding session must not be marked complete.
+
+    While an Accessibility warn row is showing, the loop also polls macOS
+    trust every TRUST_POLL_INTERVAL_S so the row flips green the moment
+    the user enables Bolo, swapping in the post-grant action.
     """
     nsrunloop, nsdate, mode = ui["run_loop"]
     window = ui["window"]
+    accessibility = ui.get("accessibility")
     window.orderFrontRegardless()
     while not STATE["user_done"]:
         ready, _, _ = select.select([sys.stdin], [], [], 0)
@@ -719,6 +941,15 @@ def run_event_loop(ui):
             update = parse_update(line)
             if update and update.get("try_it_complete"):
                 apply_try_it_complete(ui, update)
+        if (
+            accessibility is not None
+            and accessibility["active"]
+            and time.monotonic() >= accessibility["next_check"]
+        ):
+            accessibility["next_check"] = time.monotonic() + TRUST_POLL_INTERVAL_S
+            if accessibility_self_trusted():
+                accessibility["active"] = False
+                accessibility["apply"]()
         nsrunloop.mainRunLoop().runMode_beforeDate_(
             mode, nsdate.dateWithTimeIntervalSinceNow_(0.05)
         )
