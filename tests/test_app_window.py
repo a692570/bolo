@@ -216,6 +216,68 @@ def test_plan_layout_without_key_entry_matches_legacy_geometry():
     )
 
 
+def test_plan_layout_reserves_the_brand_row():
+    payload = {
+        "title": "Set up Bolo",
+        "welcome": "hello",
+        "rows": [
+            {"label": "Accessibility", "detail": "Granted.", "state": "ok"},
+            {"label": "Try it", "detail": "Hold Right Option.", "state": "pending"},
+        ],
+        "button": "Done",
+    }
+    without_brand = app_window.plan_layout(dict(payload))
+    with_brand = app_window.plan_layout({**payload, "brand": "BOLO"})
+
+    assert without_brand["brand_y"] is None
+    assert with_brand["brand_y"] == app_window.TOP_PAD
+    shift = app_window.BRAND_ROW_H + app_window.BRAND_GAP
+    assert with_brand["welcome_y"] == without_brand["welcome_y"] + shift
+    assert (
+        with_brand["rows"][0]["label_y"]
+        == without_brand["rows"][0]["label_y"] + shift
+    )
+    assert with_brand["height"] == without_brand["height"] + shift
+
+
+def test_plan_layout_brand_without_welcome_still_stacks_rows():
+    plan = app_window.plan_layout(
+        {
+            "brand": "BOLO",
+            "rows": [{"label": "Version", "detail": "1.6.0", "state": "ok"}],
+            "button": "Close",
+        }
+    )
+
+    assert plan["welcome_y"] is None
+    assert plan["brand_y"] == app_window.TOP_PAD
+    assert plan["rows"][0]["label_y"] == (
+        app_window.TOP_PAD + app_window.BRAND_ROW_H + app_window.BRAND_GAP
+    )
+
+
+def test_try_it_hero_is_styling_only_not_geometry():
+    # The hero line changes fonts and colors in build_ui, never the plan:
+    # payloads with and without it must produce identical geometry.
+    base = {
+        "rows": [
+            {"label": "Try it", "detail": "Hold Right Option.", "state": "pending"}
+        ],
+        "try_it_index": 0,
+        "button": "Done",
+    }
+    plan_plain = app_window.plan_layout(dict(base))
+    plan_hero = app_window.plan_layout(
+        {
+            **base,
+            "try_it_hero": "Hold Right Option. This window will stay open, and the dot turns green when you're done.",
+        }
+    )
+
+    assert plan_plain["rows"] == plan_hero["rows"]
+    assert plan_plain["height"] == plan_hero["height"]
+
+
 def test_appkit_action_selectors_have_single_colons():
     """Guard against the pyobjc underscore-to-colon trap.
 

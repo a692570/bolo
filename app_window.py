@@ -34,6 +34,21 @@ KEY_FIELD_H = 24
 VALIDATE_BUTTON_W = 100
 KEY_ENTRY_NAME = "ASSEMBLYAI_API_KEY"
 
+# Brand row: wordmark plus a small green waveform glyph (matching the
+# Bolo.icns family: dark surfaces, green bars).
+BRAND_ROW_H = 26
+BRAND_GAP = 12
+BRAND_BARS = ((3, 9), (3, 15), (3, 19), (3, 12), (3, 6))
+BRAND_BAR_GAP = 3
+BRAND_WORDMARK_SIZE = 15.0
+
+# Hero try-it row: when the payload marks the try-it step as the one thing
+# left, its label grows and its instruction line brightens.
+HERO_LABEL_SIZE = 15.0
+
+DONE_BUTTON_W = 120
+DONE_BUTTON_H = 26
+
 ASSEMBLYAI_LIST_URL = "https://api.assemblyai.com/v2/transcript?limit=1"
 KEY_VALIDATION_TIMEOUT_S = 6.0
 
@@ -169,14 +184,20 @@ def plan_layout(payload):
     per-row y positions for the label, optional key-entry field, and
     wrapped detail lines, all in flipped-content coordinates (origin
     top-left). The row named by ``payload["key_entry"]["index"]`` reserves
-    extra vertical space for the text field plus Validate button.
+    extra vertical space for the text field plus Validate button. A truthy
+    ``payload["brand"]`` reserves the brand row above the welcome lines.
     """
     rows = payload.get("rows", [])
+    brand = bool(payload.get("brand"))
     welcome = payload.get("welcome") or ""
     welcome_lines = wrap_lines(welcome) if welcome else []
     key_index = key_entry_index(payload)
     row_plans = []
     y = float(TOP_PAD)
+    brand_y = None
+    if brand:
+        brand_y = y
+        y += BRAND_ROW_H + BRAND_GAP
     if welcome_lines:
         y += len(welcome_lines) * LABEL_LINE_H + WELCOME_GAP
     for index, row in enumerate(rows):
@@ -198,9 +219,14 @@ def plan_layout(payload):
         y = detail_y + len(detail_lines) * DETAIL_LINE_H + ROW_GAP
     button_y = y + 6
     height = button_y + BUTTON_AREA_H
+    welcome_y = None
+    if welcome_lines:
+        welcome_y = TOP_PAD + ((BRAND_ROW_H + BRAND_GAP) if brand else 0)
     return {
+        "brand": brand,
+        "brand_y": brand_y,
         "welcome_lines": welcome_lines,
-        "welcome_y": TOP_PAD if welcome_lines else None,
+        "welcome_y": welcome_y,
         "rows": row_plans,
         "key_index": key_index,
         "button_y": button_y,
@@ -284,10 +310,13 @@ def build_ui(payload):
         "warn": NSColor.colorWithCalibratedRed_green_blue_alpha_(1.0, 0.36, 0.36, 1.0),
         "pending": NSColor.colorWithCalibratedRed_green_blue_alpha_(0.60, 0.60, 0.62, 1.0),
     }
+    accent = NSColor.colorWithCalibratedRed_green_blue_alpha_(0.34, 0.86, 0.61, 1.0)
 
     plan = plan_layout(payload)
     try_it_index = payload.get("try_it_index")
     try_it_index = try_it_index if isinstance(try_it_index, int) else None
+    hero_line = payload.get("try_it_hero")
+    hero_line = hero_line if isinstance(hero_line, str) else None
 
     app = NSApplication.sharedApplication()
     app.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
@@ -317,6 +346,32 @@ def build_ui(payload):
         content.addSubview_(label)
         return label
 
+    if plan["brand_y"] is not None:
+        # Brand row: small green waveform glyph plus the wordmark, matching
+        # the icon family (dark surface, green bars) at a subtle size. Bars
+        # sit on a shared baseline so the glyph reads as a waveform.
+        bar_x = float(MARGIN)
+        baseline = plan["brand_y"] + BRAND_ROW_H - 4.0
+        for bar_w, bar_h in BRAND_BARS:
+            bar = NSView.alloc().initWithFrame_(
+                NSMakeRect(bar_x, baseline - bar_h, bar_w, bar_h)
+            )
+            bar.setWantsLayer_(True)
+            bar.layer().setCornerRadius_(bar_w / 2.0)
+            bar.layer().setBackgroundColor_(accent.CGColor())
+            content.addSubview_(bar)
+            bar_x += bar_w + BRAND_BAR_GAP
+        bars_width = sum(w for w, _h in BRAND_BARS) + BRAND_BAR_GAP * (len(BRAND_BARS) - 1)
+        wordmark = make_label(
+            payload.get("brand") or "BOLO",
+            plan["brand_y"] + 5,
+            BRAND_ROW_H - 5,
+            NSFont.boldSystemFontOfSize_(BRAND_WORDMARK_SIZE),
+            NSColor.labelColor(),
+            x=MARGIN + bars_width + 10,
+        )
+        wordmark.setSelectable_(False)
+
     if plan["welcome_y"] is not None:
         make_label(
             "\n".join(plan["welcome_lines"]),
@@ -328,11 +383,20 @@ def build_ui(payload):
 
     label_font = NSFont.systemFontOfSize_weight_(13.0, NSFontWeightMedium)
     detail_font = NSFont.systemFontOfSize_weight_(12.0, NSFontWeightRegular)
+    hero_label_font = NSFont.systemFontOfSize_weight_(
+        HERO_LABEL_SIZE, NSFontWeightMedium
+    )
     controller = WindowController.alloc().init()
     try_it_refs = None
     key_refs = None
     key_index = plan["key_index"]
     for index, (row, row_plan) in enumerate(zip(payload.get("rows", []), plan["rows"])):
+        is_hero_row = (
+            try_it_index is not None
+            and index == try_it_index
+            and hero_line is not None
+            and row.get("state") == "pending"
+        )
         dot = NSView.alloc().initWithFrame_(NSMakeRect(MARGIN, row_plan["label_y"] + 5, 10, 10))
         dot.setWantsLayer_(True)
         dot.layer().setCornerRadius_(5)
@@ -344,7 +408,7 @@ def build_ui(payload):
             row.get("label", ""),
             row_plan["label_y"],
             LABEL_LINE_H,
-            label_font,
+            hero_label_font if is_hero_row else label_font,
             NSColor.labelColor(),
             x=TEXT_X,
         )
@@ -379,7 +443,7 @@ def build_ui(payload):
             row_plan["detail_y"],
             len(row_plan["detail_lines"]) * DETAIL_LINE_H,
             detail_font,
-            NSColor.secondaryLabelColor(),
+            NSColor.labelColor() if is_hero_row else NSColor.secondaryLabelColor(),
             x=TEXT_X,
         )
         if try_it_index is not None and index == try_it_index:
@@ -389,11 +453,38 @@ def build_ui(payload):
 
     STATE["key_refs"] = key_refs
 
+    # Done affordance: the brand-green accent background with white text,
+    # so the button reads as enabled against both light and dark windows
+    # instead of the washed-out default bezel. Return triggers it too.
+    # NSAttributedString attribute keys are stable string constants
+    # ("NSFont", "NSColor", "NSParagraphStyle"), used as literals here.
+    from AppKit import NSMutableParagraphStyle, NSTextAlignmentCenter
+
     button = NSButton.buttonWithTitle_target_action_(
         payload.get("button") or "Close", controller, "finish:"
     )
-    button.setBezelStyle_(NSBezelStyleRounded)
-    button.setFrame_(NSMakeRect(WIDTH - MARGIN - 120, plan["button_y"], 120, 24))
+    button.setBordered_(False)
+    button.setWantsLayer_(True)
+    button.layer().setBackgroundColor_(accent.CGColor())
+    button.layer().setCornerRadius_(13.0)
+    button.setKeyEquivalent_("\r")
+    paragraph = NSMutableParagraphStyle.alloc().init()
+    paragraph.setAlignment_(NSTextAlignmentCenter)
+    title_attributes = {
+        "NSFont": NSFont.systemFontOfSize_weight_(13.0, NSFontWeightMedium),
+        "NSColor": NSColor.whiteColor(),
+        "NSParagraphStyle": paragraph,
+    }
+    from Foundation import NSAttributedString
+
+    button.setAttributedTitle_(
+        NSAttributedString.alloc().initWithString_attributes_(
+            payload.get("button") or "Close", title_attributes
+        )
+    )
+    button.setFrame_(
+        NSMakeRect(WIDTH - MARGIN - DONE_BUTTON_W, plan["button_y"], DONE_BUTTON_W, DONE_BUTTON_H)
+    )
     content.addSubview_(button)
 
     window.setDelegate_(controller)
