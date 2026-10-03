@@ -40,7 +40,7 @@ warnings.filterwarnings("ignore", category=ObjCPointerWarning)
 NX_DEVICELALTKEYMASK = 0x00000020
 NX_DEVICERALTKEYMASK = 0x00000040
 NX_DEVICERCTLKEYMASK = 0x00002000
-NX_DEVICERSHIFTKEYMASK = 0x00000020
+NX_DEVICERSHIFTKEYMASK = 0x00000004
 NX_SECONDARYFNMASK = 0x00004000
 POLL_INTERVAL = 0.02
 RECHECK_INTERVAL = POLL_INTERVAL
@@ -111,7 +111,9 @@ def is_hotkey_down():
         except Exception:
             return state
 
-        if HOTKEY == "right_option":
+        if HOTKEY == "left_option":
+            return bool(flags & NX_DEVICELALTKEYMASK)
+        elif HOTKEY == "right_option":
             return bool(flags & NX_DEVICERALTKEYMASK)
         elif HOTKEY == "right_control":
             return bool(flags & NX_DEVICERCTLKEYMASK)
@@ -199,10 +201,7 @@ if USE_FLAGS_CHANGED:
         if HOTKEY == "right_option":
             set_state(bool(event.modifierFlags() & NX_DEVICERALTKEYMASK))
         elif HOTKEY == "left_option":
-            set_state(
-                int(event.keyCode()) == TARGET_KEYCODE
-                and bool(event.modifierFlags() & NX_DEVICELALTKEYMASK)
-            )
+            set_state(bool(event.modifierFlags() & NX_DEVICELALTKEYMASK))
         elif HOTKEY == "right_control":
             set_state(bool(event.modifierFlags() & NX_DEVICERCTLKEYMASK))
         elif HOTKEY == "right_shift":

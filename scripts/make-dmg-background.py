@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """Generate the Bolo DMG background image as a 660x400 PNG.
 
-Draws the dark brand surface with green accents (matching the app icon
-family: near-black surface, green waveform), the "Drag Bolo to
-Applications" instruction line, and a green arrow pointing from the
-Bolo.app slot to the Applications slot the Finder layout pins. Run under
-the same build-time venv that renders the app icon:
+A warm paper installer surface with the brand mark (lowercase "bolo"
+wordmark using the same bolo_brand.draw_mark path the app icon uses),
+finder-readable dark ink labels, and a restrained clay drag arrow from
+the Bolo.app slot on the left to the Applications slot on the right.
+Light surface so Finder's black icon labels under Bolo.app and
+Applications stay readable without relying on any undocumented Finder
+text color property. Run under the same build-time venv that renders
+the app icon:
 
     python3 scripts/make-dmg-background.py --output build/dmg/background.png
 """
@@ -14,37 +17,45 @@ import argparse
 import os
 import sys
 
+# Shared brand module lives beside the runtime, above these build scripts.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 WIDTH = 660
 HEIGHT = 400
 
-# Icon slots the Finder layout (build-dmg.sh) pins: the Applications
-# symlink on the left, Bolo.app on the right.
+# Icon slots the Finder layout (scripts/make-dmg-layout.py) pins:
+# Bolo.app on the LEFT, the Applications symlink on the RIGHT, so the
+# drag arrow points rightward in the direction of the drag.
 ICON_SIZE = 80
-APPLICATIONS_POS = (180, 220)
-BOLO_POS = (480, 220)
+BOLO_POS = (150, 232)
+APPLICATIONS_POS = (462, 232)
 
-WORDMARK = "BOLO"
-WORDMARK_FONT_SIZE = 44
+# The mark sits beside a lowercase "bolo" wordmark, both drawn from the
+# shared bolo_brand primitives. The serif wordmark matches setup headings.
+MARK_GRID_SIZE = 38.0
+WORDMARK = "bolo"
+WORDMARK_FONT_SIZE = 46
 WORDMARK_CENTER_Y = 64
-WORDMARK_GAP = 16.0
-BAR_W = 4.5
-BAR_GAP = 3.0
-BAR_HEIGHTS = (13.0, 22.0, 28.0, 18.0, 9.0)
+WORDMARK_GAP = 14.0
 
 SUBTITLE = "Drag Bolo to Applications"
-SUBTITLE_FONT_SIZE = 20
+SUBTITLE_FONT_SIZE = 18
 SUBTITLE_CENTER_Y = 116
+# Second instruction line: the next step after the drag.
+SUBTITLE2 = "then open it from Applications"
+SUBTITLE2_FONT_SIZE = 12
+SUBTITLE2_CENTER_Y = 142
+SUBTITLE2_COLOR_ALPHA = 0.85
 
-ARROW_SHAFT_H = 8.0
-ARROW_SHAFT_LEN = 110.0
-ARROW_HEAD_W = 30.0
-ARROW_HEAD_H = 28.0
-
-BG_COLOR = (0.055, 0.075, 0.070, 1.0)
-ACCENT_COLOR = (0.30, 0.875, 0.49, 1.0)
-ACCENT_DIM_ALPHA = 0.45
-WORD_COLOR = (0.95, 0.96, 0.95, 1.0)
-SUBTITLE_COLOR = (0.80, 0.86, 0.82, 1.0)
+# The arrow rides the icon band's centerline (y 232), its tail starting
+# just right of the Bolo icon and its tip stopping just left of the
+# Applications icon, so it sits between them rather than under either.
+ARROW_SHAFT_H = 7.0
+ARROW_TAIL_X = 244.0
+ARROW_TIP_X = 388.0
+ARROW_HEAD_W = 24.0
+ARROW_HEAD_H = 24.0
+ARROW_ALPHA = 0.65
 
 
 def icon_center(slot):
@@ -53,44 +64,31 @@ def icon_center(slot):
 
 
 def arrow_center():
-    """Midpoint between the two icon slots, at the icon band's height."""
-    left = icon_center(APPLICATIONS_POS)
-    right = icon_center(BOLO_POS)
+    """Center of the arrow at the icon band's height (y 232 centerline)."""
+    left = icon_center(BOLO_POS)
+    right = icon_center(APPLICATIONS_POS)
     return ((left[0] + right[0]) / 2.0, (left[1] + right[1]) / 2.0)
 
 
 def arrow_pieces():
     """The drag arrow as (shaft_rect, head_points), pointing from Bolo's
-    slot toward the Applications slot (right to left)."""
-    center_x, center_y = arrow_center()
-    shaft_left = center_x - ARROW_SHAFT_LEN / 2.0 + ARROW_HEAD_W / 2.0
+    slot toward the Applications slot (left to right). The shaft spans
+    from the tail (just right of the Bolo icon) to just before the head,
+    on the same horizontal band as both icons."""
+    center_y = arrow_center()[1]
+    shaft_w = (ARROW_TIP_X - ARROW_HEAD_W) - ARROW_TAIL_X
     shaft = (
-        shaft_left,
+        ARROW_TAIL_X,
         center_y - ARROW_SHAFT_H / 2.0,
-        ARROW_SHAFT_LEN,
+        shaft_w,
         ARROW_SHAFT_H,
     )
     head = (
-        (shaft[0], center_y - ARROW_HEAD_H / 2.0),
-        (shaft[0], center_y + ARROW_HEAD_H / 2.0),
-        (shaft[0] - ARROW_HEAD_W, center_y),
+        (ARROW_TIP_X - ARROW_HEAD_W, center_y - ARROW_HEAD_H / 2.0),
+        (ARROW_TIP_X - ARROW_HEAD_W, center_y + ARROW_HEAD_H / 2.0),
+        (ARROW_TIP_X, center_y),
     )
     return shaft, head
-
-
-def wave_bar_rects(unit_left):
-    """(x, y, w, h) for each waveform bar, ordered left to right, vertically
-    centered on the wordmark line starting at ``unit_left``."""
-    rects = []
-    x = unit_left
-    for height in BAR_HEIGHTS:
-        rects.append((x, WORDMARK_CENTER_Y - height / 2.0, BAR_W, height))
-        x += BAR_W + BAR_GAP
-    return rects
-
-
-def wave_bars_width():
-    return len(BAR_HEIGHTS) * BAR_W + (len(BAR_HEIGHTS) - 1) * BAR_GAP
 
 
 def render(width=WIDTH, height=HEIGHT):
@@ -99,7 +97,6 @@ def render(width=WIDTH, height=HEIGHT):
         NSAttributedString,
         NSBezierPath,
         NSBitmapImageRep,
-        NSColor,
         NSFont,
         NSFontAttributeName,
         NSForegroundColorAttributeName,
@@ -108,11 +105,24 @@ def render(width=WIDTH, height=HEIGHT):
         NSMutableParagraphStyle,
         NSParagraphStyleAttributeName,
     )
+    from bolo_brand import (
+        CLAY,
+        INK,
+        PAPER,
+        draw_mark,
+        native_color,
+    )
 
-    def rgba(components, alpha=None):
-        red, green, blue, base_alpha = components
-        return NSColor.colorWithCalibratedRed_green_blue_alpha_(
-            red, green, blue, base_alpha if alpha is None else alpha
+    def attributed(text, font, color, alignment):
+        paragraph = NSMutableParagraphStyle.alloc().init()
+        paragraph.setAlignment_(alignment)
+        return NSAttributedString.alloc().initWithString_attributes_(
+            text,
+            {
+                NSFontAttributeName: font,
+                NSForegroundColorAttributeName: color,
+                NSParagraphStyleAttributeName: paragraph,
+            },
         )
 
     rep = (
@@ -135,55 +145,40 @@ def render(width=WIDTH, height=HEIGHT):
     NSGraphicsContext.saveGraphicsState()
     NSGraphicsContext.setCurrentContext_(context)
 
-    rgba(BG_COLOR).setFill()
+    # Warm paper surface (Finder labels stay black-on-light, readable).
+    native_color(PAPER).setFill()
     NSBezierPath.fillRect_(NSMakeRect(0, 0, width, height))
 
-    def attributed(text, font, color, alignment):
-        paragraph = NSMutableParagraphStyle.alloc().init()
-        paragraph.setAlignment_(alignment)
-        return NSAttributedString.alloc().initWithString_attributes_(
-            text,
-            {
-                NSFontAttributeName: font,
-                NSForegroundColorAttributeName: color,
-                NSParagraphStyleAttributeName: paragraph,
-            },
-        )
-
-    # Wordmark plus waveform glyph, centered as one unit. Bitmap contexts
-    # are not flipped, so top-down center lines convert at draw time.
-    word_font = NSFont.boldSystemFontOfSize_(WORDMARK_FONT_SIZE)
-    word_attributed = attributed(WORDMARK, word_font, rgba(WORD_COLOR), 0)
+    # Brand mark + lowercase wordmark centered as one unit. Bitmap
+    # contexts are not flipped, so top-down center lines convert at draw.
+    word_font = (NSFont.fontWithName_size_("Georgia", WORDMARK_FONT_SIZE)
+                 or NSFont.systemFontOfSize_(WORDMARK_FONT_SIZE))
+    word_attributed = attributed(
+        WORDMARK, word_font, native_color(INK), 0
+    )
     word_w, word_h = word_attributed.size()
-    unit_width = wave_bars_width() + WORDMARK_GAP + word_w
+    mark_width = MARK_GRID_SIZE  # on the grid; draw_mark multiplies by /100
+    unit_width = mark_width + WORDMARK_GAP + word_w
     unit_left = (width - unit_width) / 2.0
-    accent = rgba(ACCENT_COLOR)
-    accent.setFill()
-    for bar_x, bar_y, bar_w, bar_h in wave_bar_rects(unit_left):
-        path = NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
-            NSMakeRect(bar_x, height - bar_y - bar_h, bar_w, bar_h),
-            bar_w / 2.0,
-            bar_w / 2.0,
-        )
-        path.fill()
+    draw_mark(
+        unit_left,
+        height - WORDMARK_CENTER_Y - MARK_GRID_SIZE / 2.0,
+        MARK_GRID_SIZE,
+        ink=INK,
+        terminal=CLAY,
+        flipped=False,
+    )
     word_attributed.drawAtPoint_(
         (
-            unit_left + wave_bars_width() + WORDMARK_GAP,
+            unit_left + mark_width + WORDMARK_GAP,
             height - WORDMARK_CENTER_Y - word_h / 2.0,
         )
     )
 
-    subtitle_attributed = attributed(
-        SUBTITLE, NSFont.systemFontOfSize_(SUBTITLE_FONT_SIZE), rgba(SUBTITLE_COLOR), 1
-    )
-    subtitle_w, subtitle_h = subtitle_attributed.size()
-    subtitle_attributed.drawAtPoint_(
-        ((width - subtitle_w) / 2.0, height - SUBTITLE_CENTER_Y - subtitle_h / 2.0)
-    )
-
-    # Drag arrow: shaft plus a leftward head, in the dimmed accent green.
+    # Drag arrow: shaft plus a rightward head, in clay at restrained
+    # strength so it does not overpower the mark or the Finder labels.
     shaft, head = arrow_pieces()
-    rgba(ACCENT_COLOR, ACCENT_DIM_ALPHA).setFill()
+    native_color(CLAY, ARROW_ALPHA).setFill()
     shaft_path = NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
         NSMakeRect(
             shaft[0],
@@ -201,6 +196,29 @@ def render(width=WIDTH, height=HEIGHT):
     head_path.lineToPoint_((head[2][0], height - head[2][1]))
     head_path.closePath()
     head_path.fill()
+
+    subtitle_attributed = attributed(
+        SUBTITLE,
+        NSFont.systemFontOfSize_(SUBTITLE_FONT_SIZE),
+        native_color(INK),
+        1,
+    )
+    subtitle_w, subtitle_h = subtitle_attributed.size()
+    subtitle_attributed.drawAtPoint_(
+        ((width - subtitle_w) / 2.0, height - SUBTITLE_CENTER_Y - subtitle_h / 2.0)
+    )
+
+    # Second line: the next step, dimmer so the drag line stays primary.
+    subtitle2_attributed = attributed(
+        SUBTITLE2,
+        NSFont.systemFontOfSize_(SUBTITLE2_FONT_SIZE),
+        native_color(INK, SUBTITLE2_COLOR_ALPHA),
+        1,
+    )
+    subtitle2_w, subtitle2_h = subtitle2_attributed.size()
+    subtitle2_attributed.drawAtPoint_(
+        ((width - subtitle2_w) / 2.0, height - SUBTITLE2_CENTER_Y - subtitle2_h / 2.0)
+    )
 
     NSGraphicsContext.restoreGraphicsState()
     return rep
@@ -223,7 +241,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--output",
-        default="dmg-background.png",
+        default="background.png",
         help="output PNG path (default: %(default)s)",
     )
     args = parser.parse_args(argv)
@@ -231,14 +249,12 @@ def main(argv=None):
         rep = render()
     except ImportError as error:
         print(
-            "[make-dmg-background] AppKit is unavailable: {0}. Use a python with pyobjc.".format(
-                error
-            ),
+            "[dmg-background] AppKit is unavailable: {0}. Use a python with pyobjc.".format(error),
             file=sys.stderr,
         )
         return 1
     write_png(rep, args.output)
-    print("[make-dmg-background] wrote {0}".format(args.output))
+    print("[dmg-background] wrote {0}".format(args.output))
     return 0
 
 

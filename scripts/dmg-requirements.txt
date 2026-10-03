@@ -1,0 +1,13 @@
+# Build-only deps for the DMG layout writer (scripts/make-dmg-layout.py).
+# Not shipped in Bolo.app: they run under the build-time venv only.
+# Both are from the dmgbuild project (pure Python; mac_alias needs macOS).
+# Pinned exact versions, SHA256 hashes verified against the official PyPI
+# JSON metadata (source URLs shown; the hash is of the wheel PyPI serves):
+#   ds_store 1.3.3  wheel https://pypi.org/pypi/ds_store/1.3.3/json
+#     sha256 b92a371efbf1b4ccce2a04d1ed13fceacc4736c81ba09cf5aefb74c088160a35
+#   mac_alias 2.2.3 wheel https://pypi.org/pypi/mac_alias/2.2.3/json
+#     sha256 7362b521d2132ef92f606a37abfed5fcd849ceb2f28b6f9743e014b02af92f0d
+ds_store==1.3.3 \
+    --hash=sha256:b92a371efbf1b4ccce2a04d1ed13fceacc4736c81ba09cf5aefb74c088160a35
+mac_alias==2.2.3 \
+    --hash=sha256:7362b521d2132ef92f606a37abfed5fcd849ceb2f28b6f9743e014b02af92f0d

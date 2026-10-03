@@ -13,3 +13,4 @@ icon_options/
 .DS_Store
 eval_results.json
 test-overlay.py
+chatwork/
