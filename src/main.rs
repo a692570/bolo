@@ -11,7 +11,7 @@ use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread::JoinHandle;
@@ -106,6 +106,20 @@ const TRAILING_RELATIVE_CAP: f32 = 0.0143;
 /// Only trust a floor-relative threshold when speech clears the room by ~12 dB
 /// (x3.98 in amplitude). Below that the absolute threshold is the safer bar.
 const TRAILING_TRUST_SNR: f32 = 3.98;
+/// Bounded wait for tail energy that stays above the stop bar but is not
+/// clearly stronger than it. Measured live cases (2026-10-01) released at
+/// 0.00210-0.00372 RMS against floors of 0.00142-0.00176; sustained energy
+/// in that range then held capture open to the 1506-1524ms cap for a
+/// 2112-2171ms total while the other stages were far faster. Without
+/// evidence that such energy is a tail word, this band gets a short wait
+/// instead of the full cap.
+const TRAILING_WEAK_ACTIVITY_STOP: Duration = Duration::from_millis(300);
+/// Heuristic boundary of the weak band: tail levels at or above this ratio of
+/// the stop bar keep the full hard cap, levels below it get the bounded
+/// wait. Chosen, not measured: a tradeoff that a faint ongoing tail word
+/// may be cut sooner than before, while the sustained near-floor energy the
+/// live cases showed no longer runs the cap out.
+const TRAILING_WEAK_SPEECH_RATIO: f32 = 3.0;
 /// The room is the quietest tenth of the session, not its minimum: one anomalous
 /// frame should not define the floor.
 const NOISE_FLOOR_PERCENTILE: f64 = 0.10;
@@ -236,6 +250,7 @@ struct Config {
     streaming_stt: Option<StreamingProvider>,
     stt_fallbacks: Vec<SttFallback>,
     microphone: Option<String>,
+    microphone_id: Option<String>,
     root_dir: PathBuf,
     hotkey: String,
     paste_last_hotkey: Option<String>,
@@ -419,10 +434,56 @@ struct AppState {
     correction_until: Option<Instant>,
     history: VecDeque<TranscriptHistoryEntry>,
     selected_microphone: Option<String>,
+    /// Stable CoreAudio device UID (cpal `DeviceId` string form) the
+    /// next recording must honor. Authoritative over the display name
+    /// in `selected_microphone`: a reconnected or same-named different
+    /// device must never silently bind.
+    selected_microphone_id: Option<String>,
     selected_language: Option<String>,
     cleanup_status: Option<String>,
     post_insert_watch: Option<PostInsertWatch>,
     edit_learning: Option<EditLearningWatch>,
+    /// Transcription/insert pipeline jobs currently running. Taking the
+    /// active recording clears `active` before the pipeline thread
+    /// starts, so `active.is_none()` alone would let the watchdog exit
+    /// mid-processing; the counter closes that gap.
+    processing_jobs: u32,
+}
+
+impl AppState {
+    #[cfg(test)]
+    fn default_test_state() -> Self {
+        Self {
+            active: None,
+            recording_fsm: RecordingFsm::default(),
+            last_result: None,
+            correction_until: None,
+            history: VecDeque::new(),
+            selected_microphone: None,
+            selected_microphone_id: None,
+            selected_language: None,
+            cleanup_status: None,
+            post_insert_watch: None,
+            edit_learning: None,
+            processing_jobs: 0,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_post_insert_watch(mut self) -> Self {
+        self.post_insert_watch = Some(PostInsertWatch {
+            completed_at: Instant::now(),
+            words_bucket: "test",
+            cleanup_status: "test",
+        });
+        self
+    }
+
+    #[cfg(test)]
+    fn with_processing_jobs(mut self, jobs: u32) -> Self {
+        self.processing_jobs = jobs;
+        self
+    }
 }
 
 struct ActiveRecording {
@@ -1346,7 +1407,7 @@ async fn run_stt_stream(
             ),
             api_key,
         ),
-        other => (
+        other @ (StreamingProvider::AssemblyAi | StreamingProvider::Deepgram) => (
             format!(
                 "{TELNYX_STT_STREAMING_ENDPOINT}?{}",
                 telnyx_stream_query(other, &language, &vocabulary)
@@ -1661,7 +1722,102 @@ struct App {
     latest_release: Mutex<Option<UpdateNotice>>,
     prompt_bindings: Mutex<Vec<PromptBinding>>,
     state: Mutex<AppState>,
+    /// Cumulative successful dictations since tracking began in 1.9. Loaded
+    /// from `~/.bolo/usage.json` at startup and incremented once per completed
+    /// dictation pipeline, never on history refreshes or deferred cleanup, so
+    /// retained history cannot be counted twice. Never written from the audio
+    /// frame callback.
+    usage: Mutex<UsageCounters>,
+    /// Whether a dashboard settings save changed a restart-requiring value
+    /// (hotkey or cleanup mode) that the running process has not applied.
+    /// Sticky: it survives refreshes and identical re-saves until a restart
+    /// happens, so the window never drops the pending-restart notice.
+    dashboard_restart_pending: Mutex<bool>,
     event_proxy: Mutex<Option<EventLoopProxy<UserEvent>>>,
+}
+
+/// Cumulative usage counters, persisted at `~/.bolo/usage.json` with the same
+/// atomic write pattern as the other `~/.bolo` JSON files. Counting begins with
+/// this feature in 1.9; the file's absence means zero and the dashboard shows
+/// these as cumulative since tracking began, never as lifetime claims.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+struct UsageCounters {
+    #[serde(default)]
+    dictations: u64,
+    #[serde(default)]
+    words: u64,
+    #[serde(default)]
+    recording_ms: u64,
+    #[serde(default)]
+    started_at_ms: u64,
+}
+
+impl UsageCounters {
+    /// One successful dictation. `stt_words` comes from the actual STT input
+    /// text, `recording_ms` from the finished capture, and `started_at_ms` is
+    /// set the first time a counter moves off zero.
+    fn record_dictation(mut self, stt_words: u64, recording_ms: u64) -> Self {
+        if self.started_at_ms == 0 {
+            self.started_at_ms = unix_time_ms();
+        }
+        self.dictations = self.dictations.saturating_add(1);
+        self.words = self.words.saturating_add(stt_words);
+        self.recording_ms = self.recording_ms.saturating_add(recording_ms);
+        self
+    }
+
+    /// Whitespace-separated word count of the raw STT input.
+    fn stt_word_count(text: &str) -> u64 {
+        text.split_whitespace()
+            .count()
+            .try_into()
+            .unwrap_or(u64::MAX)
+    }
+}
+
+fn load_usage_counters() -> UsageCounters {
+    load_usage_counters_at(&usage_counters_path())
+}
+
+#[cfg_attr(test, allow(dead_code))]
+fn save_usage_counters(counters: UsageCounters) -> Result<(), AppError> {
+    save_usage_counters_at(&usage_counters_path(), counters)
+}
+
+/// Testable form of [`save_usage_counters`] over an explicit path, mirroring
+/// the atomic tmp-then-rename write the other `~/.bolo` JSON stores use.
+fn save_usage_counters_at(path: &Path, counters: UsageCounters) -> Result<(), AppError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    let text = serde_json::to_string_pretty(&counters)?;
+    fs::write(&tmp, format!("{text}\n"))?;
+    #[cfg(unix)]
+    fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))?;
+    fs::rename(tmp, path)?;
+    Ok(())
+}
+
+/// Testable form of [`load_usage_counters`] over an explicit path: a missing
+/// file is a fresh zero counter, an unparseable one is ignored rather than
+/// reset, so a reload never fabricates or invents totals.
+fn load_usage_counters_at(path: &Path) -> UsageCounters {
+    match fs::read_to_string(path) {
+        Ok(text) => serde_json::from_str(&text).unwrap_or_else(|error| {
+            warn!("usage counters ignored at {}: {error}", path.display());
+            UsageCounters::default()
+        }),
+        Err(error) if error.kind() == ErrorKind::NotFound => UsageCounters::default(),
+        Err(error) => {
+            warn!("usage counters ignored at {}: {error}", path.display());
+            UsageCounters::default()
+        }
+    }
+}
+
+fn usage_counters_path() -> PathBuf {
+    home_path(".bolo/usage.json")
 }
 
 impl std::fmt::Debug for App {
@@ -1694,6 +1850,29 @@ enum UserEvent {
     ShowOnboarding,
     ShowStatus,
     ShowLearned,
+    ShowDashboard,
+    DashboardAction(DashboardAction),
+    DashboardInvalid(String),
+    DashboardRestart,
+    /// A request line from an open window helper: the onboarding window
+    /// asks for the runtime's real Accessibility trust reading and the
+    /// event loop answers on its stdin.
+    WindowRequest(WindowRequest),
+}
+
+/// One helper request awaiting a runtime answer. The runtime only needs
+/// to know which window asked; the request body's exact line is
+/// diagnostic only.
+#[derive(Clone, Copy, Debug)]
+struct WindowRequest {
+    kind: WindowRequestKind,
+}
+
+/// Which window a request came from; the answer route depends on it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WindowRequestKind {
+    Onboarding,
+    Dashboard,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1734,7 +1913,11 @@ impl OverlayPhase {
 
 struct TrayUi {
     tray_icon: TrayIcon,
-    microphone_items: Vec<(String, CheckMenuItem)>,
+    microphone_menu: Submenu,
+    microphone_items: Vec<(MicrophoneDescriptor, CheckMenuItem)>,
+    microphone_placeholder_item: Option<MenuItem>,
+    microphone_default_item: CheckMenuItem,
+    microphone_snapshot: MicrophoneMenuSnapshot,
     copy_last_item: MenuItem,
     rewrite_selected_item: MenuItem,
     bind_prompt_profile_item: MenuItem,
@@ -1750,6 +1933,7 @@ struct TrayUi {
     add_vocabulary_alias_item: MenuItem,
     add_replacement_item: MenuItem,
     learned_words_item: MenuItem,
+    show_dashboard_item: MenuItem,
     show_onboarding_item: MenuItem,
     quit_item: MenuItem,
 }
@@ -1884,6 +2068,55 @@ fn main() -> Result<(), AppError> {
         Err(error) => warn!("accessibility daemon supervisor failed to start: {error}"),
     }
     run_app_event_loop(app)
+}
+
+/// Interval at which the event loop polls the bounded launch/reopen
+/// request file under `~/.bolo`, shared with the native launcher.
+const OPEN_DASHBOARD_POLL_INTERVAL: Duration = Duration::from_millis(200);
+
+/// Path of the atomic launch/reopen request file: `~/.bolo/open-dashboard.request`.
+fn open_dashboard_request_path() -> PathBuf {
+    home_path(".bolo/open-dashboard.request")
+}
+
+/// Consume the launcher's open-dashboard request, if one is waiting.
+///
+/// The launcher writes the request atomically (tmp-then-rename), so a read
+/// either sees nothing or a complete request; a successful consume removes
+/// the file so duplicate launches never open two dashboards. Removal
+/// itself is the "consumed" verdict: a delete race with a second launcher
+/// simply means the second request arrived while one was already being
+/// honored, which is exactly the dedupe this enforces.
+fn consume_open_dashboard_request() -> bool {
+    consume_open_dashboard_request_at(&open_dashboard_request_path())
+}
+
+/// Testable core of `consume_open_dashboard_request`: every caller passes
+/// the exact path, and the production wrapper injects the real `~/.bolo`
+/// location, so tests consume only paths they stage.
+fn consume_open_dashboard_request_at(path: &Path) -> bool {
+    if fs::metadata(path).is_err() {
+        return false;
+    }
+    fs::remove_file(path).is_ok()
+}
+
+/// The policy the event loop applies to a launch/reopen request: onboarding
+/// wins while it is still needed (it opens on the same Init pass), and a
+/// completed setup opens the dashboard instead.
+fn handle_launch_request_for_state(marker: OnboardingStatus) -> LaunchRequestAction {
+    match marker {
+        OnboardingStatus::Complete => LaunchRequestAction::OpenDashboard,
+        OnboardingStatus::Needed | OnboardingStatus::Corrupt => {
+            LaunchRequestAction::PreferOnboarding
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LaunchRequestAction {
+    OpenDashboard,
+    PreferOnboarding,
 }
 
 /// Ask GitHub whether a newer release exists, off the critical path. The
@@ -2144,6 +2377,12 @@ fn run_hotkey_helper(
     Ok(())
 }
 
+// This function owns the deliberate supervisor restart protocol: the
+// dashboard-restart and post-onboarding key-reload paths drop every window
+// slot and exit with the supervisor restart code, so the only way to hand
+// control back is a process exit. Returning instead would change the
+// existing restart behavior.
+#[allow(clippy::exit)]
 fn run_app_event_loop(app: Arc<App>) -> Result<(), AppError> {
     let mut event_loop_builder = EventLoopBuilder::<UserEvent>::with_user_event();
     let event_loop = event_loop_builder.build();
@@ -2183,11 +2422,15 @@ fn run_app_event_loop(app: Arc<App>) -> Result<(), AppError> {
     let mut onboarding_window: Option<AppWindow> = None;
     let mut status_window: Option<AppWindow> = None;
     let mut learning_window: Option<AppWindow> = None;
+    let mut dashboard_window: Option<AppWindow> = None;
     let mut onboarding_try_it_complete = false;
     let mut onboarding_try_it_snapshot: Option<u64> = None;
-    let mut onboarding_key_pending = false;
+    // The required speech key that was missing when the onboarding window
+    // opened; the watchdog restarts the runtime once it lands on disk.
+    let mut onboarding_missing_key: Option<&'static str> = None;
     let mut overlay_hide_at: Option<Instant> = None;
     let mut recording_check_at: Option<Instant> = None;
+    let mut request_poll_at: Option<Instant> = None;
     event_loop.run(move |event, _event_loop_target, control_flow| {
         let deadline = match (overlay_hide_at, recording_check_at) {
             (Some(a), Some(b)) => Some(a.min(b)),
@@ -2195,7 +2438,16 @@ fn run_app_event_loop(app: Arc<App>) -> Result<(), AppError> {
             (None, Some(b)) => Some(b),
             (None, None) => None,
         };
-        *control_flow = deadline.map_or(ControlFlow::Wait, ControlFlow::WaitUntil);
+        let next_request_poll_at = request_poll_at.unwrap_or_else(|| {
+            let next = Instant::now() + OPEN_DASHBOARD_POLL_INTERVAL;
+            request_poll_at = Some(next);
+            next
+        });
+        let next_deadline = match deadline {
+            Some(a) => Some(a.min(next_request_poll_at)),
+            None => Some(next_request_poll_at),
+        };
+        *control_flow = next_deadline.map_or(ControlFlow::Wait, ControlFlow::WaitUntil);
         match event {
             TaoEvent::NewEvents(StartCause::Init) => {
                 let next_recording_check = Instant::now() + RECORDING_WATCHDOG_INTERVAL;
@@ -2219,7 +2471,7 @@ fn run_app_event_loop(app: Arc<App>) -> Result<(), AppError> {
                         &mut onboarding_window,
                         &mut onboarding_try_it_complete,
                         &mut onboarding_try_it_snapshot,
-                        &mut onboarding_key_pending,
+                        &mut onboarding_missing_key,
                     );
                 }
             }
@@ -2297,7 +2549,7 @@ fn run_app_event_loop(app: Arc<App>) -> Result<(), AppError> {
                     &mut onboarding_window,
                     &mut onboarding_try_it_complete,
                     &mut onboarding_try_it_snapshot,
-                    &mut onboarding_key_pending,
+                    &mut onboarding_missing_key,
                 );
             }
             TaoEvent::UserEvent(UserEvent::ShowStatus) => {
@@ -2306,12 +2558,76 @@ fn run_app_event_loop(app: Arc<App>) -> Result<(), AppError> {
             TaoEvent::UserEvent(UserEvent::ShowLearned) => {
                 open_learning_window(&app, &mut learning_window);
             }
+            TaoEvent::UserEvent(UserEvent::ShowDashboard) => {
+                open_dashboard_window(&app, &mut dashboard_window);
+            }
+            TaoEvent::UserEvent(UserEvent::DashboardAction(action)) => {
+                let reply = handle_dashboard_action(&app, action);
+                if let Some(window) = dashboard_window.as_mut()
+                    && let Err(error) = window.send_line(&reply.to_string())
+                {
+                    warn!("dashboard action reply failed: {error}");
+                }
+            }
+            TaoEvent::UserEvent(UserEvent::DashboardInvalid(message)) => {
+                // Validation failed before any persistence: reply ok:false so
+                // the window can surface the message and keep its current
+                // values.
+                let reply = serde_json::json!({
+                    "type": "dashboard_action_reply",
+                    "ok": false,
+                    "message": message,
+                    "restart_needed": false,
+                });
+                if let Some(window) = dashboard_window.as_mut()
+                    && let Err(error) = window.send_line(&reply.to_string())
+                {
+                    warn!("dashboard validation reply failed: {error}");
+                }
+            }
+            TaoEvent::UserEvent(UserEvent::DashboardRestart) => {
+                // The dashboard asked for a restart and the runtime reported
+                // itself idle at request time; re-check here so a recording
+                // that started in between is never killed. The restart drops
+                // every window slot so the helpers close their stdin and
+                // exit, then exits with the existing supervisor restart code.
+                let idle = {
+                    let Ok(state) = app.state.lock() else {
+                        return;
+                    };
+                    !reload_is_busy(&state)
+                };
+                if idle {
+                    drop(onboarding_window.take());
+                    drop(status_window.take());
+                    drop(learning_window.take());
+                    drop(dashboard_window.take());
+                    info!("dashboard requested restart; exiting for the supervisor");
+                    std::process::exit(UPDATE_RESTART_EXIT_CODE);
+                } else {
+                    let reply = serde_json::json!({
+                        "type": "dashboard_action_reply",
+                        "ok": false,
+                        "message": "Bolo is busy. Try again when idle.",
+                        "restart_needed": false,
+                    });
+                    if let Some(window) = dashboard_window.as_mut()
+                        && let Err(error) = window.send_line(&reply.to_string())
+                    {
+                        warn!("dashboard restart reply failed: {error}");
+                    }
+                }
+            }
+            TaoEvent::UserEvent(UserEvent::WindowRequest(request)) => {
+                answer_window_request(&app, &mut onboarding_window, &request);
+            }
             TaoEvent::UserEvent(UserEvent::HistoryChanged) => {
                 if let Some(ui) = tray_ui.as_mut()
                     && let Err(error) = update_history_menu(&app, ui)
                 {
                     error!("{error}");
                 }
+                refresh_dashboard_window(&app, &mut dashboard_window);
                 mark_onboarding_try_it_complete(
                     &app,
                     &mut onboarding_window,
@@ -2323,6 +2639,7 @@ fn run_app_event_loop(app: Arc<App>) -> Result<(), AppError> {
                 if let Some(ui) = tray_ui.as_ref() {
                     update_cleanup_status_item(&app, ui);
                 }
+                refresh_dashboard_window(&app, &mut dashboard_window);
             }
             TaoEvent::UserEvent(UserEvent::RecordingWatchdog) => {
                 let max_seconds = app.config.max_recording_seconds;
@@ -2340,24 +2657,87 @@ fn run_app_event_loop(app: Arc<App>) -> Result<(), AppError> {
                         error!("{error}");
                     }
                 }
-                // The runtime loads ~/.bolo/env once at startup, so a key
-                // entered in the onboarding window needs a restart to take
-                // effect. Once that window has closed and the key is on
-                // disk, exit with the supervisor's restart code; the user
-                // sees Bolo pick the key up a few seconds later.
-                if onboarding_key_pending
-                    && load_env_value("ASSEMBLYAI_API_KEY").is_some()
-                    && !onboarding_window
-                        .as_mut()
-                        .map_or(Ok(false), AppWindow::is_running)
-                        .unwrap_or(false)
-                {
-                    info!("API key saved during onboarding; restarting the runtime to load it");
+                // Request a background microphone scan and update the menu
+                // from the last completed snapshot on this watchdog tick.
+                if let Some(ui) = tray_ui.as_mut() {
+                    refresh_microphone_menu(app.as_ref(), ui);
+                }
+                refresh_dashboard_window(&app, &mut dashboard_window);
+                // The runtime reads the speech key freshly on every
+                // request (see the STT request builders), so a key
+                // entered mid-session works without a restart. This
+                // reload exists only to clean up the gateway/config
+                // surface once the onboarding window has closed, and
+                // it never interrupts live work: an active recording, a
+                // post-insert watch, or an in-flight pipeline job keeps
+                // the runtime alive, and the next watchdog tick
+                // retries once idle. Dropping the window slots closes
+                // the helpers' stdin, so each Python window exits on
+                // EOF by itself; the Rust Child handles are merely
+                // reaped through normal teardown.
+                let window_running = onboarding_window
+                    .as_mut()
+                    .map(|window| window.is_running())
+                    // An absent window means not running: the reload
+                    // gate is free. A probe error reads as running so a
+                    // flaky check can never restart Bolo in a loop.
+                    .unwrap_or(Ok(false))
+                    .unwrap_or(true);
+                let reload_allowed = {
+                    let Ok(app_state) = app.state.lock() else {
+                        return;
+                    };
+                    // Restart exactly when the key that was missing at
+                    // open time has landed on disk: the onboarding picker
+                    // may save either provider's key, and the saved
+                    // BOLO_STT_MODEL follows that choice at restart.
+                    let missing_key_saved =
+                        onboarding_missing_key.and_then(load_env_value).is_some();
+                    should_exit_for_key_reload(
+                        &app_state,
+                        onboarding_missing_key.is_some(),
+                        missing_key_saved,
+                        window_running,
+                    )
+                };
+                if reload_allowed {
+                    info!(
+                        "API key saved during onboarding ({}); restarting the runtime to load it",
+                        onboarding_missing_key.unwrap_or("UNKNOWN")
+                    );
+                    drop(onboarding_window.take());
+                    drop(status_window.take());
+                    drop(learning_window.take());
+                    drop(dashboard_window.take());
                     std::process::exit(UPDATE_RESTART_EXIT_CODE);
                 }
             }
             TaoEvent::NewEvents(StartCause::ResumeTimeReached { .. }) => {
                 let now = Instant::now();
+                if request_poll_at.is_some_and(|at| now >= at) {
+                    request_poll_at = None;
+                    if consume_open_dashboard_request() {
+                        let action = handle_launch_request_for_state(onboarding_status_at(
+                            &onboarding_marker_path(),
+                        ));
+                        match action {
+                            LaunchRequestAction::OpenDashboard => {
+                                info!("launch request received; opening the dashboard");
+                                open_dashboard_window(&app, &mut dashboard_window);
+                            }
+                            LaunchRequestAction::PreferOnboarding => {
+                                info!("launch request deferred to the open onboarding window");
+                                open_onboarding_window(
+                                    &app,
+                                    &mut onboarding_window,
+                                    &mut onboarding_try_it_complete,
+                                    &mut onboarding_try_it_snapshot,
+                                    &mut onboarding_missing_key,
+                                );
+                            }
+                        }
+                    }
+                }
                 if overlay_hide_at.is_some_and(|deadline| now >= deadline) {
                     overlay_hide_at = None;
                     *control_flow = ControlFlow::Wait;
@@ -2391,6 +2771,7 @@ impl App {
         let root_dir = app_root_dir()?;
         let config = Config::load(root_dir)?;
         let selected_microphone = config.microphone.clone();
+        let selected_microphone_id = config.microphone_id.clone();
         let selected_language = Some(config.stt_language.clone());
         let vocabulary = load_vocabulary(&config.root_dir);
         let vocabulary_usage_path = home_path(".bolo/vocabulary_usage.json");
@@ -2415,9 +2796,12 @@ impl App {
             state: Mutex::new(AppState {
                 history,
                 selected_microphone,
+                selected_microphone_id,
                 selected_language,
                 ..AppState::default()
             }),
+            usage: Mutex::new(load_usage_counters()),
+            dashboard_restart_pending: Mutex::new(false),
             event_proxy: Mutex::new(None),
         })
     }
@@ -2428,13 +2812,16 @@ impl App {
         // mtime means the stat-only common case, a change reloads.
         self.refresh_learned_vocabulary_at(&learned_vocabulary_path());
         let pressed_at = Instant::now();
-        let selected_microphone = {
+        let (selected_microphone_id, selected_microphone_name) = {
             let mut state = self.lock_state()?;
             if state.recording_fsm.handle(RecordingEvent::Press) != RecordingCommand::StartRecording
             {
                 return Ok(());
             }
-            state.selected_microphone.clone()
+            (
+                state.selected_microphone_id.clone(),
+                state.selected_microphone.clone(),
+            )
         };
         // Capture is the first meaningful action at press: the measured gap
         // from hotkey to first captured frame was ~220ms, and every wire
@@ -2443,8 +2830,11 @@ impl App {
         // The hub buffers every captured frame until the consumers attach,
         // so all of the setup below runs after capture with nothing lost.
         let hub = Arc::new(AudioHub::new(pressed_at));
-        let mut recording = match start_recording(selected_microphone.as_deref(), Arc::clone(&hub))
-        {
+        let mut recording = match start_recording(
+            selected_microphone_id.as_deref(),
+            selected_microphone_name.as_deref(),
+            Arc::clone(&hub),
+        ) {
             Ok(recording) => recording,
             Err(error) => {
                 let mut state = self.lock_state()?;
@@ -2501,16 +2891,23 @@ impl App {
     fn finish_active_recording(self: &Arc<Self>, event: RecordingEvent) -> Result<(), AppError> {
         let recording = {
             let mut state = self.lock_state()?;
-            if state.recording_fsm.handle(event) == RecordingCommand::FinishRecording {
+            let taken = if state.recording_fsm.handle(event) == RecordingCommand::FinishRecording {
                 state.active.take()
             } else {
                 None
+            };
+            if taken.is_some() {
+                // The pipeline thread below owns the job once spawned;
+                // count it under the same lock so the watchdog's idle
+                // check can never miss the in-flight window.
+                state.processing_jobs = state.processing_jobs.saturating_add(1);
             }
+            taken
         };
         if let Some(recording) = recording {
             let app = Arc::clone(self);
             let released_at = Instant::now();
-            let _join_handle = std::thread::Builder::new()
+            let spawn_result = std::thread::Builder::new()
                 .name(String::from("bolo-pipeline"))
                 .spawn(move || {
                     if let Err(error) = app.finish_recording(recording, released_at) {
@@ -2521,7 +2918,22 @@ impl App {
                         )));
                         play_sound("Basso");
                     }
-                })?;
+                    // Decrement on every pipeline exit: success and
+                    // error paths both land here after the work is done.
+                    if let Ok(mut state) = app.lock_state() {
+                        state.processing_jobs = state.processing_jobs.saturating_sub(1);
+                    }
+                });
+            if spawn_result.is_err() {
+                // Spawn failed: the job never ran, so roll the counter
+                // back or the idle gate would stay blocked forever.
+                if let Ok(mut state) = self.lock_state() {
+                    state.processing_jobs = state.processing_jobs.saturating_sub(1);
+                }
+                return Err(AppError::MenuBar(String::from(
+                    "pipeline thread failed to start",
+                )));
+            }
         }
         Ok(())
     }
@@ -2683,8 +3095,20 @@ impl App {
                 })
             );
             let pasted_text = prepared.text.clone();
+            // Count the successful dictation before the insert path fires
+            // HistoryChanged, so a live dashboard refresh cannot land between
+            // the history update and the usage update and render one stale
+            // block. Only reached after the insert succeeded.
+            self.record_successful_dictation(
+                &stt.text,
+                elapsed.as_millis().try_into().unwrap_or(u64::MAX),
+            );
             paste_text(&self.config.root_dir, &prepared.text)?;
             self.remember_result(&stt.text, &prepared.text, Some(&prepared))?;
+            // The usage counters were recorded above, before
+            // remember_result fired HistoryChanged, so the first live
+            // dashboard refresh after this dictation sees the usage block
+            // already updated. Deferred cleanup never adds to the counters.
             if let Some(cleanup_input) = prepared.cleanup_input {
                 self.start_deferred_cleanup(cleanup_input, pasted_text, &recording.warmup)?;
             }
@@ -3857,7 +4281,13 @@ impl App {
         let (name, instruction) = match kind {
             DictationCommandKind::Polish => ("Polish", polish_transform_instruction()),
             DictationCommandKind::Prompt => ("Prompt", prompt_transform_instruction()),
-            _ => return Ok(()),
+            DictationCommandKind::Scratch
+            | DictationCommandKind::Insert
+            | DictationCommandKind::InsertReturn
+            | DictationCommandKind::PressReturn
+            | DictationCommandKind::Replace
+            | DictationCommandKind::Rewrite
+            | DictationCommandKind::AddCorrection => return Ok(()),
         };
         self.set_cleanup_status(format!("{name}: running"));
         let rewritten = self.rewrite_selected_text_with_llm(&previous, instruction, &context)?;
@@ -4123,6 +4553,26 @@ impl App {
         Ok(true)
     }
 
+    /// Cumulative counters for the dashboard's optional usage block. Called
+    /// exactly once per completed dictation pipeline, on the pipeline thread
+    /// after the insert, never from the audio frame callback and never from
+    /// the history refresh or deferred-cleanup paths.
+    fn record_successful_dictation(&self, stt_text: &str, recording_ms: u64) {
+        let updated = {
+            let Ok(mut usage) = self.usage.lock() else {
+                return;
+            };
+            *usage = usage.record_dictation(UsageCounters::stt_word_count(stt_text), recording_ms);
+            *usage
+        };
+        #[cfg(not(test))]
+        if let Err(error) = save_usage_counters(updated) {
+            warn!("usage counter save failed: {error}");
+        }
+        #[cfg(test)]
+        let _ = updated;
+    }
+
     fn set_cleanup_status(&self, status: String) {
         match self.state.lock() {
             Ok(mut state) => {
@@ -4339,9 +4789,12 @@ impl App {
     }
 
     fn run_health_check(&self) {
-        let microphone_status = input_device_names()
-            .map(|devices| format!("{} mic(s)", devices.len()))
-            .unwrap_or_else(|error| format!("mic error: {error}"));
+        let microphone_status = {
+            // Cached catalog read: the health check runs on the UI thread
+            // and must not block on hardware probing.
+            let count = cached_input_device_names().len();
+            format!("{count} mic(s)")
+        };
         let language = self
             .stt_language()
             .unwrap_or_else(|_| self.config.stt_language.clone());
@@ -4386,6 +4839,15 @@ impl App {
     fn selected_microphone(&self) -> Result<Option<String>, AppError> {
         let state = self.lock_state()?;
         Ok(state.selected_microphone.clone())
+    }
+
+    /// The authoritative stable UID of the current microphone choice.
+    /// Only the runtime state: `clear_microphone` sets it to None and the
+    /// startup config UID must never resurrect through this getter, or
+    /// System Default would stay bound to the old device until restart.
+    fn selected_microphone_id(&self) -> Result<Option<String>, AppError> {
+        let state = self.lock_state()?;
+        Ok(state.selected_microphone_id.clone())
     }
 
     fn stt_language(&self) -> Result<String, AppError> {
@@ -4555,10 +5017,52 @@ impl App {
     }
 
     fn set_microphone(&self, microphone: &str) -> Result<(), AppError> {
+        write_bolo_env_value("BOLO_MICROPHONE", microphone)?;
+        remove_bolo_env_value("BOLO_MICROPHONE_ID")?;
         let mut state = self.lock_state()?;
         state.selected_microphone = Some(microphone.to_owned());
+        // A legacy-name selection is a user choice too: any previously
+        // stored UID must not survive to override the new pick.
+        state.selected_microphone_id = None;
         drop(state);
         info!("selected microphone: {microphone}");
+        Ok(())
+    }
+
+    /// Record a microphone choice by its stable UID, persisting both the
+    /// UID and the human-readable name. The UID is authoritative on the
+    /// next recording start; the name keeps `BOLO_MICROPHONE` readable
+    /// for backward compatibility.
+    fn set_microphone_by_uid(
+        &self,
+        microphone_id: &str,
+        microphone_name: Option<&str>,
+    ) -> Result<(), AppError> {
+        write_bolo_env_value("BOLO_MICROPHONE_ID", microphone_id)?;
+        if let Some(name) = microphone_name {
+            write_bolo_env_value("BOLO_MICROPHONE", name)?;
+        }
+        let mut state = self.lock_state()?;
+        state.selected_microphone_id = Some(microphone_id.to_owned());
+        if let Some(name) = microphone_name {
+            state.selected_microphone = Some(name.to_owned());
+        }
+        drop(state);
+        info!("selected microphone id: {microphone_id:?} ({microphone_name:?})");
+        Ok(())
+    }
+
+    /// Return to the real system default microphone: the stored UID and
+    /// the legacy name are both cleared so a reconnected device or a
+    /// same-named replacement can never bind again silently.
+    fn clear_microphone(&self) -> Result<(), AppError> {
+        remove_bolo_env_value("BOLO_MICROPHONE_ID")?;
+        remove_bolo_env_value("BOLO_MICROPHONE")?;
+        let mut state = self.lock_state()?;
+        state.selected_microphone_id = None;
+        state.selected_microphone = None;
+        drop(state);
+        info!("selected microphone: system default");
         Ok(())
     }
 
@@ -4680,6 +5184,76 @@ impl App {
         sort_replacements(&mut replacements);
         replacements
     }
+    /// Persist a validated dashboard settings change. Only the choices that
+    /// differ from the running config are written: an identical save must not
+    /// claim a restart or rewrite the env file. The microphone goes through
+    /// the same setter the menu uses, which records the selection the
+    /// recording start already reads. Hotkey and cleanup-mode changes need a
+    /// restart on the live runtime; the returned flag is sticky in the
+    /// dashboard state so a later refresh does not silently clear it.
+    fn apply_dashboard_settings(
+        &self,
+        hotkey: Option<&str>,
+        microphone: Option<&str>,
+        cleanup_mode: Option<&str>,
+    ) -> Result<bool, AppError> {
+        let mut restart_needed = false;
+        if let Some(hotkey) = hotkey
+            && hotkey != self.config.hotkey
+        {
+            write_bolo_env_value("BOLO_HOTKEY", hotkey)?;
+            restart_needed = true;
+        }
+        if let Some(mode) = cleanup_mode
+            && mode != dashboard_cleanup_mode(self.config.llm_cleanup)
+        {
+            write_bolo_env_value("BOLO_LLM_CLEANUP", mode)?;
+            restart_needed = true;
+        }
+        if let Some(microphone) = microphone {
+            let descriptors = cached_microphone_snapshot().descriptors;
+            match normalize_microphone_value(microphone, &descriptors) {
+                Ok(MicrophoneSelection::SystemDefault) => {
+                    // Explicit System Default: clear the stored UID so a
+                    // later hotplug can never rebind silently.
+                    let stored_id = self
+                        .selected_microphone_id()?
+                        .or_else(|| self.config.microphone_id.clone());
+                    let stored_name = self.selected_microphone()?;
+                    if stored_id.is_some() || stored_name.is_some() {
+                        self.clear_microphone()?;
+                    }
+                }
+                Ok(MicrophoneSelection::Device(descriptor)) => match descriptor.id.as_deref() {
+                    Some(id) => {
+                        let name = if descriptor.name.is_empty() {
+                            None
+                        } else {
+                            Some(descriptor.name.as_str())
+                        };
+                        self.set_microphone_by_uid(id, name)?;
+                    }
+                    None => {
+                        self.set_microphone(&descriptor.name)?;
+                    }
+                },
+                Err(_) => {
+                    // The saved UID may point at a currently disconnected
+                    // device: keep it untouched instead of clearing the
+                    // user's choice while saving unrelated settings.
+                    if let Some(id) = microphone.strip_prefix("uid:") {
+                        let stored_id = self
+                            .selected_microphone_id()?
+                            .or_else(|| self.config.microphone_id.clone());
+                        if stored_id.as_deref() != Some(id) {
+                            self.set_microphone_by_uid(id, None)?;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(restart_needed)
+    }
 
     fn log_text(&self, text: &str) -> serde_json::Value {
         transcript_log_value(self.config.log_transcripts, text)
@@ -4728,6 +5302,7 @@ impl Config {
             streaming_stt,
             stt_fallbacks,
             microphone: load_env_value("BOLO_MICROPHONE"),
+            microphone_id: load_env_value("BOLO_MICROPHONE_ID"),
             replacements: load_replacements(),
             root_dir,
             hotkey,
@@ -4900,11 +5475,13 @@ impl StreamingProvider {
 }
 
 fn start_recording(
-    selected_microphone: Option<&str>,
+    selected_microphone_id: Option<&str>,
+    selected_microphone_name: Option<&str>,
     hub: Arc<AudioHub>,
 ) -> Result<ActiveRecording, AppError> {
     let host = cpal::default_host();
-    let device = select_input_device(&host, selected_microphone)?;
+    let device = select_input_device(&host, selected_microphone_id, selected_microphone_name);
+    let device = device?;
     let device_name = device_name(&device);
     let supported = device
         .default_input_config()
@@ -4960,53 +5537,400 @@ fn start_recording(
     })
 }
 
-fn select_input_device(
-    host: &cpal::Host,
-    selected_microphone: Option<&str>,
-) -> Result<cpal::Device, AppError> {
-    let devices = host
-        .input_devices()
-        .map_err(|error| AppError::AudioStream(error.to_string()))?;
-    let mut fallback = None;
-    let mut names = Vec::new();
-    for device in devices {
-        let name = device_name(&device);
-        names.push(name.clone());
-        if fallback.is_none() {
-            fallback = Some(device.clone());
-        }
-        if let Some(selected) = selected_microphone
-            && (name == selected
-                || name
-                    .to_ascii_lowercase()
-                    .contains(&selected.to_ascii_lowercase()))
-        {
-            info!("available microphones: {}", names.join(", "));
-            return Ok(device);
-        }
-    }
-    info!("available microphones: {}", names.join(", "));
-    if selected_microphone.is_some() {
-        warn!("selected microphone not found; using system default");
-    }
-    host.default_input_device()
-        .or(fallback)
-        .ok_or(AppError::MissingAudioDevice)
+/// One enumerated input device in testable form: display name plus the
+/// stable cpal `DeviceId` string. The UID is authoritative for device
+/// identity; the name is a human label only.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MicrophoneDescriptor {
+    name: String,
+    id: Option<String>,
 }
 
-fn input_device_names() -> Result<Vec<String>, AppError> {
+impl MicrophoneDescriptor {
+    fn new(name: impl Into<String>, id: Option<String>) -> Self {
+        Self {
+            name: name.into(),
+            id,
+        }
+    }
+}
+
+/// The fake-descriptor mirror of the hardware list, kept identical in
+/// meaning: enumerated order, unique display names, per-device UIDs.
+fn enumerate_input_descriptors() -> Result<Vec<MicrophoneDescriptor>, AppError> {
     let host = cpal::default_host();
     let devices = host
         .input_devices()
         .map_err(|error| AppError::AudioStream(error.to_string()))?;
-    let mut names = Vec::new();
+    let mut descriptors: Vec<MicrophoneDescriptor> = Vec::new();
     for device in devices {
-        let name = device_name(&device);
-        if !names.contains(&name) {
-            names.push(name);
+        let descriptor = MicrophoneDescriptor::new(
+            device_name(&device),
+            device.id().ok().map(|id| id.to_string()),
+        );
+        if !descriptors
+            .iter()
+            .any(|existing| existing.name == descriptor.name && existing.id == descriptor.id)
+        {
+            descriptors.push(descriptor);
         }
     }
-    Ok(names)
+    Ok(descriptors)
+}
+
+/// Last successful microphone discovery for UI reads.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct MicrophoneSnapshot {
+    descriptors: Vec<MicrophoneDescriptor>,
+    default_id: Option<String>,
+    ready: bool,
+}
+
+type MicrophoneDiscovery =
+    Arc<dyn Fn() -> Result<MicrophoneSnapshot, AppError> + Send + Sync + 'static>;
+
+/// CPAL input enumeration probes audio-unit configurations. Run it off
+/// the UI thread and coalesce requests while a scan is still in flight.
+struct MicrophoneCatalog {
+    discovery: MicrophoneDiscovery,
+    state: Arc<Mutex<MicrophoneCatalogState>>,
+}
+
+#[derive(Debug, Default)]
+struct MicrophoneCatalogState {
+    snapshot: MicrophoneSnapshot,
+    in_flight: bool,
+}
+
+impl std::fmt::Debug for MicrophoneCatalog {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MicrophoneCatalog")
+            .finish_non_exhaustive()
+    }
+}
+
+static MICROPHONE_CATALOG: OnceLock<MicrophoneCatalog> = OnceLock::new();
+
+fn microphone_catalog() -> &'static MicrophoneCatalog {
+    MICROPHONE_CATALOG.get_or_init(|| {
+        MicrophoneCatalog::with_discovery(Arc::new(|| {
+            Ok(MicrophoneSnapshot {
+                descriptors: enumerate_input_descriptors()?,
+                default_id: default_input_device_id(),
+                ready: true,
+            })
+        }))
+    })
+}
+
+impl MicrophoneCatalog {
+    fn with_discovery(discovery: MicrophoneDiscovery) -> Self {
+        Self {
+            discovery,
+            state: Arc::new(Mutex::new(MicrophoneCatalogState::default())),
+        }
+    }
+
+    fn snapshot(&self) -> MicrophoneSnapshot {
+        self.state
+            .lock()
+            .map(|state| state.snapshot.clone())
+            .unwrap_or_default()
+    }
+
+    // The caller may retain the handle to wait for a specific scan.
+    // UI callers drop it and keep using the previous snapshot.
+    fn request_refresh(&self) -> Option<JoinHandle<()>> {
+        let mut state = self.state.lock().ok()?;
+        if state.in_flight {
+            return None;
+        }
+        state.in_flight = true;
+        drop(state);
+        let discovery = Arc::clone(&self.discovery);
+        let state = Arc::clone(&self.state);
+        match std::thread::Builder::new()
+            .name(String::from("bolo-microphone-catalog"))
+            .spawn(move || {
+                let discovered = discovery();
+                if let Ok(mut state) = state.lock() {
+                    match discovered {
+                        Ok(mut snapshot) => {
+                            snapshot.ready = true;
+                            state.snapshot = snapshot;
+                        }
+                        Err(error) => {
+                            warn!("microphone scan failed; keeping previous devices: {error}")
+                        }
+                    }
+                    state.in_flight = false;
+                }
+            }) {
+            Ok(handle) => Some(handle),
+            Err(error) => {
+                warn!("microphone scan could not start: {error}");
+                if let Ok(mut state) = self.state.lock() {
+                    state.in_flight = false;
+                }
+                None
+            }
+        }
+    }
+}
+
+fn cached_microphone_snapshot() -> MicrophoneSnapshot {
+    let catalog = microphone_catalog();
+    drop(catalog.request_refresh());
+    catalog.snapshot()
+}
+
+fn cached_input_device_names() -> Vec<String> {
+    let mut names = Vec::new();
+    for descriptor in cached_microphone_snapshot().descriptors {
+        if !names.contains(&descriptor.name) {
+            names.push(descriptor.name);
+        }
+    }
+    names
+}
+
+/// Enumerate once and keep the live `cpal::Device` alongside each
+/// descriptor, so a recording start resolves its device from the same
+/// single enumeration and never re-walks the host list.
+fn enumerate_input_devices(
+    host: &cpal::Host,
+) -> Result<Vec<(MicrophoneDescriptor, cpal::Device)>, AppError> {
+    let devices = host
+        .input_devices()
+        .map_err(|error| AppError::AudioStream(error.to_string()))?;
+    let mut pairs = Vec::new();
+    for device in devices {
+        let descriptor = MicrophoneDescriptor::new(
+            device_name(&device),
+            device.id().ok().map(|id| id.to_string()),
+        );
+        if !pairs
+            .iter()
+            .any(|(existing, _): &(MicrophoneDescriptor, cpal::Device)| {
+                existing.name == descriptor.name && existing.id == descriptor.id
+            })
+        {
+            pairs.push((descriptor, device));
+        }
+    }
+    Ok(pairs)
+}
+
+/// How a recording start should bind to a device. `SystemDefault` is the
+/// real macOS default input, never the first enumerated device; `Device`
+/// carries the stable UID so the resolved device is always the exact one
+/// the user picked, and the name only for labels and logs.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum MicrophoneSelection {
+    SystemDefault,
+    Device(MicrophoneDescriptor),
+}
+
+/// The UID of the real macOS default input device, if it exposes one.
+fn default_input_device_id() -> Option<String> {
+    cpal::default_host()
+        .default_input_device()?
+        .id()
+        .ok()
+        .map(|id| id.to_string())
+}
+
+/// Decide which enumerated device a saved selection points at.
+///
+/// Priority order, matching the OpenSuperWhisper reliability model:
+/// 1. A saved UID wins when it is present among the devices. The device
+///    display name is never consulted here, so a re-enumerated or
+///    same-named different device can never silently bind.
+/// 2. A saved UID that disappeared means the chosen device is gone: fall
+///    back to the actual system default, never a same-named other device.
+/// 3. Legacy name config migrates only on an unambiguous match: exact
+///    name equality, or a unique case-insensitive substring across the
+///    device list. Two matches stay unresolved and fall back to default.
+/// 4. No selection at all means the system default choice.
+fn resolve_microphone_selection(
+    saved_id: Option<&str>,
+    saved_name: Option<&str>,
+    descriptors: &[MicrophoneDescriptor],
+) -> MicrophoneSelection {
+    if let Some(id) = saved_id {
+        if let Some(descriptor) = descriptors
+            .iter()
+            .find(|descriptor| descriptor.id.as_deref() == Some(id))
+        {
+            return MicrophoneSelection::Device(descriptor.clone());
+        }
+        // The saved UID no longer exists. The name is NOT trusted to
+        // pick a replacement: the authoritative key is gone, so the
+        // system default takes over.
+        return MicrophoneSelection::SystemDefault;
+    }
+    if let Some(name) = saved_name
+        && let Some(descriptor) = match_legacy_name(name, descriptors)
+    {
+        return MicrophoneSelection::Device(descriptor);
+    }
+    MicrophoneSelection::SystemDefault
+}
+
+/// Legacy display-name migration: exact matches first, but only when
+/// the exact name is unique across the device list; then a unique
+/// case-insensitive substring match. Two devices sharing the requested
+/// name is ambiguous and stays unresolved: the system default takes
+/// over rather than an arbitrary first row.
+fn match_legacy_name(
+    name: &str,
+    descriptors: &[MicrophoneDescriptor],
+) -> Option<MicrophoneDescriptor> {
+    let exact: Vec<&MicrophoneDescriptor> = descriptors
+        .iter()
+        .filter(|descriptor| descriptor.name == name)
+        .collect();
+    match exact.as_slice() {
+        [descriptor] => return Some((*descriptor).clone()),
+        [] => {}
+        _ => return None,
+    }
+    let needle = name.to_ascii_lowercase();
+    let matches: Vec<&MicrophoneDescriptor> = descriptors
+        .iter()
+        .filter(|descriptor| descriptor.name.to_ascii_lowercase().contains(&needle))
+        .collect();
+    match matches.as_slice() {
+        [descriptor] => Some((*descriptor).clone()),
+        _ => None,
+    }
+}
+
+fn select_input_device(
+    host: &cpal::Host,
+    selected_microphone_id: Option<&str>,
+    selected_microphone_name: Option<&str>,
+) -> Result<cpal::Device, AppError> {
+    // Resolve a stable UID or the actual default without probing every
+    // device's input configurations. Legacy names still need enumeration.
+    if let Some(id) = selected_microphone_id {
+        let parsed = id.parse::<cpal::DeviceId>();
+        match parsed {
+            Ok(device_id) => {
+                if let Some(device) = host.device_by_id(&device_id) {
+                    info!(
+                        "microphone selected by stable UID: {} ({id})",
+                        device_name(&device)
+                    );
+                    return Ok(device);
+                }
+            }
+            Err(error) => {
+                warn!("saved microphone UID is not parseable: {id} ({error})");
+            }
+        }
+        if let Some(device) = host.default_input_device() {
+            warn!("saved microphone unavailable; using system default");
+            return Ok(device);
+        }
+    } else if selected_microphone_name.is_none()
+        && let Some(device) = host.default_input_device()
+    {
+        info!("microphone selected: system default");
+        return Ok(device);
+    }
+    let pairs = enumerate_input_devices(host)?;
+    let descriptors: Vec<MicrophoneDescriptor> = pairs
+        .iter()
+        .map(|(descriptor, _)| descriptor.clone())
+        .collect();
+    if selected_microphone_id.is_none() && selected_microphone_name.is_none() {
+        // The default query above came back empty, so the enumerating
+        // fallback from the original flow takes over.
+        if let Some((descriptor, _)) = pairs.first() {
+            info!("available microphones: {}", descriptor.name);
+        }
+    }
+    let selection = resolve_microphone_selection(
+        selected_microphone_id,
+        selected_microphone_name,
+        &descriptors,
+    );
+    match selection {
+        MicrophoneSelection::Device(descriptor) => {
+            if let Some((_, device)) = pairs.iter().find(|(candidate, _)| candidate == &descriptor)
+            {
+                if selected_microphone_id.is_some() {
+                    info!(
+                        "microphone selected by stable UID: {} ({:?})",
+                        descriptor.name, descriptor.id
+                    );
+                } else {
+                    info!(
+                        "microphone selected by legacy name: {} ({:?})",
+                        descriptor.name, descriptor.id
+                    );
+                }
+                return Ok(device.clone());
+            }
+            warn!("selected microphone vanished mid-selection; using system default");
+        }
+        MicrophoneSelection::SystemDefault => {}
+    }
+    if selected_microphone_id.is_some() || selected_microphone_name.is_some() {
+        warn!("selected microphone not found; using system default");
+    }
+    host.default_input_device()
+        .or_else(|| pairs.first().map(|(_, device)| device.clone()))
+        .ok_or(AppError::MissingAudioDevice)
+}
+
+/// Labels for menus and the dashboard: deduplicated names, with an
+/// index-qualified suffix only when two devices genuinely share a name
+/// so each menu choice still identifies one row.
+fn microphone_labels(descriptors: &[MicrophoneDescriptor]) -> Vec<String> {
+    let mut labels = Vec::new();
+    for descriptor in descriptors {
+        let duplicates = descriptors
+            .iter()
+            .filter(|other| other.name == descriptor.name)
+            .count();
+        if duplicates > 1 {
+            let seen = descriptors
+                .iter()
+                .take_while(|other| other.name != descriptor.name)
+                .filter(|other| other.name == descriptor.name)
+                .count();
+            let index = descriptors
+                .iter()
+                .position(|other| other == descriptor)
+                .unwrap_or(seen);
+            labels.push(format!("{} ({})", descriptor.name, index + 1));
+        } else if !labels.contains(&descriptor.name) {
+            labels.push(descriptor.name.clone());
+        }
+    }
+    labels
+}
+
+/// Checked-state rule for one device row when no stable UID is stored:
+/// only a legacy name that resolves unambiguously checks its device row;
+/// with no selection at all nothing but the System Default row is ever
+/// checked, so the menu never claims the user picked the device that
+/// merely happens to be the macOS default.
+fn descriptor_matches_default_or_legacy(
+    descriptor: &MicrophoneDescriptor,
+    selected_name: Option<&str>,
+    _default_id: Option<&str>,
+    descriptors: &[MicrophoneDescriptor],
+) -> bool {
+    match selected_name {
+        Some(name) => {
+            match_legacy_name(name, descriptors).is_some_and(|resolved| resolved == *descriptor)
+        }
+        None => false,
+    }
 }
 
 fn device_name(device: &cpal::Device) -> String {
@@ -5096,6 +6020,7 @@ fn create_tray_ui(app: &App) -> Result<TrayUi, AppError> {
         .map_err(|error| AppError::MenuBar(error.to_string()))?;
 
     let learned_words_item = MenuItem::with_id("show-learned-words", "Learned Words", true, None);
+    let show_dashboard_item = MenuItem::with_id("open-dashboard", "Open Bolo...", true, None);
     tray_menu
         .append(&learned_words_item)
         .map_err(|error| AppError::MenuBar(error.to_string()))?;
@@ -5140,6 +6065,9 @@ fn create_tray_ui(app: &App) -> Result<TrayUi, AppError> {
 
     let update_item = MenuItem::with_id("check-for-updates", "Check for Updates", true, None);
     tray_menu
+        .append(&show_dashboard_item)
+        .map_err(|error| AppError::MenuBar(error.to_string()))?;
+    tray_menu
         .append(&update_item)
         .map_err(|error| AppError::MenuBar(error.to_string()))?;
 
@@ -5171,23 +6099,67 @@ fn create_tray_ui(app: &App) -> Result<TrayUi, AppError> {
         .map_err(|error| AppError::MenuBar(error.to_string()))?;
 
     let microphone_menu = Submenu::new("Choose Microphone", true);
-    let selected_microphone = app.selected_microphone()?;
-    let devices = input_device_names()?;
+    let selected_microphone_id = app.selected_microphone_id()?;
+    let selected_microphone_name = app.selected_microphone()?;
+    let catalog = cached_microphone_snapshot();
+    let default_id = catalog.default_id;
+    let descriptors = catalog.descriptors;
+    let catalog_pending = !catalog.ready;
+    let labels = microphone_labels(&descriptors);
     let mut microphone_items = Vec::new();
-    if devices.is_empty() {
-        let empty_item = MenuItem::new("No input devices found", false, None);
+    let mut microphone_placeholder: Option<MenuItem> = None;
+    // The system default choice is always present and its checked state
+    // is driven by the real macOS default UID, never by enumeration
+    // order: when the user never picked anything, the checked row is the
+    // device the system actually uses.
+    let default_checked = selected_microphone_id.is_none()
+        && (selected_microphone_name.is_none()
+            || match_legacy_name(
+                selected_microphone_name.as_deref().unwrap_or_default(),
+                &descriptors,
+            )
+            .is_none());
+    let default_item = CheckMenuItem::with_id(
+        MenuId::new("microphone:default"),
+        "System Default",
+        true,
+        default_checked,
+        None,
+    );
+    microphone_menu
+        .append(&default_item)
+        .map_err(|error| AppError::MenuBar(error.to_string()))?;
+    if descriptors.is_empty() {
+        // Honest placeholder: before the first successful background
+        // discovery the list is simply not known yet, so the menu says
+        // so instead of claiming no devices exist.
+        let pending_text = if catalog_pending {
+            "Looking for input devices..."
+        } else {
+            "No input devices found"
+        };
+        let empty_item = MenuItem::new(pending_text, false, None);
         microphone_menu
             .append(&empty_item)
             .map_err(|error| AppError::MenuBar(error.to_string()))?;
+        microphone_placeholder = Some(empty_item);
     } else {
-        for (index, name) in devices.iter().enumerate() {
-            let checked = selected_microphone
-                .as_ref()
-                .is_some_and(|selected| selected == name)
-                || (selected_microphone.is_none() && index == 0);
+        for (index, descriptor) in descriptors.iter().enumerate() {
+            let checked = match selected_microphone_id.as_deref() {
+                Some(id) => descriptor.id.as_deref() == Some(id),
+                None => descriptor_matches_default_or_legacy(
+                    descriptor,
+                    selected_microphone_name.as_deref(),
+                    default_id.as_deref(),
+                    &descriptors,
+                ),
+            };
             let item = CheckMenuItem::with_id(
-                MenuId::new(format!("microphone:{index}")),
-                name,
+                MenuId::new(format!("microphone:{}", mic_choice_value(descriptor))),
+                labels
+                    .get(index)
+                    .cloned()
+                    .unwrap_or_else(|| descriptor.name.clone()),
                 true,
                 checked,
                 None,
@@ -5195,7 +6167,7 @@ fn create_tray_ui(app: &App) -> Result<TrayUi, AppError> {
             microphone_menu
                 .append(&item)
                 .map_err(|error| AppError::MenuBar(error.to_string()))?;
-            microphone_items.push((name.clone(), item));
+            microphone_items.push((descriptor.clone(), item));
         }
     }
     tray_menu
@@ -5220,7 +6192,11 @@ fn create_tray_ui(app: &App) -> Result<TrayUi, AppError> {
 
     let mut ui = TrayUi {
         tray_icon,
+        microphone_menu,
         microphone_items,
+        microphone_placeholder_item: microphone_placeholder,
+        microphone_default_item: default_item,
+        microphone_snapshot: MicrophoneMenuSnapshot::capture(app),
         copy_last_item,
         rewrite_selected_item,
         bind_prompt_profile_item,
@@ -5236,6 +6212,7 @@ fn create_tray_ui(app: &App) -> Result<TrayUi, AppError> {
         add_vocabulary_alias_item,
         add_replacement_item,
         learned_words_item,
+        show_dashboard_item,
         show_onboarding_item,
         quit_item,
     };
@@ -5282,6 +6259,10 @@ fn handle_menu_event(
     }
     if event_id == tray_ui.learned_words_item.id().as_ref() {
         app.send_user_event(UserEvent::ShowLearned);
+        return;
+    }
+    if event_id == tray_ui.show_dashboard_item.id().as_ref() {
+        app.send_user_event(UserEvent::ShowDashboard);
         return;
     }
     if event_id == tray_ui.show_onboarding_item.id().as_ref() {
@@ -5332,19 +6313,149 @@ fn handle_menu_event(
         }
         return;
     }
-    if let Some((selected_name, _)) = tray_ui
+    if event_id == tray_ui.microphone_default_item.id().as_ref() {
+        if let Err(error) = app.clear_microphone() {
+            error!("{error}");
+            return;
+        }
+        tray_ui.microphone_default_item.set_checked(true);
+        for (_, item) in &tray_ui.microphone_items {
+            item.set_checked(false);
+        }
+        return;
+    }
+    if let Some((descriptor, _)) = tray_ui
         .microphone_items
         .iter()
         .find(|(_, item)| event_id == item.id().as_ref())
     {
-        if let Err(error) = app.set_microphone(selected_name) {
-            error!("{error}");
-            return;
+        match descriptor.id.as_deref() {
+            Some(id) => {
+                if let Err(error) = app.set_microphone_by_uid(id, Some(&descriptor.name)) {
+                    error!("{error}");
+                    return;
+                }
+            }
+            None => {
+                if let Err(error) = app.set_microphone(&descriptor.name) {
+                    error!("{error}");
+                    return;
+                }
+            }
         }
-        for (name, item) in &tray_ui.microphone_items {
-            item.set_checked(name == selected_name);
+        tray_ui.microphone_default_item.set_checked(false);
+        for (candidate, item) in &tray_ui.microphone_items {
+            item.set_checked(candidate == descriptor);
         }
     }
+}
+
+/// Snapshot of the microphone menu contents, compared across watchdog
+/// ticks so a hotplug rebuilds the submenu only when something real
+/// changed: UID set, device names, or the selected marker.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct MicrophoneMenuSnapshot {
+    entries: Vec<(String, Option<String>)>,
+    selected_id: Option<String>,
+    default_id: Option<String>,
+    pending: bool,
+}
+
+impl MicrophoneMenuSnapshot {
+    fn capture(app: &App) -> Self {
+        let selected_id = app.selected_microphone_id().ok().flatten();
+        let catalog = cached_microphone_snapshot();
+        let entries = catalog
+            .descriptors
+            .into_iter()
+            .map(|descriptor| (descriptor.name, descriptor.id))
+            .collect();
+        Self {
+            entries,
+            selected_id,
+            default_id: catalog.default_id,
+            pending: !catalog.ready,
+        }
+    }
+}
+
+/// Rebuild the tray's microphone submenu after a hotplug. The old items
+/// are removed and re-appended on the main thread; muda supports this
+/// through the same submenu API the initial build uses. A rebuild that
+/// would show an identical menu is skipped, so the common idle tick does
+/// compares cached microphone facts without probing hardware.
+fn refresh_microphone_menu(app: &App, tray_ui: &mut TrayUi) {
+    let snapshot = MicrophoneMenuSnapshot::capture(app);
+    if snapshot == tray_ui.microphone_snapshot {
+        return;
+    }
+    if let Some(placeholder) = tray_ui.microphone_placeholder_item.take()
+        && let Err(error) = tray_ui.microphone_menu.remove(&placeholder)
+    {
+        warn!("microphone menu placeholder removal failed: {error}");
+    }
+    for (_, item) in tray_ui.microphone_items.drain(..) {
+        if let Err(error) = tray_ui.microphone_menu.remove(&item) {
+            warn!("microphone menu item removal failed: {error}");
+        }
+    }
+    tray_ui.microphone_items.clear();
+    let descriptors: Vec<MicrophoneDescriptor> = snapshot
+        .entries
+        .iter()
+        .map(|(name, id)| MicrophoneDescriptor::new(name.clone(), id.clone()))
+        .collect();
+    let labels = microphone_labels(&descriptors);
+    if descriptors.is_empty() {
+        let label = if snapshot.pending {
+            "Looking for input devices..."
+        } else {
+            "No input devices found"
+        };
+        let empty_item = MenuItem::new(label, false, None);
+        if let Err(error) = tray_ui.microphone_menu.append(&empty_item) {
+            warn!("microphone menu append failed: {error}");
+        } else {
+            tray_ui.microphone_placeholder_item = Some(empty_item);
+        }
+        tray_ui.microphone_snapshot = snapshot;
+        return;
+    }
+    let selected_id = snapshot.selected_id.as_deref();
+    let selected_name = app.selected_microphone().ok().flatten();
+    let default_id = snapshot.default_id.as_deref();
+    for (index, descriptor) in descriptors.iter().enumerate() {
+        let checked = match selected_id {
+            Some(id) => descriptor.id.as_deref() == Some(id),
+            None => descriptor_matches_default_or_legacy(
+                descriptor,
+                selected_name.as_deref(),
+                default_id,
+                &descriptors,
+            ),
+        };
+        let label = labels
+            .get(index)
+            .cloned()
+            .unwrap_or_else(|| descriptor.name.clone());
+        let item = CheckMenuItem::with_id(
+            MenuId::new(format!("microphone:{}", mic_choice_value(descriptor))),
+            label,
+            true,
+            checked,
+            None,
+        );
+        if let Err(error) = tray_ui.microphone_menu.append(&item) {
+            warn!("microphone menu append failed: {error}");
+        }
+        tray_ui.microphone_items.push((descriptor.clone(), item));
+    }
+    let default_checked = selected_id.is_none()
+        && (selected_name.is_none()
+            || match_legacy_name(selected_name.as_deref().unwrap_or_default(), &descriptors)
+                .is_none());
+    tray_ui.microphone_default_item.set_checked(default_checked);
+    tray_ui.microphone_snapshot = snapshot;
 }
 
 fn update_history_menu(app: &App, tray_ui: &mut TrayUi) -> Result<(), AppError> {
@@ -5775,8 +6886,10 @@ impl NativeOverlay {
 // update lines (app_window.py). Onboarding completion is persisted by the
 // helper itself, mirroring how onboarding.py writes the hotkey choice.
 
-/// Schema version of the onboarding completion marker.
-const ONBOARDING_MARKER_VERSION: u8 = 1;
+/// Schema version of the onboarding completion marker. Version 2 requires
+/// the polished wizard's verified setup; a version-1 marker (the old
+/// checklist) reads as corrupt so onboarding runs again.
+const ONBOARDING_MARKER_VERSION: u8 = 2;
 
 /// Completion marker for the in-app onboarding: `~/.bolo/onboarding.json`.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
@@ -5857,17 +6970,6 @@ impl WindowRow {
             action: None,
         }
     }
-
-    /// Attach the Open Accessibility Settings button, used by the
-    /// onboarding Accessibility warn row so the user can jump straight to
-    /// the pane Apple never prompts for.
-    fn open_settings(mut self) -> Self {
-        self.action = Some(RowAction {
-            kind: String::from("open_settings"),
-            title: String::from("Open Accessibility Settings"),
-        });
-        self
-    }
 }
 
 /// Payload for one `app_window.py` helper process.
@@ -5892,15 +6994,32 @@ struct AppWindowPayload {
     #[serde(skip_serializing_if = "Option::is_none")]
     key_entry: Option<KeyEntrySpec>,
     write_marker: bool,
+    /// Progressive-wizard facts; present only for mode "onboarding", whose
+    /// helper walks welcome > key > microphone > Accessibility > practice >
+    /// ready screens from these facts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wizard: Option<WizardSpec>,
     /// Learning-window spec; present only for mode "learning", which renders
     /// its rows from the pairs instead of the generic `rows` list.
     #[serde(skip_serializing_if = "Option::is_none")]
     learning: Option<LearningWindowSpec>,
 }
 
-/// Placement of the API-key entry field inside the onboarding window. The
-/// bundle flow defaults to `AssemblyAI` and has no provider picker, so the
-/// entry is shown whenever the resolved pipeline is missing that one key.
+/// Facts the runtime reports for the onboarding wizard: whether the
+/// required speech key is missing, the runtime's own Accessibility trust
+/// reading, the microphone count, and the dictation hotkey.
+#[derive(Debug, Serialize)]
+struct WizardSpec {
+    key_missing: bool,
+    accessibility_state: String,
+    microphones: usize,
+    hotkey: String,
+}
+
+/// Placement of the API-key entry field inside legacy onboarding payloads.
+/// The wizard renderer owns the provider picker and reveals its own field
+/// per provider, so live payloads leave this None; the struct stays the
+/// wire shape for the generic rows renderer the preview scripts use.
 #[derive(Debug, Serialize)]
 struct KeyEntrySpec {
     index: usize,
@@ -5944,11 +7063,6 @@ const LEARNING_UNREADABLE_LINE: &str = "Could not read the learned-words file.";
 /// Row cap for the learning window; the most recent pairs win.
 const LEARNING_WINDOW_ROWS: usize = 20;
 
-/// The one-line welcome shown at the top of the onboarding window.
-const fn onboarding_welcome() -> &'static str {
-    "Bolo listens while you hold a key and pastes what you said when you let go."
-}
-
 /// Whether Bolo is running as the distributed `Bolo.app` bundle. The
 /// launcher inside the bundle sets `BOLO_BUNDLE_MODE=1`; a source checkout
 /// leaves it unset. In bundle mode macOS attributes Accessibility trust to
@@ -5973,86 +7087,6 @@ fn accessibility_fix_detail(bundle: bool, python: &str) -> String {
              Accessibility, then run ./restart.sh: {python}"
         )
     }
-}
-
-/// Onboarding Accessibility warn-row copy: points at the row's Open
-/// Accessibility Settings button, then names the exact list item to
-/// enable (Bolo in bundle mode, the helper interpreter from source).
-fn accessibility_row_detail(bundle: bool, python: &str) -> String {
-    if bundle {
-        String::from(
-            "Bolo needs Accessibility to type for you. Click the button, then \
-             enable Bolo in the list.",
-        )
-    } else {
-        format!(
-            "Bolo needs Accessibility to type for you. Click the button, then \
-             enable this interpreter in the list: {python}"
-        )
-    }
-}
-
-fn microphone_detail(device_count: usize) -> String {
-    if device_count == 0 {
-        String::from(
-            "No microphone found. Allow microphone access for Bolo in System Settings > \
-             Privacy & Security > Microphone, then run ./restart.sh.",
-        )
-    } else if device_count == 1 {
-        String::from("1 microphone found.")
-    } else {
-        format!("{device_count} microphones found.")
-    }
-}
-
-/// The onboarding row's key-entry placement, shown only for the missing
-/// `AssemblyAI` key: the bundle flow defaults to `AssemblyAI` with no provider
-/// picker, and a Telnyx key never gets an entry field, so source installs
-/// that picked Telnyx keep the plain file instruction.
-fn key_entry_spec(missing: Option<&str>) -> Option<KeyEntrySpec> {
-    (missing == Some("ASSEMBLYAI_API_KEY")).then(|| KeyEntrySpec {
-        index: 2,
-        placeholder: String::from("Paste your AssemblyAI API key"),
-    })
-}
-
-/// Detail text for the speech-to-text row while the key-entry field is
-/// visible; a plain line, the placeholder and the field itself carry the
-/// instruction.
-fn key_entry_row_detail() -> String {
-    String::from("Paste your AssemblyAI API key.")
-}
-
-/// Provider and key row detail; `missing` comes from
-/// `Config::missing_required_key` and names the exact environment variable
-/// to add when absent. The bundle flow defaults to the `AssemblyAI` key:
-/// present keys get the plain connected line, a missing `AssemblyAI` key
-/// gets the entry field with a plain instruction. Other missing keys (only
-/// possible on source installs) keep the file-path fix line because no
-/// entry field is shown for them.
-fn onboarding_provider_key_detail(missing: Option<&str>) -> String {
-    if key_entry_spec(missing).is_some() {
-        return key_entry_row_detail();
-    }
-    missing.map_or_else(
-        || String::from("Connected to AssemblyAI."),
-        |key| format!("Missing {key}. Add it to ~/.bolo/env, then run ./restart.sh."),
-    )
-}
-
-fn onboarding_try_it_detail(hotkey: &str) -> String {
-    format!("Hold {} and say a sentence.", human_readable_hotkey(hotkey))
-}
-
-/// Emphasized try-it instruction shown when every earlier row is green:
-/// the try-it step is the one thing left, so the window calls it out and
-/// tells the user what a completed capture looks like.
-fn onboarding_try_it_hero(hotkey: &str) -> String {
-    format!(
-        "Hold {} and say a sentence. This window will stay open, and the dot turns \
-         green when you're done.",
-        human_readable_hotkey(hotkey)
-    )
 }
 
 /// Try-it detail line after the first captured dictation; the user is set
@@ -6184,6 +7218,10 @@ fn fetch_latest_release() -> Option<UpdateNotice> {
 struct AppWindow {
     child: Child,
     stdin: ChildStdin,
+    /// Reader half of the helper's stdout; the Accessibility screen asks
+    /// for the runtime's real trust reading there, and the event loop
+    /// answers on stdin. Drained by a reader thread once pumping starts.
+    stdout_reader: Option<ChildStdout>,
 }
 
 impl std::fmt::Debug for AppWindow {
@@ -6208,6 +7246,655 @@ impl AppWindow {
         self.stdin.flush()?;
         Ok(())
     }
+
+    /// Start the stdout reader thread. The helper writes one JSON request
+    /// per trust recheck; the reader forwards each as a
+    /// [`UserEvent::WindowRequest`] so the event loop answers with the
+    /// runtime's own reading instead of the window guessing from its own
+    /// process trust.
+    fn start_request_reader(&mut self, proxy: &EventLoopProxy<UserEvent>, kind: WindowRequestKind) {
+        let Some(reader) = self.stdout_reader.take() else {
+            return;
+        };
+        let proxy = proxy.clone();
+        if let Err(error) = std::thread::Builder::new()
+            .name(String::from("bolo-window-requests"))
+            .spawn(move || {
+                use std::io::BufRead as _;
+                for line in BufReader::new(reader).lines() {
+                    let Ok(line) = line else {
+                        return;
+                    };
+                    match kind {
+                        WindowRequestKind::Onboarding => {
+                            // The onboarding helper's trust recheck is the one
+                            // request this window makes.
+                            if line.contains("\"trust_check\"")
+                                && proxy
+                                    .send_event(UserEvent::WindowRequest(WindowRequest { kind }))
+                                    .is_err()
+                            {
+                                return;
+                            }
+                        }
+                        WindowRequestKind::Dashboard => {
+                            // The dashboard dispatches on parsed JSON, not
+                            // substrings. Invalid requests become a
+                            // validation-failure event so the event loop
+                            // replies on the window slot; nothing is
+                            // persisted until validation passes.
+                            let Some(request) = parse_dashboard_request_line(&line) else {
+                                continue;
+                            };
+                            let microphones = cached_input_device_names();
+                            match typed_dashboard_action(&request, &microphones) {
+                                Ok(action) => {
+                                    if proxy
+                                        .send_event(UserEvent::DashboardAction(action))
+                                        .is_err()
+                                    {
+                                        return;
+                                    }
+                                }
+                                Err(message) => {
+                                    if proxy
+                                        .send_event(UserEvent::DashboardInvalid(message))
+                                        .is_err()
+                                    {
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            })
+        {
+            warn!("window request reader failed to start: {error}");
+        }
+    }
+}
+
+/// Payload for the dashboard window (`dashboard_window.py` via the shared
+/// `app_window.py` helper entry point). Frozen contract: `mode` is
+/// "dashboard", the title is "Bolo", `write_marker` is always false, and
+/// `dashboard` carries every fact the window renders. No keys, file paths, or
+/// debug logs ever appear here, and no count claims anything beyond the
+/// retained saved history or the locally persisted usage counters.
+#[derive(Debug, Serialize)]
+struct DashboardPayload {
+    mode: String,
+    title: String,
+    write_marker: bool,
+    dashboard: DashboardSpec,
+}
+
+/// Facts for the dashboard window, exactly the frozen field set: version,
+/// the configured hotkey label, the microphone selection, cleanup mode,
+/// Accessibility trust, provider, the retained-history stats, and optional
+/// cumulative usage counting from 1.9.
+#[derive(Debug, Serialize)]
+struct DashboardSpec {
+    version: String,
+    hotkey: String,
+    microphone: String,
+    microphones: Vec<String>,
+    /// Stable-UID valued choices for the dropdown: (value, label) per
+    /// device. Values are `uid:<id>` so duplicate display names stay
+    /// distinguishable; labels stay human-readable names. The plain
+    /// `microphones` name list remains for backward compatibility.
+    microphone_choices: Vec<DashboardMicChoice>,
+    cleanup_mode: &'static str,
+    accessibility_state: &'static str,
+    provider: String,
+    history_limit: usize,
+    history: Vec<DashboardHistoryEntry>,
+    saved_dictations: usize,
+    saved_words: usize,
+    learned_words_count: usize,
+    usage: DashboardUsage,
+}
+
+/// One retained dictation in the dashboard history, newest first. Only the
+/// text as it stands and the raw STT input: no paths, no timestamps beyond the
+/// creation epoch milliseconds.
+#[derive(Debug, Serialize)]
+struct DashboardHistoryEntry {
+    text: String,
+    raw: String,
+    created_at_ms: u64,
+    edited_after_insert: bool,
+}
+
+/// Cumulative usage block. Actual counts since tracking began in 1.9, never
+/// lifetime estimates and never a time-saved claim.
+#[derive(Debug, Serialize)]
+struct DashboardUsage {
+    dictations: u64,
+    words: u64,
+    recording_ms: u64,
+    started_at_ms: u64,
+}
+
+impl DashboardUsage {
+    fn from_counters(counters: UsageCounters) -> Self {
+        Self {
+            dictations: counters.dictations,
+            words: counters.words,
+            recording_ms: counters.recording_ms,
+            started_at_ms: counters.started_at_ms,
+        }
+    }
+}
+
+/// One typed request from the dashboard window's stdout. The dashboard never
+/// dispatches on substring matches: the runtime parses the JSON and matches
+/// the `action` field against this enum.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum DashboardAction {
+    Refresh,
+    SaveSettings {
+        hotkey: Option<String>,
+        microphone: Option<String>,
+        cleanup_mode: Option<String>,
+    },
+    Restart,
+    OpenSetup,
+    OpenLearned,
+}
+
+/// A raw dashboard request line before validation.
+#[derive(Debug)]
+struct DashboardRequestLine {
+    action: String,
+    hotkey: Option<String>,
+    microphone: Option<String>,
+    cleanup_mode: Option<String>,
+}
+
+/// Parse one dashboard stdout line into its raw request. Anything that is not
+/// a well-formed dashboard_action object is rejected; a reply the frontend
+/// cannot parse is better than a half-guessed request.
+fn parse_dashboard_request_line(line: &str) -> Option<DashboardRequestLine> {
+    let value: serde_json::Value = serde_json::from_str(line).ok()?;
+    if value.get("type")?.as_str()? != "dashboard_action" {
+        return None;
+    }
+    Some(DashboardRequestLine {
+        action: value.get("action")?.as_str()?.to_owned(),
+        hotkey: value
+            .get("hotkey")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        microphone: value
+            .get("microphone")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        cleanup_mode: value
+            .get("cleanup_mode")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+    })
+}
+
+/// Turn a raw request into a typed action, validating every settings value
+/// BEFORE any persistence happens. The hotkey must be one the hotkey helper
+/// supports, the microphone must be a real current input device or "default",
+/// and the cleanup mode must be one of the three enum values.
+fn typed_dashboard_action(
+    request: &DashboardRequestLine,
+    microphones: &[String],
+) -> Result<DashboardAction, String> {
+    match request.action.as_str() {
+        "refresh" => Ok(DashboardAction::Refresh),
+        "restart" => Ok(DashboardAction::Restart),
+        "open_setup" => Ok(DashboardAction::OpenSetup),
+        "open_learned" => Ok(DashboardAction::OpenLearned),
+        "save_settings" => {
+            if let Some(hotkey) = request.hotkey.as_deref()
+                && !is_supported_hotkey(hotkey)
+            {
+                return Err(String::from("Unsupported hotkey."));
+            }
+            if let Some(microphone) = request.microphone.as_deref() {
+                // Accept the stable uid:/name: values plus the legacy
+                // plain-name and "default" forms; a disconnected saved
+                // UID stays valid so an unrelated save keeps it.
+                let valid = if microphone == "default" {
+                    true
+                } else if let Some(id) = microphone.strip_prefix("uid:") {
+                    !id.is_empty()
+                } else {
+                    let name = microphone.strip_prefix("name:").unwrap_or(microphone);
+                    microphones.iter().any(|available| available == name)
+                };
+                if !valid {
+                    return Err(String::from("Unknown microphone."));
+                }
+            }
+            if let Some(mode) = request.cleanup_mode.as_deref()
+                && !matches!(mode, "auto" | "on" | "off")
+            {
+                return Err(String::from("Cleanup mode must be auto, on, or off."));
+            }
+            Ok(DashboardAction::SaveSettings {
+                hotkey: request.hotkey.clone(),
+                microphone: request.microphone.clone(),
+                cleanup_mode: request.cleanup_mode.clone(),
+            })
+        }
+        other => Err(format!("Unknown dashboard action: {other}")),
+    }
+}
+
+/// The frozen cleanup-mode wire values, matching how `Config::load` reads
+/// `BOLO_LLM_CLEANUP` and how the dashboard renders them.
+fn dashboard_cleanup_mode(mode: CleanupMode) -> &'static str {
+    match mode {
+        CleanupMode::Auto => "auto",
+        CleanupMode::On => "on",
+        CleanupMode::Off => "off",
+    }
+}
+
+/// Real current microphone list, deduplicated the way the menu does. The
+/// selection is resolved by the caller: no configured microphone means the
+/// "default" sentinel, never a guess that the first device is what Bolo
+/// uses, because the system default and the first listed device are not the
+/// same thing.
+/// One dropdown choice: a stable wire value plus the label the user
+/// sees. Device rows use the UID-prefixed value; disconnected saved
+/// selections are preserved with their UID so an unrelated save never
+/// clears them.
+#[derive(Debug, Serialize)]
+struct DashboardMicChoice {
+    value: String,
+    label: String,
+}
+
+/// The stable wire value for one device's dropdown row.
+fn mic_choice_value(descriptor: &MicrophoneDescriptor) -> String {
+    match descriptor.id.as_deref() {
+        Some(id) => format!("uid:{id}"),
+        None => format!("name:{}", descriptor.name),
+    }
+}
+
+/// Dropdown choices for the dashboard, in enumeration order, with an
+/// index-qualified label when two devices share a name.
+fn dashboard_microphone_choices(descriptors: &[MicrophoneDescriptor]) -> Vec<DashboardMicChoice> {
+    let labels = microphone_labels(descriptors);
+    descriptors
+        .iter()
+        .enumerate()
+        .map(|(index, descriptor)| DashboardMicChoice {
+            value: mic_choice_value(descriptor),
+            label: labels
+                .get(index)
+                .cloned()
+                .unwrap_or_else(|| descriptor.name.clone()),
+        })
+        .collect()
+}
+
+/// Resolve the current microphone choice to a wire label the dashboard
+/// understands: "default" for the system default choice, otherwise the
+/// display name of the device the saved stable UID names. A saved UID
+/// that names no present device reads as "default": the authoritative
+/// key vanished, so the dashboard never offers a same-named other
+/// device as if it were the pick.
+/// Validate and normalize the microphone wire value from a dashboard
+/// save. Accepts the new stable `uid:`/`name:` values and the legacy
+/// plain-name and "default" forms. Returns the raw descriptor pair the
+/// apply path resolves.
+fn normalize_microphone_value(
+    microphone: &str,
+    descriptors: &[MicrophoneDescriptor],
+) -> Result<MicrophoneSelection, String> {
+    if microphone == "default" {
+        return Ok(MicrophoneSelection::SystemDefault);
+    }
+    if let Some(id) = microphone.strip_prefix("uid:") {
+        if id.is_empty() {
+            return Err(String::from("Unknown microphone."));
+        }
+        let descriptor = descriptors
+            .iter()
+            .find(|descriptor| descriptor.id.as_deref() == Some(id));
+        return Ok(MicrophoneSelection::Device(
+            descriptor
+                .cloned()
+                .unwrap_or_else(|| MicrophoneDescriptor::new("", Some(id.to_owned()))),
+        ));
+    }
+    if let Some(name) = microphone.strip_prefix("name:") {
+        if let Some(descriptor) = match_legacy_name(name, descriptors) {
+            return Ok(MicrophoneSelection::Device(descriptor));
+        }
+        return Err(String::from("Unknown microphone."));
+    }
+    // Legacy plain display name, preserved for older dashboards.
+    if let Some(descriptor) = match_legacy_name(microphone, descriptors) {
+        return Ok(MicrophoneSelection::Device(descriptor));
+    }
+    Err(String::from("Unknown microphone."))
+}
+
+/// The trust states map straight onto the frozen wire strings.
+fn dashboard_accessibility_state(trust: AccessibilityTrust) -> &'static str {
+    match trust {
+        AccessibilityTrust::Trusted => "ok",
+        AccessibilityTrust::Untrusted => "warn",
+        AccessibilityTrust::Unavailable => "unavailable",
+    }
+}
+
+/// Speech provider label for the dashboard: derived from the configured
+/// `BOLO_STT_MODEL` rather than the streaming label, which can read
+/// "Disabled" for a model that still works perfectly through batch STT.
+fn dashboard_provider_label(stt_model: &str) -> String {
+    let provider = stt_model.split('/').next().unwrap_or("Batch STT");
+    if provider.is_empty() {
+        return String::from("Batch STT");
+    }
+    let mut chars = provider.chars();
+    match chars.next() {
+        Some(first) => {
+            let rest: String = chars.collect();
+            format!("{}{rest}", first.to_ascii_uppercase())
+        }
+        None => provider.to_owned(),
+    }
+}
+
+/// Assemble the dashboard payload from real runtime facts. Every value is
+/// read from runtime state: the retained history, configured hotkey (the
+/// frontend renders its own label), cached microphone list and the real
+/// selection (or "default" when nothing is configured), the cleanup mode,
+/// the real insertion-path trust reading, the configured model's provider
+/// label, and the learned-words count.
+fn dashboard_payload(app: &App) -> Result<String, AppError> {
+    let descriptors = cached_microphone_snapshot().descriptors;
+    dashboard_payload_with_microphones(app, &descriptors)
+}
+
+fn dashboard_payload_with_microphones(
+    app: &App,
+    descriptors: &[MicrophoneDescriptor],
+) -> Result<String, AppError> {
+    let entries = app.history_entries()?;
+    let learned_count = learning_window_pairs(&learned_vocabulary_path()).0.len();
+    let saved_words = entries
+        .iter()
+        .map(|entry| entry.text.split_whitespace().count())
+        .sum::<usize>();
+    let mut microphones = Vec::new();
+    for descriptor in descriptors {
+        if !microphones.contains(&descriptor.name) {
+            microphones.push(descriptor.name.clone());
+        }
+    }
+    if microphones.is_empty() {
+        microphones.push(String::from("default"));
+    }
+    let mut choices = dashboard_microphone_choices(descriptors);
+    let selected_id = app.selected_microphone_id()?;
+    let selected_name = app.selected_microphone()?;
+    let microphone = if let Some(id) = selected_id.as_deref() {
+        let value = format!("uid:{id}");
+        if !choices.iter().any(|choice| choice.value == value) {
+            choices.push(DashboardMicChoice {
+                value: value.clone(),
+                label: format!(
+                    "{} (not connected)",
+                    selected_name.as_deref().unwrap_or("Microphone")
+                ),
+            });
+        }
+        value
+    } else {
+        selected_name
+            .as_deref()
+            .and_then(|name| match_legacy_name(name, descriptors))
+            .map_or_else(
+                || String::from("default"),
+                |descriptor| mic_choice_value(&descriptor),
+            )
+    };
+    let accessibility =
+        dashboard_accessibility_state(accessibility_trust(&app.config.root_dir, false));
+    let usage =
+        DashboardUsage::from_counters(app.usage.lock().map(|usage| *usage).unwrap_or_default());
+    let payload = DashboardPayload {
+        mode: String::from("dashboard"),
+        title: String::from("Bolo"),
+        write_marker: false,
+        dashboard: DashboardSpec {
+            version: String::from(env!("CARGO_PKG_VERSION")),
+            hotkey: app.config.hotkey.clone(),
+            microphone,
+            microphones,
+            microphone_choices: choices,
+            cleanup_mode: dashboard_cleanup_mode(app.config.llm_cleanup),
+            accessibility_state: accessibility,
+            provider: dashboard_provider_label(&app.config.stt_model),
+            history_limit: TRANSCRIPT_HISTORY_LIMIT,
+            history: entries
+                .iter()
+                .map(|entry| DashboardHistoryEntry {
+                    text: entry.text.clone(),
+                    raw: entry.raw.clone(),
+                    created_at_ms: entry.created_at_ms,
+                    edited_after_insert: entry.edited_after_insert,
+                })
+                .collect(),
+            saved_dictations: entries.len(),
+            saved_words,
+            learned_words_count: learned_count,
+            usage,
+        },
+    };
+    serde_json::to_string(&payload).map_err(|error| AppError::MenuBar(error.to_string()))
+}
+
+/// Open (or keep) the dashboard window slot. When the window is already
+/// brings the existing window forward, instead of doing nothing while the
+/// window sits minimized or behind other windows.
+fn open_dashboard_window(app: &App, window_slot: &mut Option<AppWindow>) {
+    let already_running = window_slot
+        .as_mut()
+        .map_or(Ok(false), AppWindow::is_running)
+        .unwrap_or(false);
+    if already_running {
+        let Some(window) = window_slot.as_mut() else {
+            return;
+        };
+        let activation = serde_json::json!({"type": "dashboard_activate"});
+        if let Err(error) = window.send_line(&activation.to_string()) {
+            warn!("dashboard activation failed: {error}");
+        }
+        return;
+    }
+    drop(window_slot.take());
+    let result = dashboard_payload(app).and_then(|payload| spawn_dashboard_window(app, &payload));
+    match result {
+        Ok(mut window) => {
+            if let Some(proxy) = app
+                .event_proxy
+                .lock()
+                .ok()
+                .and_then(|stored| stored.clone())
+            {
+                window.start_request_reader(&proxy, WindowRequestKind::Dashboard);
+            }
+            *window_slot = Some(window);
+            info!("dashboard window shown");
+        }
+        Err(error) => error!("{error}"),
+    }
+}
+
+/// Spawn the dashboard helper through the shared `app_window.py` entry point
+/// and start its typed request reader. Kept separate so the dashboard's
+/// Dashboard request kind never leaks into the other windows.
+fn spawn_dashboard_window(app: &App, payload: &str) -> Result<AppWindow, AppError> {
+    spawn_app_window(&app.config.root_dir, payload)
+}
+
+/// A fresh dashboard payload for a live update line.
+fn dashboard_update_payload(app: &App) -> Result<String, AppError> {
+    let inner = dashboard_payload(app)?;
+    let value: serde_json::Value =
+        serde_json::from_str(&inner).map_err(|error| AppError::MenuBar(error.to_string()))?;
+    let update = serde_json::json!({
+        "type": "dashboard_update",
+        "dashboard": value.get("dashboard").cloned().unwrap_or_default(),
+    });
+    Ok(update.to_string())
+}
+
+/// Push a live update to an open dashboard window. Telemetry-only failures
+/// are logged, never fatal.
+fn refresh_dashboard_window(app: &App, window_slot: &mut Option<AppWindow>) {
+    let Some(window) = window_slot.as_mut() else {
+        return;
+    };
+    if window.is_running().unwrap_or(true) {
+        match dashboard_update_payload(app) {
+            Ok(update) => {
+                if let Err(error) = window.send_line(&update) {
+                    warn!("dashboard update failed: {error}");
+                }
+            }
+            Err(error) => warn!("dashboard update payload failed: {error}"),
+        }
+    }
+}
+
+/// Answer one typed dashboard action. Returns the reply object the event
+/// loop serializes to the window's stdin. Every settings value has already
+/// been validated by the event loop before this runs, and validation errors
+/// reply ok:false without touching any persistence.
+fn handle_dashboard_action(app: &Arc<App>, action: DashboardAction) -> serde_json::Value {
+    match action {
+        DashboardAction::Refresh | DashboardAction::SaveSettings { .. } => {
+            let mut message = String::from("Updated.");
+            if let DashboardAction::SaveSettings {
+                hotkey,
+                microphone,
+                cleanup_mode,
+            } = action
+            {
+                match app.apply_dashboard_settings(
+                    hotkey.as_deref(),
+                    microphone.as_deref(),
+                    cleanup_mode.as_deref(),
+                ) {
+                    Ok(change_needs_restart) => {
+                        if change_needs_restart {
+                            if let Ok(mut pending) = app.dashboard_restart_pending.lock() {
+                                *pending = true;
+                            }
+                            message = String::from(
+                                "Saved. Restart Bolo to apply the new hotkey or cleanup mode.",
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        // The env writer is atomic per value, so a failure can
+                        // land after an earlier value was already written.
+                        // Report the failure without claiming that nothing
+                        // changed.
+                        warn!("dashboard settings save failed: {error}");
+                        if let Ok(mut pending) = app.dashboard_restart_pending.lock() {
+                            *pending = true;
+                        }
+                        return serde_json::json!({
+                            "type": "dashboard_action_reply",
+                            "ok": false,
+                            "message":
+                                "Saving failed partway. Check Bolo's settings and save again.",
+                            "restart_needed": true,
+                        });
+                    }
+                }
+            }
+            let restart_needed = app
+                .dashboard_restart_pending
+                .lock()
+                .map(|pending| *pending)
+                .unwrap_or(false);
+            match dashboard_update_payload(app) {
+                Ok(update) => {
+                    let value: serde_json::Value =
+                        serde_json::from_str(&update).unwrap_or_default();
+                    serde_json::json!({
+                        "type": "dashboard_action_reply",
+                        "ok": true,
+                        "message": message,
+                        "restart_needed": restart_needed,
+                        "dashboard": value.get("dashboard").cloned().unwrap_or_default(),
+                    })
+                }
+                Err(error) => {
+                    warn!("dashboard refresh payload failed: {error}");
+                    serde_json::json!({
+                        "type": "dashboard_action_reply",
+                        "ok": false,
+                        "message": "Bolo could not read its current settings.",
+                        "restart_needed": restart_needed,
+                    })
+                }
+            }
+        }
+        DashboardAction::Restart => {
+            let idle = {
+                let Ok(state) = app.state.lock() else {
+                    return serde_json::json!({
+                        "type": "dashboard_action_reply",
+                        "ok": false,
+                        "message": "Bolo is busy. Try again when idle.",
+                        "restart_needed": false,
+                    });
+                };
+                !reload_is_busy(&state)
+            };
+            if idle {
+                app.send_user_event(UserEvent::DashboardRestart);
+                serde_json::json!({
+                    "type": "dashboard_action_reply",
+                    "ok": true,
+                    "message": "Restarting Bolo.",
+                    "restart_needed": false,
+                })
+            } else {
+                serde_json::json!({
+                    "type": "dashboard_action_reply",
+                    "ok": false,
+                    "message": "Bolo is busy. Try again when idle.",
+                    "restart_needed": false,
+                })
+            }
+        }
+        DashboardAction::OpenSetup => {
+            app.send_user_event(UserEvent::ShowOnboarding);
+            serde_json::json!({
+                "type": "dashboard_action_reply",
+                "ok": true,
+                "message": "Opened.",
+                "restart_needed": false,
+            })
+        }
+        DashboardAction::OpenLearned => {
+            app.send_user_event(UserEvent::ShowLearned);
+            serde_json::json!({
+                "type": "dashboard_action_reply",
+                "ok": true,
+                "message": "Opened.",
+                "restart_needed": false,
+            })
+        }
+    }
 }
 
 fn spawn_app_window(root_dir: &Path, payload: &str) -> Result<AppWindow, AppError> {
@@ -6220,7 +7907,10 @@ fn spawn_app_window(root_dir: &Path, payload: &str) -> Result<AppWindow, AppErro
     let mut child = Command::new(python_helper_executable())
         .arg(script)
         .stdin(Stdio::piped())
-        .stdout(Stdio::null())
+        // stdout carries the window's trust-check requests, so the
+        // runtime answers with the real reading of the helper that
+        // pastes; stderr keeps its diagnostic role.
+        .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()
         .map_err(|error| AppError::MenuBar(format!("app window launch failed: {error}")))?;
@@ -6228,76 +7918,51 @@ fn spawn_app_window(root_dir: &Path, payload: &str) -> Result<AppWindow, AppErro
         .stdin
         .take()
         .ok_or_else(|| AppError::MenuBar(String::from("app window stdin unavailable")))?;
-    let mut window = AppWindow { child, stdin };
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| AppError::MenuBar(String::from("app window stdout unavailable")))?;
+    let mut window = AppWindow {
+        child,
+        stdin,
+        stdout_reader: Some(stdout),
+    };
     window.send_line(payload)?;
     Ok(window)
 }
 
+/// Onboarding payload for the progressive wizard. The helper owns screen
+/// sequencing; the runtime only reports facts it can actually observe:
+/// whether the required key is missing, its own Accessibility trust
+/// reading (the daemon or helper that performs the real paste), and the
+/// microphone count. `write_marker` comes from the marker state, and the
+/// helper refuses to write the marker unless a genuine insert completed.
 fn onboarding_window_payload(app: &App, write_marker: bool) -> Result<String, AppError> {
     let accessibility = match accessibility_trust(&app.config.root_dir, false) {
-        AccessibilityTrust::Trusted => WindowRow::new(
-            "Accessibility",
-            String::from("Bolo needs Accessibility to type for you."),
-            "ok",
-        ),
-        AccessibilityTrust::Untrusted => WindowRow::new(
-            "Accessibility",
-            accessibility_row_detail(bundle_mode(), &python3_executable_path()),
-            "warn",
-        )
-        .open_settings(),
-        AccessibilityTrust::Unavailable => WindowRow::new(
-            "Accessibility",
-            if bundle_mode() {
-                String::from("Reinstall Bolo by downloading the latest Bolo DMG again.")
-            } else {
-                String::from("Helper unavailable. Run ./install.sh, then ./restart.sh.")
-            },
-            "warn",
-        ),
+        AccessibilityTrust::Trusted => "ok",
+        AccessibilityTrust::Untrusted => "warn",
+        AccessibilityTrust::Unavailable => "unavailable",
     };
-    let microphone_count = input_device_names().map_or(0, |devices| devices.len());
-    let microphones = WindowRow::new(
-        "Microphone",
-        microphone_detail(microphone_count),
-        if microphone_count == 0 { "warn" } else { "ok" },
-    );
-    let missing = app.config.missing_required_key();
-    let provider = WindowRow::new(
-        "Speech to text",
-        onboarding_provider_key_detail(missing),
-        if missing.is_some() { "warn" } else { "ok" },
-    );
-    // The try-it step is the hero when everything above it is green: a
-    // bigger label and the brighter instruction line tell the user the one
-    // remaining action. Any warn row above keeps the plain detail so the
-    // fix instructions own the attention.
-    let earlier_rows_ok = [&accessibility, &microphones, &provider]
-        .iter()
-        .all(|row| row.state == "ok");
-    let try_it_detail = if earlier_rows_ok {
-        onboarding_try_it_hero(&app.config.hotkey)
-    } else {
-        onboarding_try_it_detail(&app.config.hotkey)
-    };
-    let try_it_hero = earlier_rows_ok.then(|| try_it_detail.clone());
+    let microphones = cached_input_device_names().len();
+    let missing = app.config.missing_required_key().is_some();
     let payload = AppWindowPayload {
         mode: String::from("onboarding"),
         title: String::from("Set up Bolo"),
-        welcome: String::from(onboarding_welcome()),
+        welcome: String::new(),
         brand: Some(String::from("BOLO")),
-        rows: vec![
-            accessibility,
-            microphones,
-            provider,
-            WindowRow::new("Try it", try_it_detail, "pending"),
-        ],
-        button: String::from("Done"),
-        try_it_index: Some(3),
-        try_it_hero,
-        key_entry: key_entry_spec(missing),
+        rows: Vec::new(),
+        button: String::from("Continue"),
+        try_it_index: None,
+        try_it_hero: None,
+        key_entry: None,
         write_marker,
         learning: None,
+        wizard: Some(WizardSpec {
+            key_missing: missing,
+            accessibility_state: String::from(accessibility),
+            microphones,
+            hotkey: app.config.hotkey.clone(),
+        }),
     };
     serde_json::to_string(&payload).map_err(|error| AppError::MenuBar(error.to_string()))
 }
@@ -6325,6 +7990,7 @@ fn status_window_payload(app: &App) -> Result<String, AppError> {
         key_entry: None,
         write_marker: false,
         learning: None,
+        wizard: None,
     };
     serde_json::to_string(&payload).map_err(|error| AppError::MenuBar(error.to_string()))
 }
@@ -6350,6 +8016,7 @@ fn learning_window_payload_at(learned_path: &Path) -> Result<String, AppError> {
         try_it_hero: None,
         key_entry: None,
         write_marker: false,
+        wizard: None,
         learning: Some(LearningWindowSpec {
             file: learned_path.to_string_lossy().into_owned(),
             hint_welcome: String::from(LEARNING_HINT_WELCOME),
@@ -6401,18 +8068,47 @@ fn learning_window_pairs(learned_path: &Path) -> (Vec<LearnedPairRow>, Option<St
     (pairs, None)
 }
 
+/// Busy probe for the post-onboarding key reload: an active recording,
+/// an in-flight post-insert watch, or a running pipeline job (the
+/// counter survives the moment `active` is taken but the pipeline
+/// thread has not finished yet) each keep the runtime alive. The next
+/// watchdog tick retries once idle.
+fn reload_is_busy(state: &AppState) -> bool {
+    state.active.is_some() || state.post_insert_watch.is_some() || state.processing_jobs > 0
+}
+
+/// Pure decision for the watchdog's post-onboarding key reload: exit for
+/// the supervisor's restart code only when a key was saved during
+/// onboarding, it is on disk, the runtime is not busy (no active
+/// recording, no insert watch, no pipeline job), and the onboarding
+/// window is closed. An absent window means not running, so a closed
+/// window frees the gate; a window-probe error reads as running so a
+/// flaky check can never restart Bolo in a loop.
+fn should_exit_for_key_reload(
+    state: &AppState,
+    key_pending: bool,
+    key_on_disk: bool,
+    window_running: bool,
+) -> bool {
+    key_pending && key_on_disk && !reload_is_busy(state) && !window_running
+}
+
 /// Open (or ignore when already open) the onboarding window. `write_marker`
 /// comes from the marker state at open time, so a manual reopen after
 /// completion never rewrites it, while an unfinished first run still can.
-/// `key_pending` records whether this window was opened while the
-/// `AssemblyAI` key was missing, so the event loop can restart the runtime
-/// after the window closes with the key saved.
+/// `missing_key` records the required speech key that was missing when the
+/// window opened (either provider's), so the event loop can restart the
+/// runtime after the window closes with that key saved.
+fn is_bundle_mode() -> bool {
+    bundle_mode()
+}
+
 fn open_onboarding_window(
     app: &App,
     window_slot: &mut Option<AppWindow>,
     try_it_complete: &mut bool,
     try_it_snapshot: &mut Option<u64>,
-    key_pending: &mut bool,
+    missing_key: &mut Option<&'static str>,
 ) {
     let already_running = window_slot
         .as_mut()
@@ -6432,12 +8128,48 @@ fn open_onboarding_window(
     let result = onboarding_window_payload(app, write_marker)
         .and_then(|payload| spawn_app_window(&app.config.root_dir, &payload));
     match result {
-        Ok(window) => {
-            *key_pending = key_entry_spec(app.config.missing_required_key()).is_some();
+        Ok(mut window) => {
+            if let Some(proxy) = app
+                .event_proxy
+                .lock()
+                .ok()
+                .and_then(|stored| stored.clone())
+            {
+                window.start_request_reader(&proxy, WindowRequestKind::Onboarding);
+            }
+            *missing_key = app.config.missing_required_key();
             *window_slot = Some(window);
             info!("onboarding window shown");
         }
         Err(error) => error!("{error}"),
+    }
+}
+
+/// Answer one onboarding-window trust request with the runtime's own
+/// reading of the helper that actually pastes. The window asked because
+/// its own process reading cannot stand in for the paste path; the
+/// reply also tells it whether the runtime needs a restart to pick the
+/// grant up, so a stale toggle never reads as ready.
+fn answer_window_request(app: &App, window_slot: &mut Option<AppWindow>, request: &WindowRequest) {
+    if request.kind != WindowRequestKind::Onboarding {
+        return;
+    }
+    let Some(window) = window_slot.as_mut() else {
+        return;
+    };
+    let trusted = matches!(
+        accessibility_trust(&app.config.root_dir, false),
+        AccessibilityTrust::Trusted
+    );
+    let reply = serde_json::json!({
+        "type": "trust_reply",
+        "trusted": trusted,
+        "restart_needed": is_bundle_mode() && trusted,
+    });
+    if let Err(error) = window.send_line(&reply.to_string()) {
+        warn!("window trust reply failed: {error}");
+    } else {
+        info!("answered onboarding trust request (trusted={trusted})");
     }
 }
 
@@ -6510,8 +8242,16 @@ fn mark_onboarding_try_it_complete(
         return;
     }
     *try_it_complete = true;
+    // Recheck the runtime's own trust reading at the moment the practice
+    // insert succeeded, so a stale grant cannot fake readiness: the update
+    // tells the window the insert path is genuinely trusted right now.
+    let insert_trusted = matches!(
+        accessibility_trust(&app.config.root_dir, false),
+        AccessibilityTrust::Trusted
+    );
     let update = serde_json::json!({
         "try_it_complete": true,
+        "insert_trusted": insert_trusted,
         "detail": onboarding_try_it_done_detail(),
     });
     if let Err(error) = window.send_line(&update.to_string()) {
@@ -6521,28 +8261,161 @@ fn mark_onboarding_try_it_complete(
     info!("onboarding try-it step complete");
 }
 
+// Bolo's menu bar icon: the brand "b" rasterized in Rust from the same
+// 100-unit control points as the host's bolo_brand.draw_mark path so
+// every surface uses the same silhouette. Drawn as a 44x44 RGBA mask
+// (scaled to 18pt by tray-icon 0.23.1) and registered as a template icon via
+// tray_icon::TrayIconBuilder::with_icon_as_template(true), so macOS
+// tints it for the current menu bar appearance automatically and we
+// never call the deprecated NSImage template API by hand.
+
+const TRAY_ICON_PX: u32 = 44;
+
+/// One cubic Bézier control point in the 100-unit brand grid.
+type BrandPoint = (f64, f64);
+/// A cubic Bézier segment: start, control 1, control 2, end.
+type BrandSegment = (BrandPoint, BrandPoint, BrandPoint, BrandPoint);
+
 fn tray_icon_image() -> Result<Icon, AppError> {
-    let width = 18_u32;
-    let height = 18_u32;
-    let pixel_count = usize::try_from(width.saturating_mul(height).saturating_mul(4))
-        .map_err(|error| AppError::MenuBar(error.to_string()))?;
-    let mut rgba = Vec::with_capacity(pixel_count);
-    for y in 0..height {
-        for x in 0..width {
-            let capsule = (7..=10).contains(&x) && (2..=10).contains(&y);
-            let yoke = ((5..=6).contains(&x) || (11..=12).contains(&x)) && (8..=12).contains(&y);
-            let yoke_bottom = (6..=11).contains(&x) && y == 13;
-            let stem = (8..=9).contains(&x) && (13..=15).contains(&y);
-            let base = (5..=12).contains(&x) && y == 16;
-            let in_mark = capsule || yoke || yoke_bottom || stem || base;
-            if in_mark {
-                rgba.extend_from_slice(&[0, 0, 0, 255]);
-            } else {
-                rgba.extend_from_slice(&[0, 0, 0, 0]);
+    let width = TRAY_ICON_PX;
+    let height = TRAY_ICON_PX;
+    let stride = usize::try_from(width).map_err(|error| {
+        AppError::MenuBar(format!("tray icon width {width} is out of range: {error}"))
+    })? * usize::try_from(height).map_err(|error| {
+        AppError::MenuBar(format!(
+            "tray icon height {height} is out of range: {error}"
+        ))
+    })? * 4;
+    let mut rgba = vec![0u8; stride];
+
+    // 100-unit grid -> pixel scale. The mark spans x 19..83, y 5..93;
+    // 14-unit stroke; rounded joins (lineCapStyle 1 = round).
+    let scale = f64::from(width) / 100.0;
+    let stroke = 14.0_f64 * scale;
+    let half = stroke / 2.0;
+
+    let segs: [BrandSegment; 5] = [
+        (
+            (26.0, 12.0),
+            (26.0, 28.333333),
+            (26.0, 44.666667),
+            (26.0, 61.0),
+        ),
+        ((26.0, 61.0), (26.0, 77.0), (35.0, 86.0), (49.0, 86.0)),
+        ((49.0, 86.0), (64.0, 86.0), (76.0, 75.0), (76.0, 60.0)),
+        ((76.0, 60.0), (76.0, 45.0), (65.0, 35.0), (50.0, 35.0)),
+        ((50.0, 35.0), (39.0, 35.0), (29.0, 41.0), (26.0, 48.0)),
+    ];
+    let segments: Vec<(f64, f64)> = segs
+        .iter()
+        .flat_map(|(p0, p1, p2, p3)| {
+            const STEPS: u32 = 28;
+            let mut points = Vec::with_capacity(STEPS as usize + 1);
+            for step in 0..=STEPS {
+                let t = f64::from(step) / f64::from(STEPS);
+                let u = 1.0 - t;
+                let x = u * u * u * p0.0
+                    + 3.0 * u * u * t * p1.0
+                    + 3.0 * u * t * t * p2.0
+                    + t * t * t * p3.0;
+                let y = u * u * u * p0.1
+                    + 3.0 * u * u * t * p1.1
+                    + 3.0 * u * t * t * p2.1
+                    + t * t * t * p3.1;
+                // Convert from top-down grid to bottom-up image row space.
+                let px = x * scale;
+                let py = (100.0 - y) * scale;
+                points.push((px, py));
+            }
+            points
+        })
+        .collect();
+
+    let width_i = width as i32;
+    let height_i = height as i32;
+    for y in 0..height_i {
+        for x in 0..width_i {
+            let cx = f64::from(x) + 0.5;
+            let cy = f64::from(y) + 0.5;
+            let mut hit = false;
+
+            // Distance to the open stroked path, including the stem and
+            // four bowl curves copied from bolo_brand.draw_mark.
+            for window in segments.windows(2) {
+                let (ax, ay) = window[0];
+                let (bx, by) = window[1];
+                if point_segment_distance(cx, cy, ax, ay, bx, by) <= half {
+                    hit = true;
+                    break;
+                }
+            }
+
+            // Terminal block: a 14x14 rounded square at grid (68,13).
+            if !hit {
+                let bx = 68.0_f64 * scale;
+                let by = (100.0 - 27.0) * scale;
+                let bw = 14.0_f64 * scale;
+                let bh = 14.0_f64 * scale;
+                let radius = 3.0_f64 * scale;
+                if inside_rounded_rect(cx, cy, bx, by, bw, bh, radius) {
+                    hit = true;
+                }
+            }
+
+            if hit {
+                let flipped_y = height_i - 1 - y;
+                let idx = ((flipped_y * width_i + x) * 4) as usize;
+                rgba[idx + 3] = 255;
             }
         }
     }
+
     Icon::from_rgba(rgba, width, height).map_err(|error| AppError::MenuBar(error.to_string()))
+}
+
+fn point_segment_distance(px: f64, py: f64, ax: f64, ay: f64, bx: f64, by: f64) -> f64 {
+    let dx = bx - ax;
+    let dy = by - ay;
+    let len2 = dx * dx + dy * dy;
+    if len2 <= 0.0 {
+        let ex = px - ax;
+        let ey = py - ay;
+        return (ex * ex + ey * ey).sqrt();
+    }
+    let mut t = ((px - ax) * dx + (py - ay) * dy) / len2;
+    t = t.clamp(0.0, 1.0);
+    let qx = ax + t * dx;
+    let qy = ay + t * dy;
+    let ex = px - qx;
+    let ey = py - qy;
+    (ex * ex + ey * ey).sqrt()
+}
+
+fn inside_rounded_rect(px: f64, py: f64, x: f64, y: f64, w: f64, h: f64, radius: f64) -> bool {
+    if px < x || px >= x + w || py < y || py >= y + h {
+        return false;
+    }
+    let r = radius.min(w / 2.0).min(h / 2.0);
+    let corners = [
+        (x + r, y + r),
+        (x + w - r, y + r),
+        (x + r, y + h - r),
+        (x + w - r, y + h - r),
+    ];
+    for (cx, cy) in corners {
+        let on_left = cx <= x + w / 2.0;
+        let on_top = cy <= y + h / 2.0;
+        let in_corner_x = (on_left && px < cx) || (!on_left && px > cx);
+        let in_corner_y = (on_top && py < cy) || (!on_top && py > cy);
+        if in_corner_x && in_corner_y {
+            let dx = px - cx;
+            let dy = py - cy;
+            if dx * dx + dy * dy > r * r {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 fn build_stream<T>(
@@ -7031,11 +8904,25 @@ enum TrailingDecision {
 }
 
 /// The pure decision core of the trailing-capture loop, kept clock-free so the
-/// quiet and cap rules are testable without recording anything.
+/// quiet, weak-band, and cap rules are testable without recording anything.
+///
+/// Two clocks and one evaluation rule:
+/// - `quiet_for`: only below-bar frames advance it, unchanged, and it stops
+///   the tail on 250ms of sustained genuine quiet on its own;
+/// - `since_clear`: advanced by every frame that is not clearly above the
+///   bar (below-bar and weak-band frames alike) and reset only by a frame at
+///   or above the heuristic boundary. It bounds the common noisy-tail shape
+///   that alternates just below and just above the bar: the dips used to
+///   reset the quiet timer while never sustaining it, running the loop to
+///   the cap. The timeout is evaluated only on above-bar weak frames, so a
+///   genuine sustained-quiet sequence always finishes with the quiet reason
+///   first, and a fading or late-arriving strong syllable resets the window
+///   and keeps the full hard cap.
 #[derive(Clone, Copy, Debug)]
 struct TrailingCapture {
     threshold_rms: f32,
     quiet_for: Duration,
+    since_clear: Duration,
     total: Duration,
 }
 
@@ -7044,19 +8931,43 @@ impl TrailingCapture {
         Self {
             threshold_rms,
             quiet_for: Duration::ZERO,
+            since_clear: Duration::ZERO,
             total: Duration::ZERO,
         }
     }
 
     fn observe(&mut self, chunk_rms: f32, chunk_span: Duration) -> TrailingDecision {
         self.total = self.total.saturating_add(chunk_span);
-        if chunk_rms >= self.threshold_rms {
-            self.quiet_for = Duration::ZERO;
-        } else {
+        if chunk_rms < self.threshold_rms {
+            // Below the bar: quiet, and the quiet clock advances on its own
+            // with the existing 250ms grace. This frame also carries the
+            // no-clear-speech window forward, because jittering ambient
+            // dips under the bar every few frames; the window is only
+            // evaluated on the next above-bar frame, so a genuine sustained
+            // quiet sequence always finishes with the quiet reason before the
+            // carried window can fire.
             self.quiet_for = self.quiet_for.saturating_add(chunk_span);
+            self.since_clear = self.since_clear.saturating_add(chunk_span);
+        } else if chunk_rms < self.threshold_rms * TRAILING_WEAK_SPEECH_RATIO {
+            // In the weak band: not quiet, so the quiet clock resets, and
+            // the carried window fires here, on an above-bar frame, once the
+            // low+weak frames since the last clear moment exceed the bound.
+            self.quiet_for = Duration::ZERO;
+            self.since_clear = self.since_clear.saturating_add(chunk_span);
+        } else {
+            // At or above the heuristic boundary: both clocks reset and only
+            // the hard cap ends it, exactly as before.
+            self.quiet_for = Duration::ZERO;
+            self.since_clear = Duration::ZERO;
         }
         if self.quiet_for >= TRAILING_QUIET_TO_STOP {
             TrailingDecision::Stop("quiet")
+        } else if self.quiet_for.is_zero()
+            && chunk_rms >= self.threshold_rms
+            && chunk_rms < self.threshold_rms * TRAILING_WEAK_SPEECH_RATIO
+            && self.since_clear >= TRAILING_WEAK_ACTIVITY_STOP
+        {
+            TrailingDecision::Stop("weak_activity")
         } else if self.total >= TRAILING_CAPTURE_CAP {
             TrailingDecision::Stop("cap")
         } else {
@@ -8901,7 +10812,10 @@ fn read_vocabulary_file(path: &Path) -> Option<LoadedVocabulary> {
                     }
                 }
             }
-            _ => {}
+            serde_json::Value::Null
+            | serde_json::Value::Bool(_)
+            | serde_json::Value::Number(_)
+            | serde_json::Value::Array(_) => {}
         }
     }
     sort_replacements(&mut loaded.aliases);
@@ -8945,7 +10859,15 @@ fn add_personal_vocabulary_alias(term: &str, alias: &str) -> Result<bool, AppErr
         if existing.to_ascii_lowercase() != term_key {
             continue;
         }
-        let object = vocabulary_value_as_object(value, &existing);
+        // Normalize the only other accepted shape (a plain string term)
+        // into an object, then refine; the writers only ever produce these
+        // two shapes, so the refinement cannot fail on our own files.
+        if value.is_string() {
+            *value = serde_json::json!({ "text": existing, "aliases": [] });
+        }
+        let Some(object) = value.as_object_mut() else {
+            return Ok(false);
+        };
         let aliases = object
             .entry(String::from("aliases"))
             .or_insert_with(|| serde_json::Value::Array(Vec::new()));
@@ -8981,16 +10903,6 @@ fn read_vocabulary_values(path: &Path) -> Result<Vec<serde_json::Value>, AppErro
     Ok(values)
 }
 
-fn vocabulary_value_as_object<'a>(
-    value: &'a mut serde_json::Value,
-    term: &str,
-) -> &'a mut serde_json::Map<String, serde_json::Value> {
-    if value.is_string() {
-        *value = serde_json::json!({ "text": term, "aliases": [] });
-    }
-    value.as_object_mut().expect("vocabulary entry is object")
-}
-
 fn vocabulary_value_term(value: &serde_json::Value) -> Option<String> {
     match value {
         serde_json::Value::String(term) => {
@@ -8998,7 +10910,10 @@ fn vocabulary_value_term(value: &serde_json::Value) -> Option<String> {
             (!term.is_empty()).then(|| term.to_owned())
         }
         serde_json::Value::Object(object) => vocabulary_object_term(object),
-        _ => None,
+        serde_json::Value::Null
+        | serde_json::Value::Bool(_)
+        | serde_json::Value::Number(_)
+        | serde_json::Value::Array(_) => None,
     }
 }
 
@@ -9163,6 +11078,53 @@ fn load_replacements() -> Vec<TextReplacement> {
 fn read_replacements_file(path: &Path) -> Result<Vec<TextReplacement>, AppError> {
     let text = fs::read_to_string(path)?;
     Ok(parse_replacements_json(&text)?)
+}
+
+/// Remove a key from `~/.bolo/env`, used when the user returns to the
+/// system default microphone so no stale stable ID survives the choice.
+fn remove_bolo_env_value(name: &str) -> Result<(), AppError> {
+    #[cfg(test)]
+    {
+        let _ = name;
+        Ok(())
+    }
+    #[cfg(not(test))]
+    {
+        remove_bolo_env_value_at(&home_path(".bolo/env"), name)
+    }
+}
+
+/// Testable core targeting an explicit path, so persistence tests never
+/// touch the real `~/.bolo/env`.
+fn remove_bolo_env_value_at(path: &Path, name: &str) -> Result<(), AppError> {
+    let lines: Vec<String> = fs::read_to_string(path)
+        .map(|text| text.lines().map(str::to_owned).collect())
+        .unwrap_or_default();
+    if lines.is_empty() && !path.exists() {
+        // Nothing was ever stored: removing is already done and no
+        // write must happen, so concurrent readers never see the file
+        // appear and vanish under them.
+        return Ok(());
+    }
+    let prefix = format!("{name}=");
+    let kept: Vec<String> = lines
+        .iter()
+        .filter(|line| !line.trim_start().starts_with(&prefix))
+        .cloned()
+        .collect();
+    if kept.len() == lines.len() && !path.exists() {
+        return Ok(());
+    }
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let tmp = path.with_extension("env.tmp");
+    let mut kept_text = kept.join("\n");
+    kept_text.push('\n');
+    fs::write(&tmp, kept_text)?;
+    #[cfg(unix)]
+    fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))?;
+    fs::rename(tmp, path)?;
+    Ok(())
 }
 
 fn add_text_replacement(spoken: &str, replacement: &str) -> Result<bool, AppError> {
@@ -9345,13 +11307,26 @@ fn read_shell_export(path: &Path, name: &str) -> Option<String> {
 }
 
 fn write_bolo_env_value(name: &str, value: &str) -> Result<(), AppError> {
-    let path = home_path(".bolo/env");
+    #[cfg(test)]
+    {
+        let _ = (name, value);
+        Ok(())
+    }
+    #[cfg(not(test))]
+    {
+        write_bolo_env_value_at(&home_path(".bolo/env"), name, value)
+    }
+}
+
+/// Testable core of the env writer, targeted at an explicit path so
+/// persistence tests never touch the real `~/.bolo/env`.
+fn write_bolo_env_value_at(path: &Path, name: &str, value: &str) -> Result<(), AppError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
         #[cfg(unix)]
         fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
     }
-    let mut lines = fs::read_to_string(&path)
+    let mut lines = fs::read_to_string(path)
         .map(|text| text.lines().map(str::to_owned).collect::<Vec<_>>())
         .unwrap_or_default();
     let prefix = format!("{name}=");
@@ -9368,7 +11343,9 @@ fn write_bolo_env_value(name: &str, value: &str) -> Result<(), AppError> {
         lines.push(replacement);
     }
     let tmp = path.with_extension("env.tmp");
-    fs::write(&tmp, format!("{}\n", lines.join("\n")))?;
+    let mut lines_text = lines.join("\n");
+    lines_text.push('\n');
+    fs::write(&tmp, lines_text)?;
     #[cfg(unix)]
     fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))?;
     fs::rename(tmp, path)?;
@@ -9596,7 +11573,10 @@ impl AccessDaemon {
             return Err(AccessDaemonFailure::Io(error));
         }
         let reply = wait_for_daemon_reply(&self.replies, request.timeout())?;
-        serde_json::from_str(&reply).map_err(|_| AccessDaemonFailure::MalformedReply)
+        serde_json::from_str(&reply).map_err(|error| {
+            tracing::debug!("malformed access daemon reply: {error}");
+            AccessDaemonFailure::MalformedReply
+        })
     }
 }
 
@@ -10336,39 +12316,44 @@ mod tests {
         ASSEMBLYAI_STREAMING_MODEL, AccessDaemonFailure, AccessDaemonRequest, AccessibilityContext,
         AccessibilityTrust, App, AppError, AppState, AppWindowPayload, AssemblyDictationResponse,
         AudioHub, BatchRetry, CleanupMode, CleanupProfile, Config, CorrectionOutcome,
-        DictationCommandKind, DictationUploadReader, DictationUploadRelease, DictationWarmup,
-        EditLearningClaim, KeyEntrySpec, LEARNING_UNREADABLE_LINE, LEARNING_WINDOW_ROWS,
-        LearnedVocabulary, OnboardingStatus, PreparedText, PromptBinding, STREAMING_DRAIN_MIN,
-        STT_RETRY_SAMPLE_RATE, StreamingConnectionState, StreamingProvider, StreamingRecording,
-        StreamingText, StreamingTranscript, SttFallback, SttResult, TRANSCRIPT_HISTORY_LIMIT,
-        TextReplacement, TranscriptHistoryEntry, UpdateNotice, UpdateOutcome, WindowRow,
-        accessibility_fix_detail, accessibility_row_detail, apply_text_replacements,
+        DashboardAction, DashboardRequestLine, DictationCommandKind, DictationUploadReader,
+        DictationUploadRelease, DictationWarmup, EditLearningClaim, KeyEntrySpec,
+        LEARNING_UNREADABLE_LINE, LEARNING_WINDOW_ROWS, LaunchRequestAction, LearnedVocabulary,
+        MicrophoneDescriptor, MicrophoneSelection, ONBOARDING_MARKER_VERSION, OnboardingStatus,
+        PreparedText, PromptBinding, STREAMING_DRAIN_MIN, STT_RETRY_SAMPLE_RATE,
+        StreamingConnectionState, StreamingProvider, StreamingRecording, StreamingText,
+        StreamingTranscript, SttFallback, SttResult, TRANSCRIPT_HISTORY_LIMIT, TextReplacement,
+        TranscriptHistoryEntry, UpdateNotice, UpdateOutcome, UsageCounters, WindowRow, WizardSpec,
+        accessibility_fix_detail, apply_text_replacements,
         apply_vocabulary_corrections_with_matches, assemblyai_direct_query_with,
         assemblyai_language_code, batch_retry_plan, build_cleanup_user_content,
         build_rewrite_user_content, build_stt_prompt, canonicalize_known_terms, chunk_samples_for,
-        cleanup_decision, cleanup_max_tokens, cleanup_profile, contains_word_verbatim,
-        derive_word_correction, dictation_upload_config, dictation_upload_form,
-        dictation_upload_release, dictation_upload_request_timeout, downsample_wav_16k_mono,
-        empty_transcript_error, enforce_learned_vocabulary_cap,
-        final_streaming_result_is_ready_elapsed, finalize_accessibility_context,
+        cleanup_decision, cleanup_max_tokens, cleanup_profile, consume_open_dashboard_request_at,
+        contains_word_verbatim, dashboard_accessibility_state, dashboard_cleanup_mode,
+        dashboard_payload, dashboard_provider_label, derive_word_correction,
+        dictation_upload_config, dictation_upload_form, dictation_upload_release,
+        dictation_upload_request_timeout, downsample_wav_16k_mono, empty_transcript_error,
+        enforce_learned_vocabulary_cap, final_streaming_result_is_ready_elapsed,
+        finalize_accessibility_context, handle_dashboard_action, handle_launch_request_for_state,
         handshake_with_deadline, is_known_no_speech_transcript, is_supported_hotkey,
-        key_entry_row_detail, key_entry_spec, learning_window_payload_at, load_learned_vocabulary,
-        load_vocabulary_usage, load_vocabulary_with_learned, microphone_detail,
-        non_empty_transcript, onboarding_provider_key_detail, onboarding_status_at,
-        onboarding_try_it_detail, onboarding_try_it_done_detail, onboarding_try_it_hero,
+        learning_window_payload_at, load_learned_vocabulary, load_usage_counters_at,
+        load_vocabulary_usage, load_vocabulary_with_learned, microphone_labels,
+        non_empty_transcript, normalize_microphone_value, onboarding_status_at,
         parse_accessibility_trust, parse_command, parse_daemon_context_reply,
         parse_daemon_paste_reply, parse_daemon_select_reply, parse_daemon_trust_reply,
         parse_latest_release, parse_release_version, parse_replacements_json, parse_stt_fallbacks,
         parse_u64_env_value, parse_update_outcome, parse_wav_pcm16, pcm_bytes,
         preview_only_streaming, preview_release_stt, read_vocabulary_file,
-        read_vocabulary_usage_file, record_learned_correction, remove_fillers,
-        request_accessibility_daemon, retry_failed_primary, sanitize_transcript_history,
-        speech_stats, stable_streaming_best_is_ready_elapsed, status_rows,
-        streaming_batch_fallback_reason, streaming_connection, streaming_preview_tail,
-        streaming_provider_from_config, streaming_status_label, strip_reasoning_tags,
-        stt_language_for_model, stt_model_config, telnyx_stream_query, transcript_log_value,
-        transcript_menu_preview, upsert_learned_correction, upsert_replacement, version_is_newer,
-        wait_for_daemon_reply, wav_bytes, wav_duration_ms, write_learned_vocabulary_file,
+        read_vocabulary_usage_file, record_learned_correction, reload_is_busy,
+        remove_bolo_env_value_at, remove_fillers, request_accessibility_daemon,
+        resolve_microphone_selection, retry_failed_primary, sanitize_transcript_history,
+        save_usage_counters_at, should_exit_for_key_reload, speech_stats,
+        stable_streaming_best_is_ready_elapsed, status_rows, streaming_batch_fallback_reason,
+        streaming_connection, streaming_preview_tail, streaming_provider_from_config,
+        streaming_status_label, strip_reasoning_tags, stt_language_for_model, stt_model_config,
+        telnyx_stream_query, transcript_log_value, transcript_menu_preview, typed_dashboard_action,
+        upsert_learned_correction, upsert_replacement, version_is_newer, wait_for_daemon_reply,
+        wav_bytes, wav_duration_ms, write_bolo_env_value_at, write_learned_vocabulary_file,
     };
     use std::collections::{HashMap, VecDeque};
     use std::io::Read as _;
@@ -10376,6 +12361,150 @@ mod tests {
     use std::sync::mpsc;
     use std::sync::{Arc, Mutex};
     use std::{env, fs, process};
+
+    #[test]
+    fn consume_open_dashboard_request_staged_paths_only() -> Result<(), AppError> {
+        // The request is consumed exactly once: the staged file is removed
+        // and the second consume reports nothing. Production injects the
+        // real path through the wrapper, so tests never touch the live
+        // ~/.bolo/open-dashboard.request.
+        let dir = env::temp_dir().join(format!("bolo-open-req-{}", process::id()));
+        fs::create_dir_all(&dir)?;
+        let path = dir.join("open-dashboard.request");
+        fs::write(&path, b"1730000000.0")?;
+        assert!(consume_open_dashboard_request_at(&path));
+        assert!(!consume_open_dashboard_request_at(&path));
+        assert!(!path.exists(), "a consumed request must be deleted");
+        // A missing request reports nothing.
+        assert!(!consume_open_dashboard_request_at(&dir.join("absent")));
+        fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn duplicate_open_requests_converge_to_one_consume() -> Result<(), AppError> {
+        // Two launcher clicks both write the same atomic path; only one
+        // consume succeeds, so the runtime opens exactly one dashboard.
+        let dir = env::temp_dir().join(format!(
+            "bolo-open-dup-{}-{}",
+            process::id(),
+            super::unix_time_ms()
+        ));
+        fs::create_dir_all(&dir)?;
+        let path = dir.join("open-dashboard.request");
+        fs::write(&path, b"1")?;
+        fs::write(&path, b"2")?;
+        let consumed_first = consume_open_dashboard_request_at(&path);
+        let consumed_second = consume_open_dashboard_request_at(&path);
+        assert!(
+            consumed_first ^ consumed_second,
+            "exactly one of the duplicate requests may be consumed"
+        );
+        fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn launch_request_policy_prefers_incomplete_onboarding() -> Result<(), AppError> {
+        // A completed marker opens the dashboard; an absent or corrupt
+        // marker defers to the onboarding window that Init opens, so a
+        // launch never stacks the dashboard on top of unfinished setup.
+        let dir = env::temp_dir().join(format!(
+            "bolo-open-policy-{}-{}",
+            process::id(),
+            super::unix_time_ms()
+        ));
+        fs::create_dir_all(&dir)?;
+        let complete = dir.join("onboarding-complete.json");
+        fs::write(
+            &complete,
+            serde_json::to_string(&serde_json::json!({
+                "version": ONBOARDING_MARKER_VERSION,
+                "completed_at_ms": 1_u64,
+            }))?,
+        )?;
+        assert_eq!(
+            handle_launch_request_for_state(onboarding_status_at(&complete)),
+            LaunchRequestAction::OpenDashboard
+        );
+        assert_eq!(
+            handle_launch_request_for_state(onboarding_status_at(&dir.join("missing.json"))),
+            LaunchRequestAction::PreferOnboarding
+        );
+        let corrupt = dir.join("corrupt.json");
+        fs::write(&corrupt, "{not json")?;
+        assert_eq!(
+            handle_launch_request_for_state(onboarding_status_at(&corrupt)),
+            LaunchRequestAction::PreferOnboarding
+        );
+        fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn usage_counters_round_trip_and_increment_once() -> Result<(), AppError> {
+        // Counting starts at zero: a fresh file absence means an empty counter,
+        // and the first dictation stamps started_at_ms.
+        let fresh = UsageCounters::default();
+        assert_eq!(fresh.dictations, 0);
+        assert_eq!(fresh.started_at_ms, 0);
+        let after_first =
+            fresh.record_dictation(UsageCounters::stt_word_count("hello world"), 2_400);
+        assert_eq!(after_first.dictations, 1);
+        assert_eq!(after_first.words, 2);
+        assert_eq!(after_first.recording_ms, 2_400);
+        assert!(after_first.started_at_ms > 0);
+        // started_at_ms is stamped once, not rewritten.
+        let after_second =
+            after_first.record_dictation(UsageCounters::stt_word_count("three more words"), 1_000);
+        assert_eq!(after_second.dictations, 2);
+        assert_eq!(after_second.words, 5);
+        assert_eq!(after_second.recording_ms, 3_400);
+        assert_eq!(after_second.started_at_ms, after_first.started_at_ms);
+        // The file save/reload path must preserve every field so a restart
+        // never resets or double counts, and the atomic write must leave no
+        // temp file behind.
+        let path = temp_usage_counters_path();
+        save_usage_counters_at(&path, after_second)?;
+        assert!(!path.with_extension("json.tmp").exists());
+        let reloaded = load_usage_counters_at(&path);
+        assert_eq!(reloaded, after_second);
+        // A second increment after the reload accumulates, proving the reload
+        // fed real counters rather than a fresh zero.
+        let after_third = reloaded.record_dictation(1, 100);
+        assert_eq!(after_third.dictations, 3);
+        assert_eq!(after_third.words, 6);
+        // A missing file is a fresh zero, never an invented total.
+        let missing = load_usage_counters_at(&env::temp_dir().join("bolo-usage-missing.json"));
+        assert_eq!(missing, UsageCounters::default());
+        drop(fs::remove_file(&path));
+        Ok(())
+    }
+
+    #[test]
+    fn usage_counters_do_not_advance_on_history_operations() -> Result<(), AppError> {
+        // History refreshes, edits, and clear operations must never add to the
+        // cumulative counters; only the dictation pipeline does. A command or
+        // rewrite paste reuses remember_result without the pipeline call, so
+        // the same rule holds there.
+        let app = plain_test_app();
+        let before = app.usage.lock().map(|usage| *usage).unwrap_or_default();
+        app.remember_result("another dictated line", "another dictated line", None)?;
+        let entries = app.history_entries()?;
+        assert!(!entries.is_empty());
+        app.remember_result("edited line", "edited line", None)?;
+        app.clear_transcript_history()?;
+        let after = app.usage.lock().map(|usage| *usage).unwrap_or_default();
+        assert_eq!(after, before, "history operations must not touch usage");
+        Ok(())
+    }
+
+    #[test]
+    fn usage_word_count_uses_whitespace_words() {
+        assert_eq!(UsageCounters::stt_word_count("one two   three\nfour"), 4);
+        assert_eq!(UsageCounters::stt_word_count("   "), 0);
+        assert_eq!(UsageCounters::stt_word_count(""), 0);
+    }
 
     #[test]
     fn parses_max_recording_seconds_env_value() {
@@ -10409,12 +12538,15 @@ mod tests {
         path.push(format!("bolo-onboarding-marker-{}.json", process::id()));
 
         fs::write(&path, r#"{"version":1,"completed_at_ms":123}"#)?;
+        assert_eq!(onboarding_status_at(&path), OnboardingStatus::Corrupt);
+
+        fs::write(&path, r#"{"version":2,"completed_at_ms":123}"#)?;
         assert_eq!(onboarding_status_at(&path), OnboardingStatus::Complete);
 
         fs::write(&path, "not json")?;
         assert_eq!(onboarding_status_at(&path), OnboardingStatus::Corrupt);
 
-        fs::write(&path, r#"{"version":2,"completed_at_ms":123}"#)?;
+        fs::write(&path, r#"{"version":3,"completed_at_ms":123}"#)?;
         assert_eq!(onboarding_status_at(&path), OnboardingStatus::Corrupt);
 
         fs::write(&path, "")?;
@@ -10423,6 +12555,52 @@ mod tests {
         fs::remove_file(&path)?;
         assert_eq!(onboarding_status_at(&path), OnboardingStatus::Needed);
         Ok(())
+    }
+
+    #[test]
+    fn key_reload_waits_for_idle_runtime() {
+        // Idle base state: no active recording, no insert watch, no
+        // pipeline job.
+        let idle = AppState::default_test_state();
+        assert!(!reload_is_busy(&idle));
+        assert!(should_exit_for_key_reload(&idle, true, true, false));
+
+        // An in-flight post-insert watch blocks the reload.
+        let inserting = AppState::default_test_state().with_post_insert_watch();
+        assert!(reload_is_busy(&inserting));
+        assert!(!should_exit_for_key_reload(&inserting, true, true, false));
+
+        // Pipeline jobs: the window between taking the active recording
+        // and the bolo-pipeline thread finishing reads active=None, so
+        // only the counter keeps the reload honest. One job blocks.
+        let one_job = AppState::default_test_state().with_processing_jobs(1);
+        assert!(reload_is_busy(&one_job));
+        assert!(!should_exit_for_key_reload(&one_job, true, true, false));
+
+        // Multiple overlapping jobs (rapid dictations) also block.
+        let many_jobs = AppState::default_test_state().with_processing_jobs(3);
+        assert!(reload_is_busy(&many_jobs));
+        assert!(!should_exit_for_key_reload(&many_jobs, true, true, false));
+
+        // Jobs drained back to zero free the gate again.
+        let drained = AppState::default_test_state().with_processing_jobs(0);
+        assert!(!reload_is_busy(&drained));
+        assert!(should_exit_for_key_reload(&drained, true, true, false));
+
+        // A job count plus an insert watch still blocks.
+        let combined = AppState::default_test_state()
+            .with_post_insert_watch()
+            .with_processing_jobs(1);
+        assert!(reload_is_busy(&combined));
+
+        // No key on disk, or no pending onboarding key: never exit.
+        assert!(!should_exit_for_key_reload(&idle, false, true, false));
+        assert!(!should_exit_for_key_reload(&idle, true, false, false));
+
+        // The window still running (including a probe error mapped to
+        // running) blocks the exit, so a flaky window probe cannot
+        // restart Bolo in a loop. An absent window (false) frees it.
+        assert!(!should_exit_for_key_reload(&idle, true, true, true));
     }
 
     #[test]
@@ -10443,36 +12621,6 @@ mod tests {
     }
 
     #[test]
-    fn onboarding_provider_key_row_names_the_exact_missing_var() {
-        // The missing AssemblyAI key gets the in-window entry field instead
-        // of a file instruction, with a plain one-line ask.
-        assert_eq!(
-            onboarding_provider_key_detail(Some("ASSEMBLYAI_API_KEY")),
-            "Paste your AssemblyAI API key."
-        );
-        assert_eq!(
-            onboarding_provider_key_detail(Some("TELNYX_API_KEY")),
-            "Missing TELNYX_API_KEY. Add it to ~/.bolo/env, then run ./restart.sh."
-        );
-        assert_eq!(
-            onboarding_provider_key_detail(None),
-            "Connected to AssemblyAI."
-        );
-    }
-
-    #[test]
-    fn onboarding_details_use_human_hotkey_names() {
-        assert_eq!(
-            onboarding_try_it_detail("right_option"),
-            "Hold Right Option and say a sentence."
-        );
-        assert_eq!(
-            onboarding_try_it_detail("f5"),
-            "Hold F5 and say a sentence."
-        );
-    }
-
-    #[test]
     fn accessibility_fix_names_the_interpreter_and_restart_from_source() {
         let detail = accessibility_fix_detail(false, "/Users/demo/.bolo/venv/bin/python3");
         assert!(detail.contains("System Settings > Privacy & Security > Accessibility"));
@@ -10489,18 +12637,6 @@ mod tests {
     }
 
     #[test]
-    fn accessibility_row_detail_points_at_the_button_per_mode() {
-        assert_eq!(
-            accessibility_row_detail(true, "/Users/demo/.bolo/venv/bin/python3"),
-            "Bolo needs Accessibility to type for you. Click the button, then \
-             enable Bolo in the list."
-        );
-        let source = accessibility_row_detail(false, "/Users/demo/.bolo/venv/bin/python3");
-        assert!(source.contains("Click the button"));
-        assert!(source.contains("/Users/demo/.bolo/venv/bin/python3"));
-    }
-
-    #[test]
     fn window_rows_serialize_the_action_only_when_present() -> Result<(), serde_json::Error> {
         let plain = serde_json::to_string(&WindowRow::new(
             "Accessibility",
@@ -10509,12 +12645,12 @@ mod tests {
         ))?;
         assert!(!plain.contains("action"));
 
-        let button = serde_json::to_string(
-            &WindowRow::new("Accessibility", String::from("Enable Bolo."), "warn").open_settings(),
-        )?;
-        assert!(button.contains(
-            "\"action\":{\"kind\":\"open_settings\",\"title\":\"Open Accessibility Settings\"}"
-        ));
+        let button = serde_json::to_string(&WindowRow::new(
+            "Accessibility",
+            String::from("Enable Bolo."),
+            "warn",
+        ))?;
+        assert!(!button.contains("action"));
         Ok(())
     }
 
@@ -10556,12 +12692,12 @@ mod tests {
     }
 
     #[test]
-    fn parse_latest_release_keeps_tag_and_url() {
+    fn parse_latest_release_keeps_tag_and_url() -> Result<(), Box<dyn std::error::Error>> {
         let payload = serde_json::json!({
             "tag_name": "v1.7.0",
             "html_url": "https://github.com/a692570/bolo/releases/tag/v1.7.0"
         });
-        let notice = parse_latest_release(&payload).expect("notice");
+        let notice = parse_latest_release(&payload).ok_or("notice")?;
         assert_eq!(notice.version, "1.7.0");
         assert_eq!(
             notice.url,
@@ -10571,10 +12707,12 @@ mod tests {
         // Missing fields or odd tags yield nothing.
         assert!(parse_latest_release(&serde_json::json!({})).is_none());
         assert!(parse_latest_release(&serde_json::json!({"tag_name": "v"})).is_none());
+        Ok(())
     }
 
     #[test]
-    fn app_window_payload_serializes_key_entry_only_when_present() {
+    fn app_window_payload_serializes_key_entry_only_when_present()
+    -> Result<(), Box<dyn std::error::Error>> {
         let rows = vec![WindowRow::new(
             "Speech to text",
             String::from("missing"),
@@ -10595,8 +12733,9 @@ mod tests {
             }),
             write_marker: true,
             learning: None,
+            wizard: None,
         };
-        let json = serde_json::to_string(&payload).expect("payload json");
+        let json = serde_json::to_string(&payload)?;
         assert!(json.contains("\"key_entry\":{\"index\":2"));
         assert!(json.contains("\"write_marker\":true"));
         assert!(!json.contains("\"try_it_index\""));
@@ -10604,59 +12743,76 @@ mod tests {
         assert!(!json.contains("\"try_it_hero\""));
 
         payload.key_entry = None;
-        let json_without_entry = serde_json::to_string(&payload).expect("payload json");
+        let json_without_entry = serde_json::to_string(&payload)?;
         assert!(!json_without_entry.contains("key_entry"));
+        Ok(())
     }
 
     #[test]
-    fn key_entry_spec_shows_only_for_missing_assemblyai_key() {
-        let spec = key_entry_spec(Some("ASSEMBLYAI_API_KEY")).expect("spec");
-        assert_eq!(spec.index, 2);
-        assert_eq!(spec.placeholder, "Paste your AssemblyAI API key");
-        assert!(key_entry_spec(Some("TELNYX_API_KEY")).is_none());
-        assert!(key_entry_spec(None).is_none());
+    fn onboarding_wizard_payload_reports_runtime_facts() -> Result<(), Box<dyn std::error::Error>> {
+        let payload = AppWindowPayload {
+            mode: String::from("onboarding"),
+            title: String::from("Set up Bolo"),
+            welcome: String::new(),
+            brand: Some(String::from("BOLO")),
+            rows: Vec::new(),
+            button: String::from("Continue"),
+            try_it_index: None,
+            try_it_hero: None,
+            key_entry: None,
+            write_marker: true,
+            learning: None,
+            wizard: Some(WizardSpec {
+                key_missing: true,
+                accessibility_state: String::from("warn"),
+                microphones: 2,
+                hotkey: String::from("left_option"),
+            }),
+        };
+        let json = serde_json::to_string(&payload)?;
+        assert!(json.contains("\"wizard\":{\"key_missing\":true"));
+        assert!(json.contains("\"accessibility_state\":\"warn\""));
+        assert!(json.contains("\"microphones\":2"));
+        assert!(json.contains("\"write_marker\":true"));
+        // The helper renders every wizard screen from the wizard facts, so
+        // the payload carries no pre-rendered rows.
+        let parsed: serde_json::Value = serde_json::from_str(&json)?;
+        let rows = parsed
+            .get("rows")
+            .and_then(serde_json::Value::as_array)
+            .ok_or("rows array")?;
+        assert!(rows.is_empty());
+        Ok(())
     }
 
     #[test]
-    fn onboarding_provider_key_detail_switches_for_key_entry() {
-        assert!(onboarding_provider_key_detail(Some("ASSEMBLYAI_API_KEY")).contains("Paste"));
-        assert_eq!(
-            onboarding_provider_key_detail(Some("TELNYX_API_KEY")),
-            "Missing TELNYX_API_KEY. Add it to ~/.bolo/env, then run ./restart.sh."
-        );
-        assert_eq!(
-            onboarding_provider_key_detail(None),
-            "Connected to AssemblyAI."
-        );
-    }
-
-    #[test]
-    fn key_entry_row_detail_is_the_plain_paste_line() {
-        assert_eq!(key_entry_row_detail(), "Paste your AssemblyAI API key.");
-    }
-
-    #[test]
-    fn onboarding_try_it_lines_cover_hero_and_done() {
-        assert_eq!(
-            onboarding_try_it_detail("left_option"),
-            "Hold Left Option and say a sentence."
-        );
-        let hero = onboarding_try_it_hero("left_option");
+    fn onboarding_provider_picks_pin_models_the_runtime_resolves()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // The onboarding picker writes each provider's key variable and
+        // pins BOLO_STT_MODEL to the provider's model so the resolved
+        // pipeline follows the choice. These exact strings are the
+        // cross-language contract; a drift in either file breaks the
+        // pipeline silently, so this test pins them against app_window.py.
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        let source_path = std::path::Path::new(manifest).join("app_window.py");
+        let source = fs::read_to_string(&source_path)?;
         assert!(
-            hero.starts_with("Hold Left Option and say a sentence. This window will stay open")
+            source.contains("\"assemblyai\": \"assemblyai/universal-3-5-pro\""),
+            "picker must pin the AssemblyAI dictation model"
         );
-        assert!(hero.contains("the dot turns green when you're done."));
-        assert_eq!(
-            onboarding_try_it_done_detail(),
-            "First dictation captured. You're set."
+        assert!(
+            source.contains("\"telnyx\": \"deepgram/nova-3\""),
+            "picker must pin the Telnyx-hosted Deepgram model"
         );
-    }
-
-    #[test]
-    fn microphone_detail_reports_counts_and_fix() {
-        assert!(microphone_detail(0).starts_with("No microphone found."));
-        assert_eq!(microphone_detail(1), "1 microphone found.");
-        assert_eq!(microphone_detail(3), "3 microphones found.");
+        assert!(
+            source.contains("\"assemblyai\": \"ASSEMBLYAI_API_KEY\""),
+            "picker must write the AssemblyAI key variable"
+        );
+        assert!(
+            source.contains("\"telnyx\": \"TELNYX_API_KEY\""),
+            "picker must write the Telnyx key variable"
+        );
+        Ok(())
     }
 
     #[test]
@@ -11346,6 +13502,7 @@ mod tests {
                 "openai/whisper-large-v3-turbo",
             ))],
             microphone: None,
+            microphone_id: None,
             replacements: Vec::new(),
             root_dir: PathBuf::new(),
             hotkey: String::from("right_option"),
@@ -11387,6 +13544,7 @@ mod tests {
             streaming_stt: None,
             stt_fallbacks: Vec::new(),
             microphone: None,
+            microphone_id: None,
             replacements: Vec::new(),
             root_dir: PathBuf::new(),
             hotkey: String::from("right_option"),
@@ -11420,6 +13578,7 @@ mod tests {
             streaming_stt: None,
             stt_fallbacks: Vec::new(),
             microphone: None,
+            microphone_id: None,
             replacements: Vec::new(),
             root_dir: PathBuf::new(),
             hotkey: String::from("right_option"),
@@ -11583,6 +13742,7 @@ mod tests {
             streaming_stt,
             stt_fallbacks,
             microphone: None,
+            microphone_id: None,
             replacements: Vec::new(),
             root_dir: PathBuf::new(),
             hotkey: String::from("right_option"),
@@ -12052,6 +14212,244 @@ mod tests {
     }
 
     #[test]
+    fn trailing_weak_band_from_the_measured_slow_cases_stops_promptly() {
+        // Live slow cases (2026-10-01) released at 0.00210-0.00372 RMS against
+        // floors of 0.00142-0.00176, and sustained energy in that band held
+        // capture to the 1506-1524ms cap for a 2112-2171ms total. Each
+        // (floor, release) pair with the floor-relative bar (floor x 1.413)
+        // now lands in the weak band and gets the bounded stop instead. The
+        // boundary is heuristic; this test pins the two measured inputs only.
+        for (floor, release) in [
+            (0.001_421_8_f32, 0.002_102_2),
+            (0.001_826_1_f32, 0.003_003_8),
+            (0.001_760_7_f32, 0.003_717_6),
+        ] {
+            let bar =
+                (floor * super::TRAILING_FLOOR_MARGIN).max(super::TRAILING_SPEECH_RMS_THRESHOLD);
+            // The measured releases sit in the weak band, not above it.
+            assert!(release >= bar, "release {release} must reach the bar {bar}");
+            assert!(
+                release < bar * super::TRAILING_WEAK_SPEECH_RATIO,
+                "release {release} must be in the weak band under bar x ratio"
+            );
+            let mut capture = super::TrailingCapture::new(bar);
+            let frame = std::time::Duration::from_millis(20);
+            let mut decision = super::TrailingDecision::KeepListening;
+            let mut frames = 0;
+            while decision == super::TrailingDecision::KeepListening && frames < 100 {
+                decision = capture.observe(release, frame);
+                frames += 1;
+            }
+            assert_eq!(
+                decision,
+                super::TrailingDecision::Stop("weak_activity"),
+                "sustained weak-band energy must stop with the weak_activity reason"
+            );
+            let waited = frame.saturating_mul(frames);
+            assert!(
+                waited >= std::time::Duration::from_millis(250),
+                "weak-band energy must get its bounded window, waited {waited:?}"
+            );
+            assert!(
+                waited <= std::time::Duration::from_millis(400),
+                "weak-band energy must stop promptly, waited {waited:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn trailing_strong_continuing_speech_keeps_the_full_hard_cap() {
+        // Anything at or above the heuristic boundary (bar x 3) keeps the
+        // previous behavior: the tail stays open to the existing hard cap and
+        // stops only with the cap reason. The level here is only "clearly
+        // above the bar"; no speech/noise claim is made beyond that.
+        let bar = 0.002_009_f32;
+        let above_boundary = bar * super::TRAILING_WEAK_SPEECH_RATIO;
+        let mut capture = super::TrailingCapture::new(bar);
+        let step = std::time::Duration::from_millis(50);
+        let mut decision = super::TrailingDecision::KeepListening;
+        for _ in 0..30 {
+            decision = capture.observe(above_boundary, step);
+        }
+        assert_eq!(
+            decision,
+            super::TrailingDecision::Stop("cap"),
+            "above-boundary energy must still run to the hard cap"
+        );
+        // Exactly at the boundary is included, matching the >= semantics that
+        // preserve the hard cap for the strongest tail levels.
+        let mut capture = super::TrailingCapture::new(bar);
+        let mut decision = super::TrailingDecision::KeepListening;
+        for _ in 0..30 {
+            decision = capture.observe(above_boundary * 2.0, step);
+        }
+        assert_eq!(decision, super::TrailingDecision::Stop("cap"));
+    }
+
+    #[test]
+    fn trailing_fading_syllable_is_retained_through_genuine_quiet() {
+        // A short burst above the boundary, then energy fading through the
+        // weak band, then below the bar: this sequence must not trip the weak
+        // stop early, and quiet still ends it with the existing reason. The
+        // labels are about band membership, not speech identification.
+        let mut capture = super::TrailingCapture::new(0.002_580_3);
+        let frame = std::time::Duration::from_millis(20);
+        // 120ms above the boundary.
+        for _ in 0..6 {
+            assert_eq!(
+                capture.observe(0.02, frame),
+                super::TrailingDecision::KeepListening
+            );
+        }
+        // 160ms fading through the weak band, under the 300ms bound.
+        for _ in 0..8 {
+            assert_eq!(
+                capture.observe(0.0035, frame),
+                super::TrailingDecision::KeepListening
+            );
+        }
+        // Genuine quiet finishes the tail: 250ms of it at 20ms frames, so
+        // twelve quiet frames still listen and the thirteenth stops.
+        for index in 0..13 {
+            let decision = capture.observe(0.0004, frame);
+            if index < 12 {
+                assert_eq!(decision, super::TrailingDecision::KeepListening);
+            } else {
+                assert_eq!(decision, super::TrailingDecision::Stop("quiet"));
+            }
+        }
+    }
+
+    #[test]
+    fn trailing_noisy_room_fallback_still_declines_or_sets_the_bar() {
+        // The noisy-room paths are unchanged: a room that drowns every bar
+        // still declines (room_too_loud, 0ms), and a merely noisy room still
+        // settles immediately because the release reads below the bar.
+        assert_eq!(
+            super::trailing_stop_threshold(Some(0.014_798), 0.057_638),
+            None
+        );
+        let threshold =
+            super::trailing_stop_threshold(Some(0.004_228), 0.031_196).unwrap_or_default();
+        assert!(0.004_228 < threshold);
+        assert!(threshold <= super::TRAILING_RELATIVE_CAP);
+    }
+
+    #[test]
+    fn trailing_alternating_ambient_around_the_bar_stops_promptly() {
+        // The alternating shape the reviewer flagged: ambient that flips
+        // every 20-40ms between just below and just above the stop bar used
+        // to reset the quiet timer on every weak frame while never holding
+        // quiet long enough to stop, so the loop ran to the 1500ms cap. The
+        // since_clear clock advances across both frame kinds, so the bounded
+        // weak_activity stop fires instead, on every measured bar.
+        for (floor, release) in [
+            (0.001_421_8_f32, 0.002_102_2),
+            (0.001_826_1_f32, 0.003_003_8),
+            (0.001_760_7_f32, 0.003_717_6),
+        ] {
+            let bar =
+                (floor * super::TRAILING_FLOOR_MARGIN).max(super::TRAILING_SPEECH_RMS_THRESHOLD);
+            let below = bar * 0.8;
+            let mut capture = super::TrailingCapture::new(bar);
+            let frame = std::time::Duration::from_millis(20);
+            // Alternate below/above every frame: 20ms flips, the fastest
+            // shape that keeps both timers from ever winning on their own.
+            let mut decision = super::TrailingDecision::KeepListening;
+            let mut frames = 0;
+            while decision == super::TrailingDecision::KeepListening && frames < 200 {
+                decision = capture.observe(if frames % 2 == 0 { below } else { release }, frame);
+                frames += 1;
+            }
+            assert_eq!(
+                decision,
+                super::TrailingDecision::Stop("weak_activity"),
+                "alternating ambient around bar {bar} must stop with weak_activity"
+            );
+            let waited = frame.saturating_mul(frames);
+            assert!(
+                waited <= std::time::Duration::from_millis(400),
+                "alternating ambient must stop promptly, waited {waited:?}"
+            );
+            // A slower 40ms alternation must hit the same bound.
+            let mut capture = super::TrailingCapture::new(bar);
+            let mut decision = super::TrailingDecision::KeepListening;
+            let mut frames = 0;
+            while decision == super::TrailingDecision::KeepListening && frames < 200 {
+                // Two frames low, two frames high: a 40ms flip.
+                let level = if (frames / 2) % 2 == 0 {
+                    below
+                } else {
+                    release
+                };
+                decision = capture.observe(level, frame);
+                frames += 1;
+            }
+            assert_eq!(decision, super::TrailingDecision::Stop("weak_activity"));
+        }
+    }
+
+    #[test]
+    fn trailing_late_strong_syllable_resets_the_bounded_window() {
+        // A strong syllable arriving inside the bounded window resets
+        // since_clear, so a fading tail that ends with real energy is never
+        // cut by the weak_activity stop: the strong reset plus sustained
+        // quiet still ends with the quiet reason, and a strong tail that
+        // keeps going still reaches the hard cap.
+        let bar = 0.002_009_f32;
+        let mut capture = super::TrailingCapture::new(bar);
+        let frame = std::time::Duration::from_millis(20);
+        // 200ms of weak-band energy, almost to the bound.
+        for _ in 0..10 {
+            assert_eq!(
+                capture.observe(0.0028, frame),
+                super::TrailingDecision::KeepListening
+            );
+        }
+        // A strong moment resets the window.
+        assert_eq!(
+            capture.observe(bar * super::TRAILING_WEAK_SPEECH_RATIO, frame),
+            super::TrailingDecision::KeepListening
+        );
+        // Another 200ms of weak-band energy: no stop yet, the reset held.
+        for _ in 0..10 {
+            assert_eq!(
+                capture.observe(0.0028, frame),
+                super::TrailingDecision::KeepListening
+            );
+        }
+        // Sustained quiet still ends it with the quiet reason.
+        for index in 0..13 {
+            let decision = capture.observe(0.0004, frame);
+            if index < 12 {
+                assert_eq!(decision, super::TrailingDecision::KeepListening);
+            } else {
+                assert_eq!(decision, super::TrailingDecision::Stop("quiet"));
+            }
+        }
+    }
+
+    #[test]
+    fn trailing_capture_stops_at_a_bounded_weak_activity_window() {
+        // Exactly the bound: the frame that reaches 300ms of unbroken weak
+        // energy stops with the new reason, well under the 1500ms cap.
+        let mut capture = super::TrailingCapture::new(0.002_009);
+        let frame = std::time::Duration::from_millis(20);
+        let mut decision = super::TrailingDecision::KeepListening;
+        let mut frames = 0;
+        while decision == super::TrailingDecision::KeepListening {
+            decision = capture.observe(0.002_8, frame);
+            frames += 1;
+            assert!(frames < 200, "weak activity must stop within the bound");
+        }
+        assert_eq!(decision, super::TrailingDecision::Stop("weak_activity"));
+        assert_eq!(
+            frame.saturating_mul(frames),
+            super::TRAILING_WEAK_ACTIVITY_STOP
+        );
+    }
+
+    #[test]
     fn trailing_capture_resets_the_quiet_timer_when_speech_returns() {
         let mut capture = super::TrailingCapture::new(0.008);
         let step = std::time::Duration::from_millis(100);
@@ -12375,6 +14773,99 @@ mod tests {
         );
     }
 
+    #[test]
+    fn microphone_catalog_stays_readable_during_blocked_scan()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let catalog = super::MicrophoneCatalog::with_discovery(Arc::new(move || {
+            started_tx
+                .send(())
+                .map_err(|error| AppError::AudioStream(error.to_string()))?;
+            release_rx
+                .lock()
+                .map_err(|error| AppError::PoisonedMutex(error.to_string()))?
+                .recv_timeout(Duration::from_secs(5))
+                .map_err(|error| AppError::AudioStream(error.to_string()))?;
+            Ok(super::MicrophoneSnapshot {
+                descriptors: vec![MicrophoneDescriptor::new(
+                    "Test microphone",
+                    Some("test-uid".to_owned()),
+                )],
+                default_id: Some("test-uid".to_owned()),
+                ready: true,
+            })
+        }));
+        let worker = catalog.request_refresh().ok_or("scan was not started")?;
+        let started = started_rx.recv_timeout(Duration::from_secs(1));
+        let before = Instant::now();
+        let pending = catalog.snapshot();
+        let read_duration = before.elapsed();
+        let second = catalog.request_refresh();
+        let coalesced = second.is_none();
+        let released = release_tx.send(());
+        worker
+            .join()
+            .map_err(|panic_payload| format!("scan worker panicked: {panic_payload:?}"))?;
+        if let Some(second) = second {
+            second.join().map_err(|panic_payload| {
+                format!("second scan worker panicked: {panic_payload:?}")
+            })?;
+        }
+        started?;
+        released?;
+        assert!(
+            read_duration < Duration::from_millis(100),
+            "cached read waited for discovery"
+        );
+        assert!(!pending.ready);
+        assert!(pending.descriptors.is_empty());
+        assert!(coalesced, "blocked scan spawned another worker");
+        let completed = catalog.snapshot();
+        assert!(completed.ready);
+        assert_eq!(completed.default_id.as_deref(), Some("test-uid"));
+        assert_eq!(completed.descriptors.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn microphone_catalog_keeps_devices_after_failed_refresh()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = AtomicUsize::new(0);
+        let catalog = super::MicrophoneCatalog::with_discovery(Arc::new(move || {
+            if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                Ok(super::MicrophoneSnapshot {
+                    descriptors: vec![MicrophoneDescriptor::new(
+                        "Test microphone",
+                        Some("test-uid".to_owned()),
+                    )],
+                    default_id: Some("test-uid".to_owned()),
+                    ready: true,
+                })
+            } else {
+                Err(AppError::MissingAudioDevice)
+            }
+        }));
+        catalog
+            .request_refresh()
+            .ok_or("first scan was not started")?
+            .join()
+            .map_err(|panic_payload| format!("first scan worker panicked: {panic_payload:?}"))?;
+        let successful = catalog.snapshot();
+        catalog
+            .request_refresh()
+            .ok_or("refresh was not started")?
+            .join()
+            .map_err(|panic_payload| format!("refresh worker panicked: {panic_payload:?}"))?;
+        assert_eq!(catalog.snapshot(), successful);
+        assert!(successful.ready);
+        Ok(())
+    }
+
     fn temp_vocabulary_usage_path() -> PathBuf {
         static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -12400,6 +14891,7 @@ mod tests {
                 streaming_stt: None,
                 stt_fallbacks: Vec::new(),
                 microphone: None,
+                microphone_id: None,
                 replacements: Vec::new(),
                 root_dir: PathBuf::new(),
                 hotkey: String::from("right_option"),
@@ -12418,6 +14910,8 @@ mod tests {
             vocabulary_usage: Mutex::new(usage),
             vocabulary_usage_path: usage_path.clone(),
             state: Mutex::new(AppState::default()),
+            usage: Mutex::new(UsageCounters::default()),
+            dashboard_restart_pending: Mutex::new(false),
             event_proxy: Mutex::new(None),
         };
         (app, usage_path)
@@ -12437,6 +14931,7 @@ mod tests {
                 streaming_stt: None,
                 stt_fallbacks: Vec::new(),
                 microphone: None,
+                microphone_id: None,
                 replacements: Vec::new(),
                 root_dir: PathBuf::new(),
                 hotkey: String::from("right_option"),
@@ -12455,6 +14950,8 @@ mod tests {
             vocabulary_usage: Mutex::new(HashMap::new()),
             vocabulary_usage_path: temp_vocabulary_usage_path(),
             state: Mutex::new(AppState::default()),
+            usage: Mutex::new(UsageCounters::default()),
+            dashboard_restart_pending: Mutex::new(false),
             event_proxy: Mutex::new(None),
         };
 
@@ -12480,6 +14977,7 @@ mod tests {
                 streaming_stt: None,
                 stt_fallbacks: Vec::new(),
                 microphone: None,
+                microphone_id: None,
                 replacements: Vec::new(),
                 root_dir: PathBuf::new(),
                 hotkey: String::from("right_option"),
@@ -12498,6 +14996,8 @@ mod tests {
             vocabulary_usage: Mutex::new(HashMap::new()),
             vocabulary_usage_path: temp_vocabulary_usage_path(),
             state: Mutex::new(AppState::default()),
+            usage: Mutex::new(UsageCounters::default()),
+            dashboard_restart_pending: Mutex::new(false),
             event_proxy: Mutex::new(None),
         };
 
@@ -12540,6 +15040,7 @@ mod tests {
                 streaming_stt: None,
                 stt_fallbacks: Vec::new(),
                 microphone: None,
+                microphone_id: None,
                 replacements: vec![TextReplacement {
                     spoken: String::from("ship"),
                     replacement: String::from("send"),
@@ -12561,6 +15062,8 @@ mod tests {
             vocabulary_usage: Mutex::new(HashMap::new()),
             vocabulary_usage_path: temp_vocabulary_usage_path(),
             state: Mutex::new(AppState::default()),
+            usage: Mutex::new(UsageCounters::default()),
+            dashboard_restart_pending: Mutex::new(false),
             event_proxy: Mutex::new(None),
         };
 
@@ -12591,6 +15094,7 @@ mod tests {
                 streaming_stt: None,
                 stt_fallbacks: Vec::new(),
                 microphone: None,
+                microphone_id: None,
                 replacements: Vec::new(),
                 root_dir: PathBuf::new(),
                 hotkey: String::from("right_option"),
@@ -12609,6 +15113,8 @@ mod tests {
             vocabulary_usage: Mutex::new(HashMap::new()),
             vocabulary_usage_path: temp_vocabulary_usage_path(),
             state: Mutex::new(AppState::default()),
+            usage: Mutex::new(UsageCounters::default()),
+            dashboard_restart_pending: Mutex::new(false),
             event_proxy: Mutex::new(None),
         };
 
@@ -12646,6 +15152,7 @@ mod tests {
                 streaming_stt: None,
                 stt_fallbacks: Vec::new(),
                 microphone: None,
+                microphone_id: None,
                 replacements: vec![TextReplacement {
                     spoken: String::from("ship"),
                     replacement: String::from("send"),
@@ -12670,8 +15177,406 @@ mod tests {
             vocabulary_usage: Mutex::new(HashMap::new()),
             vocabulary_usage_path: temp_vocabulary_usage_path(),
             state: Mutex::new(AppState::default()),
+            usage: Mutex::new(UsageCounters::default()),
+            dashboard_restart_pending: Mutex::new(false),
             event_proxy: Mutex::new(None),
         }
+    }
+
+    /// An App with no keys and no learned data, for tests that only exercise
+    /// state-level behavior such as history and usage counters.
+    fn plain_test_app() -> App {
+        provider_cleanup_test_app(CleanupMode::Auto)
+    }
+
+    // ---- Microphone reliability: stable-ID selection, legacy migration,
+    // and default fallback, all on fake descriptors so no hardware is
+    // needed.
+
+    fn mic(name: &str, id: Option<&str>) -> MicrophoneDescriptor {
+        MicrophoneDescriptor::new(name, id.map(str::to_owned))
+    }
+
+    #[test]
+    fn saved_uid_wins_over_same_name_device() {
+        // A stable UID must always bind the exact device it names, even
+        // when another device shares the display name.
+        let devices = vec![
+            mic("Studio Mic", Some("uid-a")),
+            mic("Studio Mic", Some("uid-b")),
+        ];
+        let selection = resolve_microphone_selection(Some("uid-b"), Some("Studio Mic"), &devices);
+        assert_eq!(
+            selection,
+            MicrophoneSelection::Device(mic("Studio Mic", Some("uid-b")))
+        );
+    }
+
+    #[test]
+    fn missing_uid_falls_back_to_default_not_same_name() {
+        // The saved UID is gone: even though a same-NAMED device exists,
+        // it must never silently take over.
+        let devices = vec![mic("Studio Mic", Some("uid-a"))];
+        let selection =
+            resolve_microphone_selection(Some("uid-gone"), Some("Studio Mic"), &devices);
+        assert_eq!(selection, MicrophoneSelection::SystemDefault);
+    }
+
+    #[test]
+    fn legacy_name_migrates_only_when_unique() {
+        // Exact unique name resolves.
+        let devices = vec![
+            mic("MacBook Pro Microphone", Some("uid-mb")),
+            mic("Studio Mic", Some("uid-st")),
+        ];
+        let selection = resolve_microphone_selection(None, Some("Studio Mic"), &devices);
+        assert_eq!(
+            selection,
+            MicrophoneSelection::Device(mic("Studio Mic", Some("uid-st")))
+        );
+        // Unique substring resolves too.
+        let selection = resolve_microphone_selection(None, Some("studio"), &devices);
+        assert_eq!(
+            selection,
+            MicrophoneSelection::Device(mic("Studio Mic", Some("uid-st")))
+        );
+        // Ambiguous substring stays default.
+        let selection = resolve_microphone_selection(None, Some("mic"), &devices);
+        assert_eq!(selection, MicrophoneSelection::SystemDefault);
+    }
+
+    #[test]
+    fn ambiguous_exact_name_is_default_never_first_row() {
+        // Two devices with the identical name: the legacy config must
+        // NOT bind the arbitrary first row.
+        let devices = vec![mic("AirPods", Some("uid-1")), mic("AirPods", Some("uid-2"))];
+        let selection = resolve_microphone_selection(None, Some("AirPods"), &devices);
+        assert_eq!(selection, MicrophoneSelection::SystemDefault);
+    }
+
+    #[test]
+    fn no_selection_is_system_default() {
+        let devices = vec![mic("Any Mic", Some("uid-1"))];
+        let selection = resolve_microphone_selection(None, None, &devices);
+        assert_eq!(selection, MicrophoneSelection::SystemDefault);
+    }
+
+    #[test]
+    fn duplicate_names_get_unique_labels() {
+        let devices = vec![
+            mic("AirPods", Some("uid-1")),
+            mic("AirPods", Some("uid-2")),
+            mic("Studio", Some("uid-3")),
+        ];
+        let labels = microphone_labels(&devices);
+        assert_eq!(labels[0], "AirPods (1)");
+        assert_eq!(labels[1], "AirPods (2)");
+        assert_eq!(labels[2], "Studio");
+    }
+
+    #[test]
+    fn dashboard_wire_value_round_trips_through_normalize() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let devices = vec![
+            mic("Studio Mic", Some("uid-st")),
+            mic("Studio Mic", Some("uid-st2")),
+        ];
+        // uid: values hit the exact device.
+        let resolved = normalize_microphone_value("uid:uid-st2", &devices)?;
+        assert_eq!(
+            resolved,
+            MicrophoneSelection::Device(mic("Studio Mic", Some("uid-st2")))
+        );
+        // "default" clears.
+        assert_eq!(
+            normalize_microphone_value("default", &devices)?,
+            MicrophoneSelection::SystemDefault
+        );
+        // A legacy duplicate plain name is rejected as ambiguous.
+        assert!(normalize_microphone_value("Studio Mic", &devices).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn clearing_microphone_does_not_resurrect_startup_uid() -> Result<(), Box<dyn std::error::Error>>
+    {
+        // Config carries a persisted UID; the user clears to System
+        // Default; the getter must read None, not the startup value.
+        let mut app = plain_test_app();
+        app.config.microphone_id = Some(String::from("uid-startup"));
+        app.config.microphone = Some(String::from("Startup Mic"));
+        {
+            let mut state = app
+                .state
+                .lock()
+                .map_err(|error| AppError::PoisonedMutex(error.to_string()))?;
+            state.selected_microphone_id = Some(String::from("uid-startup"));
+            state.selected_microphone = Some(String::from("Startup Mic"));
+        }
+        assert_eq!(
+            app.selected_microphone_id()?,
+            Some(String::from("uid-startup"))
+        );
+        // The state clear must hold regardless of the env write result:
+        // a bare CI HOME may have no ~/.bolo/env, and a missing file is
+        // the only acceptable write failure because nothing was stored.
+        let clear_result = app.clear_microphone();
+        assert_eq!(app.selected_microphone_id()?, None);
+        assert_eq!(app.selected_microphone()?, None);
+        if let Err(error) = &clear_result {
+            assert!(
+                matches!(error, AppError::Io(e) if e.kind() == std::io::ErrorKind::NotFound),
+                "unexpected clear failure: {error}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_set_microphone_clears_stale_uid() -> Result<(), Box<dyn std::error::Error>> {
+        // Choosing by legacy name must drop any previously stored UID:
+        // the old ID can never override the fresh pick at press time.
+        let app = plain_test_app();
+        {
+            let mut state = app
+                .state
+                .lock()
+                .map_err(|error| AppError::PoisonedMutex(error.to_string()))?;
+            state.selected_microphone_id = Some(String::from("uid-old"));
+        }
+        app.set_microphone("Fresh Mic")?;
+        assert_eq!(app.selected_microphone_id()?, None);
+        assert_eq!(app.selected_microphone()?, Some(String::from("Fresh Mic")));
+        Ok(())
+    }
+
+    #[test]
+    fn microphone_env_persistence_round_trip_on_isolated_path()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // The env writer/remover round trip on a temp path only: the
+        // real `~/.bolo/env` and the global HOME are never touched.
+        let dir = env::temp_dir().join(format!("bolo-mic-env-{}", process::id()));
+        let path = dir.join("env");
+        write_bolo_env_value_at(&path, "BOLO_MICROPHONE_ID", "uid-st")?;
+        write_bolo_env_value_at(&path, "BOLO_MICROPHONE", "Studio Mic")?;
+        let text = fs::read_to_string(&path)?;
+        assert!(text.contains("BOLO_MICROPHONE_ID=\"uid-st\""), "{text}");
+        assert!(text.contains("BOLO_MICROPHONE=\"Studio Mic\""), "{text}");
+        // Overwrite keeps exactly one line per key.
+        write_bolo_env_value_at(&path, "BOLO_MICROPHONE_ID", "uid-st2")?;
+        let text = fs::read_to_string(&path)?;
+        assert_eq!(text.matches("BOLO_MICROPHONE_ID=").count(), 1, "{text}");
+        assert!(text.contains("uid-st2"), "{text}");
+        // Clearing System Default removes both keys and keeps others.
+        write_bolo_env_value_at(&path, "BOLO_HOTKEY", "right_option")?;
+        remove_bolo_env_value_at(&path, "BOLO_MICROPHONE_ID")?;
+        remove_bolo_env_value_at(&path, "BOLO_MICROPHONE")?;
+        let text = fs::read_to_string(&path)?;
+        assert!(!text.contains("BOLO_MICROPHONE"), "{text}");
+        assert!(text.contains("BOLO_HOTKEY=\"right_option\""), "{text}");
+        drop(fs::remove_dir_all(&dir));
+        Ok(())
+    }
+
+    #[test]
+    fn dashboard_serialization_matches_the_frozen_contract_exactly()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Exact-field fixture: the payload must serialize every contract key,
+        // the raw hotkey value (frontend renders labels), the "default"
+        // microphone sentinel when nothing is configured, and the settings
+        // counts that describe ONLY the retained saved history.
+        let app = plain_test_app();
+        let payload = dashboard_payload(&app)?;
+        let value: serde_json::Value = serde_json::from_str(&payload)?;
+        assert_eq!(value["mode"], "dashboard");
+        assert_eq!(value["title"], "Bolo");
+        assert_eq!(value["write_marker"], false);
+        let dashboard = &value["dashboard"];
+        for key in [
+            "version",
+            "hotkey",
+            "microphone",
+            "microphones",
+            "microphone_choices",
+            "cleanup_mode",
+            "accessibility_state",
+            "provider",
+            "history_limit",
+            "history",
+            "saved_dictations",
+            "saved_words",
+            "learned_words_count",
+            "usage",
+        ] {
+            assert!(dashboard.get(key).is_some(), "missing contract key {key}");
+        }
+        // Raw hotkey, not a human label.
+        assert_eq!(dashboard["hotkey"], "right_option");
+        // No configured microphone means the default sentinel.
+        assert_eq!(dashboard["microphone"], "default");
+        // Counts describe retained history only.
+        assert_eq!(dashboard["saved_dictations"], 0);
+        assert_eq!(dashboard["saved_words"], 0);
+        assert_eq!(dashboard["history_limit"], TRANSCRIPT_HISTORY_LIMIT);
+        // The usage block carries its four cumulative fields.
+        for key in ["dictations", "words", "recording_ms", "started_at_ms"] {
+            assert!(dashboard["usage"].get(key).is_some(), "usage missing {key}");
+        }
+        // No paths or secrets anywhere in the wire form.
+        let payload_text = payload.as_str();
+        assert!(!payload_text.contains("/Users/"));
+        assert!(!payload_text.contains("API_KEY"));
+        Ok(())
+    }
+
+    #[test]
+    fn dashboard_rejects_invalid_settings_and_keeps_untrusted_state_warn()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Invalid hotkey, unknown microphone, and bad cleanup mode are all
+        // rejected by typed validation BEFORE any persistence; an unknown
+        // action is refused the same way.
+        let microphones = vec![String::from("MacBook Pro Microphone")];
+        let raw = |line: &str| -> Result<DashboardRequestLine, serde_json::Error> {
+            let value: serde_json::Value = serde_json::from_str(line)?;
+            Ok(DashboardRequestLine {
+                action: value["action"].as_str().unwrap_or_default().to_owned(),
+                hotkey: value
+                    .get("hotkey")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned),
+                microphone: value
+                    .get("microphone")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned),
+                cleanup_mode: value
+                    .get("cleanup_mode")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned),
+            })
+        };
+        let bad_hotkey =
+            raw(r#"{"type":"dashboard_action","action":"save_settings","hotkey":"right_meta"}"#)?;
+        assert!(typed_dashboard_action(&bad_hotkey, &microphones).is_err());
+        let bad_mic = raw(
+            r#"{"type":"dashboard_action","action":"save_settings","microphone":"ghost mic"}"#,
+        )?;
+        assert!(typed_dashboard_action(&bad_mic, &microphones).is_err());
+        let bad_mode = raw(
+            r#"{"type":"dashboard_action","action":"save_settings","cleanup_mode":"sometimes"}"#,
+        )?;
+        assert!(typed_dashboard_action(&bad_mode, &microphones).is_err());
+        let unknown = raw(r#"{"type":"dashboard_action","action":"teleport"}"#)?;
+        assert!(typed_dashboard_action(&unknown, &microphones).is_err());
+        // The sentinel "default" is a valid microphone choice.
+        let default_mic =
+            raw(r#"{"type":"dashboard_action","action":"save_settings","microphone":"default"}"#)?;
+        assert!(typed_dashboard_action(&default_mic, &microphones).is_ok());
+        // Accessibility trust never upgrades from a helper reply: the mapping
+        // keeps warn and unavailable distinct.
+        assert_eq!(
+            dashboard_accessibility_state(AccessibilityTrust::Trusted),
+            "ok"
+        );
+        assert_eq!(
+            dashboard_accessibility_state(AccessibilityTrust::Untrusted),
+            "warn"
+        );
+        assert_eq!(
+            dashboard_accessibility_state(AccessibilityTrust::Unavailable),
+            "unavailable"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn dashboard_save_of_unchanged_settings_needs_no_restart()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Saving the values the runtime is already running with must not
+        // claim a restart and must not flip the sticky pending flag.
+        let app = Arc::new(plain_test_app());
+        let unchanged = app.apply_dashboard_settings(
+            Some(&app.config.hotkey),
+            None,
+            Some(dashboard_cleanup_mode(app.config.llm_cleanup)),
+        )?;
+        assert!(!unchanged, "identical save must not require a restart");
+        let reply = handle_dashboard_action(
+            &app,
+            DashboardAction::SaveSettings {
+                hotkey: Some(app.config.hotkey.clone()),
+                microphone: None,
+                cleanup_mode: Some(String::from(dashboard_cleanup_mode(app.config.llm_cleanup))),
+            },
+        );
+        assert_eq!(reply["ok"], true);
+        assert_eq!(reply["restart_needed"], false);
+        let pending = app
+            .dashboard_restart_pending
+            .lock()
+            .map(|pending| *pending)
+            .unwrap_or_default();
+        assert!(!pending, "unchanged save must not set pending restart");
+        Ok(())
+    }
+
+    #[test]
+    fn dashboard_pending_restart_is_sticky_across_refresh() {
+        // A changed hotkey save flags the pending restart, and a plain
+        // refresh afterward must keep the flag rather than silently clear it;
+        // a second identical save must also keep it.
+        let app = Arc::new(plain_test_app());
+        let reply = handle_dashboard_action(
+            &app,
+            DashboardAction::SaveSettings {
+                hotkey: Some(String::from("left_option")),
+                microphone: None,
+                cleanup_mode: None,
+            },
+        );
+        assert_eq!(reply["ok"], true);
+        assert_eq!(
+            reply["restart_needed"], true,
+            "changed hotkey needs restart"
+        );
+        let refresh = handle_dashboard_action(&app, DashboardAction::Refresh);
+        assert_eq!(
+            refresh["restart_needed"], true,
+            "refresh must keep the pending restart"
+        );
+        let again = handle_dashboard_action(
+            &app,
+            DashboardAction::SaveSettings {
+                hotkey: Some(String::from("left_option")),
+                microphone: None,
+                cleanup_mode: Some(String::from("auto")),
+            },
+        );
+        assert_eq!(
+            again["restart_needed"], true,
+            "identical re-save must keep the pending restart"
+        );
+    }
+
+    #[test]
+    fn dashboard_provider_label_comes_from_the_configured_model() {
+        // The label must follow the configured STT model, because the
+        // streaming label can read "Disabled" for a model that batch STT
+        // still serves fine.
+        assert_eq!(
+            dashboard_provider_label("assemblyai/universal-3-5-pro"),
+            "Assemblyai"
+        );
+        assert_eq!(dashboard_provider_label("deepgram/nova-3"), "Deepgram");
+        assert_eq!(dashboard_provider_label("telnyx/other"), "Telnyx");
+        assert_eq!(dashboard_provider_label(""), "Batch STT");
+    }
+
+    fn temp_usage_counters_path() -> PathBuf {
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut path = env::temp_dir();
+        path.push(format!("bolo-usage-{}-{id}.json", process::id()));
+        path
     }
 
     #[test]
@@ -12734,6 +15639,7 @@ mod tests {
                 streaming_stt: None,
                 stt_fallbacks: Vec::new(),
                 microphone: None,
+                microphone_id: None,
                 replacements: Vec::new(),
                 root_dir: PathBuf::new(),
                 hotkey: String::from("right_option"),
@@ -12752,6 +15658,8 @@ mod tests {
             vocabulary_usage: Mutex::new(HashMap::new()),
             vocabulary_usage_path: temp_vocabulary_usage_path(),
             state: Mutex::new(AppState::default()),
+            usage: Mutex::new(UsageCounters::default()),
+            dashboard_restart_pending: Mutex::new(false),
             event_proxy: Mutex::new(None),
         };
 
@@ -12784,6 +15692,7 @@ mod tests {
                 streaming_stt: None,
                 stt_fallbacks: Vec::new(),
                 microphone: None,
+                microphone_id: None,
                 replacements: Vec::new(),
                 root_dir: PathBuf::new(),
                 hotkey: String::from("right_option"),
@@ -12802,6 +15711,8 @@ mod tests {
             vocabulary_usage: Mutex::new(HashMap::new()),
             vocabulary_usage_path: temp_vocabulary_usage_path(),
             state: Mutex::new(AppState::default()),
+            usage: Mutex::new(UsageCounters::default()),
+            dashboard_restart_pending: Mutex::new(false),
             event_proxy: Mutex::new(None),
         });
         let prepared = PreparedText {
@@ -12837,6 +15748,7 @@ mod tests {
                 streaming_stt: None,
                 stt_fallbacks: Vec::new(),
                 microphone: None,
+                microphone_id: None,
                 replacements: Vec::new(),
                 root_dir: PathBuf::new(),
                 hotkey: String::from("right_option"),
@@ -12862,6 +15774,8 @@ mod tests {
                 )]),
                 ..AppState::default()
             }),
+            usage: Mutex::new(UsageCounters::default()),
+            dashboard_restart_pending: Mutex::new(false),
             event_proxy: Mutex::new(None),
         };
 
@@ -12880,6 +15794,7 @@ mod tests {
                 streaming_stt: None,
                 stt_fallbacks: Vec::new(),
                 microphone: None,
+                microphone_id: None,
                 replacements: Vec::new(),
                 root_dir: PathBuf::new(),
                 hotkey: String::from("right_option"),
@@ -12904,6 +15819,8 @@ mod tests {
                 )]),
                 ..AppState::default()
             }),
+            usage: Mutex::new(UsageCounters::default()),
+            dashboard_restart_pending: Mutex::new(false),
             event_proxy: Mutex::new(None),
         };
         let latest = history_app.latest_transcript().ok().flatten();
@@ -13886,6 +16803,7 @@ mod tests {
                 streaming_stt: None,
                 stt_fallbacks: Vec::new(),
                 microphone: None,
+                microphone_id: None,
                 replacements,
                 root_dir,
                 hotkey: String::from("right_option"),
@@ -13903,6 +16821,8 @@ mod tests {
             vocabulary_usage: Mutex::new(HashMap::new()),
             vocabulary_usage_path: temp_vocabulary_usage_path(),
             state: Mutex::new(AppState::default()),
+            usage: Mutex::new(UsageCounters::default()),
+            dashboard_restart_pending: Mutex::new(false),
             event_proxy: Mutex::new(None),
             latest_release: Mutex::new(None),
         })
@@ -14553,5 +17473,47 @@ mod tests {
             inserted_at: std::time::Instant::now(),
         };
         app.finish_edit_learning_capture(&claim);
+    }
+    #[test]
+    fn dashboard_reports_default_after_clearing_startup_microphone()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut app = plain_test_app();
+        app.config.microphone_id = Some(String::from("saved-id"));
+        app.config.microphone = Some(String::from("Saved Mic"));
+        {
+            let mut state = app.state.lock().map_err(|error| error.to_string())?;
+            state.selected_microphone_id = app.config.microphone_id.clone();
+            state.selected_microphone = app.config.microphone.clone();
+        }
+        app.clear_microphone()?;
+        let descriptors = vec![MicrophoneDescriptor::new(
+            "Saved Mic",
+            Some(String::from("saved-id")),
+        )];
+        let payload: serde_json::Value = serde_json::from_str(
+            &super::dashboard_payload_with_microphones(&app, &descriptors)?,
+        )?;
+        assert_eq!(payload["dashboard"]["microphone"], "default");
+        Ok(())
+    }
+
+    #[test]
+    fn dashboard_keeps_disconnected_microphone_choice() -> Result<(), Box<dyn std::error::Error>> {
+        let app = plain_test_app();
+        {
+            let mut state = app.state.lock().map_err(|error| error.to_string())?;
+            state.selected_microphone_id = Some(String::from("offline-id"));
+            state.selected_microphone = Some(String::from("Travel Mic"));
+        }
+        let payload: serde_json::Value =
+            serde_json::from_str(&super::dashboard_payload_with_microphones(&app, &[])?)?;
+        assert_eq!(payload["dashboard"]["microphone"], "uid:offline-id");
+        assert_eq!(
+            payload["dashboard"]["microphone_choices"][0]["label"],
+            "Travel Mic (not connected)"
+        );
+        assert!(matches!(normalize_microphone_value("uid:offline-id", &[]),
+            Ok(MicrophoneSelection::Device(descriptor)) if descriptor.id.as_deref() == Some("offline-id")));
+        Ok(())
     }
 }

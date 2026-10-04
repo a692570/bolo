@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """Generate the Bolo app icon as a 1024px PNG.
 
-Draws a dark rounded square, a green centered waveform, and a bold "B"
-wordmark using AppKit, so the DMG build gets a reproducible icon with no
-binary asset checked into git. Run under any Python with pyobjc (the DMG
-build creates one from the bundled python-build-standalone runtime):
+Draws the brand mark (the host-owned path in bolo_brand.draw_mark, the
+same geometry as the SVG master) on a warm clay rounded tile: an ivory
+"b" silhouette with an ink terminal block, a subtle darker rim, and a
+thin top light. No gloss, no gradients, no waveform, no microphone.
+Geometry lives in pure functions so tests assert the real mark placement
+without importing AppKit. Run under any Python with pyobjc (the DMG build
+creates one from the bundled python-build-standalone runtime):
 
     python3 scripts/make_icon.py --output build/icon/bolo-icon-1024.png
 """
@@ -13,57 +16,93 @@ import argparse
 import os
 import sys
 
+# Shared brand module lives beside the runtime, above these build scripts.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from bolo_brand import CLAY, INK, PAPER, draw_mark, native_color
+
 SIZE = 1024
-CORNER_RADIUS = 224
-RECT_INSET = 16
-WAVE_BAR_W = 36
-WAVE_GAP = 26
-WAVE_MAX_H = 190
-WAVE_CENTER_Y = 380
-WAVE_HEIGHTS = (0.90, 0.55, 0.72, 1.00, 0.62, 0.86, 0.48, 0.74, 0.52)
-WORDMARK_FONT_SIZE = 300
-WORDMARK_CENTER_Y = 700
-BG_COLOR = (0.055, 0.075, 0.070, 1.0)
-WAVE_COLOR = (0.30, 0.875, 0.49, 1.0)
-WORD_COLOR = (0.95, 0.96, 0.95, 1.0)
+# Geometry constants are defined for the 1024-pixel canvas; render()
+# scales them with size so --size 16/32 still produces a valid tile.
+CORNER_RADIUS_1024 = 224.0
+RECT_INSET_1024 = 16.0
+EDGE_WIDTH_1024 = 10.0
+TOP_LIGHT_HEIGHT_1024 = 30.0
+
+# The 100-unit mark grid scaled so the visible ink is ~58% of the tile's
+# height. draw_mark is called with `size * MARK_GRID_FRACTION`; the ink
+# itself spans grid units x 19..83, y 5..93.
+MARK_GRID_FRACTION = 0.66
+INK_LEFT = 19.0
+INK_RIGHT = 83.0
+INK_TOP = 5.0
+INK_BOTTOM = 93.0
+
+# Warm clay tile (host token). The mark's silhouette and terminal use
+# the same shared tokens: ivory paper for the b, ink for the terminal
+# block. The terminal is ink, not a third orange, so it reads as the
+# stop-cap the host spec froze.
+MARK_INK = PAPER
+MARK_TERMINAL = INK
+# Edge treatments are monochrome-alpha over the clay color: lighter
+# than tile toward the top, darker toward the bottom, never gloss.
+EDGE_DARKEN = 0.16
+EDGE_ALPHA = 0.5
+TOP_LIGHT_LIFT = 0.20
+TOP_LIGHT_ALPHA = 0.16
 
 
-def wave_bar_rects(size=SIZE):
-    """Pure layout: each waveform bar's (x, y, w, h) in top-down pixels."""
-    count = len(WAVE_HEIGHTS)
-    total_w = count * WAVE_BAR_W + (count - 1) * WAVE_GAP
-    x = (size - total_w) / 2.0
-    rects = []
-    for scale in WAVE_HEIGHTS:
-        height = WAVE_MAX_H * scale
-        top = WAVE_CENTER_Y - height / 2.0
-        rects.append((x, top, float(WAVE_BAR_W), height))
-        x += WAVE_BAR_W + WAVE_GAP
-    return rects
+def _mark_scale(size):
+    return size * MARK_GRID_FRACTION / 100.0
 
 
-def rounded_rect_path(x, y, w, h, radius, flipped=True):
-    """Build an NSBezierPath rounded rect; `y` is top-down like the rest."""
-    from AppKit import NSMakeRect, NSBezierPath
+def mark_origin(size=SIZE):
+    """Top-left (x, y) in top-down pixels for the mark's grid origin,
+    optically centered: the ink box centers at the tile's center."""
+    scale = _mark_scale(size)
+    center_x = (INK_LEFT + INK_RIGHT) / 2.0
+    center_y = (INK_TOP + INK_BOTTOM) / 2.0
+    return (size / 2.0 - center_x * scale, size / 2.0 - center_y * scale)
 
-    if flipped:
-        y = SIZE - y - h
-    path = NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
-        NSMakeRect(x, y, w, h), radius, radius
+
+def mark_ink_box(size=SIZE):
+    """The mark's visible ink box (x, y, w, h) in top-down pixels."""
+    scale = _mark_scale(size)
+    x, y = mark_origin(size)
+    return (
+        x + INK_LEFT * scale,
+        y + INK_TOP * scale,
+        (INK_RIGHT - INK_LEFT) * scale,
+        (INK_BOTTOM - INK_TOP) * scale,
     )
-    return path
+
+
+def tile_box(size=SIZE):
+    """The tile's (x, y, w, h); `y` is the top in top-down pixels."""
+    inset = RECT_INSET_1024 * (size / SIZE)
+    side = size - 2 * inset
+    return (inset, inset, side, side)
 
 
 def render(size=SIZE):
     """Render the icon into an AppKit bitmap image rep."""
     from AppKit import (
+        NSBezierPath,
         NSBitmapImageRep,
-        NSColor,
         NSGraphicsContext,
+        NSMakeRect,
     )
 
-    def rgba(components):
-        return NSColor.colorWithCalibratedRed_green_blue_alpha_(*components)
+    def mix(base, amount):
+        if amount >= 0:
+            target = (1.0, 1.0, 1.0)
+        else:
+            target = (0.0, 0.0, 0.0)
+            amount = -amount
+        return tuple(
+            min(1.0, max(0.0, channel + (target_c - channel) * amount))
+            for channel, target_c in zip(base, target)
+        )
 
     rep = (
         NSBitmapImageRep.alloc()
@@ -85,52 +124,59 @@ def render(size=SIZE):
     NSGraphicsContext.saveGraphicsState()
     NSGraphicsContext.setCurrentContext_(context)
 
-    inset = RECT_INSET
-    body = rounded_rect_path(inset, inset, size - 2 * inset, size - 2 * inset, CORNER_RADIUS)
-    rgba(BG_COLOR).setFill()
-    body.fill()
+    scale_geometry = size / SIZE
+    inset = RECT_INSET_1024 * scale_geometry
+    corner_radius = CORNER_RADIUS_1024 * scale_geometry
+    edge_width = EDGE_WIDTH_1024 * scale_geometry
+    top_light_height = TOP_LIGHT_HEIGHT_1024 * scale_geometry
+    side = size - 2 * inset
 
-    for bar_x, bar_y, bar_w, bar_h in wave_bar_rects(size):
-        bar = rounded_rect_path(bar_x, bar_y, bar_w, bar_h, bar_w / 2.0)
-        rgba(WAVE_COLOR).setFill()
-        bar.fill()
+    def rounded(x, y, w, h, radius):
+        return NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+            NSMakeRect(x, y, w, h), radius, radius
+        )
 
-    draw_wordmark(size)
+    # Warm clay tile.
+    native_color(CLAY).setFill()
+    rounded(inset, inset, side, side, corner_radius).fill()
+
+    # Subtle darker rim: one translucent stroke inset from the tile's
+    # edge, weight toward the bottom half via the color mix only.
+    rim = rounded(
+        inset + edge_width / 2.0,
+        inset + edge_width / 2.0,
+        side - edge_width,
+        side - edge_width,
+        corner_radius - edge_width / 2.0,
+    )
+    rim.setLineWidth_(edge_width)
+    native_color(mix(CLAY, -EDGE_DARKEN), EDGE_ALPHA).setStroke()
+    rim.stroke()
+
+    # Thin top light: the same inner stroke clipped to a band along the
+    # tile's top, drawn lighter. One stroke, two clips: no gradient.
+    NSGraphicsContext.saveGraphicsState()
+    band = NSMakeRect(inset, inset + side - top_light_height, side, top_light_height)
+    NSBezierPath.bezierPathWithRect_(band).addClip()
+    rim.setLineWidth_(edge_width)
+    native_color(mix(CLAY, TOP_LIGHT_LIFT), TOP_LIGHT_ALPHA).setStroke()
+    rim.stroke()
+    NSGraphicsContext.restoreGraphicsState()
+
+    # The brand mark: ivory b silhouette plus ink terminal block, drawn
+    # from the shared path so the icon matches every other surface.
+    origin_x, origin_y = mark_origin(size)
+    draw_mark(
+        origin_x,
+        size - origin_y - size * MARK_GRID_FRACTION,
+        size * MARK_GRID_FRACTION,
+        ink=MARK_INK,
+        terminal=MARK_TERMINAL,
+        flipped=False,
+    )
 
     NSGraphicsContext.restoreGraphicsState()
     return rep
-
-
-def draw_wordmark(size=SIZE):
-    """Center the bold `B` wordmark at WORDMARK_CENTER_Y (top-down)."""
-    from AppKit import (
-        NSAttributedString,
-        NSFont,
-        NSFontAttributeName,
-        NSForegroundColorAttributeName,
-        NSMutableParagraphStyle,
-        NSParagraphStyleAttributeName,
-    )
-
-    font = NSFont.boldSystemFontOfSize_(WORDMARK_FONT_SIZE)
-    paragraph = NSMutableParagraphStyle.new()
-    paragraph.setAlignment_(1)  # NSCenterTextAlignment
-    attributes = {
-        NSFontAttributeName: font,
-        NSForegroundColorAttributeName: _word_color(),
-        NSParagraphStyleAttributeName: paragraph,
-    }
-    text = NSAttributedString.alloc().initWithString_attributes_("B", attributes)
-    width, height = text.size()
-    # Bitmap contexts are not flipped: convert the top-down baseline box.
-    center_y = size - WORDMARK_CENTER_Y
-    text.drawAtPoint_(((size - width) / 2.0, center_y - height / 2.0))
-
-
-def _word_color():
-    from AppKit import NSColor
-
-    return NSColor.colorWithCalibratedRed_green_blue_alpha_(*WORD_COLOR)
 
 
 def write_png(rep, output_path):
