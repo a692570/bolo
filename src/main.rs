@@ -2425,7 +2425,9 @@ fn run_app_event_loop(app: Arc<App>) -> Result<(), AppError> {
     let mut dashboard_window: Option<AppWindow> = None;
     let mut onboarding_try_it_complete = false;
     let mut onboarding_try_it_snapshot: Option<u64> = None;
-    let mut onboarding_key_pending = false;
+    // The required speech key that was missing when the onboarding window
+    // opened; the watchdog restarts the runtime once it lands on disk.
+    let mut onboarding_missing_key: Option<&'static str> = None;
     let mut overlay_hide_at: Option<Instant> = None;
     let mut recording_check_at: Option<Instant> = None;
     let mut request_poll_at: Option<Instant> = None;
@@ -2469,7 +2471,7 @@ fn run_app_event_loop(app: Arc<App>) -> Result<(), AppError> {
                         &mut onboarding_window,
                         &mut onboarding_try_it_complete,
                         &mut onboarding_try_it_snapshot,
-                        &mut onboarding_key_pending,
+                        &mut onboarding_missing_key,
                     );
                 }
             }
@@ -2547,7 +2549,7 @@ fn run_app_event_loop(app: Arc<App>) -> Result<(), AppError> {
                     &mut onboarding_window,
                     &mut onboarding_try_it_complete,
                     &mut onboarding_try_it_snapshot,
-                    &mut onboarding_key_pending,
+                    &mut onboarding_missing_key,
                 );
             }
             TaoEvent::UserEvent(UserEvent::ShowStatus) => {
@@ -2682,18 +2684,27 @@ fn run_app_event_loop(app: Arc<App>) -> Result<(), AppError> {
                     .unwrap_or(Ok(false))
                     .unwrap_or(true);
                 let reload_allowed = {
-                    let Ok(state) = app.state.lock() else {
+                    let Ok(app_state) = app.state.lock() else {
                         return;
                     };
+                    // Restart exactly when the key that was missing at
+                    // open time has landed on disk: the onboarding picker
+                    // may save either provider's key, and the saved
+                    // BOLO_STT_MODEL follows that choice at restart.
+                    let missing_key_saved =
+                        onboarding_missing_key.and_then(load_env_value).is_some();
                     should_exit_for_key_reload(
-                        &state,
-                        onboarding_key_pending,
-                        load_env_value("ASSEMBLYAI_API_KEY").is_some(),
+                        &app_state,
+                        onboarding_missing_key.is_some(),
+                        missing_key_saved,
                         window_running,
                     )
                 };
                 if reload_allowed {
-                    info!("API key saved during onboarding; restarting the runtime to load it");
+                    info!(
+                        "API key saved during onboarding ({}); restarting the runtime to load it",
+                        onboarding_missing_key.unwrap_or("UNKNOWN")
+                    );
                     drop(onboarding_window.take());
                     drop(status_window.take());
                     drop(learning_window.take());
@@ -2721,7 +2732,7 @@ fn run_app_event_loop(app: Arc<App>) -> Result<(), AppError> {
                                     &mut onboarding_window,
                                     &mut onboarding_try_it_complete,
                                     &mut onboarding_try_it_snapshot,
-                                    &mut onboarding_key_pending,
+                                    &mut onboarding_missing_key,
                                 );
                             }
                         }
@@ -7005,9 +7016,10 @@ struct WizardSpec {
     hotkey: String,
 }
 
-/// Placement of the API-key entry field inside the onboarding window. The
-/// bundle flow defaults to `AssemblyAI` and has no provider picker, so the
-/// entry is shown whenever the resolved pipeline is missing that one key.
+/// Placement of the API-key entry field inside legacy onboarding payloads.
+/// The wizard renderer owns the provider picker and reveals its own field
+/// per provider, so live payloads leave this None; the struct stays the
+/// wire shape for the generic rows renderer the preview scripts use.
 #[derive(Debug, Serialize)]
 struct KeyEntrySpec {
     index: usize,
@@ -7077,24 +7089,6 @@ fn accessibility_fix_detail(bundle: bool, python: &str) -> String {
     }
 }
 
-/// The onboarding row's key-entry placement, shown only for the missing
-/// `AssemblyAI` key: the bundle flow defaults to `AssemblyAI` with no provider
-/// picker, and a Telnyx key never gets an entry field, so source installs
-/// that picked Telnyx keep the plain file instruction.
-fn key_entry_spec(missing: Option<&str>) -> Option<KeyEntrySpec> {
-    (missing == Some("ASSEMBLYAI_API_KEY")).then(|| KeyEntrySpec {
-        index: 2,
-        placeholder: String::from("Paste your AssemblyAI API key"),
-    })
-}
-
-/// Detail text for the speech-to-text row while the key-entry field is
-/// visible; a plain line, the placeholder and the field itself carry the
-/// instruction.
-/// Provider and key row detail; `missing` comes from
-/// `Config::missing_required_key` and names the exact environment variable
-/// to add when absent. The bundle flow defaults to the `AssemblyAI` key:
-/// Emphasized try-it instruction shown when every earlier row is green:
 /// Try-it detail line after the first captured dictation; the user is set
 /// up at this point, so the line says so instead of restating the
 /// instruction.
@@ -8102,9 +8096,9 @@ fn should_exit_for_key_reload(
 /// Open (or ignore when already open) the onboarding window. `write_marker`
 /// comes from the marker state at open time, so a manual reopen after
 /// completion never rewrites it, while an unfinished first run still can.
-/// `key_pending` records whether this window was opened while the
-/// `AssemblyAI` key was missing, so the event loop can restart the runtime
-/// after the window closes with the key saved.
+/// `missing_key` records the required speech key that was missing when the
+/// window opened (either provider's), so the event loop can restart the
+/// runtime after the window closes with that key saved.
 fn is_bundle_mode() -> bool {
     bundle_mode()
 }
@@ -8114,7 +8108,7 @@ fn open_onboarding_window(
     window_slot: &mut Option<AppWindow>,
     try_it_complete: &mut bool,
     try_it_snapshot: &mut Option<u64>,
-    key_pending: &mut bool,
+    missing_key: &mut Option<&'static str>,
 ) {
     let already_running = window_slot
         .as_mut()
@@ -8143,7 +8137,7 @@ fn open_onboarding_window(
             {
                 window.start_request_reader(&proxy, WindowRequestKind::Onboarding);
             }
-            *key_pending = key_entry_spec(app.config.missing_required_key()).is_some();
+            *missing_key = app.config.missing_required_key();
             *window_slot = Some(window);
             info!("onboarding window shown");
         }
@@ -12342,9 +12336,9 @@ mod tests {
         enforce_learned_vocabulary_cap, final_streaming_result_is_ready_elapsed,
         finalize_accessibility_context, handle_dashboard_action, handle_launch_request_for_state,
         handshake_with_deadline, is_known_no_speech_transcript, is_supported_hotkey,
-        key_entry_spec, learning_window_payload_at, load_learned_vocabulary,
-        load_usage_counters_at, load_vocabulary_usage, load_vocabulary_with_learned,
-        microphone_labels, non_empty_transcript, normalize_microphone_value, onboarding_status_at,
+        learning_window_payload_at, load_learned_vocabulary, load_usage_counters_at,
+        load_vocabulary_usage, load_vocabulary_with_learned, microphone_labels,
+        non_empty_transcript, normalize_microphone_value, onboarding_status_at,
         parse_accessibility_trust, parse_command, parse_daemon_context_reply,
         parse_daemon_paste_reply, parse_daemon_select_reply, parse_daemon_trust_reply,
         parse_latest_release, parse_release_version, parse_replacements_json, parse_stt_fallbacks,
@@ -12755,17 +12749,6 @@ mod tests {
     }
 
     #[test]
-    fn key_entry_spec_shows_only_for_missing_assemblyai_key()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let spec = key_entry_spec(Some("ASSEMBLYAI_API_KEY")).ok_or("spec")?;
-        assert_eq!(spec.index, 2);
-        assert_eq!(spec.placeholder, "Paste your AssemblyAI API key");
-        assert!(key_entry_spec(Some("TELNYX_API_KEY")).is_none());
-        assert!(key_entry_spec(None).is_none());
-        Ok(())
-    }
-
-    #[test]
     fn onboarding_wizard_payload_reports_runtime_facts() -> Result<(), Box<dyn std::error::Error>> {
         let payload = AppWindowPayload {
             mode: String::from("onboarding"),
@@ -12799,6 +12782,36 @@ mod tests {
             .and_then(serde_json::Value::as_array)
             .ok_or("rows array")?;
         assert!(rows.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn onboarding_provider_picks_pin_models_the_runtime_resolves()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // The onboarding picker writes each provider's key variable and
+        // pins BOLO_STT_MODEL to the provider's model so the resolved
+        // pipeline follows the choice. These exact strings are the
+        // cross-language contract; a drift in either file breaks the
+        // pipeline silently, so this test pins them against app_window.py.
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        let source_path = std::path::Path::new(manifest).join("app_window.py");
+        let source = fs::read_to_string(&source_path)?;
+        assert!(
+            source.contains("\"assemblyai\": \"assemblyai/universal-3-5-pro\""),
+            "picker must pin the AssemblyAI dictation model"
+        );
+        assert!(
+            source.contains("\"telnyx\": \"deepgram/nova-3\""),
+            "picker must pin the Telnyx-hosted Deepgram model"
+        );
+        assert!(
+            source.contains("\"assemblyai\": \"ASSEMBLYAI_API_KEY\""),
+            "picker must write the AssemblyAI key variable"
+        );
+        assert!(
+            source.contains("\"telnyx\": \"TELNYX_API_KEY\""),
+            "picker must write the Telnyx key variable"
+        );
         Ok(())
     }
 

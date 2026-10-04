@@ -628,7 +628,9 @@ def test_settings_selectors_are_visible_inside_their_group():
             assert frame.origin.y + frame.size.height <= bounds.size.height
             assert frame.origin.x + frame.size.width <= bounds.size.width
             assert popup.isHidden() is False
-        assert popups[0].frame().origin.y > popups[1].frame().origin.y > popups[2].frame().origin.y
+        # The body is flipped, so the visually top selector (dictation
+        # key) carries the smallest y: rows stack downward with y growing.
+        assert popups[0].frame().origin.y < popups[1].frame().origin.y < popups[2].frame().origin.y
 
 
 def test_all_history_entries_reachable_through_list_scroll():
@@ -651,8 +653,11 @@ def test_all_history_entries_reachable_through_list_scroll():
 
     scroll = None
     for sub in body.subviews():
+        # The de-boxed detail transcript is also a scroll view on the
+        # body; the list is built first, so the first match is the list.
         if isinstance(sub, NSScrollView):
             scroll = sub
+            break
     assert scroll is not None, "the dictations list must live in a scroll view"
     doc = scroll.documentView()
     assert doc is not None

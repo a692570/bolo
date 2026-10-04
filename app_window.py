@@ -61,7 +61,6 @@ DETAIL_WRAP_AT = 78
 KEY_FIELD_W = 400
 KEY_FIELD_H = 28
 VALIDATE_BUTTON_W = 110
-KEY_ENTRY_NAME = "ASSEMBLYAI_API_KEY"
 PRACTICE_FIELD_W = 480
 PRACTICE_FIELD_H = 64
 
@@ -108,8 +107,9 @@ SCREEN_WELCOME_DETAIL = (
     "You can quit at any point and come back from the Bolo menu bar item."
 )
 SCREEN_CONNECT_SPEECH_DETAIL = (
-    "Bolo sends audio to AssemblyAI to turn speech into text. Paste your "
-    "API key, then Validate to connect. You can skip and add it later."
+    "Bolo sends audio to your speech provider to turn speech into text. "
+    "Pick a provider, paste your API key, then Validate to connect. "
+    "You can skip and add it later."
 )
 SCREEN_MICROPHONE_DETAIL = (
     "Bolo records only while you hold the dictation key; it stops and "
@@ -160,6 +160,7 @@ SOURCE_GRANTED_DETAIL = (
     "Granted. Run ./restart.sh so Bolo picks up the grant."
 )
 ASSEMBLYAI_LIST_URL = "https://api.assemblyai.com/v2/transcript?limit=1"
+TELNYX_KEY_LIST_URL = "https://api.telnyx.com/v2/phone_numbers?page[size]=1"
 KEY_VALIDATION_TIMEOUT_S = 6.0
 
 # Accessibility grant flow: the onboarding warn row carries a button that
@@ -553,7 +554,7 @@ WIZARD_PRIMARY_TITLES = {
 }
 WIZARD_OPEN_SETTINGS_TITLE = "Open Settings"
 WIZARD_CONTINUE_TITLE = "Continue"
-WIZARD_KEY_LABEL = "AssemblyAI API key"
+WIZARD_KEY_LABEL = "API key"
 WIZARD_KEY_STATUS_INITIAL = "Key not validated yet."
 WIZARD_ACCESSIBILITY_PENDING_STATUS = "Permission not confirmed yet."
 WIZARD_ACCESSIBILITY_GRANTED_STATUS = "Granted. Bolo can insert text now."
@@ -567,6 +568,36 @@ WIZARD_FINISH_LATER_TITLE = "Finish later"
 # baseline so the pair reads as one row.
 WIZARD_FINISH_LATER_W = 150
 WIZARD_FINISH_LATER_H = WIZARD_PRIMARY_H
+
+# Speech providers offered in onboarding. The default is AssemblyAI
+# (the resolved pipeline's default); Telnyx stays available for the
+# legacy hosted path. Saving a provider's key also pins BOLO_STT_MODEL
+# so the resolved pipeline follows the chosen provider after restart.
+WIZARD_PROVIDERS = ("assemblyai", "telnyx")
+WIZARD_PROVIDER_TITLES = {
+    "assemblyai": "AssemblyAI (recommended)",
+    "telnyx": "Telnyx (legacy)",
+}
+WIZARD_PROVIDER_PLACEHOLDERS = {
+    "assemblyai": "Paste your AssemblyAI API key",
+    "telnyx": "Paste your Telnyx API key",
+}
+WIZARD_PROVIDER_ENV_NAMES = {
+    "assemblyai": "ASSEMBLYAI_API_KEY",
+    "telnyx": "TELNYX_API_KEY",
+}
+WIZARD_PROVIDER_STT_MODELS = {
+    "assemblyai": "assemblyai/universal-3-5-pro",
+    "telnyx": "deepgram/nova-3",
+}
+WIZARD_PROVIDER_HOSTS = {
+    "assemblyai": "api.assemblyai.com",
+    "telnyx": "api.telnyx.com",
+}
+WIZARD_PROVIDER_LINKS = {
+    "assemblyai": "https://www.assemblyai.com/app/api-keys",
+    "telnyx": "https://dashboard.telnyx.com/",
+}
 
 HOTKEY_DISPLAY_NAMES = {
     "left_option": "Left Option",
@@ -1118,7 +1149,32 @@ def build_wizard_ui(payload, preview=False):
                 body_font_small,
                 muted_color,
             )
-            y += WIZARD_STEP_H + 8
+            y += WIZARD_STEP_H + 6
+            # Provider picker: the default is AssemblyAI (the resolved
+            # pipeline's default); Telnyx remains for the legacy hosted
+            # path. Selecting a provider reveals its own key field.
+            from AppKit import NSSegmentSwitchTrackingSelectOne
+            from AppKit import NSSegmentedControl
+
+            picker = NSSegmentedControl.alloc().initWithFrame_(
+                NSMakeRect(
+                    WIZARD_MARGIN,
+                    y,
+                    WIZARD_PRACTICE_W - 110 - 12,
+                    24,
+                )
+            )
+            picker.setSegmentCount_(len(WIZARD_PROVIDERS))
+            picker.setTrackingMode_(NSSegmentSwitchTrackingSelectOne)
+            for segment, provider_id in enumerate(WIZARD_PROVIDERS):
+                picker.setLabel_forSegment_(
+                    WIZARD_PROVIDER_TITLES[provider_id], segment
+                )
+            picker.setSelectedSegment_(0)
+            picker.setTarget_(controller)
+            picker.setAction_("providerChanged:")
+            content.addSubview_(picker)
+            y += 24 + 10
             field = NSSecureTextField.alloc().initWithFrame_(
                 NSMakeRect(
                     WIZARD_MARGIN,
@@ -1134,7 +1190,7 @@ def build_wizard_ui(payload, preview=False):
                 else None
             )
             field.cell().setPlaceholderString_(
-                placeholder or "Paste your AssemblyAI API key"
+                placeholder or WIZARD_PROVIDER_PLACEHOLDERS["assemblyai"]
             )
             content.addSubview_(field)
             validate_button = NSButton.buttonWithTitle_target_action_(
@@ -1198,9 +1254,14 @@ def build_wizard_ui(payload, preview=False):
 
             key_refs = {
                 "field": field,
+                "picker": picker,
+                "link": link,
                 "dot": key_dot,
                 "detail_label": key_label,
                 "on_valid": on_valid,
+                "provider": WIZARD_PROVIDERS[0],
+                "link_url": WIZARD_PROVIDER_LINKS[WIZARD_PROVIDERS[0]],
+                "validated": {},
             }
 
         if screen == SCREEN_MICROPHONE:
@@ -1669,34 +1730,85 @@ def fetch_assemblyai_status(key, url=ASSEMBLYAI_LIST_URL, timeout=KEY_VALIDATION
         return error.code
 
 
+def fetch_telnyx_status(key, url=TELNYX_KEY_LIST_URL, timeout=KEY_VALIDATION_TIMEOUT_S):
+    """Telnyx key probe: list one phone number, Bearer auth.
+
+    A 200 proves the key authenticates against the Telnyx API without
+    provisioning anything; a 401 is a definite reject. Raises on
+    transport failure exactly like the AssemblyAI probe.
+    """
+    import urllib.error
+    import urllib.request
+
+    request = urllib.request.Request(
+        url, headers={"Authorization": "Bearer {0}".format(key)}
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return response.getcode()
+    except urllib.error.HTTPError as error:
+        return error.code
+
+
+PROVIDER_KEY_FETCHERS = {
+    "assemblyai": fetch_assemblyai_status,
+    "telnyx": fetch_telnyx_status,
+}
+
+
 def validate_and_save_key(
     key,
     env_path=None,
-    fetch=fetch_assemblyai_status,
+    fetch=None,
+    provider="assemblyai",
 ):
-    """Validate one API key and persist it when AssemblyAI accepts it.
+    """Validate one provider's API key and persist it when accepted.
 
     Returns ``(verdict, detail)`` where detail is display text for the
-    onboarding row. `fetch` is injectable so tests cover the 200/401/other
-    branches without network access; it must raise on transport errors.
+    onboarding row. A valid key is written to the provider's own
+    environment variable and ``BOLO_STT_MODEL`` is pinned to the
+    provider's model, so the resolved pipeline follows the choice after
+    the runtime restarts. `fetch` is injectable so tests cover the
+    200/401/other branches without network access; it must raise on
+    transport errors. The default is AssemblyAI, the pipeline default.
     """
     key = (key or "").strip()
+    provider = provider if provider in WIZARD_PROVIDER_ENV_NAMES else "assemblyai"
+    provider_title = WIZARD_PROVIDER_TITLES[provider].split(" (")[0]
     if not key:
-        return "empty", "Paste your AssemblyAI API key first, then click Validate."
+        return (
+            "empty",
+            "Paste your {0} API key first, then click Validate.".format(
+                provider_title
+            ),
+        )
     if env_path is None:
         env_path = bolo_env.default_env_path()
+    if fetch is None:
+        fetch = PROVIDER_KEY_FETCHERS[provider]
     try:
         status = fetch(key)
     except Exception:
         return (
             "unreachable",
-            "Could not reach api.assemblyai.com. Check your internet "
-            "connection and try again.",
+            "Could not reach {0}. Check your internet connection and "
+            "try again.".format(WIZARD_PROVIDER_HOSTS[provider]),
         )
     verdict = classify_key_response(status)
     if verdict == "valid":
-        bolo_env.write_env_value(env_path, KEY_ENTRY_NAME, key)
-        print("[app-window] key validation: valid", file=sys.stderr, flush=True)
+        bolo_env.write_env_value(
+            env_path, WIZARD_PROVIDER_ENV_NAMES[provider], key
+        )
+        # The saved choice decides the resolved pipeline: AssemblyAI
+        # direct or Telnyx-hosted Deepgram, read at restart.
+        bolo_env.write_env_value(
+            env_path, "BOLO_STT_MODEL", WIZARD_PROVIDER_STT_MODELS[provider]
+        )
+        print(
+            "[app-window] key validation: valid ({0})".format(provider),
+            file=sys.stderr,
+            flush=True,
+        )
         return (
             "valid",
             "Key saved. Click Continue to finish setup and try dictation.",
@@ -1704,11 +1816,15 @@ def validate_and_save_key(
     if verdict == "invalid":
         return (
             "invalid",
-            "AssemblyAI rejected that key. Double-check it and try again.",
+            "{0} rejected that key. Double-check it and try again.".format(
+                provider_title
+            ),
         )
     return (
         "error",
-        "AssemblyAI returned an unexpected response. Try again in a moment.",
+        "{0} returned an unexpected response. Try again in a moment.".format(
+            provider_title
+        ),
     )
 
 
@@ -1892,12 +2008,60 @@ def _appkit_classes_cached(NSView, NSObject):
             STATE["advanced"] = True
 
         def openDashboard_(self, sender):
+            key_refs = STATE.get("key_refs") or {}
+            url = key_refs.get("link_url") or ASSEMBLYAI_DASHBOARD_URL
             print(
-                "[app-window] opening API key dashboard",
+                "[app-window] opening API key dashboard: {0}".format(url),
                 file=sys.stderr,
                 flush=True,
             )
-            subprocess.Popen(["open", ASSEMBLYAI_DASHBOARD_URL])
+            subprocess.Popen(["open", url])
+
+        def providerChanged_(self, sender):
+            refs = STATE.get("key_refs") or {}
+            if not refs:
+                return
+            try:
+                segment = int(sender.selectedSegment())
+            except (TypeError, ValueError):
+                return
+            if not 0 <= segment < len(WIZARD_PROVIDERS):
+                return
+            provider = WIZARD_PROVIDERS[segment]
+            if provider == refs.get("provider"):
+                return
+            refs["provider"] = provider
+            refs["link_url"] = WIZARD_PROVIDER_LINKS[provider]
+            validated = refs.get("validated") or {}
+            field = refs.get("field")
+            label_text = WIZARD_KEY_STATUS_INITIAL
+            state = "pending"
+            if validated.get(provider):
+                # This provider already validated earlier in the
+                # session: the row keeps its saved state without
+                # re-asking for the key.
+                state = "ok"
+                label_text = "Key saved. Click Continue to finish setup and try dictation."
+                if field is not None:
+                    field.setEnabled_(False)
+            elif field is not None:
+                field.setEnabled_(True)
+                field.cell().setPlaceholderString_(
+                    WIZARD_PROVIDER_PLACEHOLDERS[provider]
+                )
+                field.setStringValue_("")
+            dot = refs.get("dot")
+            colors = STATE.get("colors") or {}
+            if dot is not None and colors:
+                dot_color = {
+                    "ok": colors.get("ok"),
+                    "pending": colors.get("pending"),
+                }.get(state)
+                if dot_color is not None:
+                    dot.layer().setBackgroundColor_(dot_color.CGColor())
+            detail = refs.get("detail_label")
+            if detail is not None:
+                detail.setStringValue_(label_text)
 
         def validateKey_(self, sender):
             refs = STATE.get("key_refs")
@@ -1905,7 +2069,8 @@ def _appkit_classes_cached(NSView, NSObject):
                 return
             field = refs["field"]
             key = str(field.stringValue())
-            verdict, detail = validate_and_save_key(key)
+            provider = refs.get("provider") or "assemblyai"
+            verdict, detail = validate_and_save_key(key, provider=provider)
             state_colors = STATE.get("colors") or {}
             dot_color = {
                 "valid": state_colors.get("ok"),
@@ -1915,6 +2080,7 @@ def _appkit_classes_cached(NSView, NSObject):
                 refs["dot"].layer().setBackgroundColor_(dot_color.CGColor())
             refs["detail_label"].setStringValue_("\n".join(wrap_lines(detail)))
             if verdict == "valid":
+                (refs.setdefault("validated", {}))[provider] = True
                 field.setEnabled_(False)
                 unlock = refs.get("on_valid")
                 if unlock is not None:

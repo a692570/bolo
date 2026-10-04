@@ -17,6 +17,10 @@ DARK_MUTED = (0.733, 0.698, 0.635)
 MOSS = (0.294, 0.424, 0.306)
 MOSS_LIGHT = (0.584, 0.733, 0.537)
 
+# The voice waveform accent: nine bars of varying heights, drawn in the
+# brand moss green. Levels are fractions of the drawing height.
+WAVEFORM_BARS = (0.24, 0.5, 0.82, 1.0, 0.58, 0.86, 0.42, 0.64, 0.28)
+
 
 def palette(dark=False):
     return {
@@ -44,6 +48,28 @@ def is_dark(appearance):
 def native_color(rgb, alpha=1.0):
     from AppKit import NSColor
     return NSColor.colorWithSRGBRed_green_blue_alpha_(*rgb, alpha)
+
+
+def draw_waveform(x, y, w, h, color):
+    """Draw the voice waveform accent: rounded bars in one color.
+
+    Nine pill bars of varying heights, vertically centered, sharing one
+    rhythm; the dictation voice made visible. Coordinates follow the
+    caller's view (top-down when the view is flipped), like draw_mark.
+    """
+    from AppKit import NSBezierPath, NSMakeRect
+
+    count = len(WAVEFORM_BARS)
+    unit = w / float(2 * count - 1)
+    for index, level in enumerate(WAVEFORM_BARS):
+        bar_h = max(1.5, h * level)
+        top = y + (h - bar_h) / 2.0
+        bar = NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+            NSMakeRect(x + index * 2 * unit, top, unit, bar_h),
+            unit / 2.0, unit / 2.0
+        )
+        native_color(color).setFill()
+        bar.fill()
 
 
 def draw_mark(x, y, size, ink=INK, terminal=CLAY, flipped=True):

@@ -6,15 +6,19 @@ keeps talking over stdin: `dashboard_update` lines refresh facts and
 history, `dashboard_action_reply` lines answer the window's requests.
 The window prints one `dashboard_action` JSON line per user action on
 stdout. Everything renders with AppKit in the shared warm-paper identity
-from bolo_brand: system typography for body text, Georgia for headings.
+from bolo_brand: system typography for body text, Georgia for the
+wordmark, and the moss voice-waveform accent for dictation identity.
 Counts and transcripts come only from the payload's retained history
 (the last N saved dictations), never from files this window reads, and
 no file path, key, or debug line is ever shown in the UI.
 
 Layout notes: the sidebar is a FlippedView (y grows downward) so nav
-rows and the footer never invert on resize. Main headings are system
-sans 22 semibold, sections 14/15 semibold, body 13, metadata 11/12;
-only the small "bolo" wordmark keeps the serif brand voice.
+rows and the footer never invert on resize. The de-boxed body lays
+content directly on the canvas with 0.5pt hairline separators and
+small-caps section labels instead of bordered cards: the only fills
+are the sidebar's selected-row tint, the primary Save button, and
+leading accent bars for selection. Page labels are 11pt small caps;
+stats use monospaced tabular digits; body stays 13pt; metadata 11/12.
 """
 
 import json
@@ -35,11 +39,17 @@ MARGIN = 28
 INNER_W = MAIN_W - 2 * MARGIN
 BODY_TOP = 24
 # Visual type scale: system sans everywhere except the small wordmark.
-TITLE_SIZE = 22
-SECTION_SIZE = 14
+PAGE_LABEL_SIZE = 11
 BODY_SIZE = 13
 META_SIZE = 11
-HOME_ROW_H = 62
+HERO_SIZE = 38
+STAT_SIZE = 17
+TRACKING = 0.8
+HOME_ROW_H = 58  # dictations list rows (scroll math derives from this)
+RECENT_ROW_H = 36  # Home recent rows: one dense line plus hover affordance
+RECENT_MAX = 8  # recent dictations shown on Home before "View all"
+CHART_W = 260
+CHART_H = 64
 
 TABS = ("home", "dictations", "settings")
 TAB_TITLES = {"home": "Home", "dictations": "Dictations", "settings": "Settings"}
@@ -179,30 +189,61 @@ def _format_since_date(now_ms=None):
     return time.strftime("%B %-d, %Y", time.localtime(now_ms / 1000.0))
 
 
+def _daily_words(history, days=7, now_ms=None):
+    """(letters, totals) for the last `days` local days, oldest first.
+
+    Totals are the word counts of the retained history entries bucketed
+    by each entry's real local day: days without saved entries total
+    zero, entries outside the window are ignored, and nothing is ever
+    extrapolated. Letters are the weekday initials of each day.
+    """
+    if now_ms is None:
+        now_ms = int(time.time() * 1000)
+    day_specs = []
+    for offset in range(days):
+        stamp = time.localtime((now_ms - offset * 86400000) / 1000.0)
+        day_specs.append((time.strftime("%Y-%m-%d", stamp), time.strftime("%a", stamp)))
+    day_specs.reverse()
+    totals = {date: 0 for date, _ in day_specs}
+    for entry in history:
+        created = entry.get("created_at_ms")
+        if not isinstance(created, int) or isinstance(created, bool) or created <= 0:
+            continue
+        key = time.strftime("%Y-%m-%d", time.localtime(created / 1000.0))
+        if key in totals:
+            totals[key] += len(entry["text"].split())
+    letters = [letter for _, letter in day_specs]
+    return letters, [totals[date] for date, _ in day_specs]
+
+
 def palette_extras(dark=False):
     """Dashboard-local surfaces layered on the shared brand palette.
 
-    Pale stone sidebar, card surfaces, hairlines, the soft fill for
-    secondary actions, and a gentle clay tint for selected nav and rows.
+    The de-boxed dashboard draws content straight onto the canvas, so
+    these are only the quiet structural tones: the canvas itself, the
+    warm stone sidebar, the 0.5pt hairline separators, and the gentle
+    clay tint for the sidebar's selected nav row.
     """
     if dark:
         return {
-            # Neutral charcoal canvas, slightly darker stone sidebar.
+            # Neutral charcoal canvas; the sidebar goes a step darker and
+            # warm-hued so the two surfaces differ in value and in hue.
+            # The nav tint is the light warm clay with ink labels: the
+            # same selected-row treatment as light mode (a light pill on
+            # a dark desk), A/B tested as the crispest figure-ground.
             "canvas": (0.133, 0.133, 0.141),
-            "sidebar": (0.110, 0.110, 0.118),
-            "card": (0.180, 0.180, 0.188),
+            "sidebar": (0.100, 0.096, 0.086),
             "hairline": (0.271, 0.271, 0.279),
-            "tint": (0.312, 0.224, 0.184),
-            "soft": (0.208, 0.208, 0.218),
+            "tint": (0.847, 0.788, 0.694),
         }
     return {
-        # Neutral ivory canvas, slightly darker warm stone sidebar.
+        # Neutral ivory canvas, slightly darker warm stone sidebar. The
+        # nav tint is a clear clay peach so the selected row reads at a
+        # glance, not a whisper.
         "canvas": (0.973, 0.969, 0.957),
         "sidebar": (0.933, 0.929, 0.909),
-        "card": (0.996, 0.995, 0.991),
         "hairline": (0.886, 0.882, 0.866),
-        "tint": (0.957, 0.898, 0.859),
-        "soft": (0.945, 0.941, 0.929),
+        "tint": (0.933, 0.867, 0.800),
     }
 
 
@@ -229,6 +270,24 @@ def usage_counts(dashboard):
         dashboard["saved_words"],
         "Last {0} saved".format(dashboard["history_limit"]),
     )
+
+
+def _recorded_label(dashboard):
+    """Human "2h 30m" for the cumulative recording time; None if absent.
+
+    Comes only from the runtime's usage counters; never estimated.
+    """
+    usage = dashboard.get("usage")
+    if not isinstance(usage, dict):
+        return None
+    ms = usage.get("recording_ms")
+    if not isinstance(ms, int) or isinstance(ms, bool) or ms <= 0:
+        return None
+    minutes = ms // 60000
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return "{0}h {1}m".format(hours, minutes)
+    return "{0}m".format(minutes)
 
 
 def build_action(action, hotkey=None, microphone=None, cleanup_mode=None):
@@ -299,7 +358,10 @@ def timestamp_label(created_at_ms, now_ms=None):
     today = time.localtime(now_ms / 1000.0)
     if stamp.tm_year == today.tm_year and stamp.tm_yday == today.tm_yday:
         return time.strftime("Today at %H:%M", stamp)
-    return time.strftime("%b %d at %H:%M", stamp)
+    # "Oct 2" (no zero padding): the macOS date idiom, not "Oct 02".
+    return time.strftime("%b ", stamp) + str(stamp.tm_mday) + time.strftime(
+        " at %H:%M", stamp
+    )
 
 
 def preview_text(text, limit=200):
@@ -690,6 +752,22 @@ def _controller_class_cached(NSObject):
             refs["selected_index"] = index
             render_body(refs)
 
+        def recentDictation_(self, sender):
+            """A Home recent row click: select that entry in Dictations."""
+            refs = self._refs()
+            try:
+                index = int(sender.tag()) if sender is not None else 0
+            except (TypeError, ValueError):
+                return
+            history = (refs.get("dashboard") or {}).get("history") or []
+            if not 0 <= index < len(history):
+                return
+            refs["selected_index"] = index
+            refs.pop("list_scroll_offset", None)
+            refs["tab"] = "dictations"
+            restyle_nav(refs)
+            render_body(refs)
+
         def toggleRaw_(self, sender):
             refs = self._refs()
             refs["show_raw"] = not refs.get("show_raw")
@@ -710,36 +788,73 @@ def _controller_class_cached(NSObject):
 
 
 def restyle_nav(refs):
-    """Recolor the three sidebar pills and icon tints for the current tab."""
+    """Recolor the sidebar nav rows, icon tints, and count badges."""
     pal = refs["palette"]()
     extras = palette_extras(dark=refs["dark"])
+    dashboard = refs.get("dashboard") or {}
+    saved = dashboard.get("saved_dictations") or 0
     for name in TABS:
         button = refs.get("nav_" + name)
         if button is None:
             continue
         active = refs["tab"] == name
+        count = str(saved) if name == "dictations" and saved else None
+        # The dark-mode pill is light clay, so its labels go ink, the
+        # same pairing as the light-mode pill; inactive rows keep the
+        # palette's normal text and muted tones.
         if active:
-            button.setAttributedTitle_(_styled_title(
-                TAB_TITLES[name], pal["text"], size=13, medium=True,
-                align="left",
-            ))
-            button.layer().setBackgroundColor_(
-                bolo_brand.native_color(extras["tint"]).CGColor()
-            )
+            tone = bolo_brand.INK if refs["dark"] else pal["text"]
         else:
-            button.setAttributedTitle_(_styled_title(
-                TAB_TITLES[name], pal["muted"], size=13, medium=False,
-                align="left",
-            ))
-            button.layer().setBackgroundColor_(None)
+            tone = pal["muted"]
+        button.setAttributedTitle_(_nav_title(TAB_TITLES[name], count, tone))
+        button.layer().setBackgroundColor_(
+            bolo_brand.native_color(extras["tint"]).CGColor() if active else None
+        )
         icon = refs.get("nav_icon_" + name)
         if icon is not None:
-            icon.setContentTintColor_(bolo_brand.native_color(
-                pal["text"] if active else pal["muted"]
-            ))
+            icon.setContentTintColor_(bolo_brand.native_color(tone))
 
 
-def _styled_title(text, color, size=13, medium=False, align="center"):
+def _nav_title(text, count, color):
+    """A nav row title: the page name plus its right-aligned count."""
+    from AppKit import (
+        NSAttributedString,
+        NSMutableAttributedString,
+        NSMutableParagraphStyle,
+        NSTextTab,
+        NSTextAlignmentLeft,
+        NSTextAlignmentRight,
+    )
+
+    paragraph = NSMutableParagraphStyle.alloc().init()
+    paragraph.setAlignment_(NSTextAlignmentLeft)
+    # Nav rows: icon sits at the left pad, the label clears it, and a
+    # right tab stop pins the count to the row's trailing edge.
+    paragraph.setFirstLineHeadIndent_(40)
+    paragraph.setTabStops_([
+        NSTextTab.alloc().initWithTextAlignment_location_options_(
+            NSTextAlignmentRight, 156, None
+        ),
+    ])
+    title = NSMutableAttributedString.alloc().initWithString_attributes_(
+        text,
+        {"NSFont": _body_font(13, medium=True),
+         "NSColor": bolo_brand.native_color(color),
+         "NSParagraphStyle": paragraph},
+    )
+    if count:
+        title.appendAttributedString_(
+            NSAttributedString.alloc().initWithString_attributes_(
+                "\t" + count,
+                {"NSFont": _mono_font(11),
+                 "NSColor": bolo_brand.native_color(color),
+                 "NSParagraphStyle": paragraph},
+            )
+        )
+    return title
+
+
+def _styled_title(text, color, size=13, medium=False, align="center", indent=0):
     """An attributed button title in the brand palette."""
     from AppKit import (
         NSAttributedString,
@@ -755,9 +870,8 @@ def _styled_title(text, color, size=13, medium=False, align="center"):
     paragraph.setAlignment_(
         NSTextAlignmentLeft if align == "left" else NSTextAlignmentCenter
     )
-    if align == "left":
-        # Nav rows: icon sits at the left pad, the label clears it.
-        paragraph.setFirstLineHeadIndent_(40)
+    if indent:
+        paragraph.setFirstLineHeadIndent_(indent)
     font = NSFont.systemFontOfSize_weight_(
         size, NSFontWeightMedium if medium else NSFontWeightRegular
     )
@@ -777,7 +891,7 @@ def _status_text(state):
 
 
 def _update_sidebar_status(refs):
-    """Refresh the sidebar readiness dot and word from real state."""
+    """Refresh the sidebar readiness dot, word, and nav count badges."""
     if refs.get("sidebar_status_dot") is None and refs.get("sidebar_status_label") is None:
         return
     pal = refs["palette"]()
@@ -795,6 +909,7 @@ def _update_sidebar_status(refs):
     label = refs.get("sidebar_status_label")
     if label is not None:
         label.setStringValue_(_status_text(state))
+    restyle_nav(refs)
 
 
 def _build_sidebar(controller, refs, content, payload):
@@ -877,9 +992,9 @@ def _build_sidebar(controller, refs, content, payload):
     sidebar.addSubview_(version_label)
     refs["sidebar_version_label"] = version_label
 
-    setup = _button(
+    setup = _text_button(
         controller, refs, sidebar, "Open setup",
-        20, HEIGHT - 132, SIDEBAR_W - 40, 32, "openSetup:", soft=True,
+        20, HEIGHT - 130, SIDEBAR_W - 40, 24, "openSetup:", size=12,
     )
     refs["sidebar_setup_button"] = setup
     # Flexible top margins anchor this fixed-size cluster to the bottom.
@@ -916,7 +1031,8 @@ def _nav_button(controller, refs, tab, x, y, parent):
     button.setWantsLayer_(True)
     button.layer().setCornerRadius_(8.0)
     button.layer().setBackgroundColor_(None)
-    button.setFrame_(NSMakeRect(x, y, SIDEBAR_W - 40, 36))
+    # The pill keeps 8pt margins on both sidebar edges: symmetric insets.
+    button.setFrame_(NSMakeRect(x, y, SIDEBAR_W - 16, 36))
     parent.addSubview_(button)
 
     icon = NSImageView.alloc().initWithFrame_(NSMakeRect(x + 16, y + 10, 16, 16))
@@ -943,11 +1059,13 @@ def _clear_body(refs):
         refs["body_view"] = None
 
 
-def _label(parent, text, frame, font, color, wrap=False, truncate=False):
+def _label(parent, text, frame, font, color, wrap=False, truncate=False,
+           align="left"):
     from AppKit import (
         NSTextField,
         NSMakeRect,
         NSTextAlignmentLeft,
+        NSTextAlignmentRight,
         NSLineBreakByWordWrapping,
         NSLineBreakByTruncatingTail,
     )
@@ -960,6 +1078,8 @@ def _label(parent, text, frame, font, color, wrap=False, truncate=False):
     field.setDrawsBackground_(False)
     field.setEditable_(False)
     field.setSelectable_(True)
+    if align == "right":
+        field.setAlignment_(NSTextAlignmentRight)
     if truncate:
         field.setUsesSingleLineMode_(True)
         field.setLineBreakMode_(NSLineBreakByTruncatingTail)
@@ -970,7 +1090,12 @@ def _label(parent, text, frame, font, color, wrap=False, truncate=False):
 
 
 def _text_view(parent, text, frame, font, color, dark):
-    """A scrollable, selectable, non-editable text view for long text."""
+    """A scrollable, selectable, non-editable text view for long text.
+
+    The container inset and line padding are zeroed on the leading edge
+    so the transcript text sits exactly on the pane's left edge, aligned
+    with the metadata line above it.
+    """
     from AppKit import (
         NSMakeRect,
         NSScrollView,
@@ -990,7 +1115,8 @@ def _text_view(parent, text, frame, font, color, dark):
     view.setFont_(font)
     view.setTextColor_(bolo_brand.native_color(color))
     view.setDrawsBackground_(False)
-    view.setTextContainerInset_((4, 8))
+    view.setTextContainerInset_((0, 8))
+    view.textContainer().setLineFragmentPadding_(0)
     view.setEditable_(False)
     view.setSelectable_(True)
     view.setVerticallyResizable_(True)
@@ -1000,85 +1126,346 @@ def _text_view(parent, text, frame, font, color, dark):
     return scroll_view, view
 
 
-def _button(controller, refs, parent, title, x, y, w, h, action,
-            tag=0, filled=False, soft=False):
-    """One borderless rounded button.
+def _mono_font(size, medium=False):
+    """Tabular-digits system font so every stat aligns in columns."""
+    from AppKit import NSFont, NSFontWeightMedium, NSFontWeightRegular
 
-    filled buttons carry the clay brand color, soft buttons the warm
-    low-contrast fill; both keep their native bezel behavior, focus
-    ring, and keyboard accessibility underneath the layer surface.
-    """
+    return NSFont.monospacedDigitSystemFontOfSize_weight_(
+        size, NSFontWeightMedium if medium else NSFontWeightRegular
+    )
+
+
+def _small_caps(parent, text, frame, color, size=PAGE_LABEL_SIZE, align="left"):
+    """A small-caps section label: medium weight, uppercase, tracked."""
+    from AppKit import (
+        NSAttributedString,
+        NSMutableParagraphStyle,
+        NSMakeRect,
+        NSTextField,
+        NSTextAlignmentLeft,
+        NSTextAlignmentRight,
+    )
+
+    paragraph = NSMutableParagraphStyle.alloc().init()
+    paragraph.setAlignment_(
+        NSTextAlignmentRight if align == "right" else NSTextAlignmentLeft
+    )
+    string = NSAttributedString.alloc().initWithString_attributes_(
+        text.upper(),
+        {"NSFont": _body_font(size, medium=True),
+         "NSColor": bolo_brand.native_color(color),
+         "NSKernAttributeName": TRACKING,
+         "NSParagraphStyle": paragraph},
+    )
+    field = NSTextField.labelWithString_(text.upper())
+    field.setFrame_(NSMakeRect(*frame))
+    field.setAttributedStringValue_(string)
+    field.setBezeled_(False)
+    field.setDrawsBackground_(False)
+    field.setEditable_(False)
+    field.setSelectable_(False)
+    parent.addSubview_(field)
+    return field
+
+
+def _filled_button(controller, refs, parent, title, x, y, w, h, action):
+    """The one primary action: a flat clay fill on the native button."""
     from AppKit import NSButton, NSMakeRect
 
     pal = refs["palette"]()
-    extras = palette_extras(dark=refs["dark"])
-    button = NSButton.buttonWithTitle_target_action_(title, refs["controller"], action)
-    button.setBezelStyle_(6)  # NSBezelStyleRounded keeps native press/focus
-    button.setBordered_(True)
+    button = NSButton.buttonWithTitle_target_action_(
+        title, refs["controller"], action
+    )
+    button.setBezelStyle_(6)  # keeps native press/focus behavior
+    button.setBordered_(False)
+    button.setWantsLayer_(True)
+    button.layer().setCornerRadius_(7.0)
+    button.layer().setBackgroundColor_(
+        bolo_brand.native_color(pal["button"]).CGColor()
+    )
     button.setFrame_(NSMakeRect(x, y, w, h))
-    button.setTag_(tag)
     button.setAttributedTitle_(_styled_title(
-        title,
-        pal["button_text"] if filled else pal["text"],
-        size=13,
-        medium=filled,
+        title, pal["button_text"], size=13, medium=True,
     ))
-    if filled or soft:
-        # The visible surface is the layer; the native bezel is dropped
-        # so the flat clay or soft fill stays exact in light and dark.
-        button.setBordered_(False)
-        button.setWantsLayer_(True)
-        button.layer().setCornerRadius_(7.0)
-        if filled:
-            button.layer().setBackgroundColor_(
-                bolo_brand.native_color(pal["button"]).CGColor()
-            )
-        else:
-            button.layer().setBackgroundColor_(
-                bolo_brand.native_color(extras["soft"]).CGColor()
-            )
     parent.addSubview_(button)
     return button
 
 
-def _card(parent, frame, dark, radius=12.0, border=True):
-    """A flat surface card: shared surface color, soft corner, hairline."""
-    from AppKit import NSMakeRect, NSView
+def _text_button(controller, refs, parent, title, x, y, w, h, action,
+                 tag=0, color=None, size=BODY_SIZE):
+    """A quiet borderless text action in the clay accent."""
+    from AppKit import NSButton, NSMakeRect
 
-    pal = bolo_brand.palette(dark=dark)
-    extras = palette_extras(dark=dark)
-    card = NSView.alloc().initWithFrame_(NSMakeRect(*frame))
-    card.setWantsLayer_(True)
-    card.layer().setCornerRadius_(radius)
-    card.layer().setBackgroundColor_(
-        bolo_brand.native_color(extras["card"]).CGColor()
+    pal = refs["palette"]()
+    button = NSButton.buttonWithTitle_target_action_(
+        title, refs["controller"], action
     )
-    if border:
-        card.layer().setBorderWidth_(0.5)
-        card.layer().setBorderColor_(
-            bolo_brand.native_color(pal["border"]).CGColor()
-        )
-    parent.addSubview_(card)
-    return card
+    button.setBezelStyle_(6)
+    button.setBordered_(False)
+    button.setWantsLayer_(True)
+    button.layer().setBackgroundColor_(None)
+    button.setFrame_(NSMakeRect(x, y, w, h))
+    button.setTag_(tag)
+    button.setAttributedTitle_(_styled_title(
+        title, color or pal["accent"], size=size, medium=True, align="left",
+    ))
+    parent.addSubview_(button)
+    return button
 
 
-def _fill(parent, frame, dark, radius=8.0):
-    """A borderless flat fill used for the selected transcript row."""
-    from AppKit import NSMakeRect, NSView
+def _overlay_button(controller, refs, parent, action, x, y, w, h, tag=0):
+    """A transparent full-area button: the whole row is the click target."""
+    from AppKit import NSButton, NSMakeRect
 
-    extras = palette_extras(dark=dark)
-    view = NSView.alloc().initWithFrame_(NSMakeRect(*frame))
-    view.setWantsLayer_(True)
-    view.layer().setCornerRadius_(radius)
-    view.layer().setBackgroundColor_(
-        bolo_brand.native_color(extras["tint"]).CGColor()
+    button = NSButton.buttonWithTitle_target_action_(
+        "", refs["controller"], action
     )
-    parent.addSubview_(view)
-    return view
+    button.setBezelStyle_(6)
+    button.setBordered_(False)
+    button.setWantsLayer_(True)
+    button.layer().setBackgroundColor_(None)
+    button.setFrame_(NSMakeRect(x, y, w, h))
+    button.setTag_(tag)
+    button.setTitle_("")
+    parent.addSubview_(button)
+    return button
+
+
+def _chevron(parent, x, y, color, size=12):
+    """A quiet trailing chevron: the disclosure affordance for row links."""
+    from AppKit import (
+        NSImage,
+        NSImageView,
+        NSMakeRect,
+        NSImageScaleProportionallyUpOrDown,
+    )
+
+    icon = NSImageView.alloc().initWithFrame_(NSMakeRect(x, y, size, size))
+    image = NSImage.imageWithSystemSymbolName_accessibilityDescription_(
+        "chevron.right", None
+    )
+    if image is not None:
+        image.setSize_((size, size))
+        icon.setImage_(image)
+        icon.setContentTintColor_(bolo_brand.native_color(color))
+        icon.setImageScaling_(NSImageScaleProportionallyUpOrDown)
+        icon.setEditable_(False)
+        icon.setAnimates_(False)
+        parent.addSubview_(icon)
+    return icon
+
+
+def _copy_cluster(controller, refs, parent, x, y, action, tag=0, color=None,
+                  tip="Copy"):
+    """An icon-only copy affordance: a tinted SF Symbol under a hit target."""
+    import app_window
+
+    from AppKit import (
+        NSImage,
+        NSImageView,
+        NSMakeRect,
+        NSImageScaleProportionallyUpOrDown,
+    )
+
+    pal = refs["palette"]()
+    FlippedView = app_window._APPKIT_CLASSES[0]
+    cluster = FlippedView.alloc().initWithFrame_(NSMakeRect(x, y, 28, 26))
+    icon = NSImageView.alloc().initWithFrame_(NSMakeRect(6, 5, 16, 16))
+    image = NSImage.imageWithSystemSymbolName_accessibilityDescription_(
+        "doc.on.doc", tip
+    )
+    if image is not None:
+        image.setSize_((16, 16))
+        icon.setImage_(image)
+        icon.setContentTintColor_(bolo_brand.native_color(color or pal["muted"]))
+        icon.setImageScaling_(NSImageScaleProportionallyUpOrDown)
+        icon.setEditable_(False)
+        icon.setAnimates_(False)
+        cluster.addSubview_(icon)
+    else:
+        # Symbol art unavailable on this OS: a tiny text fallback.
+        _label(cluster, "Copy", (0, 7, 28, 14), _small_font(), pal["muted"])
+    button = _overlay_button(
+        controller, refs, cluster, action, 0, 0, 28, 26, tag=tag
+    )
+    button.setToolTip_(tip)
+    parent.addSubview_(cluster)
+    return cluster
+
+
+_CLASSES = {"tuple": None}
+
+
+def _dashboard_classes_cached():
+    """Hover rows, the waveform glyph, and the chart view.
+
+    One ObjC registration per process: PyObjC raises when a class is
+    redefined in the same runtime, so repeated builds reuse the cache.
+    """
+    cached = _CLASSES.get("tuple")
+    if cached is not None:
+        return cached
+    import app_window
+
+    from AppKit import NSObject, NSView
+
+    FlippedView = app_window._appkit_classes_cached(NSView, NSObject)[0]
+
+    class HoverRowView(FlippedView):
+        """A row that reveals its copy affordance while the pointer stays
+        inside it, and hides it again when the pointer leaves."""
+
+        def setRevealView_(self, view):
+            self._reveal = view
+
+        def mouseEntered_(self, event):
+            reveal = getattr(self, "_reveal", None)
+            if reveal is not None:
+                reveal.setHidden_(False)
+
+        def mouseExited_(self, event):
+            reveal = getattr(self, "_reveal", None)
+            if reveal is not None:
+                reveal.setHidden_(True)
+
+        def updateTrackingAreas(self):
+            from AppKit import (
+                NSTrackingActiveAlways,
+                NSTrackingArea,
+                NSTrackingMouseEnteredAndExited,
+            )
+
+            for area in list(self.trackingAreas()):
+                self.removeTrackingArea_(area)
+            self.addTrackingArea_(
+                NSTrackingArea.alloc().initWithRect_options_owner_userInfo_(
+                    self.bounds(),
+                    NSTrackingMouseEnteredAndExited | NSTrackingActiveAlways,
+                    self,
+                    None,
+                )
+            )
+
+    class WaveformView(FlippedView):
+        """The moss voice-waveform accent, drawn from bolo_brand."""
+
+        def configureWithColor_(self, rgb):
+            self._rgb = rgb
+            self.setNeedsDisplay_(True)
+
+        def drawRect_(self, rect):
+            bounds = self.bounds()
+            bolo_brand.draw_waveform(
+                0, 0, bounds.size.width, bounds.size.height,
+                getattr(self, "_rgb", bolo_brand.MOSS),
+            )
+
+    class ChartView(FlippedView):
+        """Seven real words-per-day bars on a hairline baseline."""
+
+        def configureWithSpec_(self, spec):
+            self._spec = spec
+            self.setNeedsDisplay_(True)
+
+        def drawRect_(self, rect):
+            import AppKit
+
+            spec = getattr(self, "_spec", None)
+            if not spec:
+                return
+            values = spec["values"]
+            letters = spec["letters"]
+            bounds = self.bounds()
+            width = bounds.size.width
+            height = bounds.size.height
+            count = len(values)
+            bar_w, gap = 14.0, 18.0
+            pad = (width - (count * bar_w + (count - 1) * gap)) / 2.0
+            base_y = height - 14.0
+            peak = max(1, max(values or [0]))
+            max_index = values.index(max(values))
+            regular = AppKit.NSFont.monospacedDigitSystemFontOfSize_weight_(
+                10.0, AppKit.NSFontWeightRegular
+            )
+            medium = AppKit.NSFont.monospacedDigitSystemFontOfSize_weight_(
+                10.0, AppKit.NSFontWeightMedium
+            )
+            for index, value in enumerate(values):
+                bar_x = pad + index * (bar_w + gap)
+                if value > 0:
+                    # A nonzero day always earns at least a 3pt mark so a
+                    # quiet day still reads as data, never a rendering bug.
+                    bar_h = max(3.0, (base_y - 12.0) * value / float(peak))
+                    bar = AppKit.NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+                        AppKit.NSMakeRect(bar_x, base_y - bar_h, bar_w, bar_h),
+                        2.0, 2.0,
+                    )
+                    bolo_brand.native_color(spec["bar"]).setFill()
+                    bar.fill()
+                    if bar_h < 8.0:
+                        # A near-invisible bar carries its own value so a
+                        # quiet day still reads as data, not a glitch.
+                        quiet_text = AppKit.NSAttributedString.alloc().initWithString_attributes_(
+                            "{:,}".format(value),
+                            {"NSFont": AppKit.NSFont.monospacedDigitSystemFontOfSize_weight_(
+                                9.0, AppKit.NSFontWeightMedium
+                             ),
+                             "NSColor": bolo_brand.native_color(spec["muted"])},
+                        )
+                        quiet_text.drawAtPoint_((
+                            bar_x + (bar_w - quiet_text.size().width) / 2.0,
+                            base_y - bar_h - 12.0,
+                        ))
+                else:
+                    # A quiet dot on the baseline marks a day with no
+                    # saved dictations: zero reads as data, not a bug.
+                    dot = AppKit.NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+                        AppKit.NSMakeRect(bar_x + bar_w / 2 - 1, base_y - 1, 2, 2),
+                        1.0, 1.0,
+                    )
+                    bolo_brand.native_color(spec["hairline"]).setFill()
+                    dot.fill()
+                letter = letters[index] if index < len(letters) else ""
+                today = index == count - 1
+                text = AppKit.NSAttributedString.alloc().initWithString_attributes_(
+                    letter,
+                    {"NSFont": medium if today else regular,
+                     "NSColor": bolo_brand.native_color(
+                         spec["text"] if today else spec["muted"]
+                     )},
+                )
+                text.drawAtPoint_((
+                    bar_x + (bar_w - text.size().width) / 2.0,
+                    height - 12.0,
+                ))
+            # The peak bar carries its value: max context without clutter.
+            peak_text = AppKit.NSAttributedString.alloc().initWithString_attributes_(
+                "{:,}".format(values[max_index]),
+                {"NSFont": AppKit.NSFont.monospacedDigitSystemFontOfSize_weight_(
+                    9.0, AppKit.NSFontWeightMedium
+                 ),
+                 "NSColor": bolo_brand.native_color(spec["muted"])},
+            )
+            peak_x = pad + max_index * (bar_w + gap)
+            peak_text.drawAtPoint_((
+                peak_x + (bar_w - peak_text.size().width) / 2.0, 2.0,
+            ))
+            baseline = AppKit.NSBezierPath.bezierPath()
+            # The baseline spans exactly the bar block, not the full
+            # width: the axis ends where the data ends. It uses the muted
+            # ink so the axis is actually visible at 0.5pt.
+            baseline.moveToPoint_((pad, base_y))
+            baseline.lineToPoint_((width - pad, base_y))
+            bolo_brand.native_color(spec["muted"]).setStroke()
+            baseline.setLineWidth_(0.5)
+            baseline.stroke()
+
+    _CLASSES["tuple"] = (HoverRowView, WaveformView, ChartView)
+    return _CLASSES["tuple"]
 
 
 def _hairline(parent, frame, dark):
-    """A one-point hairline separator, card-local coordinates."""
+    """A one-point hairline separator, parent-local coordinates."""
     from AppKit import NSMakeRect, NSView
 
     extras = palette_extras(dark=dark)
@@ -1091,141 +1478,206 @@ def _hairline(parent, frame, dark):
     return line
 
 
+def _accent_bar(parent, frame, color):
+    """The 3pt selection bar on a row's leading edge: selection without
+    a filled box."""
+    from AppKit import NSMakeRect, NSView
+
+    bar = NSView.alloc().initWithFrame_(NSMakeRect(*frame))
+    bar.setWantsLayer_(True)
+    bar.layer().setCornerRadius_(1.5)
+    bar.layer().setBackgroundColor_(
+        bolo_brand.native_color(color).CGColor()
+    )
+    parent.addSubview_(bar)
+    return bar
+
+
 def _render_home(refs, body, controller):
-    """Compact utilitarian Home: sans title, quiet usage row, one unified
-    recent-dictations surface, and a learned-words footer."""
+    """Home as a reading page: hero word count, the real 7-day rhythm,
+    the recent list as the main body, and a compact learned-words row."""
     import app_window
 
-    from AppKit import NSMakeRect
+    from AppKit import NSMakeRect, NSTextField
 
     pal = refs["palette"]()
     dark = refs["dark"]
     dashboard = refs["dashboard"]
-    height = body.bounds().size.height or HEIGHT
     x = MARGIN
     w = INNER_W
+    HoverRowView, WaveformView, ChartView = _dashboard_classes_cached()
 
-    # Title and instruction, header at y28 (flipped view: y grows down).
-    y = 28
-    _label(
-        body, "Home", (x, y, w, 28),
-        _body_font(TITLE_SIZE, medium=True), pal["text"],
+    # Page label left; the dictation hint with its voice accent right.
+    _small_caps(body, "Home", (x, 26, 200, 16), pal["muted"])
+    hint_text = "Hold {0} to dictate in any app.".format(
+        hotkey_title(dashboard["hotkey"])
     )
-    y += 30
-    _label(
-        body,
-        "Hold {0} to dictate in any app.".format(
-            hotkey_title(dashboard["hotkey"])
-        ),
-        (x, y, w - 140, 18),
-        _body_font(BODY_SIZE), pal["muted"],
+    hint_attr = _styled_title(hint_text, pal["muted"], size=12, align="left")
+    hint_w = hint_attr.size().width
+    hint = NSTextField.labelWithString_(hint_text)
+    hint.setFrame_(NSMakeRect(x + w - hint_w - 4, 25, hint_w + 4, 17))
+    hint.setAttributedStringValue_(hint_attr)
+    hint.setBezeled_(False)
+    hint.setDrawsBackground_(False)
+    hint.setEditable_(False)
+    hint.setSelectable_(False)
+    body.addSubview_(hint)
+    wave = WaveformView.alloc().initWithFrame_(
+        NSMakeRect(x + w - hint_w - 34, 27, 26, 12)
     )
-    # A small real keycap for the configured hotkey, upper right.
-    cap = _card(body, (x + w - 120, y - 2, 120, 26), dark, radius=6.0)
-    _label(
-        cap, hotkey_title(dashboard["hotkey"]), (12, 5, 96, 16),
-        _body_font(BODY_SIZE, medium=True), pal["text"],
-    )
-    y += 44
+    wave.configureWithColor_(pal["success"])
+    body.addSubview_(wave)
 
-    # Quiet usage row: actual counts separated by labels, one line, then
-    # the honest scope note on its own line so the two never overlap.
+    # Hero stats: the word count anchors the page; dictations and the
+    # recorded time sit bottom-aligned beside it; the honest scope line
+    # runs under all three. All tabular digits.
     dictations, words, scope = usage_counts(dashboard)
-    half = 200
+    recorded = _recorded_label(dashboard)
     _label(
-        body, "{:,}".format(dictations), (x, y, half - 24, 24),
-        _body_font(19, medium=True), pal["text"],
+        body, "{:,}".format(words), (x, 48, 220, 42),
+        _mono_font(HERO_SIZE, medium=True), pal["text"],
     )
+    _small_caps(body, "Words", (x, 94, 140, 14), pal["muted"])
     _label(
-        body, "Dictations", (x, y + 25, half - 24, 15),
-        _body_font(META_SIZE + 1), pal["muted"],
+        body, "{:,}".format(dictations), (x + 168, 66, 120, 24),
+        _mono_font(STAT_SIZE, medium=True), pal["text"],
     )
+    _small_caps(body, "Dictations", (x + 168, 94, 140, 14), pal["muted"])
+    if recorded:
+        _label(
+            body, recorded, (x + 336, 66, 140, 24),
+            _mono_font(STAT_SIZE, medium=True), pal["text"],
+        )
+        _small_caps(body, "Recorded", (x + 336, 94, 140, 14), pal["muted"])
     _label(
-        body, "{:,}".format(words), (x + half, y, half, 24),
-        _body_font(19, medium=True), pal["text"],
-    )
-    _label(
-        body, "Words", (x + half, y + 25, half, 15),
-        _body_font(META_SIZE + 1), pal["muted"],
-    )
-    y += 46
-    _label(
-        body, scope, (x, y, w, 15),
+        body, scope, (x, 118, 380, 15),
         _body_font(META_SIZE + 1), pal["muted"], truncate=True,
     )
-    y += 30
 
-    # Recent dictations: section header with a compact View all action,
-    # then one unified neutral surface with hairline dividers, not cards.
-    section_y = y
-    _label(
-        body, "Recent dictations", (x, section_y, w - 100, 20),
-        _body_font(SECTION_SIZE, medium=True), pal["text"],
-    )
-    view_all = _button(
-        controller, refs, body, "View all", x + w - 76, section_y - 3,
-        76, 26, "dictationsNav:", soft=True,
-    )
-    view_all.setKeyEquivalent_("")  # keep Return for the window default
-    y = section_y + 28
+    # The real 7-day words-per-day rhythm from retained history only:
+    # omitted entirely when the history carries no in-window data. The
+    # header right-aligns with the hint cluster above it, one shared
+    # right edge for the whole top-right column.
+    letters, values = _daily_words(dashboard["history"])
+    if sum(values) > 0:
+        chart_x = x + w - CHART_W
+        _small_caps(
+            body, "Saved words · last 7 days",
+            (chart_x, 48, CHART_W, 12), pal["muted"], size=10, align="right",
+        )
+        chart = ChartView.alloc().initWithFrame_(
+            NSMakeRect(chart_x, 66, CHART_W, CHART_H)
+        )
+        chart.configureWithSpec_({
+            "values": values,
+            "letters": letters,
+            "bar": pal["success"],
+            "hairline": palette_extras(dark=dark)["hairline"],
+            "muted": pal["muted"],
+            "text": pal["text"],
+        })
+        body.addSubview_(chart)
 
-    latest = dashboard["history"][:5]
+    # Recent dictations: the page's main body, one dense row per entry.
+    body_h = body.bounds().size.height or HEIGHT
+    y = 142
+    _small_caps(body, "Recent dictations", (x, y, 300, 14), pal["muted"])
+    all_history = dashboard["history"]
+    latest = all_history[:RECENT_MAX]
+    if len(all_history) > RECENT_MAX:
+        view_all = _text_button(
+            controller, refs, body, "View all", x + w - 80, y - 3, 80, 22,
+            "dictationsNav:",
+        )
+        view_all.setKeyEquivalent_("")  # keep Return for the window default
+    y += 18
+    _hairline(body, (x, y, w, 1), dark)
+    y += 1
+
+    # The learned-words footer pins to the body's bottom edge so the
+    # page reads full-height; the recent rows stretch to fill the space
+    # between the section hairline and the footer, capped so a single
+    # entry never becomes a giant band.
+    footer_y = body_h - 46
     if not latest:
-        surface = _card(body, (x, y, w, 72), dark)
+        # The same composed, centered empty state as the Dictations
+        # page: voice accent, headline, instruction, centered both ways.
+        avail = footer_y - y
+        block_y = y + max(16, (avail - 72) // 2)
+        center_x = x + w // 2
+        empty_wave = WaveformView.alloc().initWithFrame_(
+            NSMakeRect(center_x - 22, block_y, 44, 20)
+        )
+        empty_wave.configureWithColor_(pal["success"])
+        body.addSubview_(empty_wave)
         _label(
-            surface,
-            "Nothing saved yet. Hold {0} and speak a sentence.".format(
+            body, "Nothing saved yet.", (center_x - 200, block_y + 34, 400, 20),
+            _body_font(15, medium=True), pal["text"], align="center",
+        )
+        _label(
+            body,
+            "Hold {0} and speak a sentence.".format(
                 hotkey_title(dashboard["hotkey"])
             ),
-            (16, 26, w - 32, 20),
-            _body_font(BODY_SIZE), pal["muted"],
+            (center_x - 240, block_y + 60, 480, 18),
+            _body_font(BODY_SIZE), pal["muted"], align="center",
         )
-        y += 88
     else:
-        # The surface grows with the real row count and never paints past
-        # the 650pt window: at least 5 rows fit with the footer below.
-        surface_h = len(latest) * HOME_ROW_H + 8
-        surface = _card(body, (x, y, w, surface_h), dark, radius=10.0)
+        count = len(latest)
+        # Rows keep a dense Raycast-like rhythm (36-44pt); any spare
+        # height stays as page-end whitespace above the pinned footer
+        # rather than ballooning the rows.
+        row_h = max(RECENT_ROW_H, min(44, (footer_y - y) // count))
         for index, entry in enumerate(latest):
-            # Card-local coords: the unflipped card draws visual top at
-            # H - y - h; stack rows downward from the surface top.
-            row_top = 4 + index * HOME_ROW_H
+            row_y = y + index * row_h
+            row = HoverRowView.alloc().initWithFrame_(
+                NSMakeRect(x, row_y, w, row_h)
+            )
+            body.addSubview_(row)
             if index:
-                _hairline(surface, (16, surface_h - row_top, w - 32, 1), dark)
-            stamp = timestamp_label(entry["created_at_ms"])
+                _hairline(row, (0, 0, w, 1), dark)
+            # Row content centers vertically in the stretched band.
+            content_y = (row_h - 18) // 2
             _label(
-                surface, stamp, (16, surface_h - row_top - 18, 220, 14),
-                _small_font(), pal["muted"],
+                row, timestamp_label(entry["created_at_ms"]),
+                (0, content_y + 1, 100, 14), _small_font(), pal["muted"],
             )
             _label(
-                surface, entry["text"],
-                (16, surface_h - row_top - 40, w - 130, 18),
+                row, entry["text"], (104, content_y, w - 232, 18),
                 _body_font(BODY_SIZE), pal["text"], truncate=True,
             )
-            _button(
-                controller, refs, surface, "Copy",
-                w - 92, surface_h - row_top - 44, 68, 30, "copyText:",
-                tag=index, soft=True,
+            _label(
+                row, "{0} words".format(len(entry["text"].split())),
+                (w - 128, content_y + 1, 88, 14), _small_font(), pal["muted"],
+                align="right",
             )
-        y += surface_h + 20
+            # The row is the click target; Copy appears only on hover.
+            _overlay_button(
+                controller, refs, row, "recentDictation:",
+                0, 0, w - 32, row_h, tag=index,
+            )
+            copy_cluster = _copy_cluster(
+                controller, refs, row, w - 30, (row_h - 26) // 2,
+                "copyText:", tag=index,
+            )
+            copy_cluster.setHidden_(True)
+            row.setRevealView_(copy_cluster)
 
-    # Learned-words footer pinned near the visual bottom with margins that
-    # keep everything inside the 650pt window even with 5 rows.
-    footer_y = max(y + 6, height - 92)
-    _label(
-        body, "Learned words", (x, footer_y, 110, 18),
-        _body_font(BODY_SIZE, medium=True), pal["text"],
+    # Learned words: one compact footer row pinned to the body's bottom,
+    # whole-row clickable into the vocabulary window.
+    _hairline(body, (x, footer_y, w, 1), dark)
+    _small_caps(
+        body, "Learned words", (x, footer_y + 11, 140, 14), pal["muted"],
     )
     _label(
-        body,
-        "{0} learned".format(dashboard["learned_words_count"]),
-        (x + 118, footer_y, 140, 18),
-        _body_font(BODY_SIZE), pal["muted"],
+        body, "{:,}".format(dashboard["learned_words_count"]),
+        (x + w - 72, footer_y + 10, 40, 15),
+        _mono_font(META_SIZE + 1), pal["muted"], align="right",
     )
-    _button(
-        controller, refs, body, "Open learned words",
-        x + w - 176, footer_y - 4, 176, 30, "openLearned:",
-        soft=True,
+    _chevron(body, x + w - 26, footer_y + 12, pal["muted"])
+    _overlay_button(
+        controller, refs, body, "openLearned:",
+        x, footer_y + 1, w, RECENT_ROW_H,
     )
 
 
@@ -1242,16 +1694,11 @@ def _small_font():
 
 
 def _render_dictations(refs, body, controller):
-    """All retained entries reachable through a real scrolling list, with
-    a readable detail pane, raw/clean toggle, and Copy."""
+    """Master-detail on one surface: a scrolling list beside the full
+    transcript, a hairline between them, Copy and Raw in the toolbar."""
     import app_window
 
-    from AppKit import (
-        NSButton,
-        NSMakeRect,
-        NSScrollView,
-        NSTextView,
-    )
+    from AppKit import NSMakeRect, NSScrollView
 
     pal = refs["palette"]()
     dark = refs["dark"]
@@ -1261,35 +1708,42 @@ def _render_dictations(refs, body, controller):
     x = MARGIN
     w = INNER_W
 
-    _label(
-        body, "Dictations", (x, 28, w, 28),
-        _body_font(TITLE_SIZE, medium=True), pal["text"],
-    )
+    _small_caps(body, "Dictations", (x + 14, 26, 200, 16), pal["muted"])
 
     list_width = 260
     list_x = x
     # Flipped body: y grows downward; the list fills below the header.
-    list_y = 70
-    list_h = height - list_y - 20
+    list_y = 64
+    list_h = height - list_y - 24
 
     if not history:
-        card = _card(body, (x, list_y, w, 112), dark)
+        # A composed, centered empty state: the voice accent, one
+        # headline, and the real instruction for the first dictation.
+        WaveformView = _dashboard_classes_cached()[1]
+        center_x = x + w // 2
+        block_y = list_y + max(20, (list_h - 116) // 2)
+        wave = WaveformView.alloc().initWithFrame_(
+            NSMakeRect(center_x - 22, block_y, 44, 20)
+        )
+        wave.configureWithColor_(pal["success"])
+        body.addSubview_(wave)
         _label(
-            card, "No dictations saved yet.", (24, 70, w - 48, 20),
-            _body_font(15, medium=True), pal["text"],
+            body, "No dictations saved yet.",
+            (center_x - 200, block_y + 38, 400, 20),
+            _body_font(15, medium=True), pal["text"], align="center",
         )
         _label(
-            card,
+            body,
             "Hold {0} and speak a sentence. Saved dictations appear here.".format(
                 hotkey_title(dashboard["hotkey"])
             ),
-            (24, 20, w - 48, 40),
-            _body_font(BODY_SIZE), pal["muted"], wrap=True,
+            (center_x - 240, block_y + 64, 480, 18),
+            _body_font(BODY_SIZE), pal["muted"], align="center",
         )
         return
 
-    detail_x = list_x + list_width + 16
-    detail_w = w - list_width - 16
+    detail_x = x + list_width + 28
+    detail_w = x + w - detail_x
     selected = refs.get("selected_index")
     if selected is None or not 0 <= selected < len(history):
         selected = 0
@@ -1297,63 +1751,78 @@ def _render_dictations(refs, body, controller):
     entry = history[selected]
 
     # A real scroll view so every history entry stays reachable even when
-    # ten rows exceed the visible height. The document view is flipped,
-    # so rows stack downward and survive resizes.
-    scroll = NSScrollView.alloc().initWithFrame_(NSMakeRect(list_x, list_y, list_width, list_h))
+    # ten rows exceed the visible height. Rows sit straight on the
+    # canvas, separated by hairlines, no box around them.
+    scroll = NSScrollView.alloc().initWithFrame_(
+        NSMakeRect(list_x, list_y, list_width, list_h)
+    )
     scroll.setHasVerticalScroller_(True)
     scroll.setDrawsBackground_(False)
     scroll.setBorderType_(0)
     body.addSubview_(scroll)
 
-    doc = app_window._APPKIT_CLASSES[0].alloc().initWithFrame_(
+    FlippedView = app_window._APPKIT_CLASSES[0]
+    doc = FlippedView.alloc().initWithFrame_(
         NSMakeRect(0, 0, list_width, len(history) * HOME_ROW_H)
     )
     scroll.setDocumentView_(doc)
     for index, item in enumerate(history):
         row_top = index * HOME_ROW_H
         is_selected = index == selected
-        row = _fill(doc, (0, row_top, list_width, HOME_ROW_H - 2), dark) if is_selected else None
-        if row is None:
-            row = _card(doc, (0, row_top, list_width, HOME_ROW_H - 2), dark, radius=0.0, border=False)
+        row = FlippedView.alloc().initWithFrame_(
+            NSMakeRect(0, row_top, list_width, HOME_ROW_H)
+        )
+        doc.addSubview_(row)
+        if index:
+            _hairline(row, (16, 0, list_width - 32, 1), dark)
+        if is_selected:
+            # Selection reads as a clay leading bar plus medium-weight
+            # text, not a filled box.
+            _accent_bar(row, (0, 10, 3, 42), pal["accent"])
         _label(
             row, timestamp_label(item["created_at_ms"]),
-            (16, 12, list_width - 32, 14), _small_font(), pal["muted"],
+            (14, 10, list_width - 26, 14), _small_font(), pal["muted"],
         )
         _label(
-            row, item["text"], (16, 34, list_width - 32, 18),
-            _body_font(BODY_SIZE), pal["text"], truncate=True,
+            row, item["text"], (14, 30, list_width - 26, 18),
+            _body_font(BODY_SIZE, medium=is_selected), pal["text"],
+            truncate=True,
         )
-        # The row is the click target: a transparent borderless button
-        # stretched over it routes the click without hiding the labels.
-        select = _button(
-            controller, refs, row, "", 0, 0, list_width, HOME_ROW_H - 2,
-            "selectDictation:", tag=index,
+        # The row is the click target: a transparent button stretched
+        # over it routes the click without hiding the labels.
+        _overlay_button(
+            controller, refs, row, "selectDictation:",
+            0, 0, list_width, HOME_ROW_H, tag=index,
         )
-        select.setBordered_(False)
-        select.setTitle_("")
-        select.setWantsLayer_(True)
-        select.layer().setBackgroundColor_(None)
 
-    # Detail pane: timestamp, Copy, raw/clean toggle in one small toolbar
-    # row, then the full transcript in its own scrollable text view.
-    detail = _card(body, (detail_x, list_y, detail_w, list_h), dark)
+    # The hairline seam between the list and the detail column.
+    _hairline(body, (list_x + list_width + 12, list_y, 1, list_h), dark)
+
+    # Detail toolbar: real metadata left, the quiet actions right. The
+    # cluster sits on the first list row's timestamp line so the two
+    # columns share one optical top line.
+    meta = "{0} · {1} words".format(
+        timestamp_label(entry["created_at_ms"]), len(entry["text"].split())
+    )
+    if entry["edited_after_insert"]:
+        meta += " · edited"
     _label(
-        detail, timestamp_label(entry["created_at_ms"]),
-        (20, list_h - 30, detail_w - 220, 16), _small_font(), pal["muted"],
+        body, meta, (detail_x, list_y + 9, 240, 16),
+        _small_font(), pal["muted"], truncate=True,
     )
-    _button(
-        controller, refs, detail, "Copy",
-        detail_w - 92, list_h - 38, 72, 30, "copyText:", tag=selected, soft=True,
-    )
-    _button(
-        controller, refs, detail,
+    _text_button(
+        controller, refs, body,
         "Show raw" if not refs.get("show_raw") else "Show clean",
-        detail_w - 176, list_h - 38, 76, 30, "toggleRaw:", soft=True,
+        detail_x + detail_w - 136, list_y + 4, 92, 24, "toggleRaw:", size=12,
+    )
+    _copy_cluster(
+        controller, refs, body, detail_x + detail_w - 30, list_y + 3,
+        "copyText:", tag=selected, color=pal["text"],
     )
     shown = entry["raw"] if refs.get("show_raw") else entry["text"]
     detail_scroll, _ = _text_view(
-        detail, shown,
-        (16, 16, detail_w - 32, list_h - 64),
+        body, shown,
+        (detail_x, list_y + 36, detail_w, list_h - 36),
         _body_font(BODY_SIZE), pal["text"], dark,
     )
     refs["detail_scroll"] = detail_scroll
@@ -1373,8 +1842,8 @@ def _render_dictations(refs, body, controller):
 
 
 def _render_settings(refs, body, controller):
-    """Compact settings: title, one tidy selector group, save/restart,
-    status, and a separate Setup & vocabulary surface."""
+    """De-boxed settings: hairline selector rows straight on the canvas,
+    the one primary Save, and disclosure rows for setup and vocabulary."""
     import app_window
 
     from AppKit import NSMakeRect, NSPopUpButton
@@ -1387,33 +1856,25 @@ def _render_settings(refs, body, controller):
     x = MARGIN
     w = INNER_W
 
-    _label(
-        body, "Settings", (x, 28, w, 28),
-        _body_font(TITLE_SIZE, medium=True), pal["text"],
-    )
+    _small_caps(body, "Settings", (x, 26, 200, 16), pal["muted"])
     _label(
         body,
         "Set Bolo up for the way you write.",
-        (x, 58, w, 18),
+        (x, 50, w, 18),
         _body_font(BODY_SIZE), pal["muted"],
     )
 
-    group_y = 88
-    group_h = 3 * 56 + 8
-    card = _card(body, (x, group_y, w, group_h), dark, radius=10.0)
-    y = group_h - 50  # card-local: visual top row
-
-    def row(title, description, y, options_list, popup_key, values_key):
+    def popup_row(title, description, top, options_list, popup_key, values_key):
         _label(
-            card, title, (20, y + 24, 260, 18), _body_font(BODY_SIZE, medium=True),
-            pal["text"],
+            body, title, (x, top + 2, 260, 18),
+            _body_font(BODY_SIZE, medium=True), pal["text"],
         )
         _label(
-            card, description, (20, y + 6, 280, 15), _body_font(META_SIZE + 1),
-            pal["muted"],
+            body, description, (x, top + 22, 320, 15),
+            _body_font(META_SIZE + 1), pal["muted"],
         )
         popup = NSPopUpButton.alloc().initWithFrame_(
-            NSMakeRect(w - 320 - 20, y + 10, 320, 28)
+            NSMakeRect(x + w - 200, top + 4, 200, 28)
         )
         values = []
         for value, title_text in options_list:
@@ -1424,50 +1885,49 @@ def _render_settings(refs, body, controller):
         # Keep the user's pick in refs: the selection must survive a tab
         # switch and a dashboard_update, never silently revert to the
         # running values while a save is pending restart.
-        card.addSubview_(popup)
+        body.addSubview_(popup)
         refs[popup_key] = popup
         refs[values_key] = values
         return popup
 
-    def separator(y):
-        _hairline(card, (20, y, w - 40, 1), dark)
-
-    # Rows stack downward from the visual top of the unflipped card.
-    row(
+    _small_caps(body, "Dictation", (x, 78, 200, 14), pal["muted"])
+    popup_row(
         "Dictation key", "Hold while speaking.",
-        y, options["hotkey"], "popup_hotkey", "hotkey_values",
+        96, options["hotkey"], "popup_hotkey", "hotkey_values",
     )
-    separator(y - 4)
-    row(
+    _hairline(body, (x, 152, w, 1), dark)
+    popup_row(
         "Microphone", "Applies to your next recording.",
-        y - 56, options["microphone"], "popup_microphone", "mic_values",
+        158, options["microphone"], "popup_microphone", "mic_values",
     )
-    separator(y - 60)
-    row(
+    _hairline(body, (x, 214, w, 1), dark)
+    popup_row(
         "Cleanup", "Punctuation and formatting.",
-        y - 112, options["cleanup"], "popup_cleanup", "cleanup_values",
+        220, options["cleanup"], "popup_cleanup", "cleanup_values",
     )
+    # A closing hairline ends the selector group before the save cluster.
+    _hairline(body, (x, 276, w, 1), dark)
 
-    # Buttons and status sit on the canvas below the group, with a fixed
-    # autoresizing cluster so a taller window keeps them readable.
-    buttons_y = group_y + group_h + 18
-    _button(
+    # The one filled action on the page; Restart stays a quiet text
+    # action until a saved change actually needs it.
+    buttons_y = 300
+    _filled_button(
         controller, refs, body, "Save changes",
-        x, buttons_y, 130, 34, "saveSettings:", filled=True,
+        x, buttons_y, 130, 32, "saveSettings:",
     )
-    restart = _button(
+    restart = _text_button(
         controller, refs, body, "Restart Bolo",
-        x + 142, buttons_y, 130, 34, "restartBolo:", soft=True,
+        x + 146, buttons_y + 4, 120, 24, "restartBolo:",
     )
     restart.setHidden_(not refs.get("restart_needed"))
     refs["restart_button"] = restart
 
     _label(
         body, "Dictation key and cleanup changes need a restart.",
-        (x, buttons_y + 44, w, 18),
+        (x, buttons_y + 42, w, 18),
         _body_font(META_SIZE + 1), pal["muted"],
     )
-    status_y = buttons_y + 72
+    status_y = buttons_y + 70
     if refs.get("settings_status_text"):
         status = _label(
             body,
@@ -1483,26 +1943,41 @@ def _render_settings(refs, body, controller):
         )
         refs["settings_status_label"] = status
 
-    # A separate, tidy Setup & vocabulary surface beneath.
+    # Setup and vocabulary as disclosure rows: whole-row links into the
+    # existing windows, hairline-separated like the rest of the page.
     setup_y = status_y + (44 if refs.get("settings_status_text") else 4)
-    setup = _card(body, (x, setup_y, w, 88), dark, radius=10.0)
-    _label(
-        setup, "Setup & vocabulary", (20, 58, 300, 18),
-        _body_font(BODY_SIZE, medium=True), pal["text"],
+    _small_caps(body, "Setup & vocabulary", (x, setup_y, 220, 14), pal["muted"])
+    setup_y += 20
+
+    def link_row(title, description, top, action, trailing=None):
+        _label(
+            body, title, (x, top + 6, 300, 18),
+            _body_font(BODY_SIZE, medium=True), pal["text"],
+        )
+        _label(
+            body, description, (x, top + 25, 420, 15),
+            _body_font(META_SIZE + 1), pal["muted"],
+        )
+        if trailing is not None:
+            _label(
+                body, trailing, (x + w - 76, top + 8, 44, 15),
+                _mono_font(META_SIZE + 1), pal["muted"], truncate=True,
+                align="right",
+            )
+        _chevron(body, x + w - 26, top + 9, pal["muted"])
+        _overlay_button(controller, refs, body, action, x, top, w, 44)
+
+    link_row(
+        "Open setup",
+        "Permissions, the API key, and onboarding.",
+        setup_y + 6, "openSetup:",
     )
-    _label(
-        setup,
-        "Permissions, the API key, and learned words live in their own windows.",
-        (20, 40, w - 40, 15),
-        _body_font(META_SIZE + 1), pal["muted"],
-    )
-    _button(
-        controller, refs, setup, "Open setup", 20, 8, 110, 28, "openSetup:",
-        soft=True,
-    )
-    _button(
-        controller, refs, setup, "Learned words", 140, 8, 130, 28,
-        "openLearned:", soft=True,
+    _hairline(body, (x, setup_y + 50, w, 1), dark)
+    link_row(
+        "Learned words",
+        "Vocabulary learned from your corrections.",
+        setup_y + 56, "openLearned:",
+        trailing="{0}".format(dashboard["learned_words_count"]),
     )
 
 
@@ -1533,6 +2008,14 @@ def render_body(refs):
     from AppKit import NSViewWidthSizable, NSViewHeightSizable
 
     body.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
+    # The hairline seam on the body's leading edge marks the sidebar
+    # boundary and survives every re-render with the body itself.
+    from AppKit import NSViewHeightSizable
+
+    seam = _hairline(
+        body, (0, 0, 1, body.bounds().size.height or HEIGHT), dark
+    )
+    seam.setAutoresizingMask_(NSViewHeightSizable)
     refs["body_view"] = body
     refs["copied_label"] = None
     refs["settings_status_label"] = None

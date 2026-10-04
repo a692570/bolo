@@ -102,16 +102,19 @@ TEN_HISTORY = HISTORY + [
 
 def fixture(history=None, accessibility="ok"):
     """Explicitly synthetic dashboard payload; nothing here is real data."""
+    empty = not (history if history is not None else HISTORY)
     return {
         "mode": "dashboard",
         "title": "Bolo",
         "write_marker": False,
         "dashboard": {
             "version": "1.9.6",
+            # The empty-history shots model a first run: zero lifetime
+            # usage, so "Nothing saved yet" never contradicts the stats.
             "usage": {
-                "dictations": 244,
-                "words": 15230,
-                "recording_ms": 9000000,
+                "dictations": 0 if empty else 244,
+                "words": 0 if empty else 15230,
+                "recording_ms": 0 if empty else 9000000,
                 "started_at_ms": int(datetime(2026, 9, 1, tzinfo=timezone.utc).timestamp() * 1000),
             },
             "hotkey": "left_option",
@@ -123,7 +126,7 @@ def fixture(history=None, accessibility="ok"):
             "history_limit": 10,
             "saved_dictations": len(HISTORY if history is None else history),
             "saved_words": sum(len(item["text"].split()) for item in (HISTORY if history is None else history)),
-            "learned_words_count": 4,
+            "learned_words_count": 0 if empty else 4,
             "history": HISTORY if history is None else history,
         },
     }
