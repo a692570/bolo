@@ -20,6 +20,14 @@ pkill -f "$DIR/bolo.py" 2>/dev/null || true
 pkill -f "$DIR/hotkey.py" 2>/dev/null || true
 pkill -f "$DIR/accessibility_daemon.py" 2>/dev/null || true
 pkill -f "$DIR/overlay.py" 2>/dev/null || true
+# Kill the installed Bolo.app too: both installs share the runtime lock
+# directory, and clearing the locks below while the bundle's binary is still
+# alive lets a second pipeline come up (observed 2026-10-09: every dictation
+# pasted twice until both binaries were killed).
+pkill -f "Bolo.app/Contents/MacOS/bolo-runtime" 2>/dev/null || true
+pkill -f "Bolo.app/Contents/Resources/hotkey.py" 2>/dev/null || true
+pkill -f "Bolo.app/Contents/Resources/accessibility_daemon.py" 2>/dev/null || true
+pkill -f "Bolo.app/Contents/Resources/overlay.py" 2>/dev/null || true
 pkill -f "$DIR/app_window.py" 2>/dev/null || true
 rm -f "$RUNTIME_DIR/bolo.pid" 2>/dev/null || true
 rm -rf "$LOCK_DIR" /tmp/bolo-instance.lock 2>/dev/null || true
