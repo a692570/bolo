@@ -312,7 +312,7 @@ enum AccessibilityTrust {
     Unavailable,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "lowercase")]
 enum CleanupProfile {
     Default,
@@ -917,6 +917,32 @@ fn dictation_upload_config(
     if !vocabulary.is_empty() {
         config["keyterms_prompt"] =
             serde_json::json!(vocabulary.iter().take(50).collect::<Vec<_>>());
+    }
+    config
+}
+
+/// Config JSON for the batch Dictation request. `llm_instruction` replaces
+/// the endpoint's default cleanup task, so the key is added only when the
+/// active cleanup profile has a saved override: with no override the
+/// request carries exactly the fields it always did and the server's
+/// default cleanup (which is excellent) stays (contract:
+/// <https://www.assemblyai.com/docs/dictation>, config parameters, checked
+/// 2026-10-09).
+fn dictation_batch_config(
+    language: &str,
+    vocabulary: &[String],
+    llm_instruction: Option<&str>,
+) -> serde_json::Value {
+    let mut config = serde_json::json!({});
+    if let Some(code) = assemblyai_language_code(language) {
+        config["language_codes"] = serde_json::json!([code]);
+    }
+    if !vocabulary.is_empty() {
+        config["keyterms_prompt"] =
+            serde_json::json!(vocabulary.iter().take(50).collect::<Vec<_>>());
+    }
+    if let Some(instruction) = llm_instruction {
+        config["llm_instruction"] = serde_json::json!(instruction);
     }
     config
 }
@@ -1721,6 +1747,11 @@ struct App {
     /// recording start so deletions made in the learning window take effect
     /// without a restart.
     learned_vocabulary_mtime: Mutex<Option<SystemTime>>,
+    /// Cached cleanup-prompt overrides plus the mtime they were loaded at.
+    /// The prompts editor rewrites the file behind the runtime's back, so
+    /// every override read re-checks the mtime and reloads on change; both
+    /// halves live under one lock so they can never disagree.
+    cleanup_prompts: Mutex<CleanupPromptCache>,
     /// Newest GitHub release found by the startup check, when it is newer
     /// than this build; surfaced in the status window.
     latest_release: Mutex<Option<UpdateNotice>>,
@@ -1854,6 +1885,7 @@ enum UserEvent {
     ShowOnboarding,
     ShowStatus,
     ShowLearned,
+    ShowPrompts,
     ShowDashboard,
     DashboardAction(DashboardAction),
     DashboardInvalid(String),
@@ -2426,6 +2458,7 @@ fn run_app_event_loop(app: Arc<App>) -> Result<(), AppError> {
     let mut onboarding_window: Option<AppWindow> = None;
     let mut status_window: Option<AppWindow> = None;
     let mut learning_window: Option<AppWindow> = None;
+    let mut prompts_window: Option<AppWindow> = None;
     let mut dashboard_window: Option<AppWindow> = None;
     let mut onboarding_try_it_complete = false;
     let mut onboarding_try_it_snapshot: Option<u64> = None;
@@ -2562,6 +2595,9 @@ fn run_app_event_loop(app: Arc<App>) -> Result<(), AppError> {
             TaoEvent::UserEvent(UserEvent::ShowLearned) => {
                 open_learning_window(&app, &mut learning_window);
             }
+            TaoEvent::UserEvent(UserEvent::ShowPrompts) => {
+                open_prompts_window(&app, &mut prompts_window);
+            }
             TaoEvent::UserEvent(UserEvent::ShowDashboard) => {
                 open_dashboard_window(&app, &mut dashboard_window);
             }
@@ -2605,6 +2641,7 @@ fn run_app_event_loop(app: Arc<App>) -> Result<(), AppError> {
                     drop(onboarding_window.take());
                     drop(status_window.take());
                     drop(learning_window.take());
+                    drop(prompts_window.take());
                     drop(dashboard_window.take());
                     info!("dashboard requested restart; exiting for the supervisor");
                     std::process::exit(UPDATE_RESTART_EXIT_CODE);
@@ -2795,6 +2832,7 @@ impl App {
             vocabulary_aliases: Mutex::new(vocabulary.aliases),
             learned_aliases: Mutex::new(vocabulary.learned_aliases),
             learned_vocabulary_mtime: Mutex::new(learned_vocabulary_mtime),
+            cleanup_prompts: Mutex::new(CleanupPromptCache::default()),
             latest_release: Mutex::new(None),
             prompt_bindings: Mutex::new(prompt_bindings),
             state: Mutex::new(AppState {
@@ -3393,7 +3431,7 @@ impl App {
                 if wav_duration_ms(payload)
                     .is_some_and(|duration| duration <= ASSEMBLYAI_SYNC_MAX_DURATION_MS)
                 {
-                    self.transcribe_with_assemblyai_dictation(payload, STT_REQUEST_TIMEOUT)
+                    self.transcribe_with_assemblyai_dictation(payload, warmup, STT_REQUEST_TIMEOUT)
                 } else {
                     // The Dictation endpoint caps audio at 120 seconds; longer
                     // clips fall to the async upload+poll path.
@@ -3432,7 +3470,7 @@ impl App {
         let request = self.stt_request_parts(warmup);
         if request.primary_model.starts_with("assemblyai/") {
             return self
-                .transcribe_with_assemblyai_dictation(wav, STREAMING_BATCH_VERIFY_TIMEOUT)
+                .transcribe_with_assemblyai_dictation(wav, warmup, STREAMING_BATCH_VERIFY_TIMEOUT)
                 .map(|result| result.text);
         }
         self.transcribe_with_model(
@@ -3679,6 +3717,7 @@ impl App {
     fn transcribe_with_assemblyai_dictation(
         &self,
         wav: &[u8],
+        warmup: &DictationWarmup,
         timeout: Duration,
     ) -> Result<SttResult, AppError> {
         let api_key = load_env_value("ASSEMBLYAI_API_KEY")
@@ -3687,14 +3726,30 @@ impl App {
         let language = self
             .stt_language()
             .unwrap_or_else(|_| self.config.stt_language.clone());
-        let mut config_json = serde_json::json!({});
-        if let Some(code) = assemblyai_language_code(&language) {
-            config_json["language_codes"] = serde_json::json!([code]);
-        }
-        if !vocabulary.is_empty() {
-            config_json["keyterms_prompt"] =
-                serde_json::json!(vocabulary.iter().take(50).collect::<Vec<_>>());
-        }
+        // The same active-profile resolution the LLM fallback cleanup uses:
+        // the warmup accessibility context (the context snapshot from
+        // around press time) plus the prompt bindings. No second source.
+        let cleanup_profile = cleanup_profile(
+            self.accessibility_context_for_cleanup(warmup).as_ref(),
+            &self.prompt_bindings_snapshot(),
+        );
+        // A saved override becomes the endpoint's llm_instruction; without
+        // one the config omits the key and the server's default cleanup
+        // runs, byte-identical to requests before overrides existed.
+        let llm_instruction = self.cleanup_override(cleanup_profile).map(|instruction| {
+            let capped = truncate_to_chars(&instruction, CLEANUP_PROMPT_CAP_CHARS);
+            if capped.chars().count() < instruction.chars().count() {
+                warn!(
+                    "[cleanup] llm_instruction truncated from {} to {} chars for profile {:?}",
+                    instruction.chars().count(),
+                    capped.chars().count(),
+                    cleanup_profile
+                );
+            }
+            capped
+        });
+        let config_json =
+            dictation_batch_config(&language, &vocabulary, llm_instruction.as_deref());
         info!(
             "[stt] request {}",
             serde_json::json!({
@@ -3705,6 +3760,8 @@ impl App {
                 "audio_mime": "audio/wav",
                 "audio_bytes": wav.len(),
                 "keyterms": vocabulary.iter().take(50).collect::<Vec<_>>(),
+                "llm_instruction": llm_instruction.is_some(),
+                "cleanup_profile": format!("{:?}", cleanup_profile),
             })
         );
         let form = multipart::Form::new()
@@ -4025,14 +4082,14 @@ impl App {
         let accessibility_context = self.accessibility_context_for_cleanup(warmup);
         let prompt_bindings = self.prompt_bindings_snapshot();
         let cleanup_profile = cleanup_profile(accessibility_context.as_ref(), &prompt_bindings);
-        let system_prompt = cleanup_prompt(cleanup_profile);
+        let system_prompt = self.effective_cleanup_prompt(cleanup_profile);
         let user_content = build_cleanup_user_content(transcript, accessibility_context.as_ref());
         let request = ChatRequest {
             model: &model,
             messages: vec![
                 ChatMessageRequest {
                     role: "system",
-                    content: system_prompt,
+                    content: &system_prompt,
                 },
                 ChatMessageRequest {
                     role: "user",
@@ -5012,6 +5069,59 @@ impl App {
             *learned = loaded.learned_aliases;
         }
         info!("[learning] vocabulary_reloaded");
+    }
+
+    /// Reload the cleanup-prompt overrides from disk when the file changed
+    /// since the last check, mirroring [`App::refresh_learned_vocabulary_at`].
+    /// A missing file (current mtime `None`) only reloads when the cache saw
+    /// a file before, which clears stale overrides after the editor (or the
+    /// user) deletes the file itself. The mtime starts `None`, so the first
+    /// call after startup always loads once.
+    fn refresh_cleanup_prompts_at(&self, prompts_path: &Path) {
+        let current = fs::metadata(prompts_path)
+            .and_then(|metadata| metadata.modified())
+            .ok();
+        let mut cache = match self.cleanup_prompts.lock() {
+            Ok(cache) => cache,
+            Err(error) => {
+                warn!("cleanup prompts mtime lock poisoned: {error}");
+                return;
+            }
+        };
+        if cache.mtime == current {
+            return;
+        }
+        let overrides = cleanup_prompt_overrides(&load_cleanup_prompt_file(prompts_path));
+        cache.overrides = overrides;
+        cache.mtime = current;
+        drop(cache);
+        info!("[cleanup] prompts_reloaded");
+    }
+
+    /// The user's cleanup-prompt override for `profile`, or `None` when that
+    /// profile uses its built-in prompt. Reads current state at call time
+    /// (the editor's atomic rename moves the mtime), so no restart is needed
+    /// after an edit.
+    fn cleanup_override_at(&self, prompts_path: &Path, profile: CleanupProfile) -> Option<String> {
+        self.refresh_cleanup_prompts_at(prompts_path);
+        match self.cleanup_prompts.lock() {
+            Ok(cache) => cache.overrides.get(&profile).cloned(),
+            Err(error) => {
+                warn!("cleanup prompts lock poisoned: {error}");
+                None
+            }
+        }
+    }
+
+    fn cleanup_override(&self, profile: CleanupProfile) -> Option<String> {
+        self.cleanup_override_at(&cleanup_prompts_path(), profile)
+    }
+
+    /// The prompt text that cleans `profile`'s dictations right now: the
+    /// user's override when one is saved, else the built-in text.
+    fn effective_cleanup_prompt(&self, profile: CleanupProfile) -> String {
+        let overrides = self.cleanup_override(profile);
+        override_or_builtin_prompt_from(overrides, profile)
     }
 
     fn vocabulary_aliases_snapshot(&self) -> Vec<TextReplacement> {
@@ -7036,6 +7146,10 @@ struct AppWindowPayload {
     /// its rows from the pairs instead of the generic `rows` list.
     #[serde(skip_serializing_if = "Option::is_none")]
     learning: Option<LearningWindowSpec>,
+    /// Prompts-editor spec; present only for mode "prompts", which renders
+    /// the four cleanup profiles with their editable effective prompts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompts: Option<PromptsWindowSpec>,
 }
 
 /// Facts the runtime reports for the onboarding wizard: whether the
@@ -7079,6 +7193,51 @@ struct LearningWindowSpec {
     error: Option<String>,
     pairs: Vec<LearnedPairRow>,
 }
+
+/// One profile in the prompts editor: its wire key, display label, the
+/// built-in prompt text, and the user's saved override when one exists.
+#[derive(Debug, Serialize)]
+struct PromptEditorProfile {
+    key: String,
+    label: String,
+    builtin: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    r#override: Option<String>,
+}
+
+/// Prompts-editor spec: the file the window edits, the per-profile cap the
+/// editor enforces at save time, the copy lines, a plain error line when the
+/// file is unreadable, and the four profiles in the editor's fixed order.
+#[derive(Debug, Serialize)]
+struct PromptsWindowSpec {
+    file: String,
+    cap: usize,
+    note: String,
+    reset_line: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    profiles: Vec<PromptEditorProfile>,
+}
+
+/// Footer note the prompts editor shows under its actions: both cleanup
+/// routes read the override at call time, so an edit never needs a restart.
+const PROMPTS_WINDOW_NOTE: &str = "Changes apply from your next dictation.";
+
+/// Reset-button label carried in the spec so the copy lives with the rest of
+/// the window's lines.
+const PROMPTS_WINDOW_RESET_LINE: &str = "Reset to built-in";
+
+/// Plain line the prompts editor shows when the overrides file exists but
+/// cannot be read or parsed.
+const PROMPTS_WINDOW_UNREADABLE_LINE: &str = "Could not read the cleanup-prompts file.";
+
+/// The editor's fixed profile order and their display labels.
+const PROMPT_EDITOR_PROFILES: [(CleanupProfile, &str); 4] = [
+    (CleanupProfile::Default, "Default"),
+    (CleanupProfile::Email, "Email"),
+    (CleanupProfile::Chat, "Chat"),
+    (CleanupProfile::Notes, "Notes"),
+];
 
 /// Welcome line shown at the top of the learning window when pairs exist.
 const LEARNING_HINT_WELCOME: &str =
@@ -7434,6 +7593,7 @@ enum DashboardAction {
     Restart,
     OpenSetup,
     OpenLearned,
+    OpenPrompts,
 }
 
 /// A raw dashboard request line before validation.
@@ -7483,6 +7643,7 @@ fn typed_dashboard_action(
         "restart" => Ok(DashboardAction::Restart),
         "open_setup" => Ok(DashboardAction::OpenSetup),
         "open_learned" => Ok(DashboardAction::OpenLearned),
+        "open_prompts" => Ok(DashboardAction::OpenPrompts),
         "save_settings" => {
             if let Some(hotkey) = request.hotkey.as_deref()
                 && !is_supported_hotkey(hotkey)
@@ -7927,6 +8088,15 @@ fn handle_dashboard_action(app: &Arc<App>, action: DashboardAction) -> serde_jso
                 "restart_needed": false,
             })
         }
+        DashboardAction::OpenPrompts => {
+            app.send_user_event(UserEvent::ShowPrompts);
+            serde_json::json!({
+                "type": "dashboard_action_reply",
+                "ok": true,
+                "message": "Opened.",
+                "restart_needed": false,
+            })
+        }
     }
 }
 
@@ -7990,6 +8160,7 @@ fn onboarding_window_payload(app: &App, write_marker: bool) -> Result<String, Ap
         key_entry: None,
         write_marker,
         learning: None,
+        prompts: None,
         wizard: Some(WizardSpec {
             key_missing: missing,
             accessibility_state: String::from(accessibility),
@@ -8023,6 +8194,7 @@ fn status_window_payload(app: &App) -> Result<String, AppError> {
         key_entry: None,
         write_marker: false,
         learning: None,
+        prompts: None,
         wizard: None,
     };
     serde_json::to_string(&payload).map_err(|error| AppError::MenuBar(error.to_string()))
@@ -8057,6 +8229,7 @@ fn learning_window_payload_at(learned_path: &Path) -> Result<String, AppError> {
             error,
             pairs,
         }),
+        prompts: None,
     };
     serde_json::to_string(&payload).map_err(|json_error| AppError::MenuBar(json_error.to_string()))
 }
@@ -8099,6 +8272,82 @@ fn learning_window_pairs(learned_path: &Path) -> (Vec<LearnedPairRow>, Option<St
         })
         .collect();
     (pairs, None)
+}
+
+fn prompts_window_payload() -> Result<String, AppError> {
+    prompts_window_payload_at(&cleanup_prompts_path())
+}
+
+/// Testable form of [`prompts_window_payload`] over an explicit file. The
+/// profiles carry the built-in text and the saved override (missing file or
+/// no override reads as built-in, exactly what the runtime would use); a
+/// file that exists but cannot be read or parsed keeps that behavior and
+/// adds one plain error line, mirroring the learning window.
+fn prompts_window_payload_at(prompts_path: &Path) -> Result<String, AppError> {
+    let (overrides, error) = prompts_window_overrides_for_display(prompts_path);
+    let profiles = PROMPT_EDITOR_PROFILES
+        .iter()
+        .map(|&(profile, label)| {
+            let r#override = overrides.get(&profile).cloned();
+            PromptEditorProfile {
+                key: String::from(cleanup_profile_label(profile)),
+                label: String::from(label),
+                builtin: String::from(cleanup_prompt(profile)),
+                r#override,
+            }
+        })
+        .collect();
+    let payload = AppWindowPayload {
+        mode: String::from("prompts"),
+        title: String::from("Bolo Cleanup Prompts"),
+        welcome: String::new(),
+        brand: Some(String::from("BOLO")),
+        rows: Vec::new(),
+        button: String::from("Done"),
+        try_it_index: None,
+        try_it_hero: None,
+        key_entry: None,
+        write_marker: false,
+        wizard: None,
+        learning: None,
+        prompts: Some(PromptsWindowSpec {
+            file: prompts_path.to_string_lossy().into_owned(),
+            cap: CLEANUP_PROMPT_CAP_CHARS,
+            note: String::from(PROMPTS_WINDOW_NOTE),
+            reset_line: String::from(PROMPTS_WINDOW_RESET_LINE),
+            error,
+            profiles,
+        }),
+    };
+    serde_json::to_string(&payload).map_err(|json_error| AppError::MenuBar(json_error.to_string()))
+}
+
+/// The overrides the editor should display, plus its error line. A missing
+/// file is the plain built-in state; a file that exists but cannot be read
+/// or parsed keeps the built-ins and adds the error line.
+fn prompts_window_overrides_for_display(
+    prompts_path: &Path,
+) -> (BTreeMap<CleanupProfile, String>, Option<String>) {
+    match fs::read_to_string(prompts_path) {
+        Ok(text) => match serde_json::from_str::<CleanupPromptFile>(&text) {
+            Ok(file) => (cleanup_prompt_overrides(&file), None),
+            Err(error) => {
+                warn!("prompts window could not parse the cleanup-prompts file: {error}");
+                (
+                    BTreeMap::new(),
+                    Some(String::from(PROMPTS_WINDOW_UNREADABLE_LINE)),
+                )
+            }
+        },
+        Err(error) if error.kind() == ErrorKind::NotFound => (BTreeMap::new(), None),
+        Err(error) => {
+            warn!("prompts window could not read the cleanup-prompts file: {error}");
+            (
+                BTreeMap::new(),
+                Some(String::from(PROMPTS_WINDOW_UNREADABLE_LINE)),
+            )
+        }
+    }
 }
 
 /// Busy probe for the post-onboarding key reload: an active recording,
@@ -8244,6 +8493,30 @@ fn open_learning_window(app: &App, window_slot: &mut Option<AppWindow>) {
         Ok(window) => {
             *window_slot = Some(window);
             info!("learning window shown");
+        }
+        Err(error) => error!("{error}"),
+    }
+}
+
+/// Open (or ignore when already open) the cleanup-prompts editor. Saves and
+/// resets happen in the helper against the file itself; the runtime picks
+/// them up at the next cleanup call through the overrides-file mtime check,
+/// so edits never need a restart.
+fn open_prompts_window(app: &App, window_slot: &mut Option<AppWindow>) {
+    let already_running = window_slot
+        .as_mut()
+        .map_or(Ok(false), AppWindow::is_running)
+        .unwrap_or(false);
+    if already_running {
+        return;
+    }
+    drop(window_slot.take());
+    let result = prompts_window_payload()
+        .and_then(|payload| spawn_app_window(&app.config.root_dir, &payload));
+    match result {
+        Ok(window) => {
+            *window_slot = Some(window);
+            info!("prompts window shown");
         }
         Err(error) => error!("{error}"),
     }
@@ -10722,6 +10995,17 @@ struct LearnedVocabulary {
     corrections: BTreeMap<String, LearnedCorrectionEntry>,
 }
 
+/// Cache state for the cleanup-prompt overrides: the loaded overrides keyed
+/// by profile and the mtime they were read at. `mtime` starts `None`, so the
+/// first override read after startup always loads the file once; after that
+/// the stat-only common case returns until the editor's atomic rename moves
+/// the mtime, exactly like the learned-vocabulary reload.
+#[derive(Default)]
+struct CleanupPromptCache {
+    mtime: Option<SystemTime>,
+    overrides: BTreeMap<CleanupProfile, String>,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct LearnedCorrectionEntry {
     corrected: String,
@@ -10885,6 +11169,92 @@ fn contains_word_verbatim(text: &str, word: &str) -> bool {
         && word_pieces(text)
             .into_iter()
             .any(|piece| &text[piece.start..piece.end] == word)
+}
+
+// ==== User-editable cleanup prompts ====
+//
+// The per-profile cleanup prompts are built in (`cleanup_prompt`), and the
+// prompts editor in the dashboard can override any of them per profile.
+// Overrides live in ~/.bolo/cleanup_prompts.json (user data, never in the
+// repo): {"overrides": {"email": {"prompt": "..."}, ...}}. Only overridden
+// profiles appear; an absent profile falls back to the built-in prompt.
+
+/// Path of the cleanup-prompt overrides file. User data under ~/.bolo, never
+/// in the repo.
+fn cleanup_prompts_path() -> PathBuf {
+    home_path(".bolo/cleanup_prompts.json")
+}
+
+/// The cleanup-prompt overrides file. A `BTreeMap` keeps the serialized
+/// keys sorted and the file diffable, mirroring the learned-vocabulary
+/// store.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+struct CleanupPromptFile {
+    #[serde(default)]
+    overrides: BTreeMap<String, CleanupPromptEntry>,
+}
+
+/// One saved prompt override for a profile. The nested object (rather than
+/// a bare string) leaves room for future fields without a file-format
+/// migration.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct CleanupPromptEntry {
+    prompt: String,
+}
+
+/// Load the overrides file: a missing file is the empty state (every profile
+/// uses its built-in prompt), a corrupt one is warned about and ignored
+/// rather than fatal, mirroring `load_learned_vocabulary`.
+fn load_cleanup_prompt_file(path: &Path) -> CleanupPromptFile {
+    match fs::read_to_string(path) {
+        Ok(text) => serde_json::from_str::<CleanupPromptFile>(&text).unwrap_or_else(|error| {
+            warn!("cleanup prompts file ignored: {error}");
+            CleanupPromptFile::default()
+        }),
+        Err(error) if error.kind() == ErrorKind::NotFound => CleanupPromptFile::default(),
+        Err(error) => {
+            warn!("cleanup prompts file ignored: {error}");
+            CleanupPromptFile::default()
+        }
+    }
+}
+
+/// The file's overrides keyed by profile: known profile keys map to their
+/// prompt text, unknown keys are warned about and skipped so a typo in a
+/// hand-edited file never breaks cleanup.
+fn cleanup_prompt_overrides(file: &CleanupPromptFile) -> BTreeMap<CleanupProfile, String> {
+    let mut overrides = BTreeMap::new();
+    for (key, entry) in &file.overrides {
+        if let Some(profile) = parse_cleanup_profile(key) {
+            drop(overrides.insert(profile, entry.prompt.clone()));
+        } else {
+            warn!("[cleanup] ignoring unknown prompt profile: {key}");
+        }
+    }
+    overrides
+}
+
+/// `AssemblyAI` caps `llm_instruction` at 2048 characters; requests above the
+/// cap are rejected (config parameters, <https://www.assemblyai.com/docs/dictation>,
+/// checked 2026-10-09). The editor enforces this at save time; this is the
+/// defensive send-time backstop for files edited by hand.
+const CLEANUP_PROMPT_CAP_CHARS: usize = 2048;
+
+/// First `max_chars` Unicode scalar values of `text`. The save path rejects
+/// over-cap prompts, so this only ever trims a hand-edited file; the caller
+/// logs when it does.
+fn truncate_to_chars(text: &str, max_chars: usize) -> String {
+    text.chars().take(max_chars).collect()
+}
+
+/// The effective cleanup prompt for `profile`: the user's override when one
+/// is saved, else the built-in text. Pure core of [`App::effective_cleanup_prompt`]
+/// so the resolution is testable without a full app.
+fn override_or_builtin_prompt_from(
+    override_prompt: Option<String>,
+    profile: CleanupProfile,
+) -> String {
+    override_prompt.unwrap_or_else(|| cleanup_prompt(profile).to_owned())
 }
 
 /// Everyday words a correction must never teach as vocabulary (ported from
@@ -12710,7 +13080,8 @@ mod tests {
         ACCESS_DAEMON_ACTION_TIMEOUT, ACCESS_DAEMON_QUERY_TIMEOUT, ACCESS_DAEMON_STARTUP_TIMEOUT,
         ASSEMBLYAI_STREAMING_MODEL, AccessDaemonFailure, AccessDaemonRequest, AccessibilityContext,
         AccessibilityTrust, App, AppError, AppState, AppWindowPayload, AssemblyDictationResponse,
-        AudioHub, BatchEcho, BatchRetry, CleanupMode, CleanupProfile, Config, CorrectionOutcome,
+        AudioHub, BatchEcho, BatchRetry, CLEANUP_PROMPT_CAP_CHARS, CleanupMode, CleanupProfile,
+        CleanupPromptCache, CleanupPromptEntry, CleanupPromptFile, Config, CorrectionOutcome,
         DashboardAction, DashboardRequestLine, DictationCommandKind, DictationUploadReader,
         DictationUploadRelease, DictationWarmup, EchoVerdict, EditLearningClaim, KeyEntrySpec,
         LEARNING_UNREADABLE_LINE, LEARNING_WINDOW_ROWS, LaunchRequestAction, LearnedPair,
@@ -12724,37 +13095,39 @@ mod tests {
         assemblyai_language_code, batch_retry_plan, batch_transcript_after_echo,
         build_cleanup_user_content, build_rewrite_user_content, build_stt_prompt,
         canonicalize_known_terms, chunk_samples_for, cleanup_decision, cleanup_max_tokens,
-        cleanup_profile, consume_open_dashboard_request_at, contains_word_verbatim,
-        dashboard_accessibility_state, dashboard_cleanup_mode, dashboard_payload,
-        dashboard_provider_label, derive_word_correction, dictation_upload_config,
+        cleanup_profile, cleanup_prompt, cleanup_prompt_overrides, cleanup_prompts_path,
+        consume_open_dashboard_request_at, contains_word_verbatim, dashboard_accessibility_state,
+        dashboard_cleanup_mode, dashboard_payload, dashboard_provider_label,
+        derive_word_correction, dictation_batch_config, dictation_upload_config,
         dictation_upload_form, dictation_upload_release, dictation_upload_request_timeout,
         downsample_wav_16k_mono, edit_distance, empty_transcript_error,
         enforce_learned_vocabulary_cap, final_streaming_result_is_ready_elapsed,
         finalize_accessibility_context, handle_dashboard_action, handle_launch_request_for_state,
         handshake_with_deadline, is_blocklisted_correction, is_known_no_speech_transcript,
-        is_supported_hotkey, learning_window_payload_at, load_learned_vocabulary,
-        load_usage_counters_at, load_vocabulary_usage, load_vocabulary_with_learned,
-        microphone_labels, non_empty_transcript, normalize_microphone_value, onboarding_status_at,
+        is_supported_hotkey, learning_window_payload_at, load_cleanup_prompt_file,
+        load_learned_vocabulary, load_usage_counters_at, load_vocabulary_usage,
+        load_vocabulary_with_learned, microphone_labels, non_empty_transcript,
+        normalize_microphone_value, onboarding_status_at, override_or_builtin_prompt_from,
         parse_accessibility_trust, parse_command, parse_daemon_context_reply,
         parse_daemon_paste_reply, parse_daemon_select_reply, parse_daemon_trust_reply,
         parse_latest_release, parse_release_version, parse_replacements_json, parse_stt_fallbacks,
         parse_u64_env_value, parse_update_outcome, parse_wav_pcm16, pcm_bytes,
-        preview_only_streaming, preview_release_stt, read_vocabulary_file,
-        read_vocabulary_usage_file, record_learned_correction, reload_is_busy,
-        remove_bolo_env_value_at, remove_fillers, request_accessibility_daemon,
+        preview_only_streaming, preview_release_stt, prompts_window_payload_at,
+        read_vocabulary_file, read_vocabulary_usage_file, record_learned_correction,
+        reload_is_busy, remove_bolo_env_value_at, remove_fillers, request_accessibility_daemon,
         resolve_microphone_selection, retry_failed_primary, sanitize_transcript_history,
         save_usage_counters_at, should_exit_for_key_reload, speech_stats,
         stable_streaming_best_is_ready_elapsed, status_rows, streaming_batch_fallback_reason,
         streaming_connection, streaming_preview_tail, streaming_provider_from_config,
         streaming_status_label, strip_reasoning_tags, strip_vocabulary_echo,
         stt_language_for_model, stt_model_config, telnyx_stream_query, transcript_log_value,
-        transcript_menu_preview, typed_dashboard_action, upsert_learned_correction,
-        upsert_replacement, version_is_newer, wait_for_daemon_reply, wav_bytes, wav_duration_ms,
-        write_bolo_env_value_at, write_learned_vocabulary_file,
+        transcript_menu_preview, truncate_to_chars, typed_dashboard_action,
+        upsert_learned_correction, upsert_replacement, version_is_newer, wait_for_daemon_reply,
+        wav_bytes, wav_duration_ms, write_bolo_env_value_at, write_learned_vocabulary_file,
     };
     use std::collections::{HashMap, VecDeque};
     use std::io::Read as _;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::mpsc;
     use std::sync::{Arc, Mutex};
     use std::{env, fs, process};
@@ -13130,6 +13503,7 @@ mod tests {
             }),
             write_marker: true,
             learning: None,
+            prompts: None,
             wizard: None,
         };
         let json = serde_json::to_string(&payload)?;
@@ -13159,6 +13533,7 @@ mod tests {
             key_entry: None,
             write_marker: true,
             learning: None,
+            prompts: None,
             wizard: Some(WizardSpec {
                 key_missing: true,
                 accessibility_state: String::from("warn"),
@@ -13191,7 +13566,7 @@ mod tests {
         // cross-language contract; a drift in either file breaks the
         // pipeline silently, so this test pins them against app_window.py.
         let manifest = env!("CARGO_MANIFEST_DIR");
-        let source_path = std::path::Path::new(manifest).join("app_window.py");
+        let source_path = Path::new(manifest).join("app_window.py");
         let source = fs::read_to_string(&source_path)?;
         assert!(
             source.contains("\"assemblyai\": \"assemblyai/universal-3-5-pro\""),
@@ -15302,6 +15677,7 @@ mod tests {
             vocabulary_aliases: Mutex::new(Vec::new()),
             learned_aliases: Mutex::new(Vec::new()),
             learned_vocabulary_mtime: Mutex::new(None),
+            cleanup_prompts: Mutex::new(CleanupPromptCache::default()),
             latest_release: Mutex::new(None),
             prompt_bindings: Mutex::new(Vec::new()),
             vocabulary_usage: Mutex::new(usage),
@@ -15342,6 +15718,7 @@ mod tests {
             vocabulary_aliases: Mutex::new(Vec::new()),
             learned_aliases: Mutex::new(Vec::new()),
             learned_vocabulary_mtime: Mutex::new(None),
+            cleanup_prompts: Mutex::new(CleanupPromptCache::default()),
             latest_release: Mutex::new(None),
             prompt_bindings: Mutex::new(Vec::new()),
             vocabulary_usage: Mutex::new(HashMap::new()),
@@ -15388,6 +15765,7 @@ mod tests {
             vocabulary_aliases: Mutex::new(Vec::new()),
             learned_aliases: Mutex::new(Vec::new()),
             learned_vocabulary_mtime: Mutex::new(None),
+            cleanup_prompts: Mutex::new(CleanupPromptCache::default()),
             latest_release: Mutex::new(None),
             prompt_bindings: Mutex::new(Vec::new()),
             vocabulary_usage: Mutex::new(HashMap::new()),
@@ -15454,6 +15832,7 @@ mod tests {
             vocabulary_aliases: Mutex::new(Vec::new()),
             learned_aliases: Mutex::new(Vec::new()),
             learned_vocabulary_mtime: Mutex::new(None),
+            cleanup_prompts: Mutex::new(CleanupPromptCache::default()),
             latest_release: Mutex::new(None),
             prompt_bindings: Mutex::new(Vec::new()),
             vocabulary_usage: Mutex::new(HashMap::new()),
@@ -15505,6 +15884,7 @@ mod tests {
             vocabulary_aliases: Mutex::new(Vec::new()),
             learned_aliases: Mutex::new(Vec::new()),
             learned_vocabulary_mtime: Mutex::new(None),
+            cleanup_prompts: Mutex::new(CleanupPromptCache::default()),
             latest_release: Mutex::new(None),
             prompt_bindings: Mutex::new(Vec::new()),
             vocabulary_usage: Mutex::new(HashMap::new()),
@@ -15569,6 +15949,7 @@ mod tests {
             }]),
             learned_aliases: Mutex::new(Vec::new()),
             learned_vocabulary_mtime: Mutex::new(None),
+            cleanup_prompts: Mutex::new(CleanupPromptCache::default()),
             latest_release: Mutex::new(None),
             prompt_bindings: Mutex::new(Vec::new()),
             vocabulary_usage: Mutex::new(HashMap::new()),
@@ -16050,6 +16431,7 @@ mod tests {
             vocabulary_aliases: Mutex::new(Vec::new()),
             learned_aliases: Mutex::new(Vec::new()),
             learned_vocabulary_mtime: Mutex::new(None),
+            cleanup_prompts: Mutex::new(CleanupPromptCache::default()),
             latest_release: Mutex::new(None),
             prompt_bindings: Mutex::new(Vec::new()),
             vocabulary_usage: Mutex::new(HashMap::new()),
@@ -16103,6 +16485,7 @@ mod tests {
             vocabulary_aliases: Mutex::new(Vec::new()),
             learned_aliases: Mutex::new(Vec::new()),
             learned_vocabulary_mtime: Mutex::new(None),
+            cleanup_prompts: Mutex::new(CleanupPromptCache::default()),
             latest_release: Mutex::new(None),
             prompt_bindings: Mutex::new(Vec::new()),
             vocabulary_usage: Mutex::new(HashMap::new()),
@@ -16159,6 +16542,7 @@ mod tests {
             vocabulary_aliases: Mutex::new(Vec::new()),
             learned_aliases: Mutex::new(Vec::new()),
             learned_vocabulary_mtime: Mutex::new(None),
+            cleanup_prompts: Mutex::new(CleanupPromptCache::default()),
             latest_release: Mutex::new(None),
             prompt_bindings: Mutex::new(Vec::new()),
             vocabulary_usage: Mutex::new(HashMap::new()),
@@ -16205,6 +16589,7 @@ mod tests {
             vocabulary_aliases: Mutex::new(Vec::new()),
             learned_aliases: Mutex::new(Vec::new()),
             learned_vocabulary_mtime: Mutex::new(None),
+            cleanup_prompts: Mutex::new(CleanupPromptCache::default()),
             latest_release: Mutex::new(None),
             prompt_bindings: Mutex::new(Vec::new()),
             vocabulary_usage: Mutex::new(HashMap::new()),
@@ -17214,6 +17599,7 @@ mod tests {
             vocabulary_aliases: Mutex::new(vocabulary_aliases),
             learned_aliases: Mutex::new(learned_aliases),
             learned_vocabulary_mtime: Mutex::new(None),
+            cleanup_prompts: Mutex::new(CleanupPromptCache::default()),
             prompt_bindings: Mutex::new(Vec::new()),
             vocabulary_usage: Mutex::new(HashMap::new()),
             vocabulary_usage_path: temp_vocabulary_usage_path(),
@@ -17989,6 +18375,299 @@ mod tests {
             serde_json::json!(LEARNING_UNREADABLE_LINE)
         );
         Ok(())
+    }
+
+    fn temp_cleanup_prompts_path() -> PathBuf {
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut path = env::temp_dir();
+        path.push(format!("bolo-cleanup-prompts-{}-{id}.json", process::id()));
+        path
+    }
+
+    /// Write one overrides file with the given profile-keyed prompts.
+    fn write_cleanup_prompts(path: &Path, prompts: &[(&str, &str)]) -> Result<(), AppError> {
+        let mut file = CleanupPromptFile::default();
+        for (key, prompt) in prompts {
+            drop(file.overrides.insert(
+                (*key).to_owned(),
+                CleanupPromptEntry {
+                    prompt: (*prompt).to_owned(),
+                },
+            ));
+        }
+        let text = serde_json::to_string_pretty(&file)?;
+        fs::write(path, format!("{text}\n"))?;
+        Ok(())
+    }
+
+    #[test]
+    fn cleanup_prompt_overrides_round_trip_per_profile() -> Result<(), AppError> {
+        let path = temp_cleanup_prompts_path();
+        write_cleanup_prompts(
+            &path,
+            &[
+                ("email", "zz email custom cleanup"),
+                ("notes", "zz notes custom cleanup"),
+            ],
+        )?;
+        let file = load_cleanup_prompt_file(&path);
+        let overrides = cleanup_prompt_overrides(&file);
+        assert_eq!(
+            overrides.get(&CleanupProfile::Email).map(String::as_str),
+            Some("zz email custom cleanup")
+        );
+        assert_eq!(
+            overrides.get(&CleanupProfile::Notes).map(String::as_str),
+            Some("zz notes custom cleanup")
+        );
+        // Only overridden profiles appear; absent ones stay absent.
+        assert!(!overrides.contains_key(&CleanupProfile::Chat));
+        assert!(!overrides.contains_key(&CleanupProfile::Default));
+        Ok(())
+    }
+
+    #[test]
+    fn cleanup_prompt_overrides_skip_unknown_profiles() -> Result<(), AppError> {
+        let path = temp_cleanup_prompts_path();
+        write_cleanup_prompts(
+            &path,
+            &[
+                ("email", "zz keep me"),
+                ("bogus", "zz hand-edited typo key"),
+            ],
+        )?;
+        let overrides = cleanup_prompt_overrides(&load_cleanup_prompt_file(&path));
+        assert_eq!(overrides.len(), 1);
+        assert!(overrides.contains_key(&CleanupProfile::Email));
+        assert!(!overrides.contains_key(&CleanupProfile::Default));
+        Ok(())
+    }
+
+    #[test]
+    fn cleanup_prompt_overrides_tolerate_corrupt_and_missing_files() -> Result<(), AppError> {
+        // A corrupt file warns and reads as empty: every profile falls back
+        // to its built-in prompt, byte-identical behavior to no file.
+        let path = temp_cleanup_prompts_path();
+        fs::write(&path, "{ this is not json")?;
+        assert!(cleanup_prompt_overrides(&load_cleanup_prompt_file(&path)).is_empty());
+        // A missing file is the same empty state without a warning.
+        let missing = temp_cleanup_prompts_path();
+        assert!(load_cleanup_prompt_file(&missing).overrides.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn effective_prompt_prefers_override_and_falls_back_to_builtin() {
+        assert_eq!(
+            override_or_builtin_prompt_from(
+                Some(String::from("zz custom prompt")),
+                CleanupProfile::Chat
+            ),
+            "zz custom prompt"
+        );
+        assert_eq!(
+            override_or_builtin_prompt_from(None, CleanupProfile::Chat),
+            cleanup_prompt(CleanupProfile::Chat)
+        );
+        // Missing file -> all built-ins: every profile resolves to exactly
+        // today's built-in text.
+        for profile in [
+            CleanupProfile::Default,
+            CleanupProfile::Email,
+            CleanupProfile::Chat,
+            CleanupProfile::Notes,
+        ] {
+            let overrides = cleanup_prompt_overrides(&CleanupPromptFile::default());
+            assert_eq!(
+                override_or_builtin_prompt_from(overrides.get(&profile).cloned(), profile),
+                cleanup_prompt(profile)
+            );
+        }
+    }
+
+    #[test]
+    fn llm_instruction_cap_truncates_by_unicode_scalar() {
+        let multi_byte = "जो".repeat(1_100);
+        let truncated = truncate_to_chars(&multi_byte, CLEANUP_PROMPT_CAP_CHARS);
+        assert_eq!(truncated.chars().count(), CLEANUP_PROMPT_CAP_CHARS);
+        assert!(multi_byte.chars().count() > CLEANUP_PROMPT_CAP_CHARS);
+        assert_eq!(
+            truncate_to_chars("short", CLEANUP_PROMPT_CAP_CHARS),
+            "short"
+        );
+        assert_eq!(truncate_to_chars("जो ये मैं", 5), "जो ये");
+        assert_eq!(truncate_to_chars("जो ये मैं", 6), "जो ये ");
+    }
+
+    #[test]
+    fn dictation_batch_config_without_override_keeps_today_shape() {
+        // Regression pin: with no override the config carries exactly the
+        // fields the request always had, byte-identical, and no
+        // llm_instruction key exists for the endpoint to reject.
+        let language = "en-US";
+        let vocabulary = vec![String::from("Telnyx"), String::from("HJX7")];
+        let config = dictation_batch_config(language, &vocabulary, None);
+        let legacy = serde_json::json!({
+            "language_codes": ["en"],
+            "keyterms_prompt": ["Telnyx", "HJX7"],
+        });
+        assert_eq!(config, legacy);
+        assert!(config.get("llm_instruction").is_none());
+        assert_eq!(
+            serde_json::to_string(&config).unwrap(),
+            serde_json::to_string(&legacy).unwrap()
+        );
+
+        // The no-vocabulary and unknown-language corners keep their shape
+        // too: an empty config object, exactly as before overrides existed.
+        assert_eq!(
+            dictation_batch_config("en-US", &[], None),
+            serde_json::json!({"language_codes": ["en"]})
+        );
+        assert_eq!(
+            dictation_batch_config("zz-unknown", &[], None),
+            serde_json::json!({})
+        );
+    }
+
+    #[test]
+    fn dictation_batch_config_with_override_adds_llm_instruction() {
+        let config = dictation_batch_config(
+            "en-US",
+            &[],
+            Some("Rewrite as a concise clinical chart note."),
+        );
+        assert_eq!(
+            config["llm_instruction"],
+            serde_json::json!("Rewrite as a concise clinical chart note.")
+        );
+    }
+
+    #[test]
+    fn cleanup_override_reads_and_reloads_without_restart() -> Result<(), AppError> {
+        let path = temp_cleanup_prompts_path();
+        let app = plain_test_app();
+        // No file yet: every profile uses its built-in prompt.
+        assert_eq!(app.cleanup_override_at(&path, CleanupProfile::Email), None);
+
+        // The editor saves behind the runtime's back; the next read picks
+        // the override up without a restart.
+        write_cleanup_prompts(&path, &[("email", "zz email override v1")])?;
+        assert_eq!(
+            app.cleanup_override_at(&path, CleanupProfile::Email),
+            Some(String::from("zz email override v1"))
+        );
+        // Only the overridden profile changed.
+        assert_eq!(app.cleanup_override_at(&path, CleanupProfile::Chat), None);
+
+        // A second edit moves the file again; the cached copy must not win.
+        // Forcing the cached mtime to "never seen" stands in for a
+        // same-instant rewrite without depending on timestamp granularity,
+        // the same stand-in the learned-vocabulary reload tests use.
+        write_cleanup_prompts(&path, &[("email", "zz email override v2")])?;
+        if let Ok(mut cache) = app.cleanup_prompts.lock() {
+            cache.mtime = None;
+        }
+        assert_eq!(
+            app.cleanup_override_at(&path, CleanupProfile::Email),
+            Some(String::from("zz email override v2"))
+        );
+
+        // The editor's reset removes the override; the next read falls
+        // back to the built-in prompt again. The cached mtime is Some and
+        // the deleted file stats as None, so the reload fires naturally:
+        // this is exactly the production deletion flow.
+        drop(fs::remove_file(&path));
+        assert_eq!(app.cleanup_override_at(&path, CleanupProfile::Email), None);
+        Ok(())
+    }
+
+    #[test]
+    fn prompts_window_payload_lists_four_profiles_with_effective_prompts() -> Result<(), AppError> {
+        let path = temp_cleanup_prompts_path();
+        write_cleanup_prompts(&path, &[("notes", "zz notes override")])?;
+        let payload =
+            serde_json::from_str::<serde_json::Value>(&prompts_window_payload_at(&path)?)?;
+        assert_eq!(payload["mode"], "prompts");
+        assert_eq!(payload["title"], "Bolo Cleanup Prompts");
+        let prompts = &payload["prompts"];
+        assert_eq!(prompts["error"], serde_json::Value::Null);
+        assert_eq!(prompts["cap"], serde_json::json!(CLEANUP_PROMPT_CAP_CHARS));
+        assert!(
+            prompts["note"]
+                .as_str()
+                .is_some_and(|text| text.contains("Changes apply from your next dictation."))
+        );
+        let profiles = prompts["profiles"]
+            .as_array()
+            .ok_or(AppError::MenuBar(String::from(
+                "prompts payload profiles are not a list",
+            )))?;
+        assert_eq!(profiles.len(), 4);
+        let keys: Vec<&str> = profiles
+            .iter()
+            .filter_map(|profile| profile["key"].as_str())
+            .collect();
+        assert_eq!(keys, ["default", "email", "chat", "notes"]);
+        let labels: Vec<&str> = profiles
+            .iter()
+            .filter_map(|profile| profile["label"].as_str())
+            .collect();
+        assert_eq!(labels, ["Default", "Email", "Chat", "Notes"]);
+        // Every profile carries its built-in text; only the overridden one
+        // carries the override.
+        for profile in profiles {
+            assert_eq!(
+                profile["builtin"],
+                serde_json::json!(match profile["key"].as_str() {
+                    Some("email") => cleanup_prompt(CleanupProfile::Email),
+                    Some("chat") => cleanup_prompt(CleanupProfile::Chat),
+                    Some("notes") => cleanup_prompt(CleanupProfile::Notes),
+                    _ => cleanup_prompt(CleanupProfile::Default),
+                })
+            );
+        }
+        assert_eq!(
+            profiles[3]["override"],
+            serde_json::json!("zz notes override")
+        );
+        assert_eq!(profiles[0]["override"], serde_json::Value::Null);
+        Ok(())
+    }
+
+    #[test]
+    fn prompts_window_payload_unreadable_line_and_private_file() -> Result<(), AppError> {
+        let path = temp_cleanup_prompts_path();
+        let payload =
+            serde_json::from_str::<serde_json::Value>(&prompts_window_payload_at(&path)?)?;
+        assert_eq!(payload["prompts"]["error"], serde_json::Value::Null);
+
+        fs::write(&path, "not json at all")?;
+        let unreadable =
+            serde_json::from_str::<serde_json::Value>(&prompts_window_payload_at(&path)?)?;
+        assert_eq!(
+            unreadable["prompts"]["error"],
+            serde_json::json!("Could not read the cleanup-prompts file.")
+        );
+        // Built-ins still render: the editor opens with the real fallback
+        // text even when the file is unreadable.
+        assert_eq!(
+            unreadable["prompts"]["profiles"][0]["builtin"],
+            serde_json::json!(cleanup_prompt(CleanupProfile::Default))
+        );
+        assert_eq!(
+            unreadable["prompts"]["profiles"][0]["override"],
+            serde_json::Value::Null
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cleanup_prompts_path_is_user_data_under_bolo_home() {
+        let path = cleanup_prompts_path();
+        let text = path.to_string_lossy();
+        assert!(text.ends_with(".bolo/cleanup_prompts.json"), "{text}");
     }
 
     #[test]

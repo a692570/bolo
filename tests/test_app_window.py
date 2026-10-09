@@ -505,6 +505,206 @@ def test_try_it_hero_is_styling_only_not_geometry():
     assert plan_plain["height"] == plan_hero["height"]
 
 
+# ==== Cleanup-prompts editor ====
+
+
+def prompts_spec(overrides=None, error=None):
+    """A runtime prompts spec shaped like the Rust payload: the four
+    profiles, with per-profile overrides."""
+    return {
+        "file": "/tmp/prompts-under-test.json",
+        "cap": 2048,
+        "note": "Changes apply from your next dictation.",
+        "reset_line": "Reset to built-in",
+        "error": error,
+        "profiles": [
+            {
+                "key": "default",
+                "label": "Default",
+                "builtin": "builtin default prompt",
+                "override": None,
+            },
+            {
+                "key": "email",
+                "label": "Email",
+                "builtin": "builtin email prompt",
+                "override": None,
+            },
+            {
+                "key": "chat",
+                "label": "Chat",
+                "builtin": "builtin chat prompt",
+                "override": None,
+            },
+            {
+                "key": "notes",
+                "label": "Notes",
+                "builtin": "builtin notes prompt",
+                "override": None,
+            },
+        ],
+    }
+
+
+def test_prompts_display_payload_renders_four_profiles():
+    spec = prompts_spec()
+    spec["profiles"][1]["override"] = "zz email custom"
+
+    display = app_window.prompts_display_payload(spec)
+
+    assert [row["key"] for row in display["profiles"]] == [
+        "default", "email", "chat", "notes",
+    ]
+    assert [row["label"] for row in display["profiles"]] == [
+        "Default", "Email", "Chat", "Notes",
+    ]
+    overridden = display["profiles"][1]
+    assert overridden["effective"] == "zz email custom"
+    assert overridden["is_builtin"] is False
+    for index in (0, 2, 3):
+        row = display["profiles"][index]
+        assert row["effective"] == row["builtin"]
+        assert row["is_builtin"] is True
+    assert display["cap"] == 2048
+    assert display["note"] == "Changes apply from your next dictation."
+    assert display["error"] is None
+
+
+def test_prompts_display_payload_tolerates_degraded_specs():
+    # Missing spec, non-dict rows, and a bad cap all degrade to a renderable
+    # editor rather than raising.
+    empty = app_window.prompts_display_payload(None)
+    assert empty["profiles"] == []
+    assert empty["cap"] == 2048
+
+    display = app_window.prompts_display_payload(
+        {"cap": "bogus", "profiles": [None, {"key": "email"}, {"key": "chat", "override": 5}]}
+    )
+    assert display["cap"] == 2048
+    # The empty dict row keeps its key and falls back to the built-in text.
+    assert display["profiles"][0]["effective"] == ""
+    assert display["profiles"][0]["is_builtin"] is True
+    # A non-string override reads as no override.
+    assert display["profiles"][1]["is_builtin"] is True
+
+
+def test_validate_prompt_text_enforces_empty_and_cap():
+    assert app_window.validate_prompt_text("", 2048) == "The prompt cannot be empty."
+    assert (
+        app_window.validate_prompt_text("   \n\t ", 2048)
+        == "The prompt cannot be empty."
+    )
+    assert (
+        app_window.validate_prompt_text("x" * 2049, 2048)
+        == "The prompt is too long for AssemblyAI (2048 characters max)."
+    )
+    assert app_window.validate_prompt_text("x" * 2048, 2048) is None
+    assert app_window.validate_prompt_text("Clean up my Hinglish.", 2048) is None
+    # Characters, not bytes: Devanagari text measures like Rust's chars().
+    assert app_window.validate_prompt_text("जो" * 1024, 2048) is None
+    assert app_window.validate_prompt_text("जो" * 1025, 2048) is not None
+
+
+def test_write_prompts_file_matches_runtime_shape(tmp_path):
+    path = str(tmp_path / "cleanup_prompts.json")
+
+    app_window.write_prompts_file(
+        path, {"overrides": {"email": {"prompt": "zz custom cleanup"}}}
+    )
+
+    with open(path) as handle:
+        assert handle.read() == (
+            '{\n  "overrides": {\n    "email": {\n      "prompt": "zz custom cleanup"\n    }\n  }\n}\n'
+        )
+    assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
+    assert not os.path.exists(path + ".tmp")
+
+
+def test_save_prompt_override_round_trips_and_preserves_other_profiles(tmp_path):
+    path = str(tmp_path / "cleanup_prompts.json")
+    # A missing file starts fresh: saving one profile creates the file.
+    assert app_window.save_prompt_override(path, "email", "zz email prompt") is None
+
+    with open(path) as handle:
+        assert json.load(handle) == {"overrides": {"email": {"prompt": "zz email prompt"}}}
+
+    # The second save preserves the first profile's override.
+    assert app_window.save_prompt_override(path, "notes", "zz notes prompt") is None
+    with open(path) as handle:
+        assert json.load(handle) == {
+            "overrides": {
+                "email": {"prompt": "zz email prompt"},
+                "notes": {"prompt": "zz notes prompt"},
+            }
+        }
+
+    # The Rust runtime's reader accepts the file the editor writes: shape,
+    # 0600 perms, no temp leftovers.
+    assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
+    assert not os.path.exists(path + ".tmp")
+
+
+def test_remove_prompt_override_removes_only_that_profile(tmp_path):
+    path = str(tmp_path / "cleanup_prompts.json")
+    app_window.save_prompt_override(path, "email", "zz email prompt")
+    app_window.save_prompt_override(path, "notes", "zz notes prompt")
+
+    removed, error = app_window.remove_prompt_override(path, "email")
+
+    assert removed is True
+    assert error is None
+    with open(path) as handle:
+        assert json.load(handle) == {"overrides": {"notes": {"prompt": "zz notes prompt"}}}
+
+
+def test_remove_prompt_override_reports_missing_states(tmp_path):
+    path = str(tmp_path / "cleanup_prompts.json")
+    # No file: nothing saved for the profile, nothing written.
+    removed, error = app_window.remove_prompt_override(path, "email")
+    assert removed is False
+    assert error == "No custom prompt is saved for this profile."
+    assert not os.path.exists(path)
+
+    # File without that key: same plain message, no write.
+    app_window.save_prompt_override(path, "notes", "zz notes prompt")
+    removed, error = app_window.remove_prompt_override(path, "email")
+    assert removed is False
+    assert error == "No custom prompt is saved for this profile."
+
+    # Corrupt file: plain error, and the file is left untouched.
+    with open(path, "w") as handle:
+        handle.write("{ this is not json")
+    removed, error = app_window.remove_prompt_override(path, "notes")
+    assert removed is False
+    assert error == app_window.PROMPTS_EMPTY_ERROR
+
+
+def test_save_prompt_override_surfaces_corrupt_file_error_without_writing(tmp_path):
+    path = str(tmp_path / "cleanup_prompts.json")
+    with open(path, "w") as handle:
+        handle.write("not json at all")
+
+    error = app_window.save_prompt_override(path, "email", "zz email prompt")
+
+    assert error == app_window.PROMPTS_EMPTY_ERROR
+    with open(path) as handle:
+        assert handle.read() == "not json at all"
+
+
+def test_read_prompts_overrides_accepts_missing_and_rejects_corrupt(tmp_path):
+    assert app_window.read_prompts_overrides(str(tmp_path / "gone.json")) == (
+        {}, None)
+    path = str(tmp_path / "cleanup_prompts.json")
+    app_window.save_prompt_override(path, "chat", "zz chat prompt")
+    assert app_window.read_prompts_overrides(path) == (
+        {"chat": {"prompt": "zz chat prompt"}}, None)
+
+    with open(path, "w") as handle:
+        handle.write("[1, 2, 3]")
+    assert app_window.read_prompts_overrides(path) == (
+        {}, app_window.PROMPTS_EMPTY_ERROR)
+
+
 def test_appkit_action_selectors_have_single_colons():
     """Guard against the pyobjc underscore-to-colon trap.
 
@@ -522,6 +722,13 @@ def test_appkit_action_selectors_have_single_colons():
     assert '"openAccessibility:"' in source
     assert "restartBolo_" in source
     assert '"restartBolo:"' in source
+    # The prompts editor's actions follow the same one-colon rule.
+    assert "promptSave_" in source
+    assert '"promptSave:"' in source
+    assert "promptReset_" in source
+    assert '"promptReset:"' in source
+    assert "promptProfileSelected_" in source
+    assert '"promptProfileSelected:"' in source
 
 
 def test_accessibility_settings_url_targets_privacy_accessibility():

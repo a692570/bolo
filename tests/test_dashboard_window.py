@@ -126,6 +126,11 @@ def test_build_action_emits_the_contract_shape_and_validates():
     assert dashboard_window.build_action("refresh") == {
         "type": "dashboard_action", "action": "refresh",
     }
+    # The prompts editor opens through the same contract as the other
+    # window-opening actions: the action name alone, no settings values.
+    assert dashboard_window.build_action("open_prompts") == {
+        "type": "dashboard_action", "action": "open_prompts",
+    }
 
 
 def test_emit_request_writes_one_json_line(capsys):
@@ -370,9 +375,10 @@ def test_controller_simple_actions_emit_their_requests():
     refs["controller"].refreshNow_(None)
     refs["controller"].openSetup_(None)
     refs["controller"].openLearned_(None)
+    refs["controller"].openPrompts_(None)
     refs["controller"].restartBolo_(None)
     assert [request["action"] for request in emitted] == [
-        "refresh", "open_setup", "open_learned", "restart",
+        "refresh", "open_setup", "open_learned", "open_prompts", "restart",
     ]
 
 
