@@ -65,7 +65,7 @@ KNOWN_HOTKEYS = (
     "f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8", "f9", "f10",
     "f11", "f12", "f13", "f14", "f15", "f16", "f17", "f18", "f19",
 )
-ACTIONS = ("refresh", "save_settings", "restart", "open_setup", "open_learned")
+ACTIONS = ("refresh", "save_settings", "restart", "open_setup", "open_learned", "open_prompts")
 
 # Mutable module state: the window renderer stores its refs here so the
 # single AppKit controller can reach them from any action callback.
@@ -668,6 +668,9 @@ def _controller_class_cached(NSObject):
 
         def openLearned_(self, sender):
             self._simple_action("open_learned")
+
+        def openPrompts_(self, sender):
+            self._simple_action("open_prompts")
 
         def restartBolo_(self, sender):
             self._simple_action("restart")
@@ -1978,6 +1981,12 @@ def _render_settings(refs, body, controller):
         "Vocabulary learned from your corrections.",
         setup_y + 56, "openLearned:",
         trailing="{0}".format(dashboard["learned_words_count"]),
+    )
+    _hairline(body, (x, setup_y + 106, w, 1), dark)
+    link_row(
+        "Cleanup prompts\u2026",
+        "Control how Bolo cleans up your dictations, per app.",
+        setup_y + 112, "openPrompts:",
     )
 
 

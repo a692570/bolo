@@ -1640,6 +1640,203 @@ def write_learned_file(path, payload):
     os.replace(tmp, path)
 
 
+# ==== Cleanup-prompts editor (pure helpers) ====
+#
+# The Rust runtime owns cleanup; this editor only reads and rewrites the
+# user-data file ~/.bolo/cleanup_prompts.json. Shape on the wire and on
+# disk: {"overrides": {"email": {"prompt": "..."}, ...}}. Only overridden
+# profiles appear; an absent profile falls back to the built-in prompt, and
+# both cleanup routes in the runtime read the file at call time, so a save
+# applies from the next dictation with no restart.
+
+PROMPTS_EMPTY_ERROR = "Could not read the cleanup-prompts file."
+
+
+def prompts_display_payload(spec):
+    """Pure display payload for the cleanup-prompts editor.
+
+    Normalizes the runtime spec into the four profile rows the editor
+    renders: each row carries the key, label, the built-in text, the saved
+    override when one exists, the effective text the text view should show
+    (the override when saved, else the built-in), and whether the effective
+    text is the built-in. Malformed specs degrade to the empty editor
+    rather than raising, the same tolerance the other windows apply.
+    """
+    if not isinstance(spec, dict):
+        spec = {}
+    cap = spec.get("cap")
+    cap = cap if isinstance(cap, int) and cap > 0 else 2048
+    raw_profiles = spec.get("profiles")
+    rows = []
+    for item in raw_profiles if isinstance(raw_profiles, list) else []:
+        if not isinstance(item, dict):
+            continue
+        builtin = item.get("builtin") or ""
+        override = item.get("override")
+        override = override if isinstance(override, str) and override else None
+        rows.append(
+            {
+                "key": item.get("key") or "",
+                "label": item.get("label") or item.get("key") or "",
+                "builtin": builtin,
+                "override": override,
+                "effective": override or builtin,
+                "is_builtin": override is None,
+            }
+        )
+    return {
+        "file": spec.get("file") or "",
+        "cap": cap,
+        "note": spec.get("note") or "Changes apply from your next dictation.",
+        "reset_line": spec.get("reset_line") or "Reset to built-in",
+        "error": spec.get("error"),
+        "profiles": rows,
+    }
+
+
+def validate_prompt_text(text, cap):
+    """Plain error message when the text cannot be saved, else None.
+
+    A prompt must be non-empty after trimming, and every profile can ride
+    the AssemblyAI Dictation request as `llm_instruction`, so the
+    provider's 2048-character cap applies to all of them (docs:
+    https://www.assemblyai.com/docs/dictation, checked 2026-10-09).
+    Characters are counted, not bytes, so Hinglish and Devanagari text
+    measures like the Rust side counts it.
+    """
+    if not isinstance(text, str) or not text.strip():
+        return "The prompt cannot be empty."
+    if len(text) > cap:
+        return "The prompt is too long for AssemblyAI ({0} characters max).".format(cap)
+    return None
+
+
+def write_prompts_file(path, payload):
+    """Atomic cleanup-prompts write mirroring the Rust runtime's file
+    stores: indent 2 with a trailing newline, private permissions, rename
+    into place so a crash never leaves a half-written file."""
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2)
+        handle.write("\n")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+def read_prompts_overrides(path):
+    """Read the overrides object for editing: ``{}`` when the file is
+    missing (nothing overridden yet is a valid state), or the parsed
+    ``overrides`` mapping. Returns ``(overrides, error)`` where error is
+    plain display text when the file exists but cannot be read or parsed;
+    in that case overrides is ``{}`` and the caller must not write."""
+    try:
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+    except FileNotFoundError:
+        return {}, None
+    except Exception:
+        return {}, PROMPTS_EMPTY_ERROR
+    if not isinstance(data, dict):
+        return {}, PROMPTS_EMPTY_ERROR
+    overrides = data.get("overrides")
+    if not isinstance(overrides, dict):
+        return {}, PROMPTS_EMPTY_ERROR
+    return overrides, None
+
+
+def save_prompt_override(path, profile_key, text):
+    """Save one profile's prompt override. Returns a plain error message
+    or None on success. The read-modify-write preserves every other
+    override in the file; a missing file simply starts fresh."""
+    overrides, error = read_prompts_overrides(path)
+    if error is not None:
+        return error
+    overrides[profile_key] = {"prompt": text}
+    try:
+        write_prompts_file(path, {"overrides": overrides})
+    except Exception:
+        return "Could not save the cleanup-prompts file."
+    return None
+
+
+def remove_prompt_override(path, profile_key):
+    """Remove one profile's prompt override. Returns (removed, error): removed
+    is True only when an override existed and was written out; a missing file
+    or missing key reports the plain already-built-in message without writing;
+    an unreadable file surfaces PROMPTS_EMPTY_ERROR untouched."""
+    overrides, error = read_prompts_overrides(path)
+    if error is not None:
+        return False, error
+    if profile_key not in overrides:
+        return False, "No custom prompt is saved for this profile."
+    del overrides[profile_key]
+    try:
+        write_prompts_file(path, {"overrides": overrides})
+    except Exception:
+        return False, "Could not save the cleanup-prompts file."
+    return True, None
+
+
+def set_prompts_status(refs, text, ok=None):
+    """Show (or clear) the editor's status line: ok=True renders green,
+    ok=False red, None muted."""
+    label = refs.get("status_label")
+    if label is None:
+        return
+    label.setStringValue_(text)
+    color = (refs.get("colors") or {}).get(
+        {True: "ok", False: "warn"}.get(ok, "muted")
+    )
+    if color is not None:
+        label.setTextColor_(color)
+
+
+def update_prompts_badge(refs):
+    """Point the badge at the selected profile's current state: Built-in
+    when the effective text is the built-in prompt, Custom when an override
+    is in force."""
+    badge = refs.get("badge_label")
+    if badge is None:
+        return
+    profiles = refs.get("profiles") or []
+    selected = refs.get("selected")
+    if selected is None or not 0 <= selected < len(profiles):
+        return
+    builtin = bool(profiles[selected].get("is_builtin"))
+    badge.setStringValue_("Built-in" if builtin else "Custom")
+    color = (refs.get("colors") or {}).get("muted" if builtin else "ok")
+    if color is not None:
+        badge.setTextColor_(color)
+
+
+def update_prompts_selection(refs):
+    """Re-style the sidebar rows for the current selection: the selected
+    row reads in the text color, the rest stay muted; the selected profile
+    title and badge follow the same state."""
+    buttons = refs.get("profile_buttons") or []
+    profiles = refs.get("profiles") or []
+    colors = refs.get("colors") or {}
+    selected = refs.get("selected")
+    text_color = colors.get("text")
+    muted_color = colors.get("muted")
+    for index, button in enumerate(buttons):
+        color = (
+            text_color if index == selected and text_color is not None else muted_color
+        )
+        if color is None:
+            continue
+        button.setTextColor_(color)
+    title_label = refs.get("profile_title_label")
+    if title_label is not None and selected is not None and 0 <= selected < len(profiles):
+        title_label.setStringValue_(profiles[selected]["label"])
+    update_prompts_badge(refs)
+
+
+
+
 def delete_learned_pair(path, misheard):
     """Remove one learned pair from the corrections file.
 
@@ -2117,6 +2314,87 @@ def _appkit_classes_cached(NSView, NSObject):
             )
             subprocess.Popen(open_settings_command())
 
+        def promptProfileSelected_(self, sender):
+            """Sidebar pick: keep the typed draft for the profile being
+            left, show the new profile's effective text (its draft when the
+            user typed one, else the saved/built-in state)."""
+            refs = STATE.get("prompts_refs") or {}
+            profiles = refs.get("profiles") or []
+            try:
+                index = int(sender.tag())
+            except (TypeError, ValueError):
+                return
+            if not 0 <= index < len(profiles):
+                return
+            text_view = refs.get("text_view")
+            if text_view is not None and refs.get("selected") is not None:
+                left = profiles[refs["selected"]]
+                refs.setdefault("drafts", {})[left["key"]] = str(text_view.string())
+            refs["selected"] = index
+            row = profiles[index]
+            drafts = refs.get("drafts") or {}
+            text = drafts.get(row["key"], row["effective"])
+            if text_view is not None:
+                text_view.setString_(text)
+            update_prompts_selection(refs)
+            set_prompts_status(refs, "", ok=None)
+
+        def promptSave_(self, sender):
+            """Save the edited prompt as the selected profile's override.
+            Validation failures show a plain error and write nothing."""
+            refs = STATE.get("prompts_refs") or {}
+            profiles = refs.get("profiles") or []
+            selected = refs.get("selected")
+            text_view = refs.get("text_view")
+            if selected is None or not 0 <= selected < len(profiles):
+                return
+            if text_view is None:
+                return
+            row = profiles[selected]
+            text = str(text_view.string())
+            error = validate_prompt_text(text, refs.get("cap"))
+            if error is None:
+                error = save_prompt_override(refs.get("file") or "", row["key"], text)
+            if error is not None:
+                set_prompts_status(refs, error, ok=False)
+                return
+            row["override"] = text
+            row["effective"] = text
+            row["is_builtin"] = False
+            refs.setdefault("drafts", {})[row["key"]] = text
+            update_prompts_badge(refs)
+            set_prompts_status(refs, "Saved. " + (refs.get("note") or ""), ok=True)
+
+        def promptReset_(self, sender):
+            """Remove the selected profile's override; the built-in prompt
+            takes over from the next dictation."""
+            refs = STATE.get("prompts_refs") or {}
+            profiles = refs.get("profiles") or []
+            selected = refs.get("selected")
+            if selected is None or not 0 <= selected < len(profiles):
+                return
+            row = profiles[selected]
+            removed, error = remove_prompt_override(
+                refs.get("file") or "", row["key"]
+            )
+            if error is not None:
+                set_prompts_status(refs, error, ok=False)
+                return
+            row["override"] = None
+            row["effective"] = row["builtin"]
+            row["is_builtin"] = True
+            refs.setdefault("drafts", {})[row["key"]] = row["builtin"]
+            text_view = refs.get("text_view")
+            if text_view is not None:
+                text_view.setString_(row["builtin"])
+            update_prompts_badge(refs)
+            if removed:
+                set_prompts_status(refs, "Using the built-in prompt.", ok=True)
+            else:
+                set_prompts_status(
+                    refs, "Already using the built-in prompt.", ok=None
+                )
+
         def restartBolo_(self, sender):
             # Signal exactly the process that spawned this window, and
             # only after the kill -0 probe confirms it is alive. Never a
@@ -2223,6 +2501,295 @@ def _post_stop_wake(app):
     app.postEvent_atStart_(event, True)
 
 
+PROMPTS_WINDOW_WIDTH = 680
+PROMPTS_WINDOW_HEIGHT = 548
+PROMPTS_SIDEBAR_X = 36
+PROMPTS_SIDEBAR_W = 150
+PROMPTS_BODY_X = 214
+PROMPTS_BODY_W = 430
+
+
+def build_prompts_ui(payload, preview=False):
+    """Build the cleanup-prompts editor window.
+
+    One sidebar of the four cleanup profiles, one editable text view
+    showing the selected profile's effective prompt (the saved override,
+    or the built-in text with a Built-in badge so the user knows what they
+    are editing), Save and Reset-to-built-in actions, and the no-restart
+    note: both cleanup routes in the runtime read the overrides file at
+    call time, so edits apply from the next dictation. Saves validate the
+    text (non-empty, within the AssemblyAI cap) and write the user-data
+    file atomically, mirroring the learned-words window.
+    """
+    from AppKit import (
+        NSApplication,
+        NSApplicationActivationPolicyAccessory,
+        NSBezelBorder,
+        NSBezelStyleRounded,
+        NSButton,
+        NSFont,
+        NSFontWeightMedium,
+        NSMakeRect,
+        NSObject,
+        NSTextAlignmentLeft,
+        NSScrollView,
+        NSTextField,
+        NSTextView,
+        NSView,
+        NSWindow,
+        NSWindowStyleMaskClosable,
+        NSWindowStyleMaskTitled,
+    )
+    from objc import ObjCPointerWarning
+
+    warnings.filterwarnings("ignore", category=ObjCPointerWarning)
+    from AppKit import NSAppearance
+
+    FlippedView, BrandMarkView, _DictationKeyView, WindowController = (
+        _appkit_classes_cached(NSView, NSObject)
+    )
+
+    display = prompts_display_payload(payload.get("prompts"))
+    profiles = display["profiles"]
+    if not profiles:
+        # The spec is malformed: no rows to edit. The window still opens
+        # with the plain error line so the state is never a silent blank.
+        display = prompts_display_payload({})
+        display["error"] = PROMPTS_EMPTY_ERROR
+
+    dark_now = False
+    try:
+        dark_now = bolo_brand.is_dark(NSAppearance.currentAppearance())
+    except Exception:
+        dark_now = False
+    pal_now = bolo_brand.palette(dark=dark_now)
+    text_color = bolo_brand.native_color(pal_now["text"])
+    muted_color = bolo_brand.native_color(pal_now["muted"])
+    accent = bolo_brand.native_color(_primary_button_rgb())
+    surface_bg = bolo_brand.native_color(pal_now["surface"])
+    border_color = bolo_brand.native_color(pal_now["border"])
+
+    app = NSApplication.sharedApplication()
+    app.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
+    window = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+        NSMakeRect(0, 0, PROMPTS_WINDOW_WIDTH, PROMPTS_WINDOW_HEIGHT),
+        NSWindowStyleMaskTitled | NSWindowStyleMaskClosable,
+        2,
+        False,
+    )
+    window.setTitle_(payload.get("title") or "Bolo Cleanup Prompts")
+    window.setReleasedWhenClosed_(False)
+    controller = WindowController.alloc().init()
+    window.setDelegate_(controller)
+    content = FlippedView.alloc().initWithFrame_(
+        NSMakeRect(0, 0, PROMPTS_WINDOW_WIDTH, PROMPTS_WINDOW_HEIGHT)
+    )
+    apply_window_background(content, dark=dark_now)
+
+    def label(text, rect, font, color, alignment=NSTextAlignmentLeft):
+        field = NSTextField.labelWithString_(text)
+        field.setFrame_(rect)
+        field.setFont_(font)
+        field.setTextColor_(color)
+        field.setEditable_(False)
+        field.setSelectable_(True)
+        field.setBezeled_(False)
+        field.setDrawsBackground_(False)
+        content.addSubview_(field)
+        return field
+
+    # Brand row, matching the other windows.
+    mark_view = BrandMarkView.alloc().initWithFrame_(
+        NSMakeRect(PROMPTS_SIDEBAR_X, 28, BRAND_MARK_SIZE, BRAND_MARK_SIZE)
+    )
+    mark_view.configureWithDark_(dark_now)
+    content.addSubview_(mark_view)
+    wordmark = label(
+        "bolo",
+        NSMakeRect(
+            PROMPTS_SIDEBAR_X + BRAND_MARK_SIZE + BRAND_LOCKUP_PAD,
+            30,
+            160,
+            BRAND_ROW_H,
+        ),
+        heading_font(BRAND_LOCKUP_SIZE, bold=True),
+        text_color,
+    )
+    wordmark.setSelectable_(False)
+
+    heading = label(
+        "Cleanup prompts",
+        NSMakeRect(PROMPTS_SIDEBAR_X, 76, 300, 26),
+        heading_font(WELCOME_HEADLINE_SIZE, bold=True),
+        text_color,
+    )
+    heading.setSelectable_(False)
+    sub = label(
+        "Control how Bolo cleans up your dictations, per app.",
+        NSMakeRect(PROMPTS_SIDEBAR_X, 106, 320, 18),
+        NSFont.systemFontOfSize_weight_(13.0, NSFontWeightMedium),
+        muted_color,
+    )
+    sub.setSelectable_(False)
+
+    # Sidebar: one borderless button per profile, selected row in the text
+    # color, the rest muted.
+    profile_buttons = []
+    sidebar_top = 150
+    for index, row in enumerate(profiles):
+        button = NSButton.buttonWithTitle_target_action_(
+            row["label"], controller, "promptProfileSelected:"
+        )
+        button.setBordered_(False)
+        button.setTag_(index)
+        button.setFont_(
+            NSFont.systemFontOfSize_weight_(14.0, NSFontWeightMedium)
+        )
+        button.setAlignment_(NSTextAlignmentLeft)
+        button.setFrame_(
+            NSMakeRect(
+                PROMPTS_SIDEBAR_X,
+                sidebar_top + index * 34,
+                PROMPTS_SIDEBAR_W,
+                30,
+            )
+        )
+        content.addSubview_(button)
+        profile_buttons.append(button)
+
+    # Editor pane: profile title plus badge, editable text view, actions.
+    title_label = label(
+        profiles[0]["label"],
+        NSMakeRect(PROMPTS_BODY_X, 150, 200, 24),
+        heading_font(16, bold=True),
+        text_color,
+    )
+    title_label.setSelectable_(False)
+    badge = label(
+        "Built-in",
+        NSMakeRect(PROMPTS_BODY_X + 210, 154, 90, 18),
+        NSFont.systemFontOfSize_weight_(11.0, NSFontWeightMedium),
+        muted_color,
+    )
+    badge.setSelectable_(False)
+
+    text_scroll = NSScrollView.alloc().initWithFrame_(
+        NSMakeRect(PROMPTS_BODY_X, 192, PROMPTS_BODY_W, 268)
+    )
+    text_scroll.setHasVerticalScroller_(True)
+    text_scroll.setBorderType_(NSBezelBorder)
+    text_scroll.setDrawsBackground_(True)
+    text_scroll.setBackgroundColor_(surface_bg)
+    text_view = NSTextView.alloc().initWithFrame_(
+        NSMakeRect(0, 0, PROMPTS_BODY_W, 268)
+    )
+    text_view.setRichText_(False)
+    text_view.setUsesFontPanel_(False)
+    text_view.setAutomaticQuoteSubstitutionEnabled_(False)
+    text_view.setAutomaticDashSubstitutionEnabled_(False)
+    text_view.setAutomaticTextReplacementEnabled_(False)
+    text_view.setAutomaticSpellingCorrectionEnabled_(False)
+    text_view.setFont_(NSFont.systemFontOfSize_(12.0))
+    text_view.setString_(profiles[0]["effective"])
+    text_scroll.setDocumentView_(text_view)
+    content.addSubview_(text_scroll)
+
+    save_button = NSButton.buttonWithTitle_target_action_(
+        "Save", controller, "promptSave:"
+    )
+    save_button.setBordered_(False)
+    save_button.setWantsLayer_(True)
+    save_button.layer().setCornerRadius_(8)
+    save_button.layer().setBackgroundColor_(accent.CGColor())
+    save_button.setKeyEquivalent_("\r")
+    save_button.setFrame_(NSMakeRect(PROMPTS_BODY_X, 472, 96, 30))
+    save_button.setTextColor_(bolo_brand.native_color(bolo_brand.palette(dark=False)["button_text"]))
+    content.addSubview_(save_button)
+
+    reset_button = NSButton.buttonWithTitle_target_action_(
+        display["reset_line"], controller, "promptReset:"
+    )
+    reset_button.setBordered_(False)
+    reset_button.setFont_(NSFont.systemFontOfSize_weight_(13.0, NSFontWeightMedium))
+    reset_button.setAlignment_(NSTextAlignmentLeft)
+    reset_button.setFrame_(NSMakeRect(PROMPTS_BODY_X + 110, 474, 220, 26))
+    reset_button.setTextColor_(muted_color)
+    content.addSubview_(reset_button)
+
+    done_button = NSButton.buttonWithTitle_target_action_(
+        "Done", controller, "finish:"
+    )
+    done_button.setBezelStyle_(NSBezelStyleRounded)
+    done_button.setKeyEquivalent_("\x1b")
+    done_button.setFrame_(NSMakeRect(PROMPTS_SIDEBAR_X, 472, 96, 30))
+    content.addSubview_(done_button)
+
+    status_label = label(
+        "",
+        NSMakeRect(PROMPTS_BODY_X + 336, 474, PROMPTS_BODY_W - 336, 26),
+        NSFont.systemFontOfSize_weight_(12.0, NSFontWeightMedium),
+        muted_color,
+    )
+    status_label.setSelectable_(False)
+    if display.get("error"):
+        status_label.setStringValue_(display["error"])
+        status_label.setTextColor_(
+            bolo_brand.native_color(bolo_brand.palette(dark=dark_now)["error"])
+        )
+
+    note_label = label(
+        display["note"],
+        NSMakeRect(PROMPTS_BODY_X, 508, PROMPTS_BODY_W, 18),
+        NSFont.systemFontOfSize_weight_(12.0, NSFontWeightMedium),
+        muted_color,
+    )
+    note_label.setSelectable_(False)
+
+    window.setContentView_(content)
+    window.center()
+
+    refs = {
+        "profiles": profiles,
+        "selected": 0,
+        "file": display["file"],
+        "cap": display["cap"],
+        "note": display["note"],
+        "drafts": {},
+        "text_view": text_view,
+        "badge_label": badge,
+        "profile_title_label": title_label,
+        "status_label": status_label,
+        "profile_buttons": profile_buttons,
+        "colors": {
+            "text": text_color,
+            "muted": muted_color,
+            "ok": bolo_brand.native_color(bolo_brand.palette(dark=dark_now)["success"]),
+            "warn": bolo_brand.native_color(bolo_brand.palette(dark=dark_now)["error"]),
+        },
+    }
+    STATE["prompts_refs"] = refs
+    update_prompts_selection(refs)
+    if display.get("error"):
+        set_prompts_status(refs, display["error"], ok=False)
+
+    if preview:
+        # Offscreen rendering path: no activation, no ordering front.
+        return {
+            "window": window,
+            "app": app,
+            "controller": controller,
+            "refs": refs,
+        }
+    app.activateIgnoringOtherApps_(True)
+    window.makeKeyAndOrderFront_(None)
+    return {
+        "window": window,
+        "app": app,
+        "controller": controller,
+        "refs": refs,
+    }
+
+
 def build_ui(payload, preview=False):
     """Create the AppKit window; imports stay local so tests import safely.
 
@@ -2239,6 +2806,10 @@ def build_ui(payload, preview=False):
         return dashboard_window.build_dashboard_ui(
             payload, preview=preview
         )
+    if payload.get("mode") == "prompts":
+        # The cleanup-prompts editor renders through its own builder; the
+        # payload's "prompts" spec drives its rows and copy.
+        return build_prompts_ui(payload, preview=preview)
     is_wizard = (
         not isinstance(payload.get("learning"), dict)
         and payload.get("mode") == "onboarding"
@@ -2929,6 +3500,7 @@ def main(marker_file=None, marker_writer=None):
     user_closed = run_event_loop(ui)
     ui["window"].orderOut_(None)
     STATE["wizard"] = None
+    STATE["prompts_refs"] = None
     finish = payload.copy()
     finish["write_marker"] = payload.get("write_marker") is True
     complete = should_write_marker(
@@ -2958,6 +3530,7 @@ STATE = {
     "advanced": False,
     "practice_done": False,
     "screen": None,
+    "prompts_refs": None,
 }
 
 
@@ -2970,6 +3543,7 @@ def reset_state():
             "advanced": False,
             "practice_done": False,
             "screen": None,
+            "prompts_refs": None,
         }
     )
 
