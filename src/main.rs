@@ -598,7 +598,10 @@ impl DictationWarmup {
 struct SttRequestParts {
     primary_model: String,
     model_config: Option<serde_json::Value>,
-    prompt: Option<String>,
+    /// The free-text prompt terms (the first 50): one list serves both the
+    /// request form's joined prompt (rebuilt via `build_stt_prompt`) and the
+    /// response echo filter.
+    prompt_terms: Option<Vec<String>>,
     language: Option<String>,
 }
 
@@ -625,7 +628,8 @@ impl SttRequestParts {
         Self {
             primary_model: primary_model.to_owned(),
             model_config: stt_model_config(primary_model, vocabulary),
-            prompt: build_stt_prompt(vocabulary),
+            prompt_terms: (!vocabulary.is_empty())
+                .then(|| vocabulary.iter().take(50).cloned().collect()),
             language: stt_language_for_model(primary_model, configured_language),
         }
     }
@@ -3401,7 +3405,7 @@ impl App {
                     payload,
                     &request.primary_model,
                     request.model_config.as_ref(),
-                    request.prompt.as_deref(),
+                    request.prompt_terms.as_deref(),
                     request.language.as_deref(),
                     STT_REQUEST_TIMEOUT,
                 )
@@ -3413,7 +3417,7 @@ impl App {
             Ok(transcript) => Ok(transcript),
             Err(AppError::RateLimited) => {
                 warn!("primary STT model rate limited; trying fallback chain");
-                self.transcribe_with_fallbacks(wav, request.prompt.as_deref())
+                self.transcribe_with_fallbacks(wav, request.prompt_terms.as_deref())
             }
             Err(error) => retry_failed_primary(&mut attempt, wav, error, attempt_started),
         }
@@ -3435,7 +3439,7 @@ impl App {
             wav,
             &request.primary_model,
             request.model_config.as_ref(),
-            request.prompt.as_deref(),
+            request.prompt_terms.as_deref(),
             request.language.as_deref(),
             STREAMING_BATCH_VERIFY_TIMEOUT,
         )
@@ -3444,7 +3448,7 @@ impl App {
     fn transcribe_with_fallbacks(
         &self,
         wav: &[u8],
-        prompt: Option<&str>,
+        prompt_terms: Option<&[String]>,
     ) -> Result<SttResult, AppError> {
         if self.config.stt_fallbacks.is_empty() {
             return Err(AppError::RateLimited);
@@ -3453,7 +3457,7 @@ impl App {
         let mut last_error = AppError::RateLimited;
         for fallback in &self.config.stt_fallbacks {
             info!("[stt] trying_fallback {}", fallback.label());
-            match self.transcribe_with_fallback(wav, fallback, prompt) {
+            match self.transcribe_with_fallback(wav, fallback, prompt_terms) {
                 Ok(text) => return Ok(SttResult::verbatim(text)),
                 Err(error) => {
                     warn!("[stt] fallback_failed {}: {error}", fallback.label());
@@ -3468,14 +3472,14 @@ impl App {
         &self,
         wav: &[u8],
         fallback: &SttFallback,
-        prompt: Option<&str>,
+        prompt_terms: Option<&[String]>,
     ) -> Result<String, AppError> {
         match fallback {
             SttFallback::Telnyx(model) => self.transcribe_with_model(
                 wav,
                 model,
                 stt_model_config(model, &self.vocabulary_snapshot().unwrap_or_default()).as_ref(),
-                prompt,
+                prompt_terms,
                 stt_language_for_model(
                     model,
                     &self
@@ -3497,10 +3501,13 @@ impl App {
         wav: &[u8],
         model: &str,
         model_config: Option<&serde_json::Value>,
-        prompt: Option<&str>,
+        prompt_terms: Option<&[String]>,
         language: Option<&str>,
         request_timeout: Duration,
     ) -> Result<String, AppError> {
+        // The joined free-text prompt as it rides the request form: the same
+        // transformation `SttRequestParts::new` applied to build the terms.
+        let prompt = prompt_terms.and_then(build_stt_prompt);
         info!(
             "[stt] request {}",
             serde_json::json!({
@@ -3531,7 +3538,7 @@ impl App {
             form = form.text("model_config", serde_json::to_string(model_config)?);
         }
         if let Some(prompt) = prompt {
-            form = form.text("prompt", prompt.to_owned());
+            form = form.text("prompt", prompt);
         }
         let response = self
             .http
@@ -3564,6 +3571,11 @@ impl App {
                 message: body.chars().take(200).collect::<String>(),
             });
         }
+        // A 200-empty transcript is silence on quiet audio but a server fault
+        // on audio that demonstrably carried sound (2026-09-14: the degraded
+        // endpoint 200-emptied a 2s real-speech dictation). Classify against
+        // the evidence in the submitted WAV so the retry arm can tell the two
+        // apart. xAI and AssemblyAI empties keep the plain terminal error.
         let parsed: SttResponse = response.json()?;
         let transcript = parsed.text.unwrap_or_default();
         info!(
@@ -3574,11 +3586,26 @@ impl App {
                 "transcript": self.log_text(&transcript),
             })
         );
-        // A 200-empty transcript is silence on quiet audio but a server fault
-        // on audio that demonstrably carried sound (2026-09-14: the degraded
-        // endpoint 200-emptied a 2s real-speech dictation). Classify against
-        // the evidence in the submitted WAV so the retry arm can tell the two
-        // apart. xAI and AssemblyAI empties keep the plain terminal error.
+        // Whisper-family and Deepgram batch carry the vocabulary as a
+        // free-text `prompt`, and those models can continue that prompt list
+        // into the transcript. The check only runs when the request actually
+        // sent one, so the AssemblyAI routes (structured keyterms, never a
+        // free-text prompt) never hit it.
+        let transcript = match batch_transcript_after_echo(&transcript, prompt_terms) {
+            BatchEcho::Transcript(transcript) => transcript,
+            BatchEcho::Stripped { cleaned, fragment } => {
+                info!("[stt] echo_stripped {}", self.log_text(&fragment));
+                cleaned
+            }
+            BatchEcho::EchoedEntirely => {
+                warn!("[stt] echo_discarded {}", self.log_text(&transcript));
+                // A transcript that is nothing but the prompt is the same
+                // failure as a 200-empty response on audio that carried
+                // speech: the existing classification decides retry vs
+                // terminal.
+                return Err(empty_transcript_error(wav));
+            }
+        };
         if transcript.trim().is_empty() {
             return Err(empty_transcript_error(wav));
         }
@@ -4504,19 +4531,25 @@ impl App {
             })
         );
         match derive_word_correction(&claim.pasted_text, &context.text_before_cursor) {
-            CorrectionOutcome::Learned {
-                misheard,
-                corrected,
-            } => {
-                info!(
-                    "[learning] learned_pair {} -> {}",
-                    self.log_text(&misheard),
-                    self.log_text(&corrected)
-                );
-                // A brand-new pair gets one plain confirmation so learning is
-                // never invisible; count bumps of a known pair stay silent.
-                if self.learn_correction(&learned_vocabulary_path(), &misheard, &corrected) {
-                    show_notification("Bolo", &format!("Bolo learned: {misheard} -> {corrected}"));
+            CorrectionOutcome::Learned { pairs } => {
+                for LearnedPair {
+                    misheard,
+                    corrected,
+                } in pairs
+                {
+                    info!(
+                        "[learning] learned_pair {} -> {}",
+                        self.log_text(&misheard),
+                        self.log_text(&corrected)
+                    );
+                    // A brand-new pair gets one plain confirmation so learning
+                    // is never invisible; count bumps stay silent.
+                    if self.learn_correction(&learned_vocabulary_path(), &misheard, &corrected) {
+                        show_notification(
+                            "Bolo",
+                            &format!("Bolo learned: {misheard} -> {corrected}"),
+                        );
+                    }
                 }
             }
             CorrectionOutcome::Skipped { reason } => {
@@ -10310,6 +10343,206 @@ fn empty_transcript_error(wav: &[u8]) -> AppError {
     terminal()
 }
 
+/// Verdict of the free-text-prompt echo check on one Telnyx batch
+/// transcript (ported from `OpenWhispr`'s `dictionaryEchoFilter`, MIT).
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum EchoVerdict {
+    /// Real speech; the prompt never leaked into the transcript.
+    Clean,
+    /// The transcript continued the prompt list after real speech:
+    /// `cleaned` is the remainder to keep, `fragment` the echoed run
+    /// stripped off.
+    PartiallyEchoed { cleaned: String, fragment: String },
+    /// The whole transcript is a continuation of the prompt.
+    EchoedEntirely,
+}
+
+/// Whisper's echo pathology loops one term many times; saying a word twice
+/// is speech.
+const ECHO_LOOPED_WORD_MIN_OCCURRENCES: usize = 3;
+/// Dictation almost never recites this many consecutive prompt entries in
+/// the prompt's own order.
+const ECHO_MIN_CONSECUTIVE_TERM_RUN: usize = 3;
+/// A fragment this short dangling on a prompt delimiter is a continuation;
+/// longer text with the same shape is a real list being dictated.
+const ECHO_MAX_SHORT_FRAGMENT_CHARS: usize = 30;
+
+/// The free-text prompt indexed for echo detection: every term's words in
+/// prompt order, each tagged with its term index. Multi-word terms keep one
+/// index, so a snippet trigger like "on my way" counts as one entry and
+/// natural speech through its words never reads as a term run (#1889).
+struct EchoPromptIndex {
+    sequence: Vec<(String, usize)>,
+    words: HashSet<String>,
+}
+
+fn echo_prompt_index(prompt_terms: &[String]) -> EchoPromptIndex {
+    let mut index = EchoPromptIndex {
+        sequence: Vec::new(),
+        words: HashSet::new(),
+    };
+    for (term_index, term) in prompt_terms.iter().enumerate() {
+        for word in normalize_for_matching(term)
+            .split(' ')
+            .filter(|word| !word.is_empty())
+        {
+            index.sequence.push((word.to_owned(), term_index));
+            let _ = index.words.insert(word.to_owned());
+        }
+    }
+    index
+}
+
+const fn is_prompt_delimiter(character: char) -> bool {
+    matches!(character, ',' | '、' | '，')
+}
+
+/// True when some word repeats often enough to mark the looped-term shape of
+/// an echo.
+fn has_looped_echo_word(words: &[&str]) -> bool {
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    words.iter().any(|word| {
+        let count = counts
+            .entry(*word)
+            .and_modify(|count| *count += 1)
+            .or_insert(1);
+        *count >= ECHO_LOOPED_WORD_MIN_OCCURRENCES
+    })
+}
+
+/// True when `words` is a contiguous window of the prompt's own term
+/// sequence spanning at least three distinct terms: a literal continuation
+/// of the hint list, however long.
+fn matches_prompt_term_run(words: &[&str], index: &EchoPromptIndex) -> bool {
+    let sequence = &index.sequence;
+    if words.is_empty() || words.len() > sequence.len() {
+        return false;
+    }
+    for (start, window) in sequence.windows(words.len()).enumerate() {
+        let matched = window
+            .iter()
+            .map(|(prompt_word, _)| prompt_word.as_str())
+            .zip(words.iter().copied())
+            .take_while(|(prompt_word, text_word)| prompt_word == text_word)
+            .count();
+        if matched == words.len()
+            && sequence[start + words.len() - 1].1 - sequence[start].1 + 1
+                >= ECHO_MIN_CONSECUTIVE_TERM_RUN
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether `fragment` (a raw transcript slice) reads as a continuation of
+/// the vocabulary prompt: at least 90% of its unique words come from the
+/// prompt AND one of three shape signals holds, a word looped three or more
+/// times, a short fragment dangling on a prompt delimiter, or a run of
+/// prompt terms in the prompt's own order. Vocabulary overlap alone cannot
+/// stand in for the shape: short dictation is legitimately spelled out of
+/// dictionary words, and multi-word snippet triggers put common words into
+/// the prompt (#1889).
+fn is_vocabulary_echo_fragment(fragment: &str, index: &EchoPromptIndex) -> bool {
+    let normalized = normalize_for_matching(fragment);
+    if normalized.is_empty() {
+        return false;
+    }
+    let words: Vec<&str> = normalized.split(' ').collect();
+    let unique: HashSet<&str> = words.iter().copied().collect();
+    let matched = unique
+        .iter()
+        .filter(|word| index.words.contains(**word))
+        .count();
+    if matched * 10 < unique.len() * 9 {
+        return false;
+    }
+    let dangles_short = fragment
+        .trim_end()
+        .ends_with(|character: char| is_prompt_delimiter(character))
+        && normalized.chars().count() <= ECHO_MAX_SHORT_FRAGMENT_CHARS;
+    let carries_delimiter = fragment.chars().any(is_prompt_delimiter);
+    has_looped_echo_word(&words)
+        || dangles_short
+        || (carries_delimiter && matches_prompt_term_run(&words, index))
+}
+
+/// Check one Telnyx batch transcript against the free-text vocabulary prompt
+/// that rode the request (ported from `OpenWhispr`'s `dictionaryEchoFilter`,
+/// MIT). Whisper-family models can continue that prompt list into the
+/// transcript: the whole response can be the list, or the list can trail
+/// real speech. A prompt-free request (the `AssemblyAI` routes, whose
+/// vocabulary is structured keyterms) never echoes.
+fn strip_vocabulary_echo(transcript: &str, prompt_terms: &[String]) -> EchoVerdict {
+    let index = echo_prompt_index(prompt_terms);
+    if index.words.is_empty() || transcript.trim().is_empty() {
+        return EchoVerdict::Clean;
+    }
+    // The transcript can also be the prompt itself, verbatim, which no
+    // shape signal has to back: it is the whole list by definition.
+    let normalized_prompt = prompt_terms
+        .iter()
+        .map(|term| normalize_for_matching(term))
+        .filter(|normalized| !normalized.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if normalize_for_matching(transcript) == normalized_prompt
+        || is_vocabulary_echo_fragment(transcript, &index)
+    {
+        return EchoVerdict::EchoedEntirely;
+    }
+    // A partial echo trails real speech: strip the earliest word-boundary
+    // suffix that reads as a prompt fragment, keeping everything before it.
+    let pieces = word_pieces(transcript);
+    for piece in pieces.iter().skip(1) {
+        let tail = &transcript[piece.start..];
+        if is_vocabulary_echo_fragment(tail, &index) {
+            let cleaned = transcript[..piece.start]
+                .trim_end_matches(|character: char| {
+                    character.is_whitespace() || is_prompt_delimiter(character)
+                })
+                .to_owned();
+            return EchoVerdict::PartiallyEchoed {
+                cleaned,
+                fragment: tail.to_owned(),
+            };
+        }
+    }
+    EchoVerdict::Clean
+}
+
+/// What the Telnyx batch path should do with a response transcript once the
+/// free-text prompt echo check has run.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum BatchEcho {
+    /// Pass through untouched: real speech, or no free-text prompt was sent.
+    Transcript(String),
+    /// The response trailed a prompt continuation: keep `cleaned`, drop
+    /// `fragment`.
+    Stripped { cleaned: String, fragment: String },
+    /// The response was nothing but the prompt: hand it to the existing
+    /// empty-transcript classification and retry/terminal arms.
+    EchoedEntirely,
+}
+
+/// Apply the echo check to one Telnyx batch response. The check only runs
+/// when the request carried prompt terms (the free-text prompt is built
+/// from exactly those), so requests without them (every `AssemblyAI` path,
+/// structured keyterms) are untouched by construction.
+fn batch_transcript_after_echo(transcript: &str, prompt_terms: Option<&[String]>) -> BatchEcho {
+    let terms = prompt_terms.unwrap_or(&[]);
+    if terms.is_empty() || transcript.trim().is_empty() {
+        return BatchEcho::Transcript(transcript.to_owned());
+    }
+    match strip_vocabulary_echo(transcript, terms) {
+        EchoVerdict::Clean => BatchEcho::Transcript(transcript.to_owned()),
+        EchoVerdict::PartiallyEchoed { cleaned, fragment } => {
+            BatchEcho::Stripped { cleaned, fragment }
+        }
+        EchoVerdict::EchoedEntirely => BatchEcho::EchoedEntirely,
+    }
+}
+
 fn non_empty_transcript(text: Option<&str>, provider: &str) -> Result<String, AppError> {
     let transcript = text.unwrap_or_default().trim();
     if transcript.is_empty() {
@@ -10619,10 +10852,20 @@ fn unix_time_secs() -> u64 {
     unix_time_ms() / 1_000
 }
 
-/// The result of diffing the pasted text against the edited caret context.
+/// One substitution pair extracted from the user's edit: the word Bolo
+/// misheard and the replacement the user actually typed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LearnedPair {
+    misheard: String,
+    corrected: String,
+}
+
+/// The result of diffing the pasted text against the edited caret context:
+/// every substitution pair that cleared the learning guards, or the reason
+/// the capture was skipped and nothing learned.
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum CorrectionOutcome {
-    Learned { misheard: String, corrected: String },
+    Learned { pairs: Vec<LearnedPair> },
     Skipped { reason: &'static str },
 }
 
@@ -10644,12 +10887,185 @@ fn contains_word_verbatim(text: &str, word: &str) -> bool {
             .any(|piece| &text[piece.start..piece.end] == word)
 }
 
-/// Derive a single-word correction from the pasted text and the caret context
-/// read after the user's edit. The inserted text's tail is aligned against
-/// the context tail: every word after the changed one must match, the words
-/// before the changed word must match immediately before the replacement, and
-/// exactly one word may differ. Anything ambiguous is skipped with a reason
-/// and never learned.
+/// Everyday words a correction must never teach as vocabulary (ported from
+/// `OpenWhispr`'s `COMMON_WORDS`, MIT): swapping one of these for another
+/// ("why" -> "what") is a content edit, and an alias on an everyday word
+/// would rewrite every future dictation. Words under the minimum length are
+/// already dropped, so none shorter than three letters are listed.
+const CORRECTION_BLOCKLIST: &[&str] = &[
+    "the", "and", "for", "not", "with", "you", "this", "but", "his", "from", "they", "say", "her",
+    "she", "will", "one", "all", "would", "there", "their", "what", "out", "about", "who", "get",
+    "which", "when", "make", "can", "like", "time", "just", "him", "know", "take", "into", "year",
+    "your", "good", "some", "could", "them", "see", "other", "than", "then", "now", "look", "only",
+    "come", "over", "think", "also", "back", "after", "use", "two", "how", "our", "work", "first",
+    "well", "way", "even", "new", "want", "because", "any", "these", "give", "day", "most", "are",
+    "was", "were", "been", "has", "had", "did", "does", "said", "went", "made", "got", "came",
+    "took", "saw", "knew", "thought", "where", "why", "here", "very", "much", "many", "still",
+    "too", "again", "off", "down", "never", "every", "own", "same", "another", "both", "each",
+    "few", "more", "less", "last", "next", "while", "before", "through", "under", "between",
+    "should", "might", "must", "being", "have", "that", "its", "yes", "okay",
+];
+
+/// Whether `word` is on the everyday-word blocklist: a correction landing on
+/// one of these is a content edit, not vocabulary.
+fn is_blocklisted_correction(word: &str) -> bool {
+    CORRECTION_BLOCKLIST.contains(&word.trim().to_ascii_lowercase().as_str())
+}
+
+/// Levenshtein edit distance between two words, on characters (ported from
+/// `OpenWhispr`'s `editDistance`, MIT).
+fn edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut dp = vec![vec![0usize; b.len() + 1]; a.len() + 1];
+    for (index, row) in dp.iter_mut().enumerate() {
+        row[0] = index;
+    }
+    for (index, value) in dp[0].iter_mut().enumerate() {
+        *value = index;
+    }
+    for i in 1..=a.len() {
+        for j in 1..=b.len() {
+            if a[i - 1] == b[j - 1] {
+                dp[i][j] = dp[i - 1][j - 1];
+            } else {
+                dp[i][j] = 1 + dp[i - 1][j].min(dp[i][j - 1]).min(dp[i - 1][j - 1]);
+            }
+        }
+    }
+    dp[a.len()][b.len()]
+}
+
+/// Word-level LCS alignment (ported from `OpenWhispr`'s `findSubstitutions`,
+/// MIT): case-insensitively match the words the user left alone, then read
+/// each consecutive [orig, nothing] + [nothing, edited] run as one
+/// substitution pair.
+fn find_word_substitutions<'a, 'b>(
+    orig_words: &[&'a str],
+    edited_words: &[&'b str],
+) -> Vec<(&'a str, &'b str)> {
+    let m = orig_words.len();
+    let n = edited_words.len();
+    let mut dp = vec![vec![0usize; n + 1]; m + 1];
+    for i in 1..=m {
+        for j in 1..=n {
+            if orig_words[i - 1].eq_ignore_ascii_case(edited_words[j - 1]) {
+                dp[i][j] = dp[i - 1][j - 1] + 1;
+            } else {
+                dp[i][j] = dp[i - 1][j].max(dp[i][j - 1]);
+            }
+        }
+    }
+    let mut aligned: Vec<(Option<&'a str>, Option<&'b str>)> = Vec::new();
+    let (mut i, mut j) = (m, n);
+    while i > 0 || j > 0 {
+        if i > 0 && j > 0 && orig_words[i - 1].eq_ignore_ascii_case(edited_words[j - 1]) {
+            aligned.push((Some(orig_words[i - 1]), Some(edited_words[j - 1])));
+            i -= 1;
+            j -= 1;
+        } else if j > 0 && (i == 0 || dp[i][j - 1] >= dp[i - 1][j]) {
+            aligned.push((None, Some(edited_words[j - 1])));
+            j -= 1;
+        } else {
+            aligned.push((Some(orig_words[i - 1]), None));
+            i -= 1;
+        }
+    }
+    aligned.reverse();
+    let mut substitutions = Vec::new();
+    for window in aligned.windows(2) {
+        if let ((Some(orig_word), None), (None, Some(edited_word))) = (&window[0], &window[1]) {
+            substitutions.push((*orig_word, *edited_word));
+        }
+    }
+    substitutions
+}
+
+/// Locate the slice of the caret context that corresponds to the pasted
+/// text (ported from `OpenWhispr`'s `findEditedRegion`, MIT, adapted to the
+/// caret-context tail). The paste sits inside the context; when the context
+/// is longer, the window of the paste's own word count with the best
+/// case-insensitive overlap marks the edited region. A window overlapping
+/// less than 30% gives up and leaves the whole context, which the rewrite
+/// guard then rejects.
+fn locate_edited_region<'a>(observed: &[&str], context: &'a [&'a str]) -> &'a [&'a str] {
+    if context.len() <= observed.len() {
+        return context;
+    }
+    let window = observed.len();
+    let mut best_start = 0;
+    let mut best_matches = 0;
+    for start in 0..=(context.len() - window) {
+        let mut matches = 0;
+        for offset in 0..window {
+            if context[start + offset].eq_ignore_ascii_case(observed[offset]) {
+                matches += 1;
+            }
+        }
+        if matches > best_matches {
+            best_matches = matches;
+            best_start = start;
+        }
+    }
+    if best_matches * 10 < window * 3 {
+        return context;
+    }
+    &context[best_start..best_start + window]
+}
+
+/// Guard one extracted pair: `Ok` learns it, the `Err` reason is the logged
+/// skip cause. Every guard from the single-word era stays (typed verbatim,
+/// minimum length, trivial variant) alongside the two `OpenWhispr` guards
+/// (everyday-word blocklist, phonetic edit distance).
+fn checked_correction_pair(
+    old_word: &str,
+    new_word: &str,
+    context_tail: &str,
+) -> Result<LearnedPair, &'static str> {
+    // The replacement must appear verbatim in the context tail. By
+    // construction it is read out of the context, but the rule stays
+    // explicit so it can never silently regress.
+    if !contains_word_verbatim(context_tail, new_word) {
+        return Err("not_typed");
+    }
+    if old_word.chars().count() < LEARNED_MIN_WORD_CHARS {
+        return Err("short_misheard");
+    }
+    if new_word.chars().count() < LEARNED_MIN_WORD_CHARS {
+        return Err("short_word");
+    }
+    if is_trivial_word_variant(old_word, new_word) {
+        return Err("trivial_variant");
+    }
+    if is_blocklisted_correction(new_word) {
+        return Err("common_word");
+    }
+    // Close enough to be a mishearing: a normalized Levenshtein distance
+    // above 0.65 marks an unrelated rephrase ("meeting" -> "party"), while
+    // phonetic fixes like "Shunade" -> "Sinead" pass at 4/7 = 0.57.
+    let old_normalized = normalize_for_matching(old_word);
+    let new_normalized = normalize_for_matching(new_word);
+    let distance = edit_distance(&old_normalized, &new_normalized);
+    let longest = old_normalized
+        .chars()
+        .count()
+        .max(new_normalized.chars().count());
+    if distance * 20 > longest * 13 {
+        return Err("distant_pair");
+    }
+    Ok(LearnedPair {
+        misheard: old_word.to_owned(),
+        corrected: new_word.to_owned(),
+    })
+}
+
+/// Derive corrections from the pasted text and the caret context read after
+/// the user's edit: locate the edited region inside the context, align it
+/// against the paste word by word, and extract every substitution pair that
+/// looks like a mishearing (ported from `OpenWhispr`'s `extractCorrections`,
+/// MIT). Every pair must clear every guard before it is learned; ambiguous
+/// captures and wholesale rewrites are skipped with a reason and never
+/// learned.
 fn derive_word_correction(inserted: &str, context_tail: &str) -> CorrectionOutcome {
     let observed = word_tokens(inserted);
     let context = word_tokens(context_tail);
@@ -10660,68 +11076,47 @@ fn derive_word_correction(inserted: &str, context_tail: &str) -> CorrectionOutco
             reason: "single_word_insert",
         };
     }
-    let mut suffix = 0;
-    while suffix < observed.len()
-        && suffix < context.len()
-        && observed[observed.len() - 1 - suffix]
-            .eq_ignore_ascii_case(context[context.len() - 1 - suffix])
-    {
-        suffix += 1;
+    if context.is_empty() {
+        return CorrectionOutcome::Skipped { reason: "no_words" };
     }
-    if suffix == observed.len() {
+    let edited = locate_edited_region(&observed, &context);
+    if edited.len() == observed.len()
+        && edited
+            .iter()
+            .zip(observed.iter())
+            .all(|(edited_word, observed_word)| edited_word.eq_ignore_ascii_case(observed_word))
+    {
         // The pasted text still sits intact at the context tail.
         return CorrectionOutcome::Skipped { reason: "intact" };
     }
-    let old_index = observed.len() - 1 - suffix;
-    let Some(new_index) = context.len().checked_sub(1 + suffix) else {
+    let substitutions = find_word_substitutions(&observed, edited);
+    if substitutions.is_empty() {
         return CorrectionOutcome::Skipped {
-            reason: "unaligned",
-        };
-    };
-    let old_word = observed[old_index];
-    let new_word = context[new_index];
-    // The words before the changed word must line up immediately before the
-    // replacement, proving the change sits inside the pasted text rather
-    // than in pre-existing text around it. Multi-word rewrites and pure
-    // deletions both fail here.
-    if new_index < old_index
-        || observed[..old_index]
-            .iter()
-            .rev()
-            .zip(context[..new_index].iter().rev())
-            .any(|(observed_word, context_word)| !observed_word.eq_ignore_ascii_case(context_word))
-    {
-        return CorrectionOutcome::Skipped {
-            reason: "unaligned",
+            reason: "no_substitution",
         };
     }
-    // The replacement must appear verbatim in the context tail. By
-    // construction it is read out of the context, but the rule stays explicit
-    // so it can never silently regress.
-    if !contains_word_verbatim(context_tail, new_word) {
+    // More than half the words replaced is a rewrite, not corrections.
+    if substitutions.len() * 2 > observed.len() {
+        return CorrectionOutcome::Skipped { reason: "rewrite" };
+    }
+    let mut learned = Vec::new();
+    let mut skip_reason = None;
+    for (old_word, new_word) in substitutions {
+        match checked_correction_pair(old_word, new_word, context_tail) {
+            Ok(pair) => learned.push(pair),
+            Err(reason) => {
+                if skip_reason.is_none() {
+                    skip_reason = Some(reason);
+                }
+            }
+        }
+    }
+    if learned.is_empty() {
         return CorrectionOutcome::Skipped {
-            reason: "not_typed",
+            reason: skip_reason.unwrap_or("no_substitution"),
         };
     }
-    if old_word.chars().count() < LEARNED_MIN_WORD_CHARS {
-        return CorrectionOutcome::Skipped {
-            reason: "short_misheard",
-        };
-    }
-    if new_word.chars().count() < LEARNED_MIN_WORD_CHARS {
-        return CorrectionOutcome::Skipped {
-            reason: "short_word",
-        };
-    }
-    if is_trivial_word_variant(old_word, new_word) {
-        return CorrectionOutcome::Skipped {
-            reason: "trivial_variant",
-        };
-    }
-    CorrectionOutcome::Learned {
-        misheard: old_word.to_owned(),
-        corrected: new_word.to_owned(),
-    }
+    CorrectionOutcome::Learned { pairs: learned }
 }
 
 /// Case-only, punctuation-only, and prefix-only rewrites are not mishearings:
@@ -12315,30 +12710,31 @@ mod tests {
         ACCESS_DAEMON_ACTION_TIMEOUT, ACCESS_DAEMON_QUERY_TIMEOUT, ACCESS_DAEMON_STARTUP_TIMEOUT,
         ASSEMBLYAI_STREAMING_MODEL, AccessDaemonFailure, AccessDaemonRequest, AccessibilityContext,
         AccessibilityTrust, App, AppError, AppState, AppWindowPayload, AssemblyDictationResponse,
-        AudioHub, BatchRetry, CleanupMode, CleanupProfile, Config, CorrectionOutcome,
+        AudioHub, BatchEcho, BatchRetry, CleanupMode, CleanupProfile, Config, CorrectionOutcome,
         DashboardAction, DashboardRequestLine, DictationCommandKind, DictationUploadReader,
-        DictationUploadRelease, DictationWarmup, EditLearningClaim, KeyEntrySpec,
-        LEARNING_UNREADABLE_LINE, LEARNING_WINDOW_ROWS, LaunchRequestAction, LearnedVocabulary,
-        MicrophoneDescriptor, MicrophoneSelection, ONBOARDING_MARKER_VERSION, OnboardingStatus,
-        PreparedText, PromptBinding, STREAMING_DRAIN_MIN, STT_RETRY_SAMPLE_RATE,
+        DictationUploadRelease, DictationWarmup, EchoVerdict, EditLearningClaim, KeyEntrySpec,
+        LEARNING_UNREADABLE_LINE, LEARNING_WINDOW_ROWS, LaunchRequestAction, LearnedPair,
+        LearnedVocabulary, MicrophoneDescriptor, MicrophoneSelection, ONBOARDING_MARKER_VERSION,
+        OnboardingStatus, PreparedText, PromptBinding, STREAMING_DRAIN_MIN, STT_RETRY_SAMPLE_RATE,
         StreamingConnectionState, StreamingProvider, StreamingRecording, StreamingText,
         StreamingTranscript, SttFallback, SttResult, TRANSCRIPT_HISTORY_LIMIT, TextReplacement,
         TranscriptHistoryEntry, UpdateNotice, UpdateOutcome, UsageCounters, WindowRow, WizardSpec,
         accessibility_fix_detail, apply_text_replacements,
         apply_vocabulary_corrections_with_matches, assemblyai_direct_query_with,
-        assemblyai_language_code, batch_retry_plan, build_cleanup_user_content,
-        build_rewrite_user_content, build_stt_prompt, canonicalize_known_terms, chunk_samples_for,
-        cleanup_decision, cleanup_max_tokens, cleanup_profile, consume_open_dashboard_request_at,
-        contains_word_verbatim, dashboard_accessibility_state, dashboard_cleanup_mode,
-        dashboard_payload, dashboard_provider_label, derive_word_correction,
-        dictation_upload_config, dictation_upload_form, dictation_upload_release,
-        dictation_upload_request_timeout, downsample_wav_16k_mono, empty_transcript_error,
+        assemblyai_language_code, batch_retry_plan, batch_transcript_after_echo,
+        build_cleanup_user_content, build_rewrite_user_content, build_stt_prompt,
+        canonicalize_known_terms, chunk_samples_for, cleanup_decision, cleanup_max_tokens,
+        cleanup_profile, consume_open_dashboard_request_at, contains_word_verbatim,
+        dashboard_accessibility_state, dashboard_cleanup_mode, dashboard_payload,
+        dashboard_provider_label, derive_word_correction, dictation_upload_config,
+        dictation_upload_form, dictation_upload_release, dictation_upload_request_timeout,
+        downsample_wav_16k_mono, edit_distance, empty_transcript_error,
         enforce_learned_vocabulary_cap, final_streaming_result_is_ready_elapsed,
         finalize_accessibility_context, handle_dashboard_action, handle_launch_request_for_state,
-        handshake_with_deadline, is_known_no_speech_transcript, is_supported_hotkey,
-        learning_window_payload_at, load_learned_vocabulary, load_usage_counters_at,
-        load_vocabulary_usage, load_vocabulary_with_learned, microphone_labels,
-        non_empty_transcript, normalize_microphone_value, onboarding_status_at,
+        handshake_with_deadline, is_blocklisted_correction, is_known_no_speech_transcript,
+        is_supported_hotkey, learning_window_payload_at, load_learned_vocabulary,
+        load_usage_counters_at, load_vocabulary_usage, load_vocabulary_with_learned,
+        microphone_labels, non_empty_transcript, normalize_microphone_value, onboarding_status_at,
         parse_accessibility_trust, parse_command, parse_daemon_context_reply,
         parse_daemon_paste_reply, parse_daemon_select_reply, parse_daemon_trust_reply,
         parse_latest_release, parse_release_version, parse_replacements_json, parse_stt_fallbacks,
@@ -12350,10 +12746,11 @@ mod tests {
         save_usage_counters_at, should_exit_for_key_reload, speech_stats,
         stable_streaming_best_is_ready_elapsed, status_rows, streaming_batch_fallback_reason,
         streaming_connection, streaming_preview_tail, streaming_provider_from_config,
-        streaming_status_label, strip_reasoning_tags, stt_language_for_model, stt_model_config,
-        telnyx_stream_query, transcript_log_value, transcript_menu_preview, typed_dashboard_action,
-        upsert_learned_correction, upsert_replacement, version_is_newer, wait_for_daemon_reply,
-        wav_bytes, wav_duration_ms, write_bolo_env_value_at, write_learned_vocabulary_file,
+        streaming_status_label, strip_reasoning_tags, strip_vocabulary_echo,
+        stt_language_for_model, stt_model_config, telnyx_stream_query, transcript_log_value,
+        transcript_menu_preview, typed_dashboard_action, upsert_learned_correction,
+        upsert_replacement, version_is_newer, wait_for_daemon_reply, wav_bytes, wav_duration_ms,
+        write_bolo_env_value_at, write_learned_vocabulary_file,
     };
     use std::collections::{HashMap, VecDeque};
     use std::io::Read as _;
@@ -16837,6 +17234,18 @@ mod tests {
         }
     }
 
+    fn learned_pairs(pairs: &[(&str, &str)]) -> CorrectionOutcome {
+        CorrectionOutcome::Learned {
+            pairs: pairs
+                .iter()
+                .map(|(misheard, corrected)| LearnedPair {
+                    misheard: String::from(*misheard),
+                    corrected: String::from(*corrected),
+                })
+                .collect(),
+        }
+    }
+
     #[test]
     fn edit_learning_diff_learns_single_word_replacement() {
         let outcome = derive_word_correction(
@@ -16844,44 +17253,48 @@ mod tests {
             "Hey, can you please call tom about the meeting",
         );
         // Exactly the changed word is extracted, never the whole tail.
-        assert_eq!(
-            outcome,
-            CorrectionOutcome::Learned {
-                misheard: String::from("Tim"),
-                corrected: String::from("tom"),
-            }
-        );
+        assert_eq!(outcome, learned_pairs(&[("Tim", "tom")]));
         // A fix at the end of the insert aligns through the words before it.
         assert_eq!(
             derive_word_correction(
                 "please call about the meting",
                 "earlier today please call about the meeting"
             ),
-            CorrectionOutcome::Learned {
-                misheard: String::from("meting"),
-                corrected: String::from("meeting"),
-            }
+            learned_pairs(&[("meting", "meeting")])
         );
     }
 
     #[test]
-    fn edit_learning_diff_skips_multi_word_changes() {
-        // Two words replaced.
-        assert!(matches!(
+    fn edit_learning_diff_extracts_each_word_of_a_multi_word_fix() {
+        // A two-word fix with anchors around each change: both pairs are
+        // extracted, in order, each passing every guard on its own.
+        assert_eq!(
+            derive_word_correction(
+                "please call Tim about the meting now",
+                "please call tom about the meeting now"
+            ),
+            learned_pairs(&[("Tim", "tom"), ("meting", "meeting")])
+        );
+        // A noisier edit (a word swapped out, one inserted around the fix)
+        // misaligns one pairing ("about" -> "tom"); the distance guard
+        // rejects it and only the genuine mishearing is learned.
+        assert_eq!(
             derive_word_correction(
                 "please call Tim about the meting",
                 "please call tom regarding the meeting"
             ),
-            CorrectionOutcome::Skipped { .. }
-        ));
+            learned_pairs(&[("meting", "meeting")])
+        );
         // A deleted word must never borrow a neighbor as its replacement.
-        assert!(matches!(
+        assert_eq!(
             derive_word_correction(
                 "please call Tim about the meeting",
                 "please call about the meeting"
             ),
-            CorrectionOutcome::Skipped { .. }
-        ));
+            CorrectionOutcome::Skipped {
+                reason: "no_substitution",
+            }
+        );
     }
 
     #[test]
@@ -16938,6 +17351,81 @@ mod tests {
     }
 
     #[test]
+    fn edit_learning_blocklist_rejects_everyday_word_swaps() {
+        // "why" -> "what" is a content edit, not a mishearing: everyday
+        // words never become vocabulary (OpenWhispr's COMMON_WORDS).
+        assert_eq!(
+            derive_word_correction(
+                "explain why the build failed overnight",
+                "please explain what the build failed overnight"
+            ),
+            CorrectionOutcome::Skipped {
+                reason: "common_word"
+            }
+        );
+        assert!(is_blocklisted_correction("What"));
+        assert!(is_blocklisted_correction("okay"));
+        assert!(!is_blocklisted_correction("tom"));
+        assert!(!is_blocklisted_correction("Sinead"));
+    }
+
+    #[test]
+    fn edit_learning_distance_guard_separates_mishears_from_rephrases() {
+        // A phonetic pair passes: "Shunade" -> "Sinead" is distance 4
+        // over 7 = 0.57, inside the 0.65 bar.
+        assert_eq!(
+            derive_word_correction(
+                "please call Shunade tomorrow",
+                "hey please call Sinead tomorrow"
+            ),
+            learned_pairs(&[("Shunade", "Sinead")])
+        );
+        // An unrelated rephrase is not a mishearing: "meeting" vs "party"
+        // is distance 6 over 7 = 0.86.
+        assert_eq!(
+            derive_word_correction(
+                "let's plan the meeting tomorrow",
+                "hey let's plan the party tomorrow"
+            ),
+            CorrectionOutcome::Skipped {
+                reason: "distant_pair"
+            }
+        );
+        // The ported distance itself.
+        assert_eq!(edit_distance("meting", "meeting"), 1);
+        assert_eq!(edit_distance("shunade", "sinead"), 4);
+        assert_eq!(edit_distance("meeting", "party"), 6);
+    }
+
+    #[test]
+    fn edit_learning_skips_full_rewrites() {
+        // More than half the words replaced is a rewrite, not corrections
+        // (OpenWhispr's 50% rule).
+        assert_eq!(
+            derive_word_correction("ship the meting", "mail the party"),
+            CorrectionOutcome::Skipped { reason: "rewrite" }
+        );
+    }
+
+    #[test]
+    fn edit_learning_locates_the_edited_region_in_a_long_context() {
+        // The caret context carries long pre-existing text; the pasted
+        // dictation sits at the tail and the user fixed one word inside it.
+        // The sliding window finds the pasted region on 30% word overlap.
+        let context = "Morning notes went out to the team about the quarterly planning work we will schedule the review";
+        assert_eq!(
+            derive_word_correction("we will sheudule the review", context),
+            learned_pairs(&[("sheudule", "schedule")])
+        );
+        // Below the 30% overlap there is no pasted region to diff: the
+        // paste was wholly replaced, so nothing is learned.
+        assert!(matches!(
+            derive_word_correction("one two three four", "alpha beta gamma delta epsilon zeta"),
+            CorrectionOutcome::Skipped { .. }
+        ));
+    }
+
+    #[test]
     fn edit_learning_new_word_must_appear_verbatim_in_context() {
         // The rule's helper, at the word boundary and case-sensitively.
         assert!(contains_word_verbatim("please call tom about", "tom"));
@@ -16945,16 +17433,154 @@ mod tests {
         assert!(!contains_word_verbatim("please call to m about", "tom"));
         assert!(!contains_word_verbatim("", "tom"));
         // Every learned outcome satisfies it by construction: the corrected
-        // word of the learned pair is verbatim in the context tail.
+        // word of every learned pair is verbatim in the context tail.
         let context = "Hey, can you please call tom about the meeting";
         assert_eq!(
             derive_word_correction("please call Tim about the meeting", context),
-            CorrectionOutcome::Learned {
-                misheard: String::from("Tim"),
-                corrected: String::from("tom"),
-            }
+            learned_pairs(&[("Tim", "tom")])
         );
         assert!(contains_word_verbatim(context, "tom"));
+    }
+
+    fn echo_terms<const N: usize>(terms: [&str; N]) -> Vec<String> {
+        terms.iter().map(|term| String::from(*term)).collect()
+    }
+
+    #[test]
+    fn vocabulary_echo_filter_flags_each_echo_shape() {
+        let terms = echo_terms(["Kubernetes", "Docker", "Istio", "Prometheus"]);
+
+        // (a) A term looped three or more times is the echo pathology.
+        assert_eq!(
+            strip_vocabulary_echo("Kubernetes Kubernetes Kubernetes", &terms),
+            EchoVerdict::EchoedEntirely
+        );
+        // A word said twice is still speech.
+        assert_eq!(
+            strip_vocabulary_echo("Kubernetes Kubernetes", &terms),
+            EchoVerdict::Clean
+        );
+        // (b) Consecutive prompt terms in the prompt's own order.
+        assert_eq!(
+            strip_vocabulary_echo("Kubernetes, Docker, Istio, Prometheus", &terms),
+            EchoVerdict::EchoedEntirely
+        );
+        // The whole prompt verbatim is an echo even with no shape signal
+        // backing: it is the entire list by definition.
+        let short_terms = echo_terms(["Kubernetes", "Docker"]);
+        assert_eq!(
+            strip_vocabulary_echo("Kubernetes, Docker", &short_terms),
+            EchoVerdict::EchoedEntirely
+        );
+        // (c) A short fragment dangling on the prompt delimiter.
+        assert_eq!(
+            strip_vocabulary_echo("Kubernetes,", &terms),
+            EchoVerdict::EchoedEntirely
+        );
+        // Real speech then a loop: the loop is stripped, the speech kept.
+        assert_eq!(
+            strip_vocabulary_echo("hey Kubernetes Kubernetes Kubernetes,", &terms),
+            EchoVerdict::PartiallyEchoed {
+                cleaned: String::from("hey"),
+                fragment: String::from("Kubernetes Kubernetes Kubernetes,"),
+            }
+        );
+        // Empty inputs are clean.
+        assert_eq!(strip_vocabulary_echo("", &terms), EchoVerdict::Clean);
+        assert_eq!(
+            strip_vocabulary_echo("hello world", &Vec::new()),
+            EchoVerdict::Clean
+        );
+    }
+
+    #[test]
+    fn vocabulary_echo_filter_leaves_real_speech_alone() {
+        let terms = echo_terms(["Kubernetes", "Docker", "Istio", "Prometheus"]);
+
+        // One or two dictionary words inside real speech, in natural order.
+        assert_eq!(
+            strip_vocabulary_echo(
+                "I finally fixed the Kubernetes deployment with Docker today",
+                &terms,
+            ),
+            EchoVerdict::Clean
+        );
+        // The same terms out of the prompt's own order carry the delimiter
+        // but never match the prompt sequence.
+        assert_eq!(
+            strip_vocabulary_echo("Docker, Kubernetes, Istio", &terms),
+            EchoVerdict::Clean
+        );
+        // A sentence ending on a prompt word with a comma does not dangle:
+        // the fragment is too long to be the short-fragment shape.
+        assert_eq!(
+            strip_vocabulary_echo(
+                "we finished the migration and shipped to Kubernetes, finally",
+                &terms,
+            ),
+            EchoVerdict::Clean
+        );
+    }
+
+    #[test]
+    fn vocabulary_echo_filter_handles_multi_word_terms_1889() {
+        // Multi-word snippet triggers put everyday words ("on my way") into
+        // the prompt (OpenWhispr #1889): speech through them must not read
+        // as an echo, while a literal continuation of the prompt list must.
+        let terms = echo_terms(["on my way", "catch the train", "mind the gap"]);
+
+        assert_eq!(
+            strip_vocabulary_echo("I am on my way to the station", &terms),
+            EchoVerdict::Clean
+        );
+        assert_eq!(
+            strip_vocabulary_echo("on my way, catch the train, mind the gap,", &terms),
+            EchoVerdict::EchoedEntirely
+        );
+        // The same terms out of the prompt's order are not a continuation.
+        assert_eq!(
+            strip_vocabulary_echo("catch the train, mind the gap, on my way", &terms),
+            EchoVerdict::Clean
+        );
+    }
+
+    #[test]
+    fn batch_echo_wiring_strips_or_discards_only_when_a_prompt_was_sent() {
+        let terms = echo_terms(["Kubernetes", "Docker", "Istio", "Prometheus"]);
+
+        // A response that is nothing but the prompt list is discarded like
+        // an empty transcript and handed to the retry classification.
+        assert_eq!(
+            batch_transcript_after_echo("Kubernetes, Docker, Istio,", Some(&terms),),
+            BatchEcho::EchoedEntirely
+        );
+        // A partial echo keeps the real speech, drops the echoed fragment.
+        assert_eq!(
+            batch_transcript_after_echo(
+                "deploy the service now, Kubernetes, Docker, Istio,",
+                Some(&terms),
+            ),
+            BatchEcho::Stripped {
+                cleaned: String::from("deploy the service now"),
+                fragment: String::from("Kubernetes, Docker, Istio,"),
+            }
+        );
+        // Clean speech passes through unchanged.
+        assert_eq!(
+            batch_transcript_after_echo("I fixed the Kubernetes deploy today", Some(&terms),),
+            BatchEcho::Transcript(String::from("I fixed the Kubernetes deploy today"))
+        );
+        // No free-text prompt sent: the AssemblyAI batch routes (structured
+        // keyterms, never a free-text prompt) are untouched by construction.
+        assert_eq!(
+            batch_transcript_after_echo("Kubernetes Kubernetes Kubernetes", None),
+            BatchEcho::Transcript(String::from("Kubernetes Kubernetes Kubernetes"))
+        );
+        // An empty transcript stays the existing empty-response path's job.
+        assert_eq!(
+            batch_transcript_after_echo("", Some(&terms)),
+            BatchEcho::Transcript(String::new())
+        );
     }
 
     #[test]
