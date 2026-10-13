@@ -122,7 +122,7 @@ def fixture(history=None, accessibility="ok"):
             "microphones": ["MacBook Pro Microphone", "Studio Display Mic"],
             "cleanup_mode": "auto",
             "accessibility_state": accessibility,
-            "provider": "AssemblyAI",
+            "provider": "Deepgram",
             "history_limit": 10,
             "saved_dictations": len(HISTORY if history is None else history),
             "saved_words": sum(len(item["text"].split()) for item in (HISTORY if history is None else history)),

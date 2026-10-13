@@ -107,8 +107,8 @@ SCREEN_WELCOME_DETAIL = (
     "You can quit at any point and come back from the Bolo menu bar item."
 )
 SCREEN_CONNECT_SPEECH_DETAIL = (
-    "Bolo sends audio to your speech provider to turn speech into text. "
-    "Pick a provider, paste your API key, then Validate to connect. "
+    "Bolo sends audio to Telnyx to turn speech into text. "
+    "Paste your Telnyx API key, then Validate to connect. "
     "You can skip and add it later."
 )
 SCREEN_MICROPHONE_DETAIL = (
@@ -159,7 +159,6 @@ GRANTED_DETAIL = "Granted. Bolo can insert text now."
 SOURCE_GRANTED_DETAIL = (
     "Granted. Run ./restart.sh so Bolo picks up the grant."
 )
-ASSEMBLYAI_LIST_URL = "https://api.assemblyai.com/v2/transcript?limit=1"
 TELNYX_KEY_LIST_URL = "https://api.telnyx.com/v2/phone_numbers?page[size]=1"
 KEY_VALIDATION_TIMEOUT_S = 6.0
 
@@ -569,33 +568,27 @@ WIZARD_FINISH_LATER_TITLE = "Finish later"
 WIZARD_FINISH_LATER_W = 150
 WIZARD_FINISH_LATER_H = WIZARD_PRIMARY_H
 
-# Speech providers offered in onboarding. The default is AssemblyAI
-# (the resolved pipeline's default); Telnyx stays available for the
-# legacy hosted path. Saving a provider's key also pins BOLO_STT_MODEL
-# so the resolved pipeline follows the chosen provider after restart.
-WIZARD_PROVIDERS = ("assemblyai", "telnyx")
+# Speech provider offered in onboarding: Telnyx only. Saving the key
+# writes TELNYX_API_KEY and pins BOLO_STT_MODEL to the Telnyx-hosted
+# Deepgram model, so the resolved pipeline follows the choice after
+# the runtime restarts.
+WIZARD_PROVIDERS = ("telnyx",)
 WIZARD_PROVIDER_TITLES = {
-    "assemblyai": "AssemblyAI (recommended)",
-    "telnyx": "Telnyx (legacy)",
+    "telnyx": "Telnyx",
 }
 WIZARD_PROVIDER_PLACEHOLDERS = {
-    "assemblyai": "Paste your AssemblyAI API key",
     "telnyx": "Paste your Telnyx API key",
 }
 WIZARD_PROVIDER_ENV_NAMES = {
-    "assemblyai": "ASSEMBLYAI_API_KEY",
     "telnyx": "TELNYX_API_KEY",
 }
 WIZARD_PROVIDER_STT_MODELS = {
-    "assemblyai": "assemblyai/universal-3-5-pro",
     "telnyx": "deepgram/nova-3",
 }
 WIZARD_PROVIDER_HOSTS = {
-    "assemblyai": "api.assemblyai.com",
     "telnyx": "api.telnyx.com",
 }
 WIZARD_PROVIDER_LINKS = {
-    "assemblyai": "https://www.assemblyai.com/app/api-keys",
     "telnyx": "https://dashboard.telnyx.com/",
 }
 
@@ -619,9 +612,6 @@ def _blocked_button_rgb(dark=False):
 
 def _pending_dot_rgb():
     return (0.46, 0.46, 0.48)
-
-ASSEMBLYAI_DASHBOARD_URL = "https://www.assemblyai.com/app/api-keys"
-
 
 def _calibrated(rgb, alpha=1.0):
     """One calibrated NSColor from an RGB tuple."""
@@ -721,9 +711,10 @@ def wizard_body_paragraphs(screen, facts, practice_done=False):
         ]
     if screen == SCREEN_CONNECT_SPEECH:
         return [
-            "Bolo sends audio to AssemblyAI to turn speech into text. "
+            "Bolo sends audio to Telnyx to turn speech into text. "
             "Paste your API key below, then click Validate.",
-            "Bolo saves your key locally and uses it to connect to AssemblyAI.",
+            "Bolo saves your key locally as TELNYX_API_KEY and pins "
+            "BOLO_STT_MODEL to deepgram/nova-3.",
         ]
     if screen == SCREEN_MICROPHONE:
         return [
@@ -1150,31 +1141,8 @@ def build_wizard_ui(payload, preview=False):
                 muted_color,
             )
             y += WIZARD_STEP_H + 6
-            # Provider picker: the default is AssemblyAI (the resolved
-            # pipeline's default); Telnyx remains for the legacy hosted
-            # path. Selecting a provider reveals its own key field.
-            from AppKit import NSSegmentSwitchTrackingSelectOne
-            from AppKit import NSSegmentedControl
-
-            picker = NSSegmentedControl.alloc().initWithFrame_(
-                NSMakeRect(
-                    WIZARD_MARGIN,
-                    y,
-                    WIZARD_PRACTICE_W - 110 - 12,
-                    24,
-                )
-            )
-            picker.setSegmentCount_(len(WIZARD_PROVIDERS))
-            picker.setTrackingMode_(NSSegmentSwitchTrackingSelectOne)
-            for segment, provider_id in enumerate(WIZARD_PROVIDERS):
-                picker.setLabel_forSegment_(
-                    WIZARD_PROVIDER_TITLES[provider_id], segment
-                )
-            picker.setSelectedSegment_(0)
-            picker.setTarget_(controller)
-            picker.setAction_("providerChanged:")
-            content.addSubview_(picker)
-            y += 24 + 10
+            # No provider picker anymore: Telnyx is the only speech
+            # provider, so the key field stands alone.
             field = NSSecureTextField.alloc().initWithFrame_(
                 NSMakeRect(
                     WIZARD_MARGIN,
@@ -1190,7 +1158,7 @@ def build_wizard_ui(payload, preview=False):
                 else None
             )
             field.cell().setPlaceholderString_(
-                placeholder or WIZARD_PROVIDER_PLACEHOLDERS["assemblyai"]
+                placeholder or WIZARD_PROVIDER_PLACEHOLDERS["telnyx"]
             )
             content.addSubview_(field)
             validate_button = NSButton.buttonWithTitle_target_action_(
@@ -1254,13 +1222,12 @@ def build_wizard_ui(payload, preview=False):
 
             key_refs = {
                 "field": field,
-                "picker": picker,
                 "link": link,
                 "dot": key_dot,
                 "detail_label": key_label,
                 "on_valid": on_valid,
-                "provider": WIZARD_PROVIDERS[0],
-                "link_url": WIZARD_PROVIDER_LINKS[WIZARD_PROVIDERS[0]],
+                "provider": "telnyx",
+                "link_url": WIZARD_PROVIDER_LINKS["telnyx"],
                 "validated": {},
             }
 
@@ -1590,7 +1557,7 @@ def build_screen_payload(facts, screen, position, count, practice_done=False):
     if screen == SCREEN_CONNECT_SPEECH:
         payload["key_entry"] = {
             "index": 0,
-            "placeholder": "Paste your AssemblyAI API key",
+            "placeholder": "Paste your Telnyx API key",
         }
     if screen == SCREEN_PRACTICE:
         payload["practice"] = {"placeholder": WIZARD_PRACTICE_PLACEHOLDER}
@@ -1697,17 +1664,16 @@ def prompts_display_payload(spec):
 def validate_prompt_text(text, cap):
     """Plain error message when the text cannot be saved, else None.
 
-    A prompt must be non-empty after trimming, and every profile can ride
-    the AssemblyAI Dictation request as `llm_instruction`, so the
-    provider's 2048-character cap applies to all of them (docs:
-    https://www.assemblyai.com/docs/dictation, checked 2026-10-09).
-    Characters are counted, not bytes, so Hinglish and Devanagari text
-    measures like the Rust side counts it.
+    A prompt must be non-empty after trimming, and every cleanup ride
+    the Telnyx-hosted STT request as an instruction, so the provider's
+    2048-character cap applies to all of them. Characters are counted,
+    not bytes, so Hinglish and Devanagari text measures like the Rust
+    side counts it.
     """
     if not isinstance(text, str) or not text.strip():
         return "The prompt cannot be empty."
     if len(text) > cap:
-        return "The prompt is too long for AssemblyAI ({0} characters max).".format(cap)
+        return "The prompt is too long for Telnyx ({0} characters max).".format(cap)
     return None
 
 
@@ -1901,11 +1867,12 @@ def key_entry_index(payload):
 
 
 def classify_key_response(status):
-    """Map one AssemblyAI HTTP status to a validation verdict.
+    """Map one Telnyx HTTP status to a validation verdict.
 
-    A 200 from the transcript-list endpoint proves the key authenticates
-    without spending any audio on transcription; 401 is a definite reject.
-    Anything else is treated as a transient error rather than a rejection.
+    A 200 from the phone-number-list endpoint proves the key
+    authenticates without provisioning anything; 401 is a definite
+    reject. Anything else is treated as a transient error rather than a
+    rejection.
     """
     if status == 200:
         return "valid"
@@ -1914,25 +1881,12 @@ def classify_key_response(status):
     return "error"
 
 
-def fetch_assemblyai_status(key, url=ASSEMBLYAI_LIST_URL, timeout=KEY_VALIDATION_TIMEOUT_S):
-    """Return the HTTP status code for a key probe; raise on network failure."""
-    import urllib.error
-    import urllib.request
-
-    request = urllib.request.Request(url, headers={"Authorization": key})
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            return response.getcode()
-    except urllib.error.HTTPError as error:
-        return error.code
-
-
 def fetch_telnyx_status(key, url=TELNYX_KEY_LIST_URL, timeout=KEY_VALIDATION_TIMEOUT_S):
     """Telnyx key probe: list one phone number, Bearer auth.
 
     A 200 proves the key authenticates against the Telnyx API without
     provisioning anything; a 401 is a definite reject. Raises on
-    transport failure exactly like the AssemblyAI probe.
+    transport failure.
     """
     import urllib.error
     import urllib.request
@@ -1948,7 +1902,6 @@ def fetch_telnyx_status(key, url=TELNYX_KEY_LIST_URL, timeout=KEY_VALIDATION_TIM
 
 
 PROVIDER_KEY_FETCHERS = {
-    "assemblyai": fetch_assemblyai_status,
     "telnyx": fetch_telnyx_status,
 }
 
@@ -1957,20 +1910,20 @@ def validate_and_save_key(
     key,
     env_path=None,
     fetch=None,
-    provider="assemblyai",
+    provider="telnyx",
 ):
-    """Validate one provider's API key and persist it when accepted.
+    """Validate the Telnyx API key and persist it when accepted.
 
     Returns ``(verdict, detail)`` where detail is display text for the
-    onboarding row. A valid key is written to the provider's own
-    environment variable and ``BOLO_STT_MODEL`` is pinned to the
-    provider's model, so the resolved pipeline follows the choice after
-    the runtime restarts. `fetch` is injectable so tests cover the
+    onboarding row. A valid key is written to ``TELNYX_API_KEY`` and
+    ``BOLO_STT_MODEL`` is pinned to the Telnyx-hosted Deepgram model, so
+    the resolved pipeline follows the choice after the runtime
+    restarts. `fetch` is injectable so tests cover the
     200/401/other branches without network access; it must raise on
-    transport errors. The default is AssemblyAI, the pipeline default.
+    transport errors. The default is Telnyx, the pipeline default.
     """
     key = (key or "").strip()
-    provider = provider if provider in WIZARD_PROVIDER_ENV_NAMES else "assemblyai"
+    provider = provider if provider in WIZARD_PROVIDER_ENV_NAMES else "telnyx"
     provider_title = WIZARD_PROVIDER_TITLES[provider].split(" (")[0]
     if not key:
         return (
@@ -1996,8 +1949,8 @@ def validate_and_save_key(
         bolo_env.write_env_value(
             env_path, WIZARD_PROVIDER_ENV_NAMES[provider], key
         )
-        # The saved choice decides the resolved pipeline: AssemblyAI
-        # direct or Telnyx-hosted Deepgram, read at restart.
+        # The saved choice decides the resolved pipeline:
+        # Telnyx-hosted Deepgram, read at restart.
         bolo_env.write_env_value(
             env_path, "BOLO_STT_MODEL", WIZARD_PROVIDER_STT_MODELS[provider]
         )
@@ -2206,7 +2159,7 @@ def _appkit_classes_cached(NSView, NSObject):
 
         def openDashboard_(self, sender):
             key_refs = STATE.get("key_refs") or {}
-            url = key_refs.get("link_url") or ASSEMBLYAI_DASHBOARD_URL
+            url = key_refs.get("link_url") or WIZARD_PROVIDER_LINKS["telnyx"]
             print(
                 "[app-window] opening API key dashboard: {0}".format(url),
                 file=sys.stderr,
@@ -2214,59 +2167,13 @@ def _appkit_classes_cached(NSView, NSObject):
             )
             subprocess.Popen(["open", url])
 
-        def providerChanged_(self, sender):
-            refs = STATE.get("key_refs") or {}
-            if not refs:
-                return
-            try:
-                segment = int(sender.selectedSegment())
-            except (TypeError, ValueError):
-                return
-            if not 0 <= segment < len(WIZARD_PROVIDERS):
-                return
-            provider = WIZARD_PROVIDERS[segment]
-            if provider == refs.get("provider"):
-                return
-            refs["provider"] = provider
-            refs["link_url"] = WIZARD_PROVIDER_LINKS[provider]
-            validated = refs.get("validated") or {}
-            field = refs.get("field")
-            label_text = WIZARD_KEY_STATUS_INITIAL
-            state = "pending"
-            if validated.get(provider):
-                # This provider already validated earlier in the
-                # session: the row keeps its saved state without
-                # re-asking for the key.
-                state = "ok"
-                label_text = "Key saved. Click Continue to finish setup and try dictation."
-                if field is not None:
-                    field.setEnabled_(False)
-            elif field is not None:
-                field.setEnabled_(True)
-                field.cell().setPlaceholderString_(
-                    WIZARD_PROVIDER_PLACEHOLDERS[provider]
-                )
-                field.setStringValue_("")
-            dot = refs.get("dot")
-            colors = STATE.get("colors") or {}
-            if dot is not None and colors:
-                dot_color = {
-                    "ok": colors.get("ok"),
-                    "pending": colors.get("pending"),
-                }.get(state)
-                if dot_color is not None:
-                    dot.layer().setBackgroundColor_(dot_color.CGColor())
-            detail = refs.get("detail_label")
-            if detail is not None:
-                detail.setStringValue_(label_text)
-
         def validateKey_(self, sender):
             refs = STATE.get("key_refs")
             if not refs:
                 return
             field = refs["field"]
             key = str(field.stringValue())
-            provider = refs.get("provider") or "assemblyai"
+            provider = refs.get("provider") or "telnyx"
             verdict, detail = validate_and_save_key(key, provider=provider)
             state_colors = STATE.get("colors") or {}
             dot_color = {
@@ -2518,7 +2425,7 @@ def build_prompts_ui(payload, preview=False):
     are editing), Save and Reset-to-built-in actions, and the no-restart
     note: both cleanup routes in the runtime read the overrides file at
     call time, so edits apply from the next dictation. Saves validate the
-    text (non-empty, within the AssemblyAI cap) and write the user-data
+    text (non-empty, within the Telnyx cap) and write the user-data
     file atomically, mirroring the learned-words window.
     """
     from AppKit import (
@@ -3095,7 +3002,7 @@ def build_ui_generic(payload, preview=False):
                 )
                 field.cell().setPlaceholderString_(
                     (payload.get("key_entry") or {}).get("placeholder")
-                    or "Paste your AssemblyAI API key"
+                    or "Paste your Telnyx API key"
                 )
                 content.addSubview_(field)
                 validate_button = NSButton.buttonWithTitle_target_action_(

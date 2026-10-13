@@ -40,7 +40,7 @@ def wizard_payload(screen, trust="warn", microphones=2, hotkey="left_option"):
     queue = list(app_window.SCREEN_ORDER)
     key_entry = None
     if screen == app_window.SCREEN_CONNECT_SPEECH:
-        key_entry = {"index": 0, "placeholder": "Paste your AssemblyAI API key"}
+        key_entry = {"index": 0, "placeholder": "Paste your Telnyx API key"}
     practice = None
     if screen == app_window.SCREEN_PRACTICE:
         practice = {"placeholder": app_window.WIZARD_PRACTICE_PLACEHOLDER}

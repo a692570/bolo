@@ -24,9 +24,8 @@ system default when nothing is pinned).
 ## Setup says an API key is missing
 
 **Cause:** Bolo cannot reach its transcription provider without a key.
-**Fix:** In the setup window, pick your provider (AssemblyAI is recommended)
-and paste the key from that provider's dashboard. AssemblyAI keys come from
-https://www.assemblyai.com/dashboard/home. The key is validated before saving.
+**Fix:** In the setup window, paste your Telnyx API key from
+https://dashboard.telnyx.com/. The key is validated before saving.
 
 ## Transcription fails with 401 Unauthorized
 
@@ -35,8 +34,7 @@ https://www.assemblyai.com/dashboard/home. The key is validated before saving.
 
 ## Transcription fails with 429 or rate limited
 
-**Cause:** the provider's rate limit was hit (AssemblyAI's free tier allows 5
-new streams per minute).
+**Cause:** the provider's rate limit was hit.
 **Fix:** Wait a moment and dictate again; Bolo falls back to batch
 transcription automatically.
 

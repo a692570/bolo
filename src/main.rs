@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs::{self, File};
 use std::future::Future;
-use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
+use std::io::{BufRead, BufReader, ErrorKind, Write};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -58,21 +58,6 @@ const TELNYX_STT_ENDPOINT: &str = "https://api.telnyx.com/v2/ai/audio/transcript
 const TELNYX_STT_STREAMING_ENDPOINT: &str = "wss://api.telnyx.com/v2/speech-to-text/transcription";
 const TELNYX_LLM_ENDPOINT: &str = "https://api.telnyx.com/v2/ai/chat/completions";
 const XAI_STT_ENDPOINT: &str = "https://api.x.ai/v1/stt";
-const ASSEMBLYAI_DICTATION_ENDPOINT: &str = "https://dictation.assemblyai.com/v1/transcribe/live";
-const ASSEMBLYAI_LLM_GATEWAY_ENDPOINT: &str =
-    "https://llm-gateway.assemblyai.com/v1/chat/completions";
-const ASSEMBLYAI_LLM_DEFAULT_MODEL: &str = "gemini-2.5-flash-lite";
-const ASSEMBLYAI_UPLOAD_ENDPOINT: &str = "https://api.assemblyai.com/v2/upload";
-const ASSEMBLYAI_TRANSCRIPT_ENDPOINT: &str = "https://api.assemblyai.com/v2/transcript";
-const ASSEMBLYAI_STREAMING_ENDPOINT: &str = "wss://streaming.assemblyai.com/v3/ws";
-const ASSEMBLYAI_DICTATION_MODEL: &str = "universal-3-5-pro";
-const ASSEMBLYAI_STREAMING_MODEL: &str = "universal-streaming-english";
-const ASSEMBLYAI_SYNC_MAX_DURATION_MS: u64 = 120_000;
-const ASSEMBLYAI_LANGUAGE_CODES: [&str; 32] = [
-    "af", "ar", "yue", "ca", "da", "nl", "en", "et", "fi", "fr", "gl", "de", "he", "hi", "it",
-    "ja", "ko", "zh", "mr", "no", "nn", "fa", "pt", "ro", "ru", "es", "sv", "tr", "ur", "vi", "xh",
-    "zu",
-];
 const CORRECTION_WINDOW: Duration = Duration::from_secs(3);
 const MIN_RECORDING: Duration = Duration::from_secs(1);
 const RECORDING_WATCHDOG_INTERVAL: Duration = Duration::from_secs(5);
@@ -145,10 +130,6 @@ const STREAMING_HANDSHAKE_DEADLINE: Duration = Duration::from_secs(3);
 const STREAMING_BATCH_VERIFY_TIMEOUT: Duration = Duration::from_secs(2);
 const STREAMING_SAMPLE_RATE: u32 = 48_000;
 const STT_REQUEST_TIMEOUT: Duration = Duration::from_secs(12);
-/// Connection and TLS handshake slack added on top of the recorded audio
-/// window in the streamed Dictation request's hard ceiling. See
-/// `dictation_upload_request_timeout`.
-const DICTATION_UPLOAD_REQUEST_SLACK: Duration = Duration::from_secs(2);
 /// Sample rate of the payload-reduced batch retry. A 16 kHz re-encode passed
 /// live replay during the 2026-09-09 gateway incident while the captured
 /// 48 kHz WAV was rejected nondeterministically with 413.
@@ -172,6 +153,11 @@ const POST_INSERT_OVERLAY_HOLD: Duration = Duration::from_millis(300);
 /// the caret context once, so a burst of consecutive backspaces collapses
 /// into a single diff instead of one diff per keystroke.
 const EDIT_LEARNING_QUIET: Duration = Duration::from_millis(1_500);
+/// Poll cadence of the caret-context probe the edit-learning watcher runs
+/// when the hotkey helper's key events are unavailable (no Input Monitoring
+/// grant). Each dictation's 15-second observation window gets at most six
+/// probes; each probe is one accessibility read.
+const EDIT_LEARNING_PROBE_INTERVAL: Duration = Duration::from_millis(2_500);
 /// Cap on learned corrections persisted in `~/.bolo/learned_vocabulary.json`.
 /// Beyond it the least-confirmed pairs (lowest count, then oldest) are evicted.
 const LEARNED_VOCABULARY_CAP: usize = 100;
@@ -247,7 +233,6 @@ enum AppError {
 #[derive(Clone, Debug)]
 struct Config {
     telnyx_api_key: Option<String>,
-    assemblyai_api_key: Option<String>,
     llm_cleanup: CleanupMode,
     litellm_base: Option<String>,
     litellm_key: Option<String>,
@@ -301,12 +286,10 @@ struct PromptBinding {
 enum SttFallback {
     Telnyx(String),
     Xai,
-    AssemblyAi(Option<String>),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum StreamingProvider {
-    AssemblyAiDirect,
     AssemblyAi,
     Deepgram,
 }
@@ -419,6 +402,15 @@ struct EditLearningWatch {
     /// Debounce deadline of the pending diff capture, pushed forward by every
     /// backspace. `None` while no burst is pending.
     capture_at: Option<Instant>,
+    /// Set by whichever watcher (the backspace burst thread or the caret
+    /// poll thread) claims the observation for its diff capture, so two
+    /// live threads can never learn the same edit twice.
+    captured: bool,
+    /// Manual-copy fallback only: the popup process holding the editable
+    /// copy of the transcript. Poll probes claim only contexts from this
+    /// process; `None` marks a paste-path observation, which the whole
+    /// caret context can edit.
+    popup_pid: Option<i32>,
 }
 
 impl EditLearningWatch {
@@ -427,6 +419,8 @@ impl EditLearningWatch {
             pasted_text: pasted_text.to_owned(),
             inserted_at: Instant::now(),
             capture_at: None,
+            captured: false,
+            popup_pid: None,
         }
     }
 }
@@ -509,17 +503,13 @@ struct ActiveRecording {
     /// Capture tee shared with the same callback; the flush needs it to
     /// deliver the tail to the wire sinks before the callback (and with it
     /// the hub) is destroyed. `finish_recording` must set this to `None`
-    /// after dropping the stream: the upload request body reaches EOF only
-    /// when the last hub sender is gone, and a hub still referenced here
-    /// keeps the streamed dictation upload waiting out its full budget.
+    /// after dropping the stream: a hub still referenced here keeps the
+    /// streaming preview socket alive past its own drain deadline.
     hub: Option<Arc<AudioHub>>,
     started_at: Instant,
     sample_rate: u32,
     warmup: DictationWarmup,
     streaming: Option<StreamingRecording>,
-    /// Streamed Dictation upload for the preview-only composition, started
-    /// at press so release only has to read the response.
-    upload: Option<DictationUpload>,
 }
 
 impl ActiveRecording {
@@ -658,16 +648,14 @@ struct SttRequestParts {
     language: Option<String>,
 }
 
-/// One STT outcome: `text` is the verbatim transcript every caller needs, and
-/// `llm_cleaned` carries the provider-side cleanup when the provider bundles
-/// one (`AssemblyAI` Dictation), so Bolo's own LLM cleanup pass can be skipped.
-/// `from_local` marks a transcript produced by the offline whisper tier so
-/// latency attribution can distinguish it without touching the metrics
-/// schema.
+/// One STT outcome: `text` is the verbatim transcript every caller needs,
+/// and Bolo's own LLM cleanup pass runs on it whenever the cleanup mode
+/// allows. `from_local` marks a transcript produced by the offline whisper
+/// tier so latency attribution can distinguish it without touching the
+/// metrics schema.
 #[derive(Clone, Debug, Default)]
 struct SttResult {
     text: String,
-    llm_cleaned: Option<String>,
     from_local: bool,
 }
 
@@ -675,7 +663,6 @@ impl SttResult {
     const fn verbatim(text: String) -> Self {
         Self {
             text,
-            llm_cleaned: None,
             from_local: false,
         }
     }
@@ -685,7 +672,6 @@ impl SttResult {
     const fn verbatim_local(text: String) -> Self {
         Self {
             text,
-            llm_cleaned: None,
             from_local: true,
         }
     }
@@ -934,378 +920,6 @@ impl StreamingRecording {
     }
 }
 
-/// Request-body reader for the streamed Dictation upload: pulls captured
-/// i16 chunks from the audio-callback feed, converts them to little-endian
-/// PCM bytes, and reports EOF once the feed's last sender has dropped,
-/// which is what tells the server to finalize the transcript. `read` blocks
-/// waiting for the next chunk, but only on this request's own thread: the
-/// audio callback sends into an unbounded channel and never blocks on the
-/// upload.
-struct DictationUploadReader {
-    receiver: Receiver<Vec<i16>>,
-    buffer: Vec<u8>,
-}
-
-impl Read for DictationUploadReader {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if buf.is_empty() {
-            return Ok(0);
-        }
-        while self.buffer.is_empty() {
-            match self.receiver.recv() {
-                Ok(chunk) => self.buffer = pcm_bytes(&chunk),
-                Err(_) => return Ok(0),
-            }
-        }
-        let len = buf.len().min(self.buffer.len());
-        buf[..len].copy_from_slice(&self.buffer[..len]);
-        self.buffer = self.buffer.split_off(len);
-        Ok(len)
-    }
-}
-
-/// Config JSON for the streamed Dictation upload: the batch request's
-/// `language_codes` and `keyterms_prompt` semantics plus the
-/// `sample_rate`/`channels` pair the endpoint requires when the audio part
-/// is raw 16-bit PCM rather than a WAV (contract:
-/// <https://www.assemblyai.com/docs/dictation>, config parameters, checked
-/// 2026-10-01).
-fn dictation_upload_config(
-    sample_rate: u32,
-    language: &str,
-    vocabulary: &[String],
-) -> serde_json::Value {
-    let mut config = serde_json::json!({
-        "sample_rate": sample_rate,
-        "channels": 1,
-    });
-    if let Some(code) = assemblyai_language_code(language) {
-        config["language_codes"] = serde_json::json!([code]);
-    }
-    if !vocabulary.is_empty() {
-        config["keyterms_prompt"] =
-            serde_json::json!(vocabulary.iter().take(50).collect::<Vec<_>>());
-    }
-    config
-}
-
-/// Config JSON for the batch Dictation request. `llm_instruction` replaces
-/// the endpoint's default cleanup task, so the key is added only when the
-/// active cleanup profile has a saved override: with no override the
-/// request carries exactly the fields it always did and the server's
-/// default cleanup (which is excellent) stays (contract:
-/// <https://www.assemblyai.com/docs/dictation>, config parameters, checked
-/// 2026-10-09).
-fn dictation_batch_config(
-    language: &str,
-    vocabulary: &[String],
-    llm_instruction: Option<&str>,
-) -> serde_json::Value {
-    let mut config = serde_json::json!({});
-    if let Some(code) = assemblyai_language_code(language) {
-        config["language_codes"] = serde_json::json!([code]);
-    }
-    if !vocabulary.is_empty() {
-        config["keyterms_prompt"] =
-            serde_json::json!(vocabulary.iter().take(50).collect::<Vec<_>>());
-    }
-    if let Some(instruction) = llm_instruction {
-        config["llm_instruction"] = serde_json::json!(instruction);
-    }
-    config
-}
-
-/// Multipart body for the streamed Dictation upload: the `config` part is
-/// added before the `audio` part because the endpoint starts decoding as
-/// bytes arrive and rejects audio that arrives before config. reqwest's
-/// blocking multipart writes parts in insertion order: `Form::part` appends
-/// to the `FormParts` fields `Vec` (reqwest 0.12.28,
-/// `src/async_impl/multipart.rs`) and the blocking wire reader consumes that
-/// `Vec` front-first (`Reader::next_reader` in `src/blocking/multipart.rs`),
-/// so wire order equals build order.
-fn dictation_upload_form(
-    config: String,
-    reader: DictationUploadReader,
-) -> Result<multipart::Form, AppError> {
-    Ok(multipart::Form::new()
-        .part(
-            "config",
-            multipart::Part::text(config).mime_str("application/json")?,
-        )
-        .part(
-            "audio",
-            multipart::Part::reader(reader).mime_str("audio/pcm")?,
-        ))
-}
-
-/// Reject a non-success Dictation response with the same error mapping for
-/// the batch and streamed upload paths, so the retry and fallback arms see
-/// identical variants: rate limits map to `RateLimited`, auth failures to
-/// `Transcription`, and other statuses to `TranscriptionStatus` with the
-/// body truncated. A success passes the response through untouched.
-fn dictation_status_checked(
-    status: reqwest::StatusCode,
-    response: reqwest::blocking::Response,
-) -> Result<reqwest::blocking::Response, AppError> {
-    if status.is_success() {
-        return Ok(response);
-    }
-    if status.as_u16() == 429 {
-        return Err(AppError::RateLimited);
-    }
-    if status.as_u16() == 401 {
-        return Err(AppError::Transcription(String::from(
-            "401 Unauthorized: check ASSEMBLYAI_API_KEY",
-        )));
-    }
-    let body = response.text().unwrap_or_default();
-    Err(AppError::TranscriptionStatus {
-        status: status.as_u16(),
-        message: body.chars().take(200).collect::<String>(),
-    })
-}
-
-/// Verbatim transcript plus the provider-side cleanup from a Dictation
-/// response, shared by the batch and streamed upload paths so the cleanup
-/// semantics cannot drift: the cleaned text only counts when it is
-/// non-empty and actually differs from the verbatim transcript.
-fn dictation_verbatim_and_cleaned(parsed: &AssemblyDictationResponse) -> (String, Option<String>) {
-    let verbatim = parsed.text.clone().unwrap_or_default();
-    let cleaned = parsed
-        .llm_response
-        .as_deref()
-        .map(str::trim)
-        .filter(|cleaned| !cleaned.is_empty() && *cleaned != verbatim.trim())
-        .map(str::to_owned);
-    (verbatim, cleaned)
-}
-
-/// Release decision for the streamed Dictation upload.
-enum DictationUploadRelease {
-    /// The uploaded request produced its transcript; use it as the STT
-    /// result with no further upload work.
-    Uploaded(SttResult),
-    /// The upload failed or missed the release budget; retry once with the
-    /// release-time batch transcribe of the buffered WAV.
-    UploadFailed,
-    /// No upload ran (batch mode, a legacy primary model, or no key); the
-    /// release-time batch transcribe is the only source, exactly as before
-    /// the streamed upload existed.
-    NotUploaded,
-}
-
-/// Classify the streamed upload's release outcome. The failure log carries
-/// the reason so a degraded upload path is visible in the log next to the
-/// batch fallback that follows it.
-fn dictation_upload_release(
-    uploaded: Option<Result<SttResult, AppError>>,
-) -> DictationUploadRelease {
-    match uploaded {
-        Some(Ok(result)) => DictationUploadRelease::Uploaded(result),
-        Some(Err(error)) => {
-            warn!(
-                "[stt] dictation_upload_stream_failed {}",
-                serde_json::json!({ "error": error.to_string() })
-            );
-            DictationUploadRelease::UploadFailed
-        }
-        None => DictationUploadRelease::NotUploaded,
-    }
-}
-
-/// Hard ceiling on the streamed Dictation request, measured from press,
-/// when the request thread calls `send`. Release abandons the upload after
-/// `STT_REQUEST_TIMEOUT` and falls back to the batch transcribe, so this
-/// ceiling only exists to reap an abandoned thread's connection. It must
-/// cover the longest recording plus its trailing capture, the release-side
-/// websocket drain, and the response budget, so the ceiling never fires
-/// before release's own decision does.
-const fn dictation_upload_request_timeout(max_recording_seconds: u64) -> Duration {
-    STT_REQUEST_TIMEOUT
-        .saturating_add(Duration::from_secs(max_recording_seconds))
-        .saturating_add(TRAILING_CAPTURE_CAP)
-        .saturating_add(STREAMING_DRAIN_MAX)
-        .saturating_add(DICTATION_UPLOAD_REQUEST_SLACK)
-}
-
-/// Feed halves for the streamed Dictation upload: the sender the audio
-/// callback tees chunks into, and the receiver the request body reads. Both
-/// are None when the composition does not stream the upload.
-type DictationUploadFeed = (Option<mpsc::Sender<Vec<i16>>>, Option<Receiver<Vec<i16>>>);
-
-/// One streamed Dictation upload, opened at press: captured PCM flows into
-/// the request body while recording continues, so release only has to wait
-/// for the response the server already computed instead of uploading the
-/// whole WAV after the fact.
-#[derive(Debug)]
-struct DictationUpload {
-    outcome: Arc<Mutex<Option<Result<SttResult, AppError>>>>,
-    thread: Option<JoinHandle<()>>,
-}
-
-impl DictationUpload {
-    /// Open the streamed Dictation request on a dedicated thread. The feed
-    /// receiver is already wired to the capture stream by the caller, so
-    /// chunks are flowing into the request body by the time this returns,
-    /// and the response lands in the shared outcome slot for release to
-    /// collect. The blocking client drives the streaming body from the
-    /// calling thread of `send`, which is this thread: a blocked `recv`
-    /// inside the reader delays only the upload, never the runtime that
-    /// serves other requests.
-    fn start(
-        http: Client,
-        api_key: String,
-        language: String,
-        vocabulary: Vec<String>,
-        sample_rate: u32,
-        request_timeout: Duration,
-        receiver: Receiver<Vec<i16>>,
-    ) -> Self {
-        let outcome = Arc::new(Mutex::new(None));
-        let thread_outcome = Arc::clone(&outcome);
-        let failure_outcome = Arc::clone(&outcome);
-        let thread = std::thread::Builder::new()
-            .name(String::from("bolo-dictation-upload"))
-            .spawn(move || {
-                let result = Self::request(
-                    &http,
-                    &api_key,
-                    &language,
-                    &vocabulary,
-                    sample_rate,
-                    request_timeout,
-                    receiver,
-                );
-                if let Ok(mut slot) = thread_outcome.lock() {
-                    *slot = Some(result);
-                }
-            })
-            .unwrap_or_else(|error| {
-                warn!("dictation upload thread failed to start: {error}");
-                if let Ok(mut slot) = failure_outcome.lock() {
-                    *slot = Some(Err(AppError::Transcription(format!(
-                        "dictation upload thread failed to start: {error}"
-                    ))));
-                }
-                std::thread::spawn(|| {})
-            });
-        Self {
-            outcome,
-            thread: Some(thread),
-        }
-    }
-
-    /// Open the streamed Dictation request and block until its single JSON
-    /// response arrives. Errors are results, never panics: release always
-    /// has the batch transcribe of the buffered WAV behind it. The response
-    /// text is not logged here because the sanitizing `log_text` helper
-    /// lives on `App`; the pipeline logs the transcript after release.
-    fn request(
-        http: &Client,
-        api_key: &str,
-        language: &str,
-        vocabulary: &[String],
-        sample_rate: u32,
-        request_timeout: Duration,
-        receiver: Receiver<Vec<i16>>,
-    ) -> Result<SttResult, AppError> {
-        let reader = DictationUploadReader {
-            receiver,
-            buffer: Vec::new(),
-        };
-        let config = dictation_upload_config(sample_rate, language, vocabulary).to_string();
-        let form = dictation_upload_form(config, reader)?;
-        info!(
-            "[stt] dictation_upload_stream_started {}",
-            serde_json::json!({
-                "endpoint": ASSEMBLYAI_DICTATION_ENDPOINT,
-                "provider": "assemblyai_dictation_upload",
-                "audio_mime": "audio/pcm",
-                "sample_rate": sample_rate,
-                "language": language,
-            })
-        );
-        let response = http
-            .post(ASSEMBLYAI_DICTATION_ENDPOINT)
-            .header("Authorization", api_key)
-            .multipart(form)
-            .timeout(request_timeout)
-            .send()?;
-        let status = response.status();
-        info!(
-            "[stt] response_status {}",
-            serde_json::json!({
-                "endpoint": ASSEMBLYAI_DICTATION_ENDPOINT,
-                "provider": "assemblyai_dictation_upload",
-                "status": status.as_u16(),
-            })
-        );
-        let response = dictation_status_checked(status, response)?;
-        let parsed: AssemblyDictationResponse = response.json()?;
-        let (verbatim, cleaned) = dictation_verbatim_and_cleaned(&parsed);
-        info!(
-            "[stt] response_text {}",
-            serde_json::json!({
-                "endpoint": ASSEMBLYAI_DICTATION_ENDPOINT,
-                "provider": "assemblyai_dictation_upload",
-                "provider_cleanup": cleaned.is_some(),
-                "llm_error": &parsed.llm_error,
-                "request_time_ms": &parsed.request_time_ms,
-            })
-        );
-        if verbatim.trim().is_empty() {
-            return Err(AppError::Transcription(String::from(
-                "STT returned empty transcript",
-            )));
-        }
-        Ok(SttResult {
-            text: verbatim,
-            llm_cleaned: cleaned,
-            from_local: false,
-        })
-    }
-
-    /// Wait within `budget` for the streamed request to produce its result
-    /// and report it. The capture stream must already have been dropped so
-    /// the request body reached EOF; without that this just burns the
-    /// budget. An outcome that never arrives falls back at release, and the
-    /// thread unwinds later under its own request ceiling.
-    fn finish(mut self, budget: Duration) -> Result<SttResult, AppError> {
-        let deadline = Instant::now() + budget;
-        loop {
-            match self.outcome.lock() {
-                Ok(mut slot) => {
-                    if let Some(result) = slot.take() {
-                        if let Some(thread) = self.thread.take() {
-                            drop(thread.join());
-                        }
-                        return result;
-                    }
-                }
-                Err(error) => return Err(AppError::PoisonedMutex(error.to_string())),
-            }
-            if self.thread.as_ref().is_some_and(JoinHandle::is_finished) {
-                // The thread ended without publishing an outcome, which a
-                // plain error never does: fail fast instead of waiting out
-                // the whole budget.
-                if let Some(thread) = self.thread.take() {
-                    drop(thread.join());
-                }
-                return Err(AppError::Transcription(String::from(
-                    "dictation upload thread ended without a result",
-                )));
-            }
-            if Instant::now() >= deadline {
-                return Err(AppError::Transcription(format!(
-                    "dictation upload did not finish within {} ms",
-                    budget.as_millis()
-                )));
-            }
-            std::thread::sleep(Duration::from_millis(25));
-        }
-    }
-}
-
 fn set_streaming_error(result: &Arc<Mutex<StreamingTranscript>>, error: String) {
     if let Ok(mut result) = result.lock() {
         result.error = Some(error);
@@ -1423,48 +1037,6 @@ fn streaming_batch_fallback_reason(
     }
 }
 
-/// Whether a release should run the preview-only streaming composition: the
-/// stream exists to render live partials on the overlay while the Dictation
-/// call is the only insert source. True only for an `assemblyai/*` primary
-/// model on the direct `AssemblyAI` stream.
-fn preview_only_streaming(stt_model: &str, streaming_stt: Option<StreamingProvider>) -> bool {
-    streaming_stt == Some(StreamingProvider::AssemblyAiDirect)
-        && stt_model.starts_with("assemblyai/")
-}
-
-/// Fold a failed Dictation call into the drained streaming text, which is
-/// what the preview already rendered on the overlay. A barren stream maps to
-/// the empty result so the pipeline's shared empty-transcript handling
-/// (`save_failed_audio` plus the STT error) takes over.
-fn preview_release_stt(
-    dictation: Result<SttResult, AppError>,
-    streaming_fallback: Option<StreamingText>,
-) -> SttResult {
-    match dictation {
-        Ok(result) => result,
-        Err(error) => {
-            let Some(text) = streaming_fallback
-                .map(|streaming| streaming.text)
-                .filter(|text| !text.trim().is_empty())
-            else {
-                warn!(
-                    "[stt] preview_stream_fallback_empty {}",
-                    serde_json::json!({ "error": error.to_string() })
-                );
-                return SttResult::verbatim(String::new());
-            };
-            warn!(
-                "[stt] preview_stream_fallback {}",
-                serde_json::json!({
-                    "error": error.to_string(),
-                    "streaming_chars": text.chars().count(),
-                })
-            );
-            SttResult::verbatim(text)
-        }
-    }
-}
-
 fn best_streaming_text(result: &StreamingTranscript) -> Option<String> {
     let final_text = result.latest_final.as_deref().unwrap_or_default().trim();
     let partial_text = result.latest_partial.as_deref().unwrap_or_default().trim();
@@ -1484,7 +1056,6 @@ fn best_streaming_text(result: &StreamingTranscript) -> Option<String> {
 const fn stream_close_frame(provider: StreamingProvider) -> Option<&'static str> {
     match provider {
         StreamingProvider::Deepgram => Some(r#"{"type":"CloseStream"}"#),
-        StreamingProvider::AssemblyAiDirect => Some(r#"{"type":"Terminate"}"#),
         StreamingProvider::AssemblyAi => None,
     }
 }
@@ -1498,21 +1069,18 @@ async fn run_stt_stream(
     result: Arc<Mutex<StreamingTranscript>>,
     preview_proxy: Option<EventLoopProxy<UserEvent>>,
 ) -> Result<(), String> {
-    let (url, auth) = match provider {
-        StreamingProvider::AssemblyAiDirect => (
-            format!(
-                "{ASSEMBLYAI_STREAMING_ENDPOINT}?{}",
-                assemblyai_direct_query(&language, &vocabulary)
-            ),
-            api_key,
-        ),
-        other @ (StreamingProvider::AssemblyAi | StreamingProvider::Deepgram) => (
+    let (url, auth) = {
+        // Every provider is Telnyx-hosted, so one endpoint serves both and
+        // the engine/model pair in the query string selects the engine.
+        let (engine, model) = telnyx_stream_engine_model(provider);
+        info!("[stt] streaming_connect telnyx engine={engine} model={model}");
+        (
             format!(
                 "{TELNYX_STT_STREAMING_ENDPOINT}?{}",
-                telnyx_stream_query(other, &language, &vocabulary)
+                telnyx_stream_query(provider, &language, &vocabulary)
             ),
             format!("Bearer {api_key}"),
-        ),
+        )
     };
     let mut request = url
         .into_client_request()
@@ -1597,31 +1165,102 @@ async fn run_stt_stream(
     }
 }
 
+/// Resolve the engine and model for the Telnyx-routed stream. Defaults to
+/// Deepgram nova-3; `BOLO_TELNYX_STREAMING_ENGINE` and
+/// `BOLO_TELNYX_STREAMING_MODEL` select any engine the Telnyx websocket
+/// documents (Deepgram, Soniox, Speechmatics, AssemblyAI, ...). The
+/// AssemblyAI route keeps its own engine and model alias.
+fn telnyx_stream_engine_model(provider: StreamingProvider) -> (String, String) {
+    let engine =
+        load_env_value("BOLO_TELNYX_STREAMING_ENGINE").unwrap_or_else(|| String::from("Deepgram"));
+    let model =
+        load_env_value("BOLO_TELNYX_STREAMING_MODEL").unwrap_or_else(|| String::from("nova-3"));
+    telnyx_stream_engine_model_with(provider, &engine, &model)
+}
+
+fn telnyx_stream_engine_model_with(
+    provider: StreamingProvider,
+    engine: &str,
+    model: &str,
+) -> (String, String) {
+    if provider == StreamingProvider::AssemblyAi {
+        return (
+            String::from("AssemblyAI"),
+            String::from("assemblyai/universal-3-5-pro"),
+        );
+    }
+    // Canonical engine casing as the Telnyx docs document it; unknown
+    // values pass through verbatim so new engines work without a code change.
+    let normalized_engine = match engine.trim().to_ascii_lowercase().as_str() {
+        "deepgram" => String::from("Deepgram"),
+        "soniox" => String::from("Soniox"),
+        "speechmatics" => String::from("Speechmatics"),
+        "assemblyai" => String::from("AssemblyAI"),
+        "google" => String::from("Google"),
+        "azure" => String::from("Azure"),
+        "telnyx" => String::from("Telnyx"),
+        "xai" => String::from("xAI"),
+        "parakeet" => String::from("Parakeet"),
+        "cohere" => String::from("Cohere"),
+        "reson8" => String::from("Reson8"),
+        "humain" => String::from("Humain"),
+        _ => engine.trim().to_string(),
+    };
+    (normalized_engine, model.trim().to_string())
+}
+
 fn telnyx_stream_query(
     provider: StreamingProvider,
     language: &str,
     vocabulary: &[String],
 ) -> String {
-    let mut params = match provider {
-        StreamingProvider::AssemblyAi | StreamingProvider::AssemblyAiDirect => vec![
-            String::from("transcription_engine=AssemblyAI"),
-            String::from("model=assemblyai%2Funiversal-streaming"),
-            String::from("input_format=linear16"),
-            format!("sample_rate={STREAMING_SAMPLE_RATE}"),
-        ],
-        StreamingProvider::Deepgram => vec![
-            String::from("transcription_engine=Deepgram"),
-            String::from("model=nova-3"),
-            String::from("input_format=linear16"),
-            format!("sample_rate={STREAMING_SAMPLE_RATE}"),
-            String::from("interim_results=true"),
-            String::from("endpointing=300"),
-        ],
-    };
-    if !language.is_empty() && !language.eq_ignore_ascii_case("auto") {
+    let (engine, model) = telnyx_stream_engine_model(provider);
+    telnyx_stream_query_with(&engine, &model, language, vocabulary)
+}
+
+/// Core of `telnyx_stream_query` with the engine and model passed in, so
+/// per-engine parameter rules can be tested without reading the environment.
+fn telnyx_stream_query_with(
+    engine: &str,
+    model: &str,
+    language: &str,
+    vocabulary: &[String],
+) -> String {
+    let mut params = vec![
+        format!("transcription_engine={}", query_escape(engine)),
+        format!("model={}", query_escape(model)),
+        String::from("input_format=linear16"),
+        format!("sample_rate={STREAMING_SAMPLE_RATE}"),
+    ];
+    // Partial transcripts are engine-gated: only Deepgram, Speechmatics,
+    // and Soniox honor interim results. The others never stream partials.
+    match engine {
+        "Deepgram" => {
+            params.push(String::from("interim_results=true"));
+            params.push(String::from("endpointing=300"));
+        }
+        "Soniox" => {
+            // Soniox maps endpointing to max_endpoint_delay_ms, which the
+            // API rejects outside 500-3000 ms.
+            params.push(String::from("interim_results=true"));
+            params.push(String::from("endpointing=800"));
+        }
+        "Speechmatics" => {
+            params.push(String::from("interim_results=true"));
+        }
+        _ => {}
+    }
+    // Flux models accept base languages plus auto/multi; regional locales
+    // like en-IN are nova-only, so flux gets the multi-language mode.
+    if engine == "Deepgram" && model.starts_with("flux") {
+        params.push(String::from("language=multi"));
+    } else if !language.is_empty() && !language.eq_ignore_ascii_case("auto") {
         params.push(format!("language={}", query_escape(language)));
     }
-    if provider == StreamingProvider::Deepgram && !vocabulary.is_empty() {
+    if engine == "Deepgram"
+        && (model.starts_with("nova-3") || model.starts_with("flux"))
+        && !vocabulary.is_empty()
+    {
         let keyterms = vocabulary
             .iter()
             .take(50)
@@ -1631,86 +1270,6 @@ fn telnyx_stream_query(
         params.push(format!("keyterm={keyterms}"));
     }
     params.join("&")
-}
-
-/// `AssemblyAI` direct streaming (v3 WebSocket) is only reachable when the
-/// resolved provider is `AssemblyAiDirect`; Telnyx-routed providers never take
-/// this path.
-fn assemblyai_streaming_model() -> String {
-    load_env_value("BOLO_STT_STREAMING_MODEL")
-        .unwrap_or_else(|| String::from(ASSEMBLYAI_STREAMING_MODEL))
-        .to_ascii_lowercase()
-}
-
-fn assemblyai_direct_query(language: &str, vocabulary: &[String]) -> String {
-    assemblyai_direct_query_with(&assemblyai_streaming_model(), language, vocabulary)
-}
-
-/// Core of `assemblyai_direct_query` with the streaming model passed in, so the
-/// query string can be tested without reading the environment.
-fn assemblyai_direct_query_with(model: &str, language: &str, vocabulary: &[String]) -> String {
-    let mut params = vec![
-        format!("sample_rate={STREAMING_SAMPLE_RATE}"),
-        format!("speech_model={model}"),
-    ];
-    if model.starts_with("universal-streaming-") {
-        // The dictation models return formatted final turns natively.
-        params.push(String::from("format_turns=true"));
-    } else if let Some(code) = assemblyai_language_code(language) {
-        params.push(format!(
-            "language_codes={}",
-            query_escape(&serde_json::json!([code]).to_string())
-        ));
-    }
-    if !vocabulary.is_empty() {
-        let terms: Vec<String> = vocabulary.iter().take(50).cloned().collect();
-        if let Ok(json) = serde_json::to_string(&terms) {
-            params.push(format!("keyterms_prompt={}", query_escape(&json)));
-        }
-    }
-    params.join("&")
-}
-
-/// Map a configured Bolo language (for example `en-IN`) onto the ISO 639-1
-/// codes `AssemblyAI`'s dictation and streaming APIs accept. Regional variants
-/// collapse to their base language; anything outside the supported set is
-/// omitted so the provider falls back to its own defaults.
-fn assemblyai_language_code(configured: &str) -> Option<String> {
-    let value = configured.trim();
-    if value.is_empty()
-        || value.eq_ignore_ascii_case("auto")
-        || value.eq_ignore_ascii_case("auto_detect")
-        || value.eq_ignore_ascii_case("off")
-        || value.eq_ignore_ascii_case("none")
-        || value.eq_ignore_ascii_case("false")
-    {
-        return None;
-    }
-    let base = value
-        .split('-')
-        .next()
-        .unwrap_or(value)
-        .trim()
-        .to_ascii_lowercase();
-    if ASSEMBLYAI_LANGUAGE_CODES.contains(&base.as_str()) {
-        Some(base)
-    } else {
-        None
-    }
-}
-
-/// Duration of a parsed WAV in milliseconds; `None` when the buffer is not a
-/// parseable PCM16 WAV.
-fn wav_duration_ms(wav: &[u8]) -> Option<u64> {
-    let parsed = parse_wav_pcm16(wav)?;
-    let data_len = u64::try_from(parsed.samples.len().saturating_mul(2)).ok()?;
-    let byte_rate = u64::from(parsed.sample_rate)
-        .saturating_mul(u64::from(parsed.channels))
-        .saturating_mul(2);
-    if byte_rate == 0 {
-        return None;
-    }
-    Some(data_len.saturating_mul(1_000) / byte_rate)
 }
 
 fn benign_stream_close_error(error: &str) -> bool {
@@ -1826,6 +1385,12 @@ struct App {
     latest_release: Mutex<Option<UpdateNotice>>,
     prompt_bindings: Mutex<Vec<PromptBinding>>,
     state: Mutex<AppState>,
+    /// Write end of the live copy-transcript popup's stdin, when one is up.
+    /// Dropping it closes the pipe, which the popup treats as its own
+    /// dismissal, so a replacement popup never stacks over a stale one and
+    /// a dead runtime never leaves an orphan. The reader thread owns the
+    /// child handle and reaps it on EOF.
+    copy_prompt: Mutex<Option<ChildStdin>>,
     /// Cumulative successful dictations since tracking began in 1.9. Loaded
     /// from `~/.bolo/usage.json` at startup and incremented once per completed
     /// dictation pipeline, never on history refreshes or deferred cleanup, so
@@ -1979,6 +1544,10 @@ enum UserEvent {
     DashboardAction(DashboardAction),
     DashboardInvalid(String),
     DashboardRestart,
+    /// The copy-transcript popup's Copy button was clicked: put the
+    /// dictation's transcript back on the clipboard (the popup's whole
+    /// job), show the existing Copied cue, and let the popup close itself.
+    CopyPromptCopy(String),
     /// A request line from an open window helper: the onboarding window
     /// asks for the runtime's real Accessibility trust reading and the
     /// event loop answers on its stdin.
@@ -2095,34 +1664,6 @@ struct SttResponse {
 }
 
 #[derive(Debug, Deserialize)]
-struct AssemblyUploadResponse {
-    upload_url: String,
-}
-
-/// `AssemblyAI` Dictation response: `text` is the verbatim transcript, and
-/// `llm_response` is the provider-side cleaned text (null when the rewrite
-/// failed, with `llm_error` describing it).
-#[derive(serde::Deserialize)]
-struct AssemblyDictationResponse {
-    #[serde(default)]
-    text: Option<String>,
-    #[serde(default)]
-    llm_response: Option<String>,
-    #[serde(default)]
-    llm_error: Option<String>,
-    #[serde(default)]
-    request_time_ms: Option<f64>,
-}
-
-#[derive(Debug, Deserialize)]
-struct AssemblyTranscriptResponse {
-    id: String,
-    status: String,
-    text: Option<String>,
-    error: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
 struct ChatResponse {
     choices: Vec<ChatChoice>,
 }
@@ -2164,6 +1705,17 @@ struct AccessibilityContext {
     text_before_cursor: String,
     #[serde(default)]
     selected_text: String,
+    /// Whether the focused element at press time looked like an editable
+    /// paste target. `None` means the reading never said one way or the
+    /// other (older helper, failed read), and insert decisions must treat
+    /// unknown as writable so a stale daemon never blocks pasting.
+    #[serde(default)]
+    writable: Option<bool>,
+    /// Process of the focused element, so a fallback-path edit-learning
+    /// probe can tell the manual-copy popup's text view from every other
+    /// app's context. `None` from an older helper or a failed read.
+    #[serde(default)]
+    focused_pid: Option<i32>,
 }
 
 fn main() -> Result<(), AppError> {
@@ -2670,6 +2222,23 @@ fn run_app_event_loop(app: Arc<App>) -> Result<(), AppError> {
                 overlay_hide_at = Some(deadline);
                 *control_flow = ControlFlow::WaitUntil(deadline);
             }
+            TaoEvent::UserEvent(UserEvent::CopyPromptCopy(text)) => {
+                // The popup's Copy button: the text arrives from the
+                // popup's current body (edited or untouched), and that
+                // fresh clipboard write is the feature, reported by routing
+                // through the normal overlay arms below.
+                info!(
+                    "[insert] popup_copy_used {}",
+                    serde_json::json!({
+                        "chars": text.chars().count(),
+                    })
+                );
+                if let Err(error) = copy_to_clipboard(&text) {
+                    warn!("popup copy clipboard write failed: {error}");
+                }
+                app.send_user_event(UserEvent::Overlay(OverlayPhase::Copied));
+                app.send_user_event(UserEvent::HideOverlayAfter(POST_INSERT_OVERLAY_HOLD));
+            }
             TaoEvent::UserEvent(UserEvent::ShowOnboarding) => {
                 open_onboarding_window(
                     &app,
@@ -2937,6 +2506,7 @@ impl App {
                 selected_language,
                 ..AppState::default()
             }),
+            copy_prompt: Mutex::new(None),
             usage: Mutex::new(load_usage_counters()),
             dashboard_restart_pending: Mutex::new(false),
             event_proxy: Mutex::new(None),
@@ -2989,11 +2559,6 @@ impl App {
         // streaming thread once its handshake settles; decided here
         // because `streaming` moves into the recording below.
         let streaming_live = streaming.is_some();
-        let (upload_sender, upload_receiver) = self.open_dictation_upload_feed();
-        if let Some(sender) = upload_sender {
-            hub.attach("dictation_upload", sender, recording.sample_rate);
-        }
-        recording.upload = self.start_dictation_upload(upload_receiver, recording.sample_rate);
         hub.seal();
         recording.warmup = self.start_dictation_warmup();
         recording.streaming = streaming;
@@ -3160,8 +2725,8 @@ impl App {
         let stt_started = Instant::now();
         // BOLO_LOCAL_STT=on dictates offline dictation: cloud transcription
         // is skipped entirely and the insert path proceeds from the local
-        // model (the already-running streaming/upload threads unwind on
-        // their own when this capture drops). A missing model leaves the
+        // model (the already-running streaming thread unwinds on its own
+        // when this capture drops). A missing model leaves the
         // empty result to the unchanged failure handling below.
         let stt = if matches!(self.config.local_stt, LocalSttMode::On) {
             info!(
@@ -3174,24 +2739,20 @@ impl App {
             self.local_stt_attempt(&samples, recording.sample_rate, elapsed)
                 .map_or_else(SttResult::default, SttResult::verbatim_local)
         } else if let Some(streaming) = recording.streaming {
-            if preview_only_streaming(&self.config.stt_model, self.config.streaming_stt) {
-                self.preview_stt_result(streaming, recording.upload.take(), &wav, &recording.warmup)
-            } else {
-                match streaming.finish() {
-                    Some(streaming_text) => SttResult::verbatim(self.recheck_streaming_transcript(
-                        streaming_text,
-                        &wav,
-                        elapsed,
-                        &recording.warmup,
-                    )),
-                    None => {
-                        warn!("[stt] streaming_empty_fallback");
-                        self.transcribe(&wav, &recording.warmup)
-                            .unwrap_or_else(|error| {
-                                warn!("batch fallback after streaming failed: {error}");
-                                SttResult::verbatim(String::new())
-                            })
-                    }
+            match streaming.finish() {
+                Some(streaming_text) => SttResult::verbatim(self.recheck_streaming_transcript(
+                    streaming_text,
+                    &wav,
+                    elapsed,
+                    &recording.warmup,
+                )),
+                None => {
+                    warn!("[stt] streaming_empty_fallback");
+                    self.transcribe(&wav, &recording.warmup)
+                        .unwrap_or_else(|error| {
+                            warn!("batch fallback after streaming failed: {error}");
+                            SttResult::verbatim(String::new())
+                        })
                 }
             }
         } else {
@@ -3215,12 +2776,12 @@ impl App {
         };
         // The offline tier's `auto` rung for every other composition: the
         // paths above fold their failures into an empty transcript when
-        // no cloud source produced words (streaming empty, drained
-        // preview fallback, batch retry terminal), and this is the last
-        // chance before the shared empty handling gives up on the
-        // dictation. Clips shorter than the empty-retry gate keep their
-        // existing terminal behavior: a sub-second clip cannot prove the
-        // speaker said anything, local or cloud.
+        // no cloud source produced words (streaming empty, batch retry
+        // terminal), and this is the last chance before the shared empty
+        // handling gives up on the dictation. Clips shorter than the
+        // empty-retry gate keep their existing terminal behavior: a
+        // sub-second clip cannot prove the speaker said anything, local
+        // or cloud.
         let stt = if stt.text.trim().is_empty()
             && elapsed >= Duration::from_millis(EMPTY_RETRY_MIN_DURATION_MS)
         {
@@ -3247,8 +2808,7 @@ impl App {
         );
         metrics.outcome = "cleanup_failed";
         let cleanup_started = Instant::now();
-        let prepared =
-            self.prepare_text(&stt.text, &recording.warmup, stt.llm_cleaned.as_deref())?;
+        let prepared = self.prepare_text(&stt.text, &recording.warmup, None)?;
         metrics.cleanup_duration = Some(cleanup_started.elapsed());
         metrics.llm_cleanup_ran = prepared.llm_cleanup_ran;
         metrics.llm_cleanup_deferred = prepared.llm_cleanup_deferred;
@@ -3265,6 +2825,11 @@ impl App {
         self.send_user_event(UserEvent::Overlay(OverlayPhase::Inserting));
         metrics.outcome = "insert_failed";
         let insert_started = Instant::now();
+        // Set when the dictation took the Willow-style manual-copy fallback
+        // instead of a live insert ("not_writable" or "paste_failed"), so
+        // the tail of the pipeline can keep its metrics and overlay
+        // behavior distinct from a normal insert.
+        let mut manual_copy_outcome: Option<&'static str> = None;
         if let Some(command) = command {
             info!(
                 "[pipeline] command_detected {}",
@@ -3292,8 +2857,67 @@ impl App {
                 &stt.text,
                 elapsed.as_millis().try_into().unwrap_or(u64::MAX),
             );
-            paste_text(&self.config.root_dir, &prepared.text)?;
-            self.remember_result(&stt.text, &prepared.text, Some(&prepared))?;
+            // Press-time paste target: an editable focus means the normal
+            // Cmd+V insert below; a confirmed non-writable focus routes to
+            // the manual-copy popup first. Only the warmup context decides
+            // (it was read at press time and stored in DictationWarmup), so
+            // a missing or stale reading always keeps the insert behavior.
+            let warmup_context = match recording.warmup.accessibility_context() {
+                WarmupValue::Ready(Some(context)) => Some(context),
+                WarmupValue::Pending | WarmupValue::Ready(None) => None,
+            };
+            // The press-time read must also positively identify its target
+            // (present, with a writable verdict either way) before the
+            // fallback dares to arm its edit-learning observation: an
+            // unavailable or flag-less reading keeps today's behavior of
+            // no watch on the fallback path.
+            let ax_confirmed = warmup_context
+                .as_ref()
+                .is_some_and(|context| context.writable.is_some());
+            match insert_fallback_reason(warmup_context.as_ref()) {
+                Some(reason) => {
+                    manual_copy_outcome = Some(reason);
+                    self.manual_copy_fallback(&stt.text, &prepared.text, reason, ax_confirmed)?;
+                }
+                None => match paste_text(&self.config.root_dir, &prepared.text) {
+                    Ok(()) => {
+                        self.remember_result(&stt.text, &prepared.text, Some(&prepared))?;
+                        #[cfg(not(test))]
+                        {
+                            // Poll watcher: detects post-paste edits by
+                            // reading the accessibility caret context on a
+                            // fixed cadence, so learning works without the
+                            // Input Monitoring permission the precise
+                            // backspace path needs. The precise path still
+                            // wins whenever the helper's key events do
+                            // arrive.
+                            let app = Arc::clone(self);
+                            let expiry = Instant::now() + POST_INSERT_EDIT_MAX;
+                            if let Err(error) = std::thread::Builder::new()
+                                .name(String::from("bolo-edit-learning-poll"))
+                                .spawn(move || app.run_edit_learning_capture(expiry))
+                            {
+                                warn!("[learning] poll thread failed to start: {error}");
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        // paste_text exhausted the insert mechanics
+                        // (untrusted accessibility, dead helper, refused
+                        // pasteboard). The transcript must not die with it:
+                        // route to the same popup instead of only showing
+                        // paste_text's failure notification.
+                        warn!("[insert] paste failed: {error}; routing to manual copy");
+                        manual_copy_outcome = Some("paste_failed");
+                        self.manual_copy_fallback(
+                            &stt.text,
+                            &prepared.text,
+                            "paste_failed",
+                            ax_confirmed,
+                        )?;
+                    }
+                },
+            }
             // The usage counters were recorded above, before
             // remember_result fired HistoryChanged, so the first live
             // dashboard refresh after this dictation sees the usage block
@@ -3306,15 +2930,235 @@ impl App {
         metrics.insert_duration = Some(insert_started.elapsed());
         // The offline tier earned the transcript, so the latency log keeps
         // the attribution clean: `inserted_local` marks dictations the
-        // on-device rung rescued while `inserted` stays cloud-sourced.
-        metrics.outcome = if stt.from_local {
-            "inserted_local"
-        } else {
-            "inserted"
+        // on-device rung rescued while `inserted` stays cloud-sourced, and
+        // the manual-copy fallback keeps its own outcome so quality
+        // dashboards never read it as a normal insert.
+        metrics.outcome = match manual_copy_outcome {
+            Some(_) => "manual_copy_fallback",
+            None if stt.from_local => "inserted_local",
+            None => "inserted",
         };
-        self.send_user_event(UserEvent::Overlay(OverlayPhase::Copied));
-        self.send_user_event(UserEvent::HideOverlayAfter(POST_INSERT_OVERLAY_HOLD));
+        if manual_copy_outcome.is_some() {
+            // The popup is the visual here; clear the Inserting pill and
+            // let the popup's Copy button bring the Copied cue back.
+            self.send_user_event(UserEvent::HideOverlay);
+        } else {
+            self.send_user_event(UserEvent::Overlay(OverlayPhase::Copied));
+            self.send_user_event(UserEvent::HideOverlayAfter(POST_INSERT_OVERLAY_HOLD));
+        }
         Ok(())
+    }
+
+    /// Willow-style manual-copy fallback: the transcript goes to the
+    /// clipboard and a small popup hands it to the user, because the
+    /// normal Cmd+V insert cannot work here (nothing editable was
+    /// focused at press time, or the paste attempt failed outright).
+    /// `reason` is `not_writable` or `paste_failed` and lands on the
+    /// `[insert] manual_copy_fallback` decision line. When
+    /// `ax_confirmed` says the press-time accessibility read positively
+    /// identified its target and the transcript has words, the
+    /// edit-learning poll watcher arms for the popup exactly like a
+    /// paste arms it for the target app, so corrections typed into the
+    /// popup's editable body are learned the same way.
+    fn manual_copy_fallback(
+        self: &Arc<Self>,
+        raw: &str,
+        transcript: &str,
+        reason: &'static str,
+        ax_confirmed: bool,
+    ) -> Result<(), AppError> {
+        info!(
+            "[insert] manual_copy_fallback {}",
+            serde_json::json!({
+                "reason": reason,
+                "chars": transcript.chars().count(),
+            })
+        );
+        // In fallback mode copying the transcript IS the feature, so the
+        // clipboard write happens even when preserve_clipboard would
+        // normally skip it: the user's very next Cmd+V has to work.
+        #[cfg(not(test))]
+        if let Err(error) = copy_to_clipboard(transcript) {
+            warn!("[insert] manual copy clipboard write failed: {error}");
+        }
+        // History records the dictation (Paste Last needs it). The
+        // clipboard already carries the transcript the user is about to
+        // correct, and the watch goes in with it: a synthetic PreparedText
+        // arms EditLearningWatch through remember_result, then the live
+        // popup's process pid is pinned on the fresh observation so poll
+        // probes only learn from this popup's text view. Without the
+        // confirmed press-time reading, or for an empty transcript,
+        // nothing arms: the popup shows and behavior stays as shipped.
+        let armed = ax_confirmed && !transcript.trim().is_empty();
+        let prepared = armed.then(|| PreparedText {
+            text: transcript.to_owned(),
+            llm_cleanup_ran: false,
+            llm_cleanup_deferred: false,
+            cleanup_input: None,
+        });
+        if !armed {
+            info!(
+                "[insert] manual copy edit-learning watch not armed {}",
+                serde_json::json!({
+                    "ax_confirmed": ax_confirmed,
+                    "empty_transcript": transcript.trim().is_empty(),
+                })
+            );
+        }
+        match (armed, self.show_copy_transcript_popup(transcript)) {
+            // The stamp lands only while the observation is unstamped, so
+            // a dictation that already replaced it (and armed its own)
+            // keeps its own popup pinned. The popup spawn and the arm are
+            // microseconds apart on the same pipeline thread, so
+            // user-paced dictations never interleave here.
+            (true, Some(pid)) => {
+                self.remember_result(raw, transcript, prepared.as_ref())?;
+                if let Ok(mut state) = self.lock_state() {
+                    if let Some(learning) = state.edit_learning.as_mut()
+                        && learning.popup_pid.is_none()
+                    {
+                        learning.popup_pid = Some(pid);
+                    }
+                }
+            }
+            // Armed but the popup refused to launch (missing helper, dead
+            // interpreter): the watch arms anyway and probes unguided, the
+            // same claim rules as a paste-path observation. Derived pairs
+            // still clear every guard before anything is learned.
+            (true, None) => {
+                warn!("copy-transcript popup unavailable; edit-learning watch armed unguided");
+                self.remember_result(raw, transcript, prepared.as_ref())?;
+            }
+            _ => {
+                self.remember_result(raw, transcript, None)?;
+            }
+        }
+        #[cfg(not(test))]
+        if armed {
+            // Poll watcher: same contract as the paste path. Probes read
+            // the accessibility caret context on a fixed cadence, learn a
+            // misheard-word correction when the text diverges, and are
+            // pid-gated to the popup by the stamp above.
+            let app = Arc::clone(self);
+            let expiry = Instant::now() + POST_INSERT_EDIT_MAX;
+            if let Err(error) = std::thread::Builder::new()
+                .name(String::from("bolo-edit-learning-poll"))
+                .spawn(move || app.run_edit_learning_capture(expiry))
+            {
+                warn!("[learning] poll thread failed to start: {error}");
+            }
+        }
+        Ok(())
+    }
+
+    /// Spawn the copy-transcript popup helper for one transcript. The
+    /// popup owns its own lifetime; the runtime keeps only the child's
+    /// stdin write end (`App::copy_prompt`), whose drop tells the popup to
+    /// dismiss itself, so a newer popup replaces an older one instead of
+    /// stacking. A reader thread owns the child handle: it forwards the
+    /// popup's Copy line (carrying the popup's current, possibly edited
+    /// body text) to the event loop and reaps the process when the popup
+    /// closes, the same contract the other helper windows follow.
+    /// Returns the popup's process pid on success; the manual-copy
+    /// fallback pins it on the armed edit-learning observation so poll
+    /// probes only learn from this popup's text view.
+    fn show_copy_transcript_popup(self: &Arc<Self>, transcript: &str) -> Option<i32> {
+        let script = self.config.root_dir.join("transcript_popup.py");
+        if !script.exists() {
+            warn!(
+                "copy-transcript popup helper is missing: {}",
+                script.display()
+            );
+            return None;
+        }
+        // Dismiss any live popup first: closing its stdin is its dismissal
+        // signal, and its own reader thread reaps its child.
+        match self.copy_prompt.lock() {
+            Ok(mut slot) => drop(slot.take()),
+            Err(_) => {
+                warn!("copy prompt slot was poisoned; existing popup left alone");
+            }
+        }
+        let mut child = match Command::new(python_helper_executable())
+            .arg(&script)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(error) => {
+                warn!("copy-transcript popup failed to launch: {error}");
+                return None;
+            }
+        };
+        let popup_pid = i32::try_from(child.id()).ok();
+        let Some(mut stdin) = child.stdin.take() else {
+            warn!("copy-transcript popup stdin unavailable");
+            let _kill = child.kill();
+            let _wait = child.wait();
+            return popup_pid;
+        };
+        let Some(stdout) = child.stdout.take() else {
+            warn!("copy-transcript popup stdout unavailable");
+            let _kill = child.kill();
+            let _wait = child.wait();
+            return popup_pid;
+        };
+        let payload = serde_json::json!({ "text": transcript });
+        if writeln!(stdin, "{payload}")
+            .and_then(|()| stdin.flush())
+            .is_err()
+        {
+            warn!("copy-transcript popup payload write failed");
+            drop(stdin);
+            let _kill = child.kill();
+            let _wait = child.wait();
+            return popup_pid;
+        }
+        if let Ok(mut slot) = self.copy_prompt.lock() {
+            *slot = Some(stdin);
+        } else {
+            warn!("copy prompt slot was poisoned; popup will self-dismiss");
+            drop(stdin);
+            let _kill = child.kill();
+            let _wait = child.wait();
+            return popup_pid;
+        }
+        let app = Arc::clone(self);
+        let text = transcript.to_owned();
+        if let Err(error) = std::thread::Builder::new()
+            .name(String::from("bolo-copy-prompt"))
+            .spawn(move || {
+                use std::io::BufRead as _;
+                for line in BufReader::new(stdout).lines() {
+                    let Ok(line) = line else {
+                        break;
+                    };
+                    if let Some(copied_text) = parse_popup_copy_text(&line, &text) {
+                        app.send_user_event(UserEvent::CopyPromptCopy(copied_text));
+                    }
+                }
+                // EOF: the popup dismissed itself (button, outside click,
+                // lifetime cap, or a closed stdin). Reap it like the
+                // overlay child so no zombie survives.
+                for _ in 0..20 {
+                    match child.try_wait() {
+                        Ok(Some(_status)) => return,
+                        Ok(None) => std::thread::sleep(Duration::from_millis(25)),
+                        Err(error) => {
+                            warn!("copy-transcript popup status check failed: {error}");
+                            return;
+                        }
+                    }
+                }
+                let _kill = child.kill();
+                let _wait = child.wait();
+            })
+        {
+            warn!("copy-transcript popup reader failed to start: {error}");
+        }
+        popup_pid
     }
 
     /// Directory holding offline whisper models: `~/.bolo/models`.
@@ -3478,40 +3322,6 @@ impl App {
         }
     }
 
-    /// Resolve the transcript for the preview-only streaming composition
-    /// (assemblyai/* primary model on the direct `AssemblyAI` stream): the
-    /// streaming session exists to render live partials on the overlay while
-    /// the Dictation call is the only insert source, so the inserted text
-    /// can never disagree with the batch transcript the pipeline trusts.
-    /// When the streamed upload ran, release waits for its response within
-    /// the STT budget and only re-uploads the buffered WAV when the upload
-    /// failed. The stream is drained before the insert sequence starts so
-    /// the fallback text is the finalized preview already on screen and the
-    /// socket has finished emitting.
-    fn preview_stt_result(
-        &self,
-        streaming: StreamingRecording,
-        upload: Option<DictationUpload>,
-        wav: &[u8],
-        warmup: &DictationWarmup,
-    ) -> SttResult {
-        let streaming_text = streaming.finish();
-        let uploaded = upload.map(|upload| upload.finish(STT_REQUEST_TIMEOUT));
-        let dictation = match dictation_upload_release(uploaded) {
-            DictationUploadRelease::Uploaded(result) => {
-                info!("[stt] dictation_upload_stream_completed");
-                Ok(result)
-            }
-            DictationUploadRelease::UploadFailed | DictationUploadRelease::NotUploaded => {
-                self.transcribe(wav, warmup)
-            }
-        };
-        match dictation {
-            Ok(result) => result,
-            Err(error) => preview_release_stt(Err(error), streaming_text),
-        }
-    }
-
     fn recheck_streaming_transcript(
         &self,
         streaming: StreamingText,
@@ -3625,13 +3435,7 @@ impl App {
         sample_rate: u32,
     ) -> Option<StreamingRecording> {
         let provider = self.config.streaming_stt?;
-        let api_key = match provider {
-            StreamingProvider::AssemblyAiDirect => load_env_value("ASSEMBLYAI_API_KEY"),
-            StreamingProvider::AssemblyAi | StreamingProvider::Deepgram => {
-                self.config.telnyx_api_key.clone()
-            }
-        };
-        let Some(api_key) = api_key else {
+        let Some(api_key) = self.config.telnyx_api_key.clone() else {
             warn!(
                 "[stt] streaming skipped: {} is not configured",
                 provider.required_key_name()
@@ -3647,9 +3451,6 @@ impl App {
             .lock()
             .ok()
             .and_then(|proxy| proxy.as_ref().cloned());
-        if preview_only_streaming(&self.config.stt_model, self.config.streaming_stt) {
-            info!("[stt] preview_stream_active");
-        }
         let recording =
             StreamingRecording::start(api_key, provider, language, vocabulary, preview_proxy);
         // The preview opens after capture is already live; the hub replays
@@ -3659,62 +3460,6 @@ impl App {
             hub.attach("streaming_preview", sender, sample_rate);
         }
         Some(recording)
-    }
-
-    /// Whether the streamed Dictation upload runs alongside the preview
-    /// WebSocket: only the preview-only composition (assemblyai/* primary on
-    /// the direct `AssemblyAI` stream) with the `AssemblyAI` key configured.
-    /// Batch mode and legacy primary models never stream the upload.
-    fn dictation_upload_enabled(&self) -> bool {
-        preview_only_streaming(&self.config.stt_model, self.config.streaming_stt)
-            && load_env_value("ASSEMBLYAI_API_KEY").is_some()
-    }
-
-    /// Open the feed channel for the streamed Dictation upload. The feed
-    /// opens after capture is already live; the hub replays the buffered
-    /// backlog into the sink at attach, so the request body still carries
-    /// the recording from the first captured frame. Both halves are None
-    /// when the composition does not stream the upload. The sender must
-    /// reach the hub before the receiver can be handed to the upload
-    /// thread, because only then is the capture sample rate known for the
-    /// PCM config.
-    fn open_dictation_upload_feed(&self) -> DictationUploadFeed {
-        if !self.dictation_upload_enabled() {
-            return (None, None);
-        }
-        let (sender, receiver) = mpsc::channel();
-        (Some(sender), Some(receiver))
-    }
-
-    /// Spawn the streamed Dictation upload for a recording that just
-    /// started. The feed receiver is None when no upload should run, and
-    /// this only returns None when the `AssemblyAI` key disappeared between
-    /// the feed opening and the spawn; release then falls back to the batch
-    /// transcribe exactly as before.
-    fn start_dictation_upload(
-        &self,
-        receiver: Option<Receiver<Vec<i16>>>,
-        sample_rate: u32,
-    ) -> Option<DictationUpload> {
-        let receiver = receiver?;
-        let Some(api_key) = load_env_value("ASSEMBLYAI_API_KEY") else {
-            warn!("[stt] dictation upload skipped: ASSEMBLYAI_API_KEY is not configured");
-            return None;
-        };
-        let language = self
-            .stt_language()
-            .unwrap_or_else(|_| self.config.stt_language.clone());
-        let vocabulary = self.vocabulary_snapshot().unwrap_or_default();
-        let request_timeout = dictation_upload_request_timeout(self.config.max_recording_seconds);
-        Some(DictationUpload::start(
-            self.http.clone(),
-            api_key,
-            language,
-            vocabulary,
-            sample_rate,
-            request_timeout,
-            receiver,
-        ))
     }
 
     fn accessibility_context_for_cleanup(
@@ -3742,28 +3487,15 @@ impl App {
         info!("sending batch transcription request");
         let request = self.stt_request_parts(warmup);
         let mut attempt = |payload: &[u8]| -> Result<SttResult, AppError> {
-            if let Some(model) = request.primary_model.strip_prefix("assemblyai/") {
-                if wav_duration_ms(payload)
-                    .is_some_and(|duration| duration <= ASSEMBLYAI_SYNC_MAX_DURATION_MS)
-                {
-                    self.transcribe_with_assemblyai_dictation(payload, warmup, STT_REQUEST_TIMEOUT)
-                } else {
-                    // The Dictation endpoint caps audio at 120 seconds; longer
-                    // clips fall to the async upload+poll path.
-                    self.transcribe_with_assemblyai(payload, Some(model))
-                        .map(SttResult::verbatim)
-                }
-            } else {
-                self.transcribe_with_model(
-                    payload,
-                    &request.primary_model,
-                    request.model_config.as_ref(),
-                    request.prompt_terms.as_deref(),
-                    request.language.as_deref(),
-                    STT_REQUEST_TIMEOUT,
-                )
-                .map(SttResult::verbatim)
-            }
+            self.transcribe_with_model(
+                payload,
+                &request.primary_model,
+                request.model_config.as_ref(),
+                request.prompt_terms.as_deref(),
+                request.language.as_deref(),
+                STT_REQUEST_TIMEOUT,
+            )
+            .map(SttResult::verbatim)
         };
         let attempt_started = Instant::now();
         match attempt(wav) {
@@ -3783,11 +3515,6 @@ impl App {
     ) -> Result<String, AppError> {
         info!("sending bounded batch transcription verification");
         let request = self.stt_request_parts(warmup);
-        if request.primary_model.starts_with("assemblyai/") {
-            return self
-                .transcribe_with_assemblyai_dictation(wav, warmup, STREAMING_BATCH_VERIFY_TIMEOUT)
-                .map(|result| result.text);
-        }
         self.transcribe_with_model(
             wav,
             &request.primary_model,
@@ -3843,9 +3570,6 @@ impl App {
                 STT_REQUEST_TIMEOUT,
             ),
             SttFallback::Xai => self.transcribe_with_xai(wav),
-            SttFallback::AssemblyAi(model) => {
-                self.transcribe_with_assemblyai(wav, model.as_deref())
-            }
         }
     }
 
@@ -3928,7 +3652,7 @@ impl App {
         // on audio that demonstrably carried sound (2026-09-14: the degraded
         // endpoint 200-emptied a 2s real-speech dictation). Classify against
         // the evidence in the submitted WAV so the retry arm can tell the two
-        // apart. xAI and AssemblyAI empties keep the plain terminal error.
+        // apart. xAI empties keep the plain terminal error.
         let parsed: SttResponse = response.json()?;
         let transcript = parsed.text.unwrap_or_default();
         info!(
@@ -3942,8 +3666,8 @@ impl App {
         // Whisper-family and Deepgram batch carry the vocabulary as a
         // free-text `prompt`, and those models can continue that prompt list
         // into the transcript. The check only runs when the request actually
-        // sent one, so the AssemblyAI routes (structured keyterms, never a
-        // free-text prompt) never hit it.
+        // sent one, so the xAI route (structured keyterms, never a free-text
+        // prompt) never hits it.
         let transcript = match batch_transcript_after_echo(&transcript, prompt_terms) {
             BatchEcho::Transcript(transcript) => transcript,
             BatchEcho::Stripped { cleaned, fragment } => {
@@ -4022,225 +3746,8 @@ impl App {
         non_empty_transcript(parsed.text.as_deref(), "xAI")
     }
 
-    /// `AssemblyAI` Dictation: one POST returns the verbatim transcript plus the
-    /// provider-side cleaned text, which replaces Bolo's separate LLM cleanup
-    /// pass for this provider. Contract (2026-10-01):
-    /// <https://www.assemblyai.com/docs/dictation> — multipart with a required
-    /// `config` part first, then `audio` (WAV or raw PCM, max 120s), raw key
-    /// in the `Authorization` header, and a reply carrying `text` and
-    /// `llm_response`.
-    fn transcribe_with_assemblyai_dictation(
-        &self,
-        wav: &[u8],
-        warmup: &DictationWarmup,
-        timeout: Duration,
-    ) -> Result<SttResult, AppError> {
-        let api_key = load_env_value("ASSEMBLYAI_API_KEY")
-            .ok_or(AppError::MissingConfig("ASSEMBLYAI_API_KEY"))?;
-        let vocabulary = self.vocabulary_snapshot().unwrap_or_default();
-        let language = self
-            .stt_language()
-            .unwrap_or_else(|_| self.config.stt_language.clone());
-        // The same active-profile resolution the LLM fallback cleanup uses:
-        // the warmup accessibility context (the context snapshot from
-        // around press time) plus the prompt bindings. No second source.
-        let cleanup_profile = cleanup_profile(
-            self.accessibility_context_for_cleanup(warmup).as_ref(),
-            &self.prompt_bindings_snapshot(),
-        );
-        // A saved override becomes the endpoint's llm_instruction; without
-        // one the config omits the key and the server's default cleanup
-        // runs, byte-identical to requests before overrides existed.
-        let llm_instruction = self.cleanup_override(cleanup_profile).map(|instruction| {
-            let capped = truncate_to_chars(&instruction, CLEANUP_PROMPT_CAP_CHARS);
-            if capped.chars().count() < instruction.chars().count() {
-                warn!(
-                    "[cleanup] llm_instruction truncated from {} to {} chars for profile {:?}",
-                    instruction.chars().count(),
-                    capped.chars().count(),
-                    cleanup_profile
-                );
-            }
-            capped
-        });
-        let config_json =
-            dictation_batch_config(&language, &vocabulary, llm_instruction.as_deref());
-        info!(
-            "[stt] request {}",
-            serde_json::json!({
-                "endpoint": ASSEMBLYAI_DICTATION_ENDPOINT,
-                "provider": "assemblyai_dictation",
-                "model": ASSEMBLYAI_DICTATION_MODEL,
-                "language": &language,
-                "audio_mime": "audio/wav",
-                "audio_bytes": wav.len(),
-                "keyterms": vocabulary.iter().take(50).collect::<Vec<_>>(),
-                "llm_instruction": llm_instruction.is_some(),
-                "cleanup_profile": format!("{:?}", cleanup_profile),
-            })
-        );
-        let form = multipart::Form::new()
-            .part(
-                "config",
-                multipart::Part::text(config_json.to_string()).mime_str("application/json")?,
-            )
-            .part(
-                "audio",
-                multipart::Part::bytes(wav.to_vec())
-                    .file_name(String::from("audio.wav"))
-                    .mime_str("audio/wav")?,
-            );
-        let response = self
-            .http
-            .post(ASSEMBLYAI_DICTATION_ENDPOINT)
-            .header("Authorization", api_key.as_str())
-            .multipart(form)
-            .timeout(timeout)
-            .send()?;
-        let status = response.status();
-        info!(
-            "[stt] response_status {}",
-            serde_json::json!({
-                "endpoint": ASSEMBLYAI_DICTATION_ENDPOINT,
-                "provider": "assemblyai_dictation",
-                "status": status.as_u16(),
-            })
-        );
-        let response = dictation_status_checked(status, response)?;
-        let parsed: AssemblyDictationResponse = response.json()?;
-        let (verbatim, cleaned) = dictation_verbatim_and_cleaned(&parsed);
-        info!(
-            "[stt] response_text {}",
-            serde_json::json!({
-                "endpoint": ASSEMBLYAI_DICTATION_ENDPOINT,
-                "provider": "assemblyai_dictation",
-                "transcript": self.log_text(&verbatim),
-                "provider_cleanup": cleaned.is_some(),
-                "llm_error": &parsed.llm_error,
-                "request_time_ms": &parsed.request_time_ms,
-            })
-        );
-        if verbatim.trim().is_empty() {
-            return Err(empty_transcript_error(wav));
-        }
-        Ok(SttResult {
-            text: verbatim,
-            llm_cleaned: cleaned,
-            from_local: false,
-        })
-    }
-
-    fn transcribe_with_assemblyai(
-        &self,
-        wav: &[u8],
-        model: Option<&str>,
-    ) -> Result<String, AppError> {
-        let api_key = load_env_value("ASSEMBLYAI_API_KEY")
-            .ok_or(AppError::MissingConfig("ASSEMBLYAI_API_KEY"))?;
-        info!(
-            "[stt] request {}",
-            serde_json::json!({
-                "endpoint": ASSEMBLYAI_UPLOAD_ENDPOINT,
-                "provider": "assemblyai",
-                "audio_mime": "audio/wav",
-                "audio_bytes": wav.len(),
-                "speech_model": model,
-            })
-        );
-        let upload = self
-            .http
-            .post(ASSEMBLYAI_UPLOAD_ENDPOINT)
-            .header("Authorization", api_key.as_str())
-            .header("Content-Type", "application/octet-stream")
-            .body(wav.to_vec())
-            .send()?;
-        let upload_status = upload.status();
-        if !upload_status.is_success() {
-            let body = upload.text().unwrap_or_default();
-            return Err(AppError::Transcription(format!(
-                "AssemblyAI upload returned {upload_status}: {}",
-                body.chars().take(200).collect::<String>()
-            )));
-        }
-        let upload: AssemblyUploadResponse = upload.json()?;
-        let mut request = serde_json::json!({
-            "audio_url": upload.upload_url,
-            "format_text": true,
-            "punctuate": true,
-            "disfluencies": false,
-        });
-        if let Some(model) = model {
-            request["speech_models"] = serde_json::json!([model]);
-        }
-        let submitted = self
-            .http
-            .post(ASSEMBLYAI_TRANSCRIPT_ENDPOINT)
-            .header("Authorization", api_key.as_str())
-            .json(&request)
-            .send()?;
-        let submit_status = submitted.status();
-        if submit_status.as_u16() == 429 {
-            return Err(AppError::RateLimited);
-        }
-        if !submit_status.is_success() {
-            let body = submitted.text().unwrap_or_default();
-            return Err(AppError::Transcription(format!(
-                "AssemblyAI transcript returned {submit_status}: {}",
-                body.chars().take(200).collect::<String>()
-            )));
-        }
-        let submitted: AssemblyTranscriptResponse = submitted.json()?;
-        self.poll_assemblyai_transcript(&api_key, &submitted)
-    }
-
-    fn poll_assemblyai_transcript(
-        &self,
-        api_key: &str,
-        submitted: &AssemblyTranscriptResponse,
-    ) -> Result<String, AppError> {
-        if submitted.status == "completed" {
-            return non_empty_transcript(submitted.text.as_deref(), "AssemblyAI");
-        }
-        let endpoint = format!("{ASSEMBLYAI_TRANSCRIPT_ENDPOINT}/{}", submitted.id);
-        for _ in 0..30 {
-            std::thread::sleep(Duration::from_millis(500));
-            let response = self
-                .http
-                .get(&endpoint)
-                .header("Authorization", api_key)
-                .send()?;
-            let status = response.status();
-            if status.as_u16() == 429 {
-                return Err(AppError::RateLimited);
-            }
-            if !status.is_success() {
-                let body = response.text().unwrap_or_default();
-                return Err(AppError::Transcription(format!(
-                    "AssemblyAI poll returned {status}: {}",
-                    body.chars().take(200).collect::<String>()
-                )));
-            }
-            let result: AssemblyTranscriptResponse = response.json()?;
-            match result.status.as_str() {
-                "completed" => return non_empty_transcript(result.text.as_deref(), "AssemblyAI"),
-                "error" => {
-                    return Err(AppError::Transcription(format!(
-                        "AssemblyAI transcription failed: {}",
-                        result
-                            .error
-                            .unwrap_or_else(|| String::from("unknown error"))
-                    )));
-                }
-                _ => {}
-            }
-        }
-        Err(AppError::Transcription(String::from(
-            "AssemblyAI transcription timed out",
-        )))
-    }
-
-    /// The local correction chain shared by the verbatim and provider-cleaned
-    /// paths: whitespace normalization, known-term canonicalization, vocabulary
+    /// The local correction chain that runs on the cleanup input:
+    /// whitespace normalization, known-term canonicalization, vocabulary
     /// aliases and corrections, and filler removal.
     fn local_cleanup_chain(&self, source: &str, raw: &str) -> Result<String, AppError> {
         let whitespace_normalized = normalize_transcript(source);
@@ -4290,9 +3797,11 @@ impl App {
         _warmup: &DictationWarmup,
         provider_cleaned: Option<&str>,
     ) -> Result<PreparedText, AppError> {
-        // When the provider bundled a cleaned text (AssemblyAI Dictation), run
-        // the local correction chain on that text instead of the verbatim
-        // transcript, and skip Bolo's own LLM cleanup pass afterwards.
+        // `provider_cleaned`, when present, is a provider-side cleaned
+        // standby; every cloud provider now returns verbatim text only, so
+        // the runtime always passes None and Bolo's LLM cleanup pass runs
+        // on the verbatim transcript. The branch below keeps the contract
+        // working the day a provider bundles a cleanup again.
         let source = provider_cleaned.unwrap_or(raw);
         info!(
             "[cleanup] input {}",
@@ -4725,11 +4234,14 @@ impl App {
         }
         let post_insert_watch =
             prepared.map(|prepared| PostInsertWatch::new(&entry.text, prepared));
-        // Dictation inserts arm the learning observation for the pasted text.
-        // Command and rewrite pastes reuse `remember_result` without a
-        // `prepared` text, so they clear any pending observation rather than
-        // leaving it aimed at an entry that is no longer current, mirroring
-        // how the quality watch above is replaced.
+        // Dictation inserts arm the learning observation for the pasted
+        // text. The manual-copy fallback arms through the same door with a
+        // synthetic prepared text and pins the popup's process on it right
+        // after, so popup corrections join the same observation. Command
+        // and rewrite pastes reuse `remember_result` without a `prepared`
+        // text, so they clear any pending observation rather than leaving
+        // it aimed at an entry that is no longer current, mirroring how
+        // the quality watch above is replaced.
         let edit_learning = prepared.map(|_| EditLearningWatch::new(&entry.text));
         let history = {
             let mut state = self.lock_state()?;
@@ -4841,49 +4353,123 @@ impl App {
     /// finishes once the quiet period elapses. Only the thread spawned when
     /// the burst started runs here; later backspaces in the same burst only
     /// move `capture_at`.
+    /// Watch one armed edit-learning observation. Two capture paths share
+    /// one loop: the precise backspace-triggered capture the hotkey helper
+    /// arms when its key events are visible, and periodic caret-context
+    /// probes that detect the edit without any key-event monitoring, so
+    /// learning works on machines without the Input Monitoring grant. Both
+    /// end when the observation expires at `POST_INSERT_EDIT_MAX`; the
+    /// `captured` handshake keeps the two paths from double-learning.
     fn run_edit_learning_capture(self: &Arc<Self>, mut deadline: Instant) {
+        enum Tick {
+            Capture(EditLearningClaim),
+            SleepUntil(Instant),
+            Probe,
+            Done,
+        }
         loop {
-            std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
-            let claim = match self.lock_state() {
-                Ok(mut state) => match state.edit_learning.as_mut() {
-                    None => None,
+            std::thread::sleep(
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(EDIT_LEARNING_PROBE_INTERVAL),
+            );
+            let (tick, clear_watch) = {
+                let Ok(mut state) = self.lock_state() else {
+                    warn!("edit learning state lock poisoned: edit learning disabled");
+                    return;
+                };
+                match state.edit_learning.as_mut() {
+                    None => (Tick::Done, false),
+                    Some(learning) if learning.captured => (Tick::Done, true),
                     Some(learning) => match learning.capture_at {
-                        None => None,
                         Some(current) if current > Instant::now() => {
-                            deadline = current;
-                            None
+                            (Tick::SleepUntil(current), false)
                         }
-                        Some(current) => {
-                            deadline = current;
-                            learning.capture_at = None;
-                            Some(EditLearningClaim {
-                                pasted_text: learning.pasted_text.clone(),
-                                inserted_at: learning.inserted_at,
-                            })
+                        Some(_) => {
+                            learning.captured = true;
+                            (
+                                Tick::Capture(EditLearningClaim {
+                                    pasted_text: learning.pasted_text.clone(),
+                                    inserted_at: learning.inserted_at,
+                                }),
+                                true,
+                            )
                         }
+                        None if learning.inserted_at.elapsed() >= POST_INSERT_EDIT_MAX => {
+                            (Tick::Done, true)
+                        }
+                        None => (Tick::Probe, false),
                     },
-                },
-                Err(error) => {
-                    warn!("edit learning state lock poisoned: {error}");
-                    None
                 }
             };
-            let Some(claim) = claim else {
-                // The observation was cancelled, replaced, or its deadline is
-                // still in the future. A pushed-forward deadline loops around
-                // and keeps sleeping; everything else ends the thread.
-                if let Ok(state) = self.lock_state()
-                    && let Some(learning) = &state.edit_learning
-                    && learning
-                        .capture_at
-                        .is_some_and(|current| current >= deadline)
-                {
-                    continue;
+            if clear_watch {
+                if let Ok(mut state) = self.lock_state() {
+                    state.edit_learning = None;
                 }
-                return;
-            };
-            self.finish_edit_learning_capture(&claim);
-            return;
+            }
+            match tick {
+                Tick::Done => return,
+                Tick::SleepUntil(current) => {
+                    deadline = current;
+                }
+                Tick::Capture(claim) => {
+                    self.finish_edit_learning_capture(&claim);
+                    return;
+                }
+                Tick::Probe => {
+                    let (pasted_text, popup_pid) = {
+                        let Ok(state) = self.lock_state() else {
+                            return;
+                        };
+                        match state.edit_learning.as_ref() {
+                            Some(learning) => (learning.pasted_text.clone(), learning.popup_pid),
+                            None => return,
+                        }
+                    };
+                    let Some(context) = read_accessibility_context(&self.config.root_dir) else {
+                        // Context unavailable this round: keep polling until
+                        // the expiry clears the watch above.
+                        deadline = Instant::now() + EDIT_LEARNING_PROBE_INTERVAL;
+                        continue;
+                    };
+                    let diverged =
+                        edit_learning_context_diverged(&pasted_text, popup_pid, &context);
+                    let (claimed, clear_watch) = {
+                        let Ok(mut state) = self.lock_state() else {
+                            return;
+                        };
+                        match state.edit_learning.as_mut() {
+                            Some(learning)
+                                if !learning.captured && learning.capture_at.is_none() =>
+                            {
+                                if diverged {
+                                    learning.captured = true;
+                                    (
+                                        Some(EditLearningClaim {
+                                            pasted_text: learning.pasted_text.clone(),
+                                            inserted_at: learning.inserted_at,
+                                        }),
+                                        true,
+                                    )
+                                } else {
+                                    (None, false)
+                                }
+                            }
+                            _ => (None, false),
+                        }
+                    };
+                    if clear_watch {
+                        if let Ok(mut state) = self.lock_state() {
+                            state.edit_learning = None;
+                        }
+                    }
+                    if let Some(claim) = claimed {
+                        self.finish_edit_learning_capture(&claim);
+                        return;
+                    }
+                    deadline = Instant::now() + EDIT_LEARNING_PROBE_INTERVAL;
+                }
+            }
         }
     }
 
@@ -5722,7 +5308,6 @@ impl App {
 impl Config {
     fn load(root_dir: PathBuf) -> Result<Self, AppError> {
         let telnyx_api_key = load_env_value("TELNYX_API_KEY");
-        let assemblyai_api_key = load_env_value("ASSEMBLYAI_API_KEY");
         let llm_cleanup = match load_env_value("BOLO_LLM_CLEANUP")
             .unwrap_or_else(|| String::from("auto"))
             .to_ascii_lowercase()
@@ -5745,13 +5330,12 @@ impl Config {
                 value.to_owned(),
             ));
         }
-        let stt_model = load_env_value("BOLO_STT_MODEL")
-            .unwrap_or_else(|| String::from("assemblyai/universal-3-5-pro"));
+        let stt_model =
+            load_env_value("BOLO_STT_MODEL").unwrap_or_else(|| String::from("deepgram/nova-3"));
         let streaming_stt = load_streaming_provider(&stt_model);
-        let stt_fallbacks = load_stt_fallbacks(&stt_model);
+        let stt_fallbacks = load_stt_fallbacks();
         let config = Self {
             telnyx_api_key,
-            assemblyai_api_key,
             llm_cleanup,
             litellm_base: load_env_value("LITELLM_BASE"),
             litellm_key: load_env_value("LITELLM_KEY"),
@@ -5780,7 +5364,7 @@ impl Config {
         };
         if let Some(missing) = config.missing_required_key() {
             // A missing key is no longer fatal: the onboarding window shows
-            // an entry field for the AssemblyAI key and dictation attempts
+            // an entry field for the required key and dictation attempts
             // already fail per-request with a clean error. This keeps the
             // first-run flow (bundle or source) alive long enough to
             // collect the key in the UI.
@@ -5789,46 +5373,20 @@ impl Config {
         Ok(config)
     }
 
-    /// First API key the resolved pipeline requires but cannot find. The
-    /// `AssemblyAI`-first default needs only `ASSEMBLYAI_API_KEY`; Telnyx keys are
-    /// required only while a Telnyx-hosted provider is still selected.
+    /// First API key the resolved pipeline requires but cannot find. Every
+    /// cloud path Bolo can reach (batch, streaming, fallback) is
+    /// Telnyx-hosted, so `TELNYX_API_KEY` is the only key the pipeline
+    /// itself requires; the xAI key is reported only while an `SttFallback::Xai`
+    /// rung is configured.
     fn missing_required_key(&self) -> Option<&'static str> {
-        self.missing_required_key_with(
-            self.assemblyai_api_key.as_deref(),
-            load_env_value("XAI_API_KEY").as_deref(),
-        )
+        self.missing_required_key_with(load_env_value("XAI_API_KEY").as_deref())
     }
 
     /// Core of `missing_required_key` with the resolved provider keys passed
     /// in, so key-presence logic can be tested without touching the
     /// environment.
-    fn missing_required_key_with(
-        &self,
-        assemblyai_key: Option<&str>,
-        xai_key: Option<&str>,
-    ) -> Option<&'static str> {
-        let uses_assemblyai = self.stt_model.starts_with("assemblyai/")
-            || matches!(
-                self.streaming_stt,
-                Some(StreamingProvider::AssemblyAiDirect)
-            )
-            || self
-                .stt_fallbacks
-                .iter()
-                .any(|fallback| matches!(fallback, SttFallback::AssemblyAi(_)));
-        if uses_assemblyai && assemblyai_key.is_none() {
-            return Some("ASSEMBLYAI_API_KEY");
-        }
-        let uses_telnyx = !self.stt_model.starts_with("assemblyai/")
-            || matches!(
-                self.streaming_stt,
-                Some(StreamingProvider::AssemblyAi | StreamingProvider::Deepgram)
-            )
-            || self
-                .stt_fallbacks
-                .iter()
-                .any(|fallback| matches!(fallback, SttFallback::Telnyx(_)));
-        if uses_telnyx && self.telnyx_api_key.is_none() {
+    fn missing_required_key_with(&self, xai_key: Option<&str>) -> Option<&'static str> {
+        if self.telnyx_api_key.is_none() {
             return Some("TELNYX_API_KEY");
         }
         if self
@@ -5846,7 +5404,6 @@ impl Config {
     /// endpoint to hit, which key authenticates it, whether the key needs a
     /// Bearer prefix, and whether the endpoint understands the Telnyx-only
     /// `enable_thinking` flag. Precedence: `LITELLM_BASE` override, then the
-    /// `AssemblyAI` LLM Gateway on the same `ASSEMBLYAI_API_KEY`, then the
     /// legacy Telnyx inference endpoint while a Telnyx key exists.
     fn llm_endpoint(&self) -> Option<LlmEndpoint> {
         if let Some(base) = self.litellm_base.as_ref() {
@@ -5860,16 +5417,6 @@ impl Config {
                 url,
                 key: self.litellm_key.clone().filter(|key| !key.is_empty()),
                 bearer: true,
-                legacy_qwen: false,
-            });
-        }
-        if let Some(key) = self.assemblyai_api_key.clone() {
-            // The gateway documents raw-key Authorization with no Bearer
-            // prefix (llm-gateway.assemblyai.com docs, 2026-10-01).
-            return Some(LlmEndpoint {
-                url: String::from(ASSEMBLYAI_LLM_GATEWAY_ENDPOINT),
-                key: Some(key),
-                bearer: false,
                 legacy_qwen: false,
             });
         }
@@ -5889,8 +5436,6 @@ impl Config {
         }
         if self.litellm_base.is_some() {
             String::from("Kimi-K2.5")
-        } else if self.assemblyai_api_key.is_some() {
-            String::from(ASSEMBLYAI_LLM_DEFAULT_MODEL)
         } else {
             String::from("Qwen/Qwen3-235B-A22B")
         }
@@ -5915,8 +5460,6 @@ impl SttFallback {
         match self {
             Self::Telnyx(model) => format!("telnyx:{model}"),
             Self::Xai => String::from("xai"),
-            Self::AssemblyAi(Some(model)) => format!("assemblyai:{model}"),
-            Self::AssemblyAi(None) => String::from("assemblyai"),
         }
     }
 }
@@ -5924,7 +5467,6 @@ impl SttFallback {
 impl StreamingProvider {
     const fn label(self) -> &'static str {
         match self {
-            Self::AssemblyAiDirect => "assemblyai_direct",
             Self::AssemblyAi => "telnyx_assemblyai",
             Self::Deepgram => "telnyx_deepgram",
         }
@@ -5932,7 +5474,6 @@ impl StreamingProvider {
 
     const fn required_key_name(self) -> &'static str {
         match self {
-            Self::AssemblyAiDirect => "ASSEMBLYAI_API_KEY",
             Self::AssemblyAi | Self::Deepgram => "TELNYX_API_KEY",
         }
     }
@@ -6040,7 +5581,6 @@ fn start_recording(
         sample_rate: config.sample_rate,
         warmup: DictationWarmup::default(),
         streaming: None,
-        upload: None,
     })
 }
 
@@ -7570,9 +7110,6 @@ fn onboarding_status_at(path: &Path) -> OnboardingStatus {
 /// status window.
 const fn streaming_status_label(streaming: Option<StreamingProvider>) -> &'static str {
     match streaming {
-        Some(StreamingProvider::AssemblyAiDirect) => {
-            "AssemblyAI streaming (dictation model, direct)"
-        }
         Some(StreamingProvider::AssemblyAi) => "AssemblyAI streaming via Telnyx",
         Some(StreamingProvider::Deepgram) => "Deepgram streaming via Telnyx",
         None => "Batch STT",
@@ -9335,13 +8872,13 @@ impl Drop for StreamingAudioChunker {
     }
 }
 
-/// Wire chunk size shared by the streaming preview and the streamed
-/// Dictation upload: `AssemblyAI`'s v3 streaming spec requires 50-1000ms per
-/// binary chunk and rejects the final chunk at session teardown when it is
-/// shorter (observed 2026-10-02: a 20ms chunk drew "Input Duration
-/// Violation"). 60ms sits inside the accepted range with margin on either
-/// side; the same chunk size feeds the dictation upload, where byte
-/// framing is unrestricted.
+/// Wire chunk size for the streaming preview sink over the Telnyx
+/// websocket: 60ms per binary chunk. The 50-1000ms band with a
+/// minimum-sized final chunk was the removed direct v3 websocket's
+/// framing rule (observed 2026-10-02: a 20ms final chunk drew "Input
+/// Duration Violation"), and 60ms sits inside that band with margin on
+/// either side; the Telnyx websocket streams the same 60ms frames
+/// cleanly, so the size stays.
 fn chunk_samples_for(sample_rate: u32) -> usize {
     usize::try_from(sample_rate.max(1) * 3 / 50)
         .unwrap_or(1)
@@ -11001,31 +10538,22 @@ fn streaming_provider_from_config(
         .to_ascii_lowercase()
         .as_str()
     {
-        "assemblyai" | "assembly" | "on" | "true" | "1" => {
-            Some(StreamingProvider::AssemblyAiDirect)
-        }
         "assemblyai-telnyx" | "assembly-telnyx" => Some(StreamingProvider::AssemblyAi),
-        "deepgram" | "nova-3" | "nova3" => Some(StreamingProvider::Deepgram),
+        "deepgram" | "nova-3" | "nova3" | "telnyx" => Some(StreamingProvider::Deepgram),
         _ => None,
     }
 }
 
-fn load_stt_fallbacks(stt_model: &str) -> Vec<SttFallback> {
+fn load_stt_fallbacks() -> Vec<SttFallback> {
     if let Some(value) = load_env_value("BOLO_STT_FALLBACKS") {
         return parse_stt_fallbacks(&value);
     }
     load_env_value("BOLO_STT_FALLBACK_MODEL")
         .as_deref()
-        .map_or_else(|| default_stt_fallbacks(stt_model), parse_stt_fallbacks)
+        .map_or_else(default_stt_fallbacks, parse_stt_fallbacks)
 }
 
-fn default_stt_fallbacks(primary_model: &str) -> Vec<SttFallback> {
-    if primary_model.starts_with("assemblyai/") {
-        // The AssemblyAI async upload+poll path is the same provider's
-        // fault-isolated fallback: sync and streaming outages rarely take the
-        // async endpoint down with them.
-        return vec![SttFallback::AssemblyAi(None)];
-    }
+fn default_stt_fallbacks() -> Vec<SttFallback> {
     vec![SttFallback::Telnyx(String::from(
         "openai/whisper-large-v3-turbo",
     ))]
@@ -11048,18 +10576,21 @@ fn parse_stt_fallback(value: &str) -> Option<SttFallback> {
         return None;
     }
     let Some((provider, rest)) = value.split_once(':') else {
-        return Some(match value.to_ascii_lowercase().as_str() {
-            "xai" => SttFallback::Xai,
-            "assemblyai" => SttFallback::AssemblyAi(None),
-            _ => SttFallback::Telnyx(value.to_owned()),
-        });
+        return match value.to_ascii_lowercase().as_str() {
+            "xai" => Some(SttFallback::Xai),
+            // The removed direct-AssemblyAI fallback stayed in older env
+            // files; dropped from the chain rather than read as a Telnyx
+            // model name.
+            "assemblyai" | "assembly" => None,
+            _ => Some(SttFallback::Telnyx(value.to_owned())),
+        };
     };
     let provider = provider.trim().to_ascii_lowercase();
     let rest = non_empty_str(rest);
     match provider.as_str() {
         "telnyx" => rest.map(SttFallback::Telnyx),
         "xai" => Some(SttFallback::Xai),
-        "assemblyai" | "assembly" => Some(SttFallback::AssemblyAi(rest)),
+        "assemblyai" | "assembly" => None,
         _ => Some(SttFallback::Telnyx(value.to_owned())),
     }
 }
@@ -11226,8 +10757,8 @@ fn is_vocabulary_echo_fragment(fragment: &str, index: &EchoPromptIndex) -> bool 
 /// that rode the request (ported from `OpenWhispr`'s `dictionaryEchoFilter`,
 /// MIT). Whisper-family models can continue that prompt list into the
 /// transcript: the whole response can be the list, or the list can trail
-/// real speech. A prompt-free request (the `AssemblyAI` routes, whose
-/// vocabulary is structured keyterms) never echoes.
+/// real speech. A prompt-free request (the xAI route, which never sends a
+/// free-text prompt) never echoes.
 fn strip_vocabulary_echo(transcript: &str, prompt_terms: &[String]) -> EchoVerdict {
     let index = echo_prompt_index(prompt_terms);
     if index.words.is_empty() || transcript.trim().is_empty() {
@@ -11440,6 +10971,8 @@ fn read_accessibility_context(root_dir: &Path) -> Option<AccessibilityContext> {
         &context.bundle_id,
         &context.text_before_cursor,
         &context.selected_text,
+        context.writable,
+        context.focused_pid,
     ))
 }
 
@@ -11716,18 +11249,11 @@ fn cleanup_prompt_overrides(file: &CleanupPromptFile) -> BTreeMap<CleanupProfile
     overrides
 }
 
-/// `AssemblyAI` caps `llm_instruction` at 2048 characters; requests above the
-/// cap are rejected (config parameters, <https://www.assemblyai.com/docs/dictation>,
-/// checked 2026-10-09). The editor enforces this at save time; this is the
-/// defensive send-time backstop for files edited by hand.
+/// Cleanup prompts are capped at 2048 characters. The prompts editor
+/// rejects over-cap saves at write time using this limit, and the window
+/// payload ships the same cap to the editor for its validation copy; a
+/// hand-edited file above the cap is honored as-is by the LLM path.
 const CLEANUP_PROMPT_CAP_CHARS: usize = 2048;
-
-/// First `max_chars` Unicode scalar values of `text`. The save path rejects
-/// over-cap prompts, so this only ever trims a hand-edited file; the caller
-/// logs when it does.
-fn truncate_to_chars(text: &str, max_chars: usize) -> String {
-    text.chars().take(max_chars).collect()
-}
 
 /// The effective cleanup prompt for `profile`: the user's override when one
 /// is saved, else the built-in text. Pure core of [`App::effective_cleanup_prompt`]
@@ -11918,6 +11444,38 @@ fn checked_correction_pair(
 /// MIT). Every pair must clear every guard before it is learned; ambiguous
 /// captures and wholesale rewrites are skipped with a reason and never
 /// learned.
+/// The paste is intact when the caret context still ends with the pasted
+/// text (ignoring trailing whitespace): the user has not edited anything
+/// after it. A diverged context is the poll watcher's edit signal.
+fn paste_intact_in_context(pasted_text: &str, context_before_cursor: &str) -> bool {
+    context_before_cursor
+        .trim_end()
+        .ends_with(pasted_text.trim_end())
+}
+
+/// Whether one caret-context probe means the user edited Bolo's text.
+/// Paste-path observations (`popup_pid == None`) keep the original poll
+/// semantics: the first context that stops ending with the pasted text is
+/// the edit signal. Manual-copy fallback observations pin the popup
+/// process: a context from any other app is ignored (the popup's text view
+/// is the only editable copy of the transcript anywhere), and a popup
+/// context that still sits inside the unedited text (a click placing the
+/// caret) is a clean transcript prefix, which is not an edit either.
+fn edit_learning_context_diverged(
+    pasted_text: &str,
+    popup_pid: Option<i32>,
+    context: &AccessibilityContext,
+) -> bool {
+    let before_cursor = context.text_before_cursor.as_str();
+    if paste_intact_in_context(pasted_text, before_cursor) {
+        return false;
+    }
+    match popup_pid {
+        None => true,
+        Some(pid) => context.focused_pid == Some(pid) && !pasted_text.starts_with(before_cursor),
+    }
+}
+
 fn derive_word_correction(inserted: &str, context_tail: &str) -> CorrectionOutcome {
     let observed = word_tokens(inserted);
     let context = word_tokens(context_tail);
@@ -13042,6 +12600,13 @@ fn parse_daemon_context_reply(reply: &serde_json::Value) -> Option<Accessibility
             .get("selected_text")
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default(),
+        // A stale daemon predating the writable field answers without it,
+        // which maps to "unknown" and keeps the paste behavior.
+        reply.get("writable").and_then(serde_json::Value::as_bool),
+        reply
+            .get("focused_pid")
+            .and_then(serde_json::Value::as_i64)
+            .and_then(|pid| i32::try_from(pid).ok()),
     ))
 }
 
@@ -13051,6 +12616,8 @@ fn finalize_accessibility_context(
     bundle_id: &str,
     text_before_cursor: &str,
     selected_text: &str,
+    writable: Option<bool>,
+    focused_pid: Option<i32>,
 ) -> AccessibilityContext {
     AccessibilityContext {
         app_name: app_name.trim().to_owned(),
@@ -13069,6 +12636,8 @@ fn finalize_accessibility_context(
             .chars()
             .take(MAX_SELECTED_TEXT_CHARS)
             .collect(),
+        writable,
+        focused_pid,
     }
 }
 
@@ -13117,6 +12686,45 @@ fn paste_text(root_dir: &Path, text: &str) -> Result<(), AppError> {
     }
     warn!("insert helper failed; falling back to plain clipboard paste");
     paste_text_with_plain_clipboard(text)
+}
+
+/// Why a ready transcript skips the live Cmd+V insert and goes to the
+/// manual-copy popup instead: `None` keeps the insert. The only verdict
+/// that diverts is a press-time context that positively read
+/// `writable == false` (nothing editable had focus; password fields count
+/// as non-writable). Unknown (`writable == None`: an older helper or a
+/// failed read) and no context at all both keep the insert behavior, so a
+/// stale daemon never blocks pasting.
+fn insert_fallback_reason(context: Option<&AccessibilityContext>) -> Option<&'static str> {
+    match context {
+        Some(context) if context.writable == Some(false) => Some("not_writable"),
+        _ => None,
+    }
+}
+
+/// Parse one popup stdout line into the text its Copy button should put
+/// on the clipboard: `Some(current)` for a `copy_used` reply (the popup
+/// carries its current, possibly edited body in `text`), the show-time
+/// transcript when a damaged or pre-`text` reply still names `copy_used`,
+/// and `None` for every other line (the `empty_dismissed` self-dismiss,
+/// or log noise) so those never look like a Copy click.
+fn parse_popup_copy_text(line: &str, snapshot: &str) -> Option<String> {
+    if let Ok(reply) = serde_json::from_str::<serde_json::Value>(line.trim_end()) {
+        if reply.get("type").and_then(serde_json::Value::as_str) != Some("copy_used") {
+            return None;
+        }
+        return Some(
+            reply
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(snapshot)
+                .to_owned(),
+        );
+    }
+    if line.contains("\"copy_used\"") {
+        return Some(snapshot.to_owned());
+    }
+    None
 }
 
 /// Ask macOS whether Bolo's Python helper is trusted for Accessibility events.
@@ -13560,55 +13168,53 @@ mod tests {
 
     use super::{
         ACCESS_DAEMON_ACTION_TIMEOUT, ACCESS_DAEMON_QUERY_TIMEOUT, ACCESS_DAEMON_STARTUP_TIMEOUT,
-        ASSEMBLYAI_STREAMING_MODEL, AccessDaemonFailure, AccessDaemonRequest, AccessibilityContext,
-        AccessibilityTrust, App, AppError, AppState, AppWindowPayload, AssemblyDictationResponse,
-        AudioHub, BatchEcho, BatchRetry, CLEANUP_PROMPT_CAP_CHARS, CleanupMode, CleanupProfile,
-        CleanupPromptCache, CleanupPromptEntry, CleanupPromptFile, Config, CorrectionOutcome,
-        DashboardAction, DashboardRequestLine, DictationCommandKind, DictationUploadReader,
-        DictationUploadRelease, DictationWarmup, EchoVerdict, EditLearningClaim, KeyEntrySpec,
-        LEARNING_UNREADABLE_LINE, LEARNING_WINDOW_ROWS, LaunchRequestAction, LearnedPair,
-        LearnedVocabulary, LocalSttMode, LocalWhisperHandle, MicrophoneDescriptor,
-        MicrophoneSelection, ONBOARDING_MARKER_VERSION, OnboardingStatus, PreparedText,
-        PromptBinding, STREAMING_DRAIN_MIN, STT_RETRY_SAMPLE_RATE, StreamingConnectionState,
-        StreamingProvider, StreamingRecording, StreamingText, StreamingTranscript, SttFallback,
-        SttResult, TRANSCRIPT_HISTORY_LIMIT, TextReplacement, TranscriptHistoryEntry, UpdateNotice,
-        UpdateOutcome, UsageCounters, WindowRow, WizardSpec, accessibility_fix_detail,
-        apply_text_replacements, apply_vocabulary_corrections_with_matches,
-        assemblyai_direct_query_with, assemblyai_language_code, batch_retry_plan,
-        batch_transcript_after_echo, build_cleanup_user_content, build_rewrite_user_content,
-        build_stt_prompt, canonicalize_known_terms, chunk_samples_for, cleanup_decision,
-        cleanup_max_tokens, cleanup_profile, cleanup_prompt, cleanup_prompt_overrides,
-        cleanup_prompts_path, consume_open_dashboard_request_at, contains_word_verbatim,
-        dashboard_accessibility_state, dashboard_cleanup_mode, dashboard_payload,
-        dashboard_provider_label, derive_word_correction, dictation_batch_config,
-        dictation_upload_config, dictation_upload_form, dictation_upload_release,
-        dictation_upload_request_timeout, downsample_wav_16k_mono, edit_distance,
-        empty_transcript_error, enforce_learned_vocabulary_cap,
+        AccessDaemonFailure, AccessDaemonRequest, AccessibilityContext, AccessibilityTrust, App,
+        AppError, AppState, AppWindowPayload, AudioHub, BatchEcho, BatchRetry,
+        CLEANUP_PROMPT_CAP_CHARS, CleanupMode, CleanupProfile, CleanupPromptCache,
+        CleanupPromptEntry, CleanupPromptFile, Config, CorrectionOutcome, DashboardAction,
+        DashboardRequestLine, DictationCommandKind, DictationWarmup, EchoVerdict,
+        EditLearningClaim, KeyEntrySpec, LEARNING_UNREADABLE_LINE, LEARNING_WINDOW_ROWS,
+        LaunchRequestAction, LearnedPair, LearnedVocabulary, LocalSttMode, LocalWhisperHandle,
+        MicrophoneDescriptor, MicrophoneSelection, ONBOARDING_MARKER_VERSION, OnboardingStatus,
+        PreparedText, PromptBinding, STREAMING_DRAIN_MIN, STT_RETRY_SAMPLE_RATE,
+        StreamingConnectionState, StreamingProvider, StreamingRecording, StreamingTranscript,
+        SttFallback, SttResult, TRANSCRIPT_HISTORY_LIMIT, TextReplacement, TranscriptHistoryEntry,
+        UpdateNotice, UpdateOutcome, UsageCounters, WindowRow, WizardSpec,
+        accessibility_fix_detail, apply_text_replacements,
+        apply_vocabulary_corrections_with_matches, batch_retry_plan, batch_transcript_after_echo,
+        build_cleanup_user_content, build_rewrite_user_content, build_stt_prompt,
+        canonicalize_known_terms, chunk_samples_for, cleanup_decision, cleanup_max_tokens,
+        cleanup_profile, cleanup_prompt, cleanup_prompt_overrides, cleanup_prompts_path,
+        consume_open_dashboard_request_at, contains_word_verbatim, dashboard_accessibility_state,
+        dashboard_cleanup_mode, dashboard_payload, dashboard_provider_label,
+        derive_word_correction, downsample_wav_16k_mono, edit_distance,
+        edit_learning_context_diverged, empty_transcript_error, enforce_learned_vocabulary_cap,
         final_streaming_result_is_ready_elapsed, finalize_accessibility_context,
         handle_dashboard_action, handle_launch_request_for_state, handshake_with_deadline,
-        is_blocklisted_correction, is_known_no_speech_transcript, is_supported_hotkey,
-        learning_window_payload_at, load_cleanup_prompt_file, load_learned_vocabulary,
-        load_usage_counters_at, load_vocabulary_usage, load_vocabulary_with_learned,
-        microphone_labels, non_empty_transcript, normalize_microphone_value, onboarding_status_at,
-        override_or_builtin_prompt_from, parse_accessibility_trust, parse_command,
-        parse_daemon_context_reply, parse_daemon_paste_reply, parse_daemon_select_reply,
-        parse_daemon_trust_reply, parse_latest_release, parse_release_version,
+        insert_fallback_reason, is_blocklisted_correction, is_known_no_speech_transcript,
+        is_supported_hotkey, learning_window_payload_at, load_cleanup_prompt_file,
+        load_learned_vocabulary, load_usage_counters_at, load_vocabulary_usage,
+        load_vocabulary_with_learned, microphone_labels, non_empty_transcript,
+        normalize_microphone_value, onboarding_status_at, override_or_builtin_prompt_from,
+        parse_accessibility_trust, parse_command, parse_daemon_context_reply,
+        parse_daemon_paste_reply, parse_daemon_select_reply, parse_daemon_trust_reply,
+        parse_latest_release, parse_popup_copy_text, parse_release_version,
         parse_replacements_json, parse_stt_fallbacks, parse_u64_env_value, parse_update_outcome,
-        parse_wav_pcm16, pcm_bytes, preview_only_streaming, preview_release_stt,
-        prompts_window_payload_at, read_vocabulary_file, read_vocabulary_usage_file,
-        record_learned_correction, reload_is_busy, remove_bolo_env_value_at, remove_fillers,
-        request_accessibility_daemon, resolve_microphone_selection, retry_failed_primary,
-        sanitize_transcript_history, save_usage_counters_at, should_exit_for_key_reload,
-        speech_stats, stable_streaming_best_is_ready_elapsed, status_rows,
-        streaming_batch_fallback_reason, streaming_connection, streaming_preview_tail,
-        streaming_provider_from_config, streaming_status_label, strip_reasoning_tags,
-        strip_vocabulary_echo, stt_language_for_model, stt_model_config, telnyx_stream_query,
-        transcript_log_value, transcript_menu_preview, truncate_to_chars, typed_dashboard_action,
-        upsert_learned_correction, upsert_replacement, version_is_newer, wait_for_daemon_reply,
-        wav_bytes, wav_duration_ms, write_bolo_env_value_at, write_learned_vocabulary_file,
+        paste_intact_in_context, prompts_window_payload_at, read_vocabulary_file,
+        read_vocabulary_usage_file, record_learned_correction, reload_is_busy,
+        remove_bolo_env_value_at, remove_fillers, request_accessibility_daemon,
+        resolve_microphone_selection, retry_failed_primary, sanitize_transcript_history,
+        save_usage_counters_at, should_exit_for_key_reload, speech_stats,
+        stable_streaming_best_is_ready_elapsed, status_rows, streaming_batch_fallback_reason,
+        streaming_connection, streaming_preview_tail, streaming_provider_from_config,
+        streaming_status_label, strip_reasoning_tags, strip_vocabulary_echo,
+        stt_language_for_model, stt_model_config, telnyx_stream_engine_model_with,
+        telnyx_stream_query, telnyx_stream_query_with, transcript_log_value,
+        transcript_menu_preview, typed_dashboard_action, upsert_learned_correction,
+        upsert_replacement, version_is_newer, wait_for_daemon_reply, wav_bytes,
+        write_bolo_env_value_at, write_learned_vocabulary_file,
     };
     use std::collections::{HashMap, VecDeque};
-    use std::io::Read as _;
     use std::path::{Path, PathBuf};
     use std::sync::mpsc;
     use std::sync::{Arc, Mutex};
@@ -13859,10 +13465,6 @@ mod tests {
     fn streaming_status_labels_match_health_check_strings() {
         assert_eq!(streaming_status_label(None), "Batch STT");
         assert_eq!(
-            streaming_status_label(Some(StreamingProvider::AssemblyAiDirect)),
-            "AssemblyAI streaming (dictation model, direct)"
-        );
-        assert_eq!(
             streaming_status_label(Some(StreamingProvider::AssemblyAi)),
             "AssemblyAI streaming via Telnyx"
         );
@@ -13981,7 +13583,7 @@ mod tests {
             try_it_hero: None,
             key_entry: Some(KeyEntrySpec {
                 index: 2,
-                placeholder: String::from("Paste your AssemblyAI API key"),
+                placeholder: String::from("Paste your Telnyx API key"),
             }),
             write_marker: true,
             learning: None,
@@ -14042,29 +13644,31 @@ mod tests {
     #[test]
     fn onboarding_provider_picks_pin_models_the_runtime_resolves()
     -> Result<(), Box<dyn std::error::Error>> {
-        // The onboarding picker writes each provider's key variable and
-        // pins BOLO_STT_MODEL to the provider's model so the resolved
-        // pipeline follows the choice. These exact strings are the
-        // cross-language contract; a drift in either file breaks the
-        // pipeline silently, so this test pins them against app_window.py.
+        // Onboarding is Telnyx-only: the wizard writes TELNYX_API_KEY and
+        // pins BOLO_STT_MODEL to the Telnyx-hosted Deepgram model so the
+        // resolved pipeline follows the setup after restart. These exact
+        // strings are the cross-language contract; a drift in either file
+        // breaks the pipeline silently, so this test pins them against
+        // app_window.py, and forbids any reintroduction of the removed
+        // direct-AssemblyAI provider surface.
         let manifest = env!("CARGO_MANIFEST_DIR");
         let source_path = Path::new(manifest).join("app_window.py");
         let source = fs::read_to_string(&source_path)?;
         assert!(
-            source.contains("\"assemblyai\": \"assemblyai/universal-3-5-pro\""),
-            "picker must pin the AssemblyAI dictation model"
-        );
-        assert!(
             source.contains("\"telnyx\": \"deepgram/nova-3\""),
-            "picker must pin the Telnyx-hosted Deepgram model"
-        );
-        assert!(
-            source.contains("\"assemblyai\": \"ASSEMBLYAI_API_KEY\""),
-            "picker must write the AssemblyAI key variable"
+            "wizard must pin the Telnyx-hosted Deepgram model"
         );
         assert!(
             source.contains("\"telnyx\": \"TELNYX_API_KEY\""),
-            "picker must write the Telnyx key variable"
+            "wizard must write the Telnyx key variable"
+        );
+        assert!(
+            source.contains("WIZARD_PROVIDERS = (\"telnyx\",)"),
+            "wizard must offer Telnyx as the only speech provider"
+        );
+        assert!(
+            !source.to_ascii_lowercase().contains("assemblyai"),
+            "the removed direct-AssemblyAI surface must not come back"
         );
         Ok(())
     }
@@ -14248,6 +13852,9 @@ mod tests {
         assert_eq!(context.bundle_id, "com.apple.Notes");
         assert_eq!(context.text_before_cursor, "hello world");
         assert_eq!(context.selected_text, "kept selection");
+        // A stale daemon answers without the writable field; the runtime
+        // must read that as "unknown", never as non-writable.
+        assert_eq!(context.writable, None);
 
         // `app: null` is the daemon's failed-read signal, never a context.
         assert_eq!(
@@ -14269,6 +13876,43 @@ mod tests {
         }))
         .unwrap_or_default();
         assert_eq!(trimmed.text_before_cursor.chars().count(), 500);
+        // A current daemon reports the paste-target verdict; False is what
+        // diverts the insert into the manual-copy fallback.
+        assert_eq!(
+            parse_daemon_context_reply(&serde_json::json!({
+                "type": "context",
+                "app": "Finder",
+                "bundle_id": "com.apple.finder",
+                "before_cursor": "",
+                "selected_text": "",
+                "writable": false,
+            }))
+            .and_then(|context| context.writable),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn insert_fallback_reason_matches_only_a_confirmed_readonly_target() {
+        let context_with = |writable: Option<bool>| AccessibilityContext {
+            writable,
+            ..AccessibilityContext::default()
+        };
+        // A positive non-writable reading is the only verdict that
+        // diverts: the dictation hands the transcript to the manual-copy
+        // popup instead of a blind Cmd+V.
+        assert_eq!(
+            insert_fallback_reason(Some(&context_with(Some(false)))),
+            Some("not_writable")
+        );
+        // Missing flag (older helper, failed read), confirmed writable,
+        // and no context at all all keep the current paste behavior.
+        assert_eq!(insert_fallback_reason(Some(&context_with(None))), None);
+        assert_eq!(
+            insert_fallback_reason(Some(&context_with(Some(true)))),
+            None
+        );
+        assert_eq!(insert_fallback_reason(None), None);
     }
 
     #[test]
@@ -14308,11 +13952,26 @@ mod tests {
             " com.apple.Notes ",
             "  before cursor  ",
             "  selected  ",
+            Some(true),
+            Some(4242),
         );
         assert_eq!(context.app_name, "Notes");
         assert_eq!(context.bundle_id, "com.apple.Notes");
         assert_eq!(context.text_before_cursor, "before cursor");
         assert_eq!(context.selected_text, "selected");
+        assert_eq!(context.writable, Some(true));
+        assert_eq!(context.focused_pid, Some(4242));
+        // A stale helper predating the pid field maps to unknown, never
+        // to a bogus pid.
+        let legacy = finalize_accessibility_context(
+            "Notes",
+            "com.apple.Notes",
+            "before cursor",
+            "selected",
+            Some(true),
+            None,
+        );
+        assert_eq!(legacy.focused_pid, None);
     }
 
     #[test]
@@ -14488,6 +14147,8 @@ mod tests {
             bundle_id: String::from("com.linear"),
             text_before_cursor: String::new(),
             selected_text: String::from("old selected text"),
+            writable: None,
+            focused_pid: None,
         };
         let user_content = build_rewrite_user_content(
             "old selected text",
@@ -14732,6 +14393,8 @@ mod tests {
             bundle_id: String::from("com.tinyspeck.slackmacgap"),
             text_before_cursor: String::from("Can you send me"),
             selected_text: String::new(),
+            writable: None,
+            focused_pid: None,
         };
         let user_content = build_cleanup_user_content("the notes", Some(&context));
 
@@ -14745,7 +14408,6 @@ mod tests {
     fn litellm_cleanup_uses_kimi() {
         let config = Config {
             telnyx_api_key: Some(String::from("test")),
-            assemblyai_api_key: None,
             llm_cleanup: CleanupMode::On,
             litellm_base: Some(String::from("http://localhost:4000")),
             litellm_key: None,
@@ -14778,6 +14440,8 @@ mod tests {
             bundle_id: String::from("com.linear"),
             text_before_cursor: String::new(),
             selected_text: String::from("old selected text"),
+            writable: None,
+            focused_pid: None,
         };
         let user_content =
             build_rewrite_user_content("old selected text", "make it shorter", &context);
@@ -14791,7 +14455,6 @@ mod tests {
     fn auto_cleanup_runs_for_long_or_messy_text() {
         let config = Config {
             telnyx_api_key: Some(String::from("test")),
-            assemblyai_api_key: None,
             llm_cleanup: CleanupMode::Auto,
             litellm_base: None,
             litellm_key: None,
@@ -14827,7 +14490,6 @@ mod tests {
     fn auto_cleanup_runs_for_short_text_without_terminal_punctuation() {
         let config = Config {
             telnyx_api_key: Some(String::from("test")),
-            assemblyai_api_key: None,
             llm_cleanup: CleanupMode::Auto,
             litellm_base: None,
             litellm_key: None,
@@ -14869,9 +14531,88 @@ mod tests {
         assert!(deepgram.contains("keyterm=Telnyx,Claude%20Code"));
 
         let assembly = telnyx_stream_query(StreamingProvider::AssemblyAi, "auto", &vocabulary);
-        assert!(assembly.contains("model=assemblyai%2Funiversal-streaming"));
+        assert!(assembly.contains("model=assemblyai%2Funiversal-3-5-pro"));
         assert!(assembly.contains("input_format=linear16"));
         assert!(!assembly.contains("keyterm="));
+        assert!(!assembly.contains("interim_results=true"));
+    }
+
+    #[test]
+    fn telnyx_stream_engine_model_env_overrides_and_normalizes() {
+        assert_eq!(
+            telnyx_stream_engine_model_with(StreamingProvider::Deepgram, "Deepgram", "nova-3"),
+            (String::from("Deepgram"), String::from("nova-3"))
+        );
+        assert_eq!(
+            telnyx_stream_engine_model_with(
+                StreamingProvider::Deepgram,
+                "soniox",
+                "soniox/stt-rt-v4"
+            ),
+            (String::from("Soniox"), String::from("soniox/stt-rt-v4"))
+        );
+        // The AssemblyAI route ignores overrides and keeps its engine.
+        assert_eq!(
+            telnyx_stream_engine_model_with(
+                StreamingProvider::AssemblyAi,
+                "Soniox",
+                "soniox/stt-rt-v4"
+            ),
+            (
+                String::from("AssemblyAI"),
+                String::from("assemblyai/universal-3-5-pro")
+            )
+        );
+    }
+
+    #[test]
+    fn telnyx_stream_query_adapts_params_per_engine() {
+        let vocabulary = vec![String::from("Bolo")];
+        let soniox = telnyx_stream_query_with("Soniox", "soniox/stt-rt-v4", "en-IN", &vocabulary);
+        assert!(soniox.contains("transcription_engine=Soniox"));
+        assert!(soniox.contains("interim_results=true"));
+        assert!(soniox.contains("endpointing=800"));
+        assert!(!soniox.contains("keyterm="));
+
+        let flux_multi = telnyx_stream_query_with("Deepgram", "flux-multi", "en-IN", &vocabulary);
+        assert!(flux_multi.contains("model=flux-multi"));
+        assert!(flux_multi.contains("language=multi"));
+        assert!(flux_multi.contains("keyterm=Bolo"));
+        assert!(!flux_multi.contains("language=en-IN"));
+
+        // Engines without interim results never stream partials.
+        let assembly_routed = telnyx_stream_query_with(
+            "AssemblyAI",
+            "assemblyai/universal-3-5-pro",
+            "en-IN",
+            &vocabulary,
+        );
+        assert!(!assembly_routed.contains("interim_results=true"));
+        assert!(!assembly_routed.contains("keyterm="));
+
+        let speechmatics =
+            telnyx_stream_query_with("Speechmatics", "speechmatics/standard", "en", &vocabulary);
+        assert!(speechmatics.contains("interim_results=true"));
+        assert!(!speechmatics.contains("endpointing="));
+    }
+
+    #[test]
+    fn paste_intact_probe_flags_divergent_contexts() {
+        let pasted = String::from("Send the release note today");
+        let intact = String::from("hello team\nSend the release note today");
+        let edited = String::from("hello team\nSend the release note on Friday");
+        let moved_on = String::from("hello team\nSend the release note today\nthanks!");
+        assert!(paste_intact_in_context(&pasted, &intact));
+        assert!(!paste_intact_in_context(&pasted, &edited));
+        // Typing more after the paste also diverges the context: the probe
+        // fires, the diff capture runs, and derive_word_correction finds no
+        // mishear to learn, which consumes the watch. That is correct.
+        assert!(!paste_intact_in_context(&pasted, &moved_on));
+        // Trailing whitespace differences stay intact.
+        assert!(paste_intact_in_context(
+            &pasted,
+            "hello team\nSend the release note today "
+        ));
     }
 
     #[test]
@@ -14880,15 +14621,11 @@ mod tests {
             streaming_provider_from_config(None, "deepgram/nova-3"),
             Some(StreamingProvider::Deepgram)
         );
-        // The AssemblyAI-first default model runs the Dictation endpoint, so
-        // streaming is off unless it is explicitly selected.
+        // Only the Deepgram model defaults to streaming; every other batch
+        // model is off unless the provider is selected explicitly.
         assert_eq!(
-            streaming_provider_from_config(None, "assemblyai/universal-3-5-pro"),
+            streaming_provider_from_config(None, "openai/whisper-large-v3-turbo"),
             None
-        );
-        assert_eq!(
-            streaming_provider_from_config(Some("assemblyai"), "assemblyai/universal-3-5-pro"),
-            Some(StreamingProvider::AssemblyAiDirect)
         );
         assert_eq!(
             streaming_provider_from_config(Some("off"), "deepgram/nova-3"),
@@ -14898,102 +14635,33 @@ mod tests {
             streaming_provider_from_config(Some("deepgram"), "openai/whisper-large-v3-turbo"),
             Some(StreamingProvider::Deepgram)
         );
+        // "telnyx" is an alias for the default Telnyx-hosted Deepgram
+        // engine; the removed direct-AssemblyAI spelling stays unclaimed.
+        assert_eq!(
+            streaming_provider_from_config(Some("telnyx"), "deepgram/nova-3"),
+            Some(StreamingProvider::Deepgram)
+        );
         assert_eq!(
             streaming_provider_from_config(Some("assemblyai"), "deepgram/nova-3"),
-            Some(StreamingProvider::AssemblyAiDirect)
+            None
         );
         assert_eq!(
             streaming_provider_from_config(
                 Some("assemblyai-telnyx"),
-                "assemblyai/universal-3-5-pro"
+                "openai/whisper-large-v3-turbo"
             ),
             Some(StreamingProvider::AssemblyAi)
         );
     }
 
-    #[test]
-    fn assemblyai_direct_query_builds_the_default_streaming_url() {
-        let vocabulary = vec![String::from("Telnyx"), String::from("Claude Code")];
-        let query = assemblyai_direct_query_with(ASSEMBLYAI_STREAMING_MODEL, "en-US", &vocabulary);
-
-        assert!(query.contains("sample_rate=48000"));
-        assert!(query.contains("speech_model=universal-streaming-english"));
-        // The dictation streaming models format final turns natively.
-        assert!(query.contains("format_turns=true"));
-        assert!(query.contains("keyterms_prompt=%5B%22Telnyx%22%2C%22Claude%20Code%22%5D"));
-        assert!(!query.contains("language_codes"));
-    }
-
-    #[test]
-    fn assemblyai_direct_query_with_pro_model_sends_language_codes() {
-        let query = assemblyai_direct_query_with("universal-3-6-pro", "en-IN", &[]);
-
-        assert!(query.contains("speech_model=universal-3-6-pro"));
-        assert!(query.contains("language_codes=%5B%22en%22%5D"));
-        assert!(!query.contains("format_turns"));
-    }
-
-    #[test]
-    fn assemblyai_language_code_maps_supported_languages() {
-        assert_eq!(assemblyai_language_code("en-IN").as_deref(), Some("en"));
-        assert_eq!(assemblyai_language_code("en").as_deref(), Some("en"));
-        assert_eq!(assemblyai_language_code("hi").as_deref(), Some("hi"));
-        assert_eq!(assemblyai_language_code("auto"), None);
-        assert_eq!(assemblyai_language_code("off"), None);
-        assert_eq!(assemblyai_language_code(""), None);
-        assert_eq!(assemblyai_language_code("zz-XX"), None);
-    }
-
-    #[test]
-    fn wav_duration_ms_measures_the_recorded_wav() -> Result<(), AppError> {
-        let samples = vec![0_i16; 48_000];
-        let wav = wav_bytes(&samples, 48_000)?;
-
-        let Some(parsed) = parse_wav_pcm16(&wav) else {
-            return Err(AppError::Transcription(String::from(
-                "wav_bytes output should parse as PCM16",
-            )));
-        };
-        assert_eq!(parsed.samples.len(), 48_000);
-        assert_eq!(parsed.sample_rate, 48_000);
-        assert_eq!(parsed.channels, 1);
-        // One second of mono 16-bit audio at 48 kHz.
-        assert_eq!(wav_duration_ms(&wav), Some(1_000));
-
-        assert_eq!(wav_duration_ms(b"not a wav"), None);
-        Ok(())
-    }
-
-    #[test]
-    fn assembly_dictation_response_parses_verbatim_and_cleaned_text() -> Result<(), AppError> {
-        let failed: AssemblyDictationResponse =
-            serde_json::from_str(r#"{"text":"hello","llm_response":null,"llm_error":"timeout"}"#)
-                .map_err(|error| AppError::Transcription(error.to_string()))?;
-        assert_eq!(failed.text.as_deref(), Some("hello"));
-        assert_eq!(failed.llm_response, None);
-        assert_eq!(failed.llm_error.as_deref(), Some("timeout"));
-
-        let cleaned: AssemblyDictationResponse = serde_json::from_str(
-            r#"{"text":"hi","llm_response":"Hi.","llm_error":null,"request_time_ms":123.4}"#,
-        )
-        .map_err(|error| AppError::Transcription(error.to_string()))?;
-        assert_eq!(cleaned.text.as_deref(), Some("hi"));
-        assert_eq!(cleaned.llm_response.as_deref(), Some("Hi."));
-        assert_eq!(cleaned.llm_error, None);
-        assert_eq!(cleaned.request_time_ms, Some(123.4));
-        Ok(())
-    }
-
     fn missing_key_config(
         telnyx_api_key: Option<&str>,
-        assemblyai_api_key: Option<&str>,
         stt_model: &str,
         streaming_stt: Option<StreamingProvider>,
         stt_fallbacks: Vec<SttFallback>,
     ) -> Config {
         Config {
             telnyx_api_key: telnyx_api_key.map(str::to_owned),
-            assemblyai_api_key: assemblyai_api_key.map(str::to_owned),
             llm_cleanup: CleanupMode::Auto,
             litellm_base: None,
             litellm_key: None,
@@ -15017,59 +14685,40 @@ mod tests {
 
     #[test]
     fn missing_required_key_reports_the_first_missing_provider_key() {
-        // The AssemblyAI-first default pipeline needs only the AssemblyAI key.
-        let assemblyai =
-            missing_key_config(None, None, "assemblyai/universal-3-5-pro", None, Vec::new());
+        // Every cloud path is Telnyx-hosted now, so the Telnyx key is the
+        // one key the pipeline itself requires, streaming or not.
+        let batch = missing_key_config(None, "deepgram/nova-3", None, Vec::new());
         assert_eq!(
-            assemblyai.missing_required_key_with(None, None),
-            Some("ASSEMBLYAI_API_KEY")
-        );
-        assert_eq!(
-            assemblyai.missing_required_key_with(Some("assemblyai-key"), None),
-            None
+            batch.missing_required_key_with(None),
+            Some("TELNYX_API_KEY")
         );
 
-        // Telnyx-hosted batch models still require the Telnyx key.
+        // Key present: nothing is missing, with streaming and the default
+        // Telnyx fallback rung in the chain.
         let deepgram = missing_key_config(
-            None,
-            None,
+            Some("telnyx-key"),
             "deepgram/nova-3",
-            None,
+            Some(StreamingProvider::Deepgram),
             vec![SttFallback::Telnyx(String::from(
                 "openai/whisper-large-v3-turbo",
             ))],
         );
-        assert_eq!(
-            deepgram.missing_required_key_with(None, None),
-            Some("TELNYX_API_KEY")
-        );
+        assert_eq!(deepgram.missing_required_key_with(None), None);
 
-        // The default fallback shape for an assemblyai primary: the assemblyai
-        // fallback keeps the AssemblyAI key required.
-        let default_fallback = missing_key_config(
-            None,
-            None,
-            "assemblyai/universal-3-5-pro",
-            None,
-            vec![SttFallback::AssemblyAi(None)],
-        );
-        assert_eq!(
-            default_fallback.missing_required_key_with(None, None),
-            Some("ASSEMBLYAI_API_KEY")
-        );
-
-        // An assemblyai fallback pulls the AssemblyAI key requirement in even
-        // when the primary batch model is hosted elsewhere.
-        let assemblyai_fallback = missing_key_config(
+        // An xAI fallback rung adds its own key requirement.
+        let xai_fallback = missing_key_config(
             Some("telnyx-key"),
-            None,
             "deepgram/nova-3",
             None,
-            vec![SttFallback::AssemblyAi(None)],
+            vec![SttFallback::Xai],
         );
         assert_eq!(
-            assemblyai_fallback.missing_required_key_with(None, None),
-            Some("ASSEMBLYAI_API_KEY")
+            xai_fallback.missing_required_key_with(None),
+            Some("XAI_API_KEY")
+        );
+        assert_eq!(
+            xai_fallback.missing_required_key_with(Some("xai-key")),
+            None
         );
     }
 
@@ -15185,254 +14834,6 @@ mod tests {
     #[test]
     fn streaming_batch_verification_has_a_short_deadline() {
         assert!(super::STREAMING_BATCH_VERIFY_TIMEOUT <= std::time::Duration::from_secs(2));
-    }
-
-    #[test]
-    fn preview_streaming_needs_both_the_assemblyai_model_and_the_direct_stream() {
-        // Preview-only composition: an assemblyai/* primary model on the
-        // direct AssemblyAI stream.
-        assert!(preview_only_streaming(
-            "assemblyai/universal-3-5-pro",
-            Some(StreamingProvider::AssemblyAiDirect)
-        ));
-        // The Telnyx-hosted AssemblyAI stream keeps the legacy composition.
-        assert!(!preview_only_streaming(
-            "assemblyai/universal-3-5-pro",
-            Some(StreamingProvider::AssemblyAi)
-        ));
-        // Any other primary model keeps streaming-as-result.
-        assert!(!preview_only_streaming(
-            "deepgram/nova-3",
-            Some(StreamingProvider::AssemblyAiDirect)
-        ));
-        assert!(!preview_only_streaming(
-            "deepgram/nova-3",
-            Some(StreamingProvider::Deepgram)
-        ));
-        // Without a streaming provider the pipeline is batch dictation only.
-        assert!(!preview_only_streaming(
-            "assemblyai/universal-3-5-pro",
-            None
-        ));
-        assert!(!preview_only_streaming("deepgram/nova-3", None));
-    }
-
-    #[test]
-    fn preview_release_uses_the_dictation_result_over_a_healthy_streaming_final() {
-        let dictation = SttResult {
-            text: String::from("the batch transcript"),
-            llm_cleaned: None,
-            from_local: false,
-        };
-        let streaming_final = StreamingText {
-            text: String::from("the streaming transcript"),
-            source: "final",
-        };
-
-        let outcome = preview_release_stt(Ok(dictation), Some(streaming_final));
-
-        // A healthy streaming final never wins in preview-only mode.
-        assert_eq!(outcome.text, "the batch transcript");
-        assert!(outcome.llm_cleaned.is_none());
-    }
-
-    #[test]
-    fn preview_release_falls_back_to_the_stream_preview_when_dictation_fails() {
-        let error = AppError::Transcription(String::from("dictation unavailable"));
-        let streaming_final = StreamingText {
-            text: String::from("matches the preview on screen"),
-            source: "final",
-        };
-
-        let outcome = preview_release_stt(Err(error), Some(streaming_final));
-
-        assert_eq!(outcome.text, "matches the preview on screen");
-        assert!(outcome.llm_cleaned.is_none());
-    }
-
-    #[test]
-    fn preview_release_maps_a_barren_stream_to_the_failed_audio_path() {
-        let error = AppError::Transcription(String::from("dictation unavailable"));
-
-        // A barren stream yields the empty result, which the pipeline's
-        // shared empty-transcript check turns into save_failed_audio.
-        let no_stream = preview_release_stt(Err(error), None);
-        assert!(no_stream.text.trim().is_empty());
-
-        let whitespace_stream = preview_release_stt(
-            Err(AppError::Transcription(String::from(
-                "dictation unavailable",
-            ))),
-            Some(StreamingText {
-                text: String::from("   "),
-                source: "best_available",
-            }),
-        );
-        assert!(whitespace_stream.text.trim().is_empty());
-    }
-
-    #[test]
-    fn dictation_upload_config_carries_raw_pcm_metadata() {
-        let english = dictation_upload_config(48_000, "en-IN", &[]);
-        assert_eq!(english["sample_rate"], serde_json::json!(48_000));
-        assert_eq!(english["channels"], serde_json::json!(1));
-        assert_eq!(english["language_codes"], serde_json::json!(["en"]));
-        assert!(english.get("keyterms_prompt").is_none());
-
-        let auto_with_terms = dictation_upload_config(44_100, "auto", &[String::from("Telnyx")]);
-        assert_eq!(auto_with_terms["sample_rate"], serde_json::json!(44_100));
-        assert!(auto_with_terms.get("language_codes").is_none());
-        assert_eq!(
-            auto_with_terms["keyterms_prompt"],
-            serde_json::json!(["Telnyx"])
-        );
-    }
-
-    #[test]
-    fn dictation_upload_form_writes_config_before_audio_and_ends_at_feed_eof()
-    -> Result<(), AppError> {
-        let (sender, receiver) = mpsc::channel::<Vec<i16>>();
-        sender
-            .send(vec![1_i16, -2, 3])
-            .map_err(|error| AppError::Transcription(error.to_string()))?;
-        sender
-            .send(vec![4_i16])
-            .map_err(|error| AppError::Transcription(error.to_string()))?;
-        // Dropping the last sender is what release does by dropping the
-        // capture stream: the reader must serve the queued chunks and then
-        // end the request body.
-        drop(sender);
-        let config = dictation_upload_config(48_000, "en-US", &[]).to_string();
-        let form = dictation_upload_form(
-            config,
-            DictationUploadReader {
-                receiver,
-                buffer: Vec::new(),
-            },
-        )?;
-        let mut body = Vec::new();
-        let _ = form
-            .into_reader()
-            .read_to_end(&mut body)
-            .map_err(|error| AppError::Transcription(error.to_string()))?;
-
-        let headers = String::from_utf8_lossy(&body);
-        // The endpoint rejects audio that arrives before config, so the
-        // wire order is the contract: config part first, audio second.
-        let config_at = headers
-            .find("name=\"config\"")
-            .ok_or_else(|| AppError::Transcription(String::from("config part missing")))?;
-        let audio_at = headers
-            .find("name=\"audio\"")
-            .ok_or_else(|| AppError::Transcription(String::from("audio part missing")))?;
-        assert!(
-            config_at < audio_at,
-            "config part at {config_at} must precede the audio part at {audio_at}"
-        );
-        assert!(headers.contains("Content-Type: audio/pcm"));
-        assert!(headers.contains("\"sample_rate\":48000"));
-        // The terminating boundary only appears once every part is served,
-        // which proves the body ends when the feed drops instead of hanging.
-        assert!(body.ends_with(b"--\r\n"));
-
-        let expected_pcm = pcm_bytes(&[1_i16, -2, 3, 4]);
-        let Some(pcm_at) = body
-            .windows(expected_pcm.len())
-            .position(|window| window == expected_pcm.as_slice())
-        else {
-            return Err(AppError::Transcription(String::from(
-                "streamed chunks must arrive as little-endian PCM in order",
-            )));
-        };
-        assert!(
-            pcm_at > audio_at,
-            "PCM data must sit inside the audio part, after its headers"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn dictation_upload_reader_serves_partial_reads_and_ends_at_eof() -> Result<(), AppError> {
-        let (sender, receiver) = mpsc::channel::<Vec<i16>>();
-        sender
-            .send(vec![7_i16, 8, 9])
-            .map_err(|error| AppError::Transcription(error.to_string()))?;
-        drop(sender);
-        let mut reader = DictationUploadReader {
-            receiver,
-            buffer: Vec::new(),
-        };
-        // One byte per read forces the reader to split buffered chunks
-        // across many calls instead of stalling on the buffer boundary.
-        let mut served = Vec::new();
-        let mut one = [0_u8; 1];
-        while reader
-            .read(&mut one)
-            .map_err(|error| AppError::Transcription(error.to_string()))?
-            > 0
-        {
-            served.push(one[0]);
-        }
-        assert_eq!(served, pcm_bytes(&[7_i16, 8, 9]));
-        // After EOF another read still reports EOF, not a stall.
-        assert_eq!(
-            reader
-                .read(&mut one)
-                .map_err(|error| AppError::Transcription(error.to_string()))?,
-            0
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn dictation_upload_release_uses_the_uploaded_result_over_batch() -> Result<(), AppError> {
-        let uploaded = SttResult {
-            text: String::from("streamed transcript"),
-            llm_cleaned: None,
-            from_local: false,
-        };
-        match dictation_upload_release(Some(Ok(uploaded))) {
-            DictationUploadRelease::Uploaded(result) => {
-                assert_eq!(result.text, "streamed transcript");
-            }
-            DictationUploadRelease::UploadFailed | DictationUploadRelease::NotUploaded => {
-                return Err(AppError::Transcription(String::from(
-                    "a completed upload must release as Uploaded",
-                )));
-            }
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn dictation_upload_release_falls_back_to_the_buffered_wav_batch() {
-        // A failed upload (network error, 4xx/5xx, missed budget) releases
-        // as UploadFailed, which preview_stt_result answers with exactly one
-        // batch transcribe of the buffered WAV; no upload at all releases
-        // as NotUploaded with the same batch path as before.
-        assert!(matches!(
-            dictation_upload_release(Some(Err(AppError::RateLimited))),
-            DictationUploadRelease::UploadFailed
-        ));
-        assert!(matches!(
-            dictation_upload_release(Some(Err(AppError::TranscriptionStatus {
-                status: 413,
-                message: String::new(),
-            }))),
-            DictationUploadRelease::UploadFailed
-        ));
-        assert!(matches!(
-            dictation_upload_release(None),
-            DictationUploadRelease::NotUploaded
-        ));
-    }
-
-    #[test]
-    fn dictation_upload_request_timeout_covers_the_recording_window() {
-        let timeout = dictation_upload_request_timeout(30);
-        assert!(
-            timeout > super::STT_REQUEST_TIMEOUT.saturating_add(std::time::Duration::from_secs(30))
-        );
     }
 
     #[test]
@@ -15997,18 +15398,24 @@ mod tests {
             bundle_id: String::from("com.google.Gmail"),
             text_before_cursor: String::new(),
             selected_text: String::new(),
+            writable: None,
+            focused_pid: None,
         };
         let chat = AccessibilityContext {
             app_name: String::from("Slack"),
             bundle_id: String::from("com.tinyspeck.slackmacgap"),
             text_before_cursor: String::new(),
             selected_text: String::new(),
+            writable: None,
+            focused_pid: None,
         };
         let notes = AccessibilityContext {
             app_name: String::from("Notion"),
             bundle_id: String::from("notion.id"),
             text_before_cursor: String::new(),
             selected_text: String::new(),
+            writable: None,
+            focused_pid: None,
         };
 
         assert_eq!(cleanup_profile(Some(&email), &[]), CleanupProfile::Email);
@@ -16024,6 +15431,8 @@ mod tests {
             bundle_id: String::from("com.tinyspeck.slackmacgap"),
             text_before_cursor: String::new(),
             selected_text: String::new(),
+            writable: None,
+            focused_pid: None,
         };
         let bindings = vec![PromptBinding {
             bundle_id: String::from("com.tinyspeck.slackmacgap"),
@@ -16146,7 +15555,6 @@ mod tests {
         let app = App {
             config: Config {
                 telnyx_api_key: Some(String::from("test")),
-                assemblyai_api_key: None,
                 llm_cleanup: CleanupMode::Off,
                 litellm_base: None,
                 litellm_key: None,
@@ -16174,6 +15582,7 @@ mod tests {
             cleanup_prompts: Mutex::new(CleanupPromptCache::default()),
             latest_release: Mutex::new(None),
             prompt_bindings: Mutex::new(Vec::new()),
+            copy_prompt: Mutex::new(None),
             vocabulary_usage: Mutex::new(usage),
             vocabulary_usage_path: usage_path.clone(),
             state: Mutex::new(AppState::default()),
@@ -16190,7 +15599,6 @@ mod tests {
         let app = App {
             config: Config {
                 telnyx_api_key: Some(String::from("test")),
-                assemblyai_api_key: None,
                 llm_cleanup: CleanupMode::Off,
                 litellm_base: None,
                 litellm_key: None,
@@ -16218,6 +15626,7 @@ mod tests {
             cleanup_prompts: Mutex::new(CleanupPromptCache::default()),
             latest_release: Mutex::new(None),
             prompt_bindings: Mutex::new(Vec::new()),
+            copy_prompt: Mutex::new(None),
             vocabulary_usage: Mutex::new(HashMap::new()),
             vocabulary_usage_path: temp_vocabulary_usage_path(),
             state: Mutex::new(AppState::default()),
@@ -16240,7 +15649,6 @@ mod tests {
         let app = App {
             config: Config {
                 telnyx_api_key: Some(String::from("test")),
-                assemblyai_api_key: None,
                 llm_cleanup: CleanupMode::Auto,
                 litellm_base: None,
                 litellm_key: None,
@@ -16268,6 +15676,7 @@ mod tests {
             cleanup_prompts: Mutex::new(CleanupPromptCache::default()),
             latest_release: Mutex::new(None),
             prompt_bindings: Mutex::new(Vec::new()),
+            copy_prompt: Mutex::new(None),
             vocabulary_usage: Mutex::new(HashMap::new()),
             vocabulary_usage_path: temp_vocabulary_usage_path(),
             state: Mutex::new(AppState::default()),
@@ -16307,7 +15716,6 @@ mod tests {
         let app = App {
             config: Config {
                 telnyx_api_key: Some(String::from("test")),
-                assemblyai_api_key: None,
                 llm_cleanup: CleanupMode::Auto,
                 litellm_base: None,
                 litellm_key: None,
@@ -16338,6 +15746,7 @@ mod tests {
             cleanup_prompts: Mutex::new(CleanupPromptCache::default()),
             latest_release: Mutex::new(None),
             prompt_bindings: Mutex::new(Vec::new()),
+            copy_prompt: Mutex::new(None),
             vocabulary_usage: Mutex::new(HashMap::new()),
             vocabulary_usage_path: temp_vocabulary_usage_path(),
             state: Mutex::new(AppState::default()),
@@ -16365,7 +15774,6 @@ mod tests {
         let app = App {
             config: Config {
                 telnyx_api_key: Some(String::from("test")),
-                assemblyai_api_key: None,
                 llm_cleanup: CleanupMode::Auto,
                 litellm_base: None,
                 litellm_key: None,
@@ -16393,6 +15801,7 @@ mod tests {
             cleanup_prompts: Mutex::new(CleanupPromptCache::default()),
             latest_release: Mutex::new(None),
             prompt_bindings: Mutex::new(Vec::new()),
+            copy_prompt: Mutex::new(None),
             vocabulary_usage: Mutex::new(HashMap::new()),
             vocabulary_usage_path: temp_vocabulary_usage_path(),
             state: Mutex::new(AppState::default()),
@@ -16427,11 +15836,10 @@ mod tests {
         App {
             config: Config {
                 telnyx_api_key: Some(String::from("test")),
-                assemblyai_api_key: None,
                 llm_cleanup,
                 litellm_base: None,
                 litellm_key: None,
-                stt_model: String::from("assemblyai/universal-3-5-pro"),
+                stt_model: String::from("deepgram/nova-3"),
                 stt_language: String::from("en-US"),
                 streaming_stt: None,
                 stt_fallbacks: Vec::new(),
@@ -16461,6 +15869,7 @@ mod tests {
             cleanup_prompts: Mutex::new(CleanupPromptCache::default()),
             latest_release: Mutex::new(None),
             prompt_bindings: Mutex::new(Vec::new()),
+            copy_prompt: Mutex::new(None),
             vocabulary_usage: Mutex::new(HashMap::new()),
             vocabulary_usage_path: temp_vocabulary_usage_path(),
             state: Mutex::new(AppState::default()),
@@ -16850,11 +16259,11 @@ mod tests {
         // The label must follow the configured STT model, because the
         // streaming label can read "Disabled" for a model that batch STT
         // still serves fine.
-        assert_eq!(
-            dashboard_provider_label("assemblyai/universal-3-5-pro"),
-            "Assemblyai"
-        );
         assert_eq!(dashboard_provider_label("deepgram/nova-3"), "Deepgram");
+        assert_eq!(
+            dashboard_provider_label("whisper-large-v3"),
+            "Whisper-large-v3"
+        );
         assert_eq!(dashboard_provider_label("telnyx/other"), "Telnyx");
         assert_eq!(dashboard_provider_label(""), "Batch STT");
     }
@@ -16871,8 +16280,10 @@ mod tests {
     fn prepare_text_uses_provider_cleanup_and_still_applies_local_fixes() -> Result<(), AppError> {
         let app = provider_cleanup_test_app(CleanupMode::Auto);
 
-        // The verbatim transcript still carries the filler; the provider
-        // cleaned text from AssemblyAI Dictation has already resolved it.
+        // The verbatim transcript still carries the filler; the
+        // provider-cleaned text has already resolved it. No live
+        // provider sends a cleaned transcript today, so the branch is
+        // exercised directly to keep the contract pinned.
         let prepared = app.prepare_text(
             "um this is a longer dictated sentence that should probably ship the boloo draft",
             &DictationWarmup::default(),
@@ -16918,7 +16329,6 @@ mod tests {
         let app = App {
             config: Config {
                 telnyx_api_key: Some(String::from("test")),
-                assemblyai_api_key: None,
                 llm_cleanup: CleanupMode::Off,
                 litellm_base: None,
                 litellm_key: None,
@@ -16946,6 +16356,7 @@ mod tests {
             cleanup_prompts: Mutex::new(CleanupPromptCache::default()),
             latest_release: Mutex::new(None),
             prompt_bindings: Mutex::new(Vec::new()),
+            copy_prompt: Mutex::new(None),
             vocabulary_usage: Mutex::new(HashMap::new()),
             vocabulary_usage_path: temp_vocabulary_usage_path(),
             state: Mutex::new(AppState::default()),
@@ -16975,7 +16386,6 @@ mod tests {
         let app = Arc::new(App {
             config: Config {
                 telnyx_api_key: Some(String::from("test")),
-                assemblyai_api_key: None,
                 llm_cleanup: CleanupMode::Off,
                 litellm_base: None,
                 litellm_key: None,
@@ -17003,6 +16413,7 @@ mod tests {
             cleanup_prompts: Mutex::new(CleanupPromptCache::default()),
             latest_release: Mutex::new(None),
             prompt_bindings: Mutex::new(Vec::new()),
+            copy_prompt: Mutex::new(None),
             vocabulary_usage: Mutex::new(HashMap::new()),
             vocabulary_usage_path: temp_vocabulary_usage_path(),
             state: Mutex::new(AppState::default()),
@@ -17035,7 +16446,6 @@ mod tests {
         let app = App {
             config: Config {
                 telnyx_api_key: Some(String::from("test")),
-                assemblyai_api_key: None,
                 llm_cleanup: CleanupMode::Off,
                 litellm_base: None,
                 litellm_key: None,
@@ -17063,6 +16473,7 @@ mod tests {
             cleanup_prompts: Mutex::new(CleanupPromptCache::default()),
             latest_release: Mutex::new(None),
             prompt_bindings: Mutex::new(Vec::new()),
+            copy_prompt: Mutex::new(None),
             vocabulary_usage: Mutex::new(HashMap::new()),
             vocabulary_usage_path: temp_vocabulary_usage_path(),
             state: Mutex::new(AppState {
@@ -17085,7 +16496,6 @@ mod tests {
         let history_app = App {
             config: Config {
                 telnyx_api_key: Some(String::from("test")),
-                assemblyai_api_key: None,
                 llm_cleanup: CleanupMode::Off,
                 litellm_base: None,
                 litellm_key: None,
@@ -17113,6 +16523,7 @@ mod tests {
             cleanup_prompts: Mutex::new(CleanupPromptCache::default()),
             latest_release: Mutex::new(None),
             prompt_bindings: Mutex::new(Vec::new()),
+            copy_prompt: Mutex::new(None),
             vocabulary_usage: Mutex::new(HashMap::new()),
             vocabulary_usage_path: temp_vocabulary_usage_path(),
             state: Mutex::new(AppState {
@@ -17311,14 +16722,24 @@ mod tests {
     #[test]
     fn parses_multi_provider_stt_fallbacks() {
         assert_eq!(
-            parse_stt_fallbacks("xai,assemblyai:universal-2,telnyx:openai/whisper-large-v3-turbo"),
+            parse_stt_fallbacks("xai,telnyx:openai/whisper-large-v3-turbo"),
             vec![
                 SttFallback::Xai,
-                SttFallback::AssemblyAi(Some(String::from("universal-2"))),
                 SttFallback::Telnyx(String::from("openai/whisper-large-v3-turbo")),
             ]
         );
+        // The removed direct-AssemblyAI rungs drop out of a legacy chain
+        // instead of being read as Telnyx model names.
+        assert_eq!(
+            parse_stt_fallbacks(
+                "assemblyai,off,telnyx:openai/whisper-large-v3-turbo,assemblyai:universal-2"
+            ),
+            vec![SttFallback::Telnyx(String::from(
+                "openai/whisper-large-v3-turbo"
+            ))]
+        );
         assert!(parse_stt_fallbacks("off").is_empty());
+        assert!(parse_stt_fallbacks("assemblyai").is_empty());
     }
 
     #[test]
@@ -17682,10 +17103,12 @@ mod tests {
 
     #[test]
     fn fallback_provider_empty_transcripts_stay_terminal() {
-        // The xAI and AssemblyAI empty checks keep the plain terminal error:
-        // no evidence is computed there, so nothing about their empties became
-        // retryable.
-        for provider in ["xAI", "AssemblyAI"] {
+        // A provider-labeled empty transcript keeps the plain terminal
+        // error: no evidence is computed on the xAI route, so its
+        // empties never became retryable. The Telnyx label exercises
+        // the same interpolated format without the removed fallback
+        // rung.
+        for provider in ["xAI", "Telnyx"] {
             assert!(matches!(
                 non_empty_transcript(None, provider),
                 Err(AppError::Transcription(_))
@@ -17972,14 +17395,14 @@ mod tests {
         hub.on_audio(&[1; 60]);
         let (preview_sender, preview_receiver) = mpsc::channel();
         hub.attach("streaming_preview", preview_sender, 1_000);
-        let (upload_sender, upload_receiver) = mpsc::channel();
-        hub.attach("dictation_upload", upload_sender, 1_000);
+        let (second_sender, second_receiver) = mpsc::channel();
+        hub.attach("second_sink", second_sender, 1_000);
         hub.seal();
         hub.on_audio(&[2; 60]);
 
         let expected = [vec![1; 60], vec![2; 60]].concat();
         assert_eq!(hub_samples(&preview_receiver), expected);
-        assert_eq!(hub_samples(&upload_receiver), expected);
+        assert_eq!(hub_samples(&second_receiver), expected);
     }
 
     #[test]
@@ -18098,7 +17521,6 @@ mod tests {
         Arc::new(App {
             config: Config {
                 telnyx_api_key: Some(String::from("test")),
-                assemblyai_api_key: None,
                 llm_cleanup: CleanupMode::Off,
                 litellm_base: None,
                 litellm_key: None,
@@ -18125,6 +17547,7 @@ mod tests {
             learned_vocabulary_mtime: Mutex::new(None),
             cleanup_prompts: Mutex::new(CleanupPromptCache::default()),
             prompt_bindings: Mutex::new(Vec::new()),
+            copy_prompt: Mutex::new(None),
             vocabulary_usage: Mutex::new(HashMap::new()),
             vocabulary_usage_path: temp_vocabulary_usage_path(),
             state: Mutex::new(AppState::default()),
@@ -18481,8 +17904,8 @@ mod tests {
             batch_transcript_after_echo("I fixed the Kubernetes deploy today", Some(&terms),),
             BatchEcho::Transcript(String::from("I fixed the Kubernetes deploy today"))
         );
-        // No free-text prompt sent: the AssemblyAI batch routes (structured
-        // keyterms, never a free-text prompt) are untouched by construction.
+        // No free-text prompt sent: the xAI batch route (structured
+        // keyterms, never a free-text prompt) is untouched by construction.
         assert_eq!(
             batch_transcript_after_echo("Kubernetes Kubernetes Kubernetes", None),
             BatchEcho::Transcript(String::from("Kubernetes Kubernetes Kubernetes"))
@@ -19012,64 +18435,6 @@ mod tests {
     }
 
     #[test]
-    fn llm_instruction_cap_truncates_by_unicode_scalar() {
-        let multi_byte = "जो".repeat(1_100);
-        let truncated = truncate_to_chars(&multi_byte, CLEANUP_PROMPT_CAP_CHARS);
-        assert_eq!(truncated.chars().count(), CLEANUP_PROMPT_CAP_CHARS);
-        assert!(multi_byte.chars().count() > CLEANUP_PROMPT_CAP_CHARS);
-        assert_eq!(
-            truncate_to_chars("short", CLEANUP_PROMPT_CAP_CHARS),
-            "short"
-        );
-        assert_eq!(truncate_to_chars("जो ये मैं", 5), "जो ये");
-        assert_eq!(truncate_to_chars("जो ये मैं", 6), "जो ये ");
-    }
-
-    #[test]
-    fn dictation_batch_config_without_override_keeps_today_shape() {
-        // Regression pin: with no override the config carries exactly the
-        // fields the request always had, byte-identical, and no
-        // llm_instruction key exists for the endpoint to reject.
-        let language = "en-US";
-        let vocabulary = vec![String::from("Telnyx"), String::from("HJX7")];
-        let config = dictation_batch_config(language, &vocabulary, None);
-        let legacy = serde_json::json!({
-            "language_codes": ["en"],
-            "keyterms_prompt": ["Telnyx", "HJX7"],
-        });
-        assert_eq!(config, legacy);
-        assert!(config.get("llm_instruction").is_none());
-        assert_eq!(
-            serde_json::to_string(&config).unwrap(),
-            serde_json::to_string(&legacy).unwrap()
-        );
-
-        // The no-vocabulary and unknown-language corners keep their shape
-        // too: an empty config object, exactly as before overrides existed.
-        assert_eq!(
-            dictation_batch_config("en-US", &[], None),
-            serde_json::json!({"language_codes": ["en"]})
-        );
-        assert_eq!(
-            dictation_batch_config("zz-unknown", &[], None),
-            serde_json::json!({})
-        );
-    }
-
-    #[test]
-    fn dictation_batch_config_with_override_adds_llm_instruction() {
-        let config = dictation_batch_config(
-            "en-US",
-            &[],
-            Some("Rewrite as a concise clinical chart note."),
-        );
-        assert_eq!(
-            config["llm_instruction"],
-            serde_json::json!("Rewrite as a concise clinical chart note.")
-        );
-    }
-
-    #[test]
     fn cleanup_override_reads_and_reloads_without_restart() -> Result<(), AppError> {
         let path = temp_cleanup_prompts_path();
         let app = plain_test_app();
@@ -19303,6 +18668,169 @@ mod tests {
             inserted_at: std::time::Instant::now(),
         };
         app.finish_edit_learning_capture(&claim);
+    }
+
+    /// The fallback arm needs `show_copy_transcript_popup` to find no
+    /// helper (a nonexistent root keeps the spawn quiet in tests), which
+    /// routes through the armed-unguided branch exactly like a failed
+    /// launch in production.
+    fn manual_copy_test_app() -> Arc<App> {
+        edit_learning_test_app_with_root(
+            env::temp_dir().join("bolo-manual-copy-tests-root-that-does-not-exist"),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+    }
+
+    #[test]
+    fn manual_copy_fallback_arms_the_poll_watch_for_a_confirmed_read() -> Result<(), AppError> {
+        let app = manual_copy_test_app();
+        let transcript = "please call Sinead about the meeting";
+        app.manual_copy_fallback("raw dictated words", transcript, "not_writable", true)?;
+
+        // The synthetic prepared text arms the observation against the
+        // transcript exactly as a prepared paste would.
+        let armed = app.lock_state()?.edit_learning.clone();
+        assert_eq!(
+            armed.as_ref().map(|learning| learning.pasted_text.as_str()),
+            Some(transcript)
+        );
+        assert!(armed.is_some_and(|learning| {
+            learning.capture_at.is_none() && !learning.captured && learning.popup_pid.is_none()
+        }));
+        // The quality watch rides along, and history keeps the entry (the
+        // Paste Last queue needs it) with the dictation recorded.
+        assert!(app.lock_state()?.post_insert_watch.is_some());
+        assert_eq!(
+            app.lock_state()?
+                .history
+                .front()
+                .map(|entry| entry.text.as_str()),
+            Some(transcript)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn manual_copy_fallback_without_ax_confirmation_keeps_today_behavior() -> Result<(), AppError> {
+        // An unavailable press-time read (or one without the writable
+        // verdict) shows the popup and records history but never arms.
+        let app = manual_copy_test_app();
+        let transcript = "please call Sinead about the meeting";
+        app.manual_copy_fallback("raw dictated words", transcript, "paste_failed", false)?;
+
+        assert_eq!(app.lock_state()?.edit_learning, None);
+        assert_eq!(
+            app.lock_state()?
+                .history
+                .front()
+                .map(|entry| entry.text.as_str()),
+            Some(transcript)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn manual_copy_fallback_skips_the_watch_for_empty_transcripts() -> Result<(), AppError> {
+        for transcript in ["", "   \n\t "] {
+            let app = manual_copy_test_app();
+            app.manual_copy_fallback("raw", transcript, "not_writable", true)?;
+            assert!(
+                app.lock_state()?.edit_learning.is_none(),
+                "an empty transcript must never arm the watch: {transcript:?}"
+            );
+            assert!(app.lock_state()?.history.front().is_none());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn edit_learning_probe_keeps_paste_path_claims_for_foreign_contexts() {
+        let pasted = "alpha bravo shunade delta";
+        // Paste-path observation: the first context that stops ending with
+        // the pasted text is the edit signal, whatever app it came from.
+        let other_app = AccessibilityContext {
+            app_name: String::from("Finder"),
+            text_before_cursor: String::from("totally unrelated tail"),
+            writable: Some(false),
+            focused_pid: Some(1234),
+            ..AccessibilityContext::default()
+        };
+        assert!(edit_learning_context_diverged(pasted, None, &other_app));
+        let intact = AccessibilityContext {
+            text_before_cursor: String::from(pasted),
+            focused_pid: Some(999),
+            ..AccessibilityContext::default()
+        };
+        assert!(!edit_learning_context_diverged(pasted, None, &intact));
+    }
+
+    #[test]
+    fn edit_learning_probe_gates_fallback_claims_on_the_popup_process() {
+        let pasted = "alpha bravo shunade delta";
+        let popup_pid = 4242;
+        let context = |before_cursor: &str, focused_pid: Option<i32>| AccessibilityContext {
+            text_before_cursor: String::from(before_cursor),
+            focused_pid,
+            ..AccessibilityContext::default()
+        };
+
+        // The original non-writable focus never held the paste: without
+        // the pid pin the first probe would burn the watch. Gated, the
+        // probe ignores it and keeps watching.
+        assert!(!edit_learning_context_diverged(
+            pasted,
+            Some(popup_pid),
+            &context("totally unrelated tail", Some(1234))
+        ));
+        // Clicking into the popup before any edit leaves a clean
+        // transcript prefix before the caret, which is not an edit.
+        assert!(!edit_learning_context_diverged(
+            pasted,
+            Some(popup_pid),
+            &context("alpha bravo", Some(popup_pid))
+        ));
+        // Caret at the end, no edit: intact.
+        assert!(!edit_learning_context_diverged(
+            pasted,
+            Some(popup_pid),
+            &context(pasted, Some(popup_pid))
+        ));
+        // An edited popup body no longer ends with the paste and is not a
+        // clean prefix either: that is the edit signal.
+        assert!(edit_learning_context_diverged(
+            pasted,
+            Some(popup_pid),
+            &context("alpha bravo Sinead", Some(popup_pid))
+        ));
+    }
+
+    #[test]
+    fn popup_copy_line_carries_the_current_body_text() {
+        // The Copy reply carries the popup's current (possibly edited)
+        // body, so an in-popup correction is what lands on the clipboard.
+        let edited = r#"{"type": "copy_used", "text": "please call Sinead about the meeting"}"#;
+        assert_eq!(
+            parse_popup_copy_text(edited, "stale snapshot"),
+            Some(String::from("please call Sinead about the meeting"))
+        );
+        // A pre-text reply (or a damaged line that still names copy_used)
+        // falls back to the show-time transcript so Copy still works.
+        assert_eq!(
+            parse_popup_copy_text(r#"{"type": "copy_used"}"#, "stale snapshot"),
+            Some(String::from("stale snapshot"))
+        );
+        assert_eq!(
+            parse_popup_copy_text(r#"junk {"type": "copy_used"}"#, "stale snapshot"),
+            Some(String::from("stale snapshot"))
+        );
+        // The self-dismiss line is not a Copy click.
+        assert_eq!(
+            parse_popup_copy_text(r#"{"type": "empty_dismissed"}"#, "stale snapshot"),
+            None
+        );
+        assert_eq!(parse_popup_copy_text("", "stale snapshot"), None);
     }
     #[test]
     fn dashboard_reports_default_after_clearing_startup_microphone()

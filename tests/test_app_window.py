@@ -106,10 +106,10 @@ def test_classify_key_response_maps_http_statuses():
 
 
 def _stub_fetch(status):
-    def fetch(key, url=app_window.ASSEMBLYAI_LIST_URL, timeout=None):
+    def fetch(key, url=app_window.TELNYX_KEY_LIST_URL, timeout=None):
         return status
 
-    def failing(key, url=app_window.ASSEMBLYAI_LIST_URL, timeout=None):
+    def failing(key, url=app_window.TELNYX_KEY_LIST_URL, timeout=None):
         raise OSError("no route to host")
 
     return fetch, failing
@@ -124,8 +124,8 @@ def test_validate_and_save_key_accepts_200_and_writes_env(tmp_path):
     assert verdict == "valid"
     assert "saved" in detail
     assert env.read_text() == (
-        'ASSEMBLYAI_API_KEY="abc123"\n'
-        'BOLO_STT_MODEL="assemblyai/universal-3-5-pro"\n'
+        'TELNYX_API_KEY="abc123"\n'
+        'BOLO_STT_MODEL="deepgram/nova-3"\n'
     )
     import stat
     assert stat.S_IMODE(env.stat().st_mode) == 0o600
@@ -158,7 +158,7 @@ def test_validate_and_save_key_handles_network_failure(tmp_path):
     )
 
     assert verdict == "unreachable"
-    assert "api.assemblyai.com" in detail
+    assert "api.telnyx.com" in detail
     assert not (tmp_path / "env").exists()
 
 
@@ -173,14 +173,14 @@ def test_validate_and_save_key_requires_nonempty_key(tmp_path):
 
 def test_validate_and_save_key_replaces_existing_value(tmp_path):
     env = tmp_path / "env"
-    env.write_text('ASSEMBLYAI_API_KEY="old"\nBOLO_HOTKEY="right_option"\n')
+    env.write_text('TELNYX_API_KEY="old"\nBOLO_HOTKEY="right_option"\n')
     fetch, _ = _stub_fetch(200)
 
     app_window.validate_and_save_key("new", env_path=str(env), fetch=fetch)
 
     assert env.read_text() == (
-        'ASSEMBLYAI_API_KEY="new"\nBOLO_HOTKEY="right_option"\n'
-        'BOLO_STT_MODEL="assemblyai/universal-3-5-pro"\n'
+        'TELNYX_API_KEY="new"\nBOLO_HOTKEY="right_option"\n'
+        'BOLO_STT_MODEL="deepgram/nova-3"\n'
     )
 
 
@@ -220,29 +220,24 @@ def test_validate_and_save_key_rejects_unknown_provider(tmp_path):
         "k", env_path=str(env), fetch=lambda *a, **k: 200, provider="other"
     )
 
-    # An unknown provider id falls back to AssemblyAI semantics rather
+    # An unknown provider id falls back to Telnyx semantics rather
     # than writing a variable the runtime would never read.
     assert verdict == "valid"
     assert env.read_text() == (
-        'ASSEMBLYAI_API_KEY="k"\n'
-        'BOLO_STT_MODEL="assemblyai/universal-3-5-pro"\n'
+        'TELNYX_API_KEY="k"\n'
+        'BOLO_STT_MODEL="deepgram/nova-3"\n'
     )
 
 
 def test_provider_fetchers_map_to_each_provider():
-    assert (
-        app_window.PROVIDER_KEY_FETCHERS["assemblyai"]
-        is app_window.fetch_assemblyai_status
-    )
-    assert (
-        app_window.PROVIDER_KEY_FETCHERS["telnyx"]
-        is app_window.fetch_telnyx_status
-    )
+    assert app_window.PROVIDER_KEY_FETCHERS == {
+        "telnyx": app_window.fetch_telnyx_status,
+    }
 
 
 def test_fetch_telnyx_status_sends_bearer_header(monkeypatch):
-    """The Telnyx probe authenticates with Bearer, unlike AssemblyAI's
-    raw-key header; a captured request proves the header shape."""
+    """The Telnyx probe authenticates with Bearer; a captured request
+    proves the header shape."""
     import urllib.request
 
     captured = {}
@@ -273,16 +268,11 @@ def test_fetch_telnyx_status_sends_bearer_header(monkeypatch):
     assert captured["headers"].get("Authorization") == "Bearer KEY1"
 
 
-def test_wizard_provider_choice_covers_both_providers_with_defaults():
-    assert app_window.WIZARD_PROVIDERS == ("assemblyai", "telnyx")
-    assert app_window.WIZARD_PROVIDER_TITLES["assemblyai"] == (
-        "AssemblyAI (recommended)"
-    )
-    assert app_window.WIZARD_PROVIDER_TITLES["telnyx"] == "Telnyx (legacy)"
-    assert app_window.WIZARD_PROVIDER_ENV_NAMES["assemblyai"] == "ASSEMBLYAI_API_KEY"
+def test_wizard_provider_choice_is_telnyx_only_with_defaults():
+    assert app_window.WIZARD_PROVIDERS == ("telnyx",)
+    assert app_window.WIZARD_PROVIDER_TITLES["telnyx"] == "Telnyx"
     assert app_window.WIZARD_PROVIDER_ENV_NAMES["telnyx"] == "TELNYX_API_KEY"
     assert app_window.WIZARD_PROVIDER_STT_MODELS == {
-        "assemblyai": "assemblyai/universal-3-5-pro",
         "telnyx": "deepgram/nova-3",
     }
 
@@ -596,7 +586,7 @@ def test_validate_prompt_text_enforces_empty_and_cap():
     )
     assert (
         app_window.validate_prompt_text("x" * 2049, 2048)
-        == "The prompt is too long for AssemblyAI (2048 characters max)."
+        == "The prompt is too long for Telnyx (2048 characters max)."
     )
     assert app_window.validate_prompt_text("x" * 2048, 2048) is None
     assert app_window.validate_prompt_text("Clean up my Hinglish.", 2048) is None
@@ -1330,7 +1320,7 @@ def test_wizard_step_line_shows_number_and_name():
     assert line == "Step 3 of 5 · Accessibility"
 
 
-def test_validated_key_persists_only_on_assemblyai_acceptance():
+def test_validated_key_persists_only_on_telnyx_acceptance():
     import os
 
     def fetcher(status):
@@ -1574,10 +1564,10 @@ def test_key_validation_unlocks_continue_and_advances_in_wizard():
     app_window.reset_state()
 
 
-def test_provider_picker_switches_field_and_link_per_choice():
-    """The key screen's provider choice reveals that provider's key field:
-    the placeholder, the "Get an API key" link, and the saved-validation
-    state all follow the selection, with AssemblyAI as the default."""
+def test_key_screen_pins_telnyx_provider_and_link():
+    """The key screen is Telnyx-only: no provider picker exists, and the
+    key field, the "Get an API key" link, and the saved-validation state
+    all carry the Telnyx provider."""
     app_window.reset_state()
     payload = {
         "mode": "onboarding",
@@ -1599,15 +1589,9 @@ def test_provider_picker_switches_field_and_link_per_choice():
     assert refs["screen"] == app_window.SCREEN_CONNECT_SPEECH
     key_refs = refs["key_refs"]
 
-    # The default is AssemblyAI: the recommended first choice.
-    assert key_refs["provider"] == "assemblyai"
-    assert key_refs["link_url"] == app_window.WIZARD_PROVIDER_LINKS["assemblyai"]
-
-    picker = key_refs["picker"]
-    controller = picker.target()
-    picker.setSelectedSegment_(1)
-    controller.providerChanged_(picker)
-
+    # Telnyx is the only provider: no picker is wired up, and the
+    # refs pin the Telnyx link for the "Get an API key" button.
+    assert "picker" not in key_refs
     assert key_refs["provider"] == "telnyx"
     assert key_refs["link_url"] == app_window.WIZARD_PROVIDER_LINKS["telnyx"]
     field = key_refs["field"]
@@ -1620,15 +1604,6 @@ def test_provider_picker_switches_field_and_link_per_choice():
     assert str(key_refs["detail_label"].stringValue()) == (
         app_window.WIZARD_KEY_STATUS_INITIAL
     )
-
-    # Mark AssemblyAI validated, then switch back: the row shows the
-    # saved state for that provider without re-asking for the key.
-    key_refs["validated"]["assemblyai"] = True
-    picker.setSelectedSegment_(0)
-    controller.providerChanged_(picker)
-    assert key_refs["provider"] == "assemblyai"
-    assert field.isEnabled() is False
-    assert "Key saved" in str(key_refs["detail_label"].stringValue())
     app_window.reset_state()
 
 
