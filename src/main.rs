@@ -1,5 +1,6 @@
 //! Bolo's Rust push-to-talk dictation runtime.
 
+mod audio_conditioning;
 mod recording_fsm;
 
 use std::cmp::Ordering;
@@ -42,6 +43,7 @@ use tray_icon::menu::{
 };
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
+use audio_conditioning::AudioConditioner;
 use recording_fsm::{Command as RecordingCommand, Event as RecordingEvent, RecordingFsm};
 
 const LOG_FILE: &str = "/tmp/bolo.log";
@@ -489,6 +491,14 @@ impl AppState {
 struct ActiveRecording {
     stream: Stream,
     samples: Arc<Mutex<Vec<i16>>>,
+    /// Pre-ASR conditioner shared with the audio callback, when
+    /// conditioning is enabled. `finish_recording` locks it once to drain
+    /// the sub-frame tail before the stream drops.
+    conditioner: Option<Arc<Mutex<AudioConditioner>>>,
+    /// Capture tee shared with the same callback; the flush needs it to
+    /// deliver the tail to the wire sinks before the callback (and with it
+    /// the hub) is destroyed.
+    hub: Arc<AudioHub>,
     started_at: Instant,
     sample_rate: u32,
     warmup: DictationWarmup,
@@ -496,6 +506,33 @@ struct ActiveRecording {
     /// Streamed Dictation upload for the preview-only composition, started
     /// at press so release only has to read the response.
     upload: Option<DictationUpload>,
+}
+
+impl ActiveRecording {
+    /// Drains the conditioner's sub-10 ms remainder into both audio
+    /// consumers, mirroring one callback. Must run after trailing capture
+    /// and before the stream is dropped: the callback's captures (and
+    /// therefore the hub's sinks) die with the stream, and anything still
+    /// buffered inside the conditioner at that point would be lost against
+    /// the byte-exact total-samples contract.
+    fn flush_conditioning_tail(&self) {
+        let Some(conditioner) = &self.conditioner else {
+            return;
+        };
+        let Ok(mut guard) = conditioner.lock() else {
+            // Poisoned: the callback died mid-processing; the tail is not
+            // worth killing the pipeline over.
+            return;
+        };
+        let tail = guard.flush();
+        if tail.is_empty() {
+            return;
+        }
+        if let Ok(mut samples) = self.samples.lock() {
+            samples.extend_from_slice(tail);
+        }
+        self.hub.on_audio(tail);
+    }
 }
 
 #[derive(Debug)]
@@ -2875,7 +2912,7 @@ impl App {
         let mut recording = match start_recording(
             selected_microphone_id.as_deref(),
             selected_microphone_name.as_deref(),
-            Arc::clone(&hub),
+            &hub,
         ) {
             Ok(recording) => recording,
             Err(error) => {
@@ -2987,6 +3024,11 @@ impl App {
     ) -> Result<(), AppError> {
         let trailing = capture_trailing_audio(&recording)?;
         let elapsed = recording.started_at.elapsed();
+        // Drain the conditioner's sub-10 ms tail into both consumers while
+        // the hub still exists (it dies with the audio callback's captures
+        // on the stream drop below), keeping the capture stream's
+        // total-samples contract byte exact.
+        recording.flush_conditioning_tail();
         drop(recording.stream);
         info!(
             "[pipeline] trailing_capture {}",
@@ -5620,7 +5662,7 @@ impl StreamingProvider {
 fn start_recording(
     selected_microphone_id: Option<&str>,
     selected_microphone_name: Option<&str>,
-    hub: Arc<AudioHub>,
+    hub: &Arc<AudioHub>,
 ) -> Result<ActiveRecording, AppError> {
     let host = cpal::default_host();
     let device = select_input_device(&host, selected_microphone_id, selected_microphone_name);
@@ -5638,16 +5680,57 @@ fn start_recording(
         config.channels,
         supported.sample_format()
     );
+    // Pre-ASR conditioning: AEC3 + noise suppression + AGC1 over 10 ms
+    // frames (src/audio_conditioning.rs), mirroring the WebRTC stack Willow
+    // runs in front of its ASR. Default on; BOLO_AUDIO_CONDITIONING=off is
+    // the kill switch. Init failure falls back to raw capture with a log
+    // line, never a failed recording.
+    let conditioner = if load_bool_env("BOLO_AUDIO_CONDITIONING", true) {
+        match AudioConditioner::new(config.sample_rate) {
+            Ok(conditioner) => {
+                info!(
+                    "[audio] conditioning on: aec3+ns+agc, frame={} samples",
+                    conditioner.frame_len()
+                );
+                Some(Arc::new(Mutex::new(conditioner)))
+            }
+            Err(error) => {
+                warn!("[audio] conditioning unavailable: {error}; capturing unconditioned");
+                None
+            }
+        }
+    } else {
+        info!("[audio] conditioning off (BOLO_AUDIO_CONDITIONING)");
+        None
+    };
+    // Both the audio callback and finish_recording's tail flush need the
+    // conditioner; the recording keeps the clone the flush locks.
+    let recording_conditioner = conditioner.as_ref().map(Arc::clone);
     let stream = match supported.sample_format() {
-        SampleFormat::I16 => {
-            build_stream::<i16>(&device, &config, channels, Arc::clone(&samples), hub)?
-        }
-        SampleFormat::F32 => {
-            build_stream::<f32>(&device, &config, channels, Arc::clone(&samples), hub)?
-        }
-        SampleFormat::U16 => {
-            build_stream::<u16>(&device, &config, channels, Arc::clone(&samples), hub)?
-        }
+        SampleFormat::I16 => build_stream::<i16>(
+            &device,
+            &config,
+            channels,
+            Arc::clone(&samples),
+            Arc::clone(hub),
+            conditioner,
+        )?,
+        SampleFormat::F32 => build_stream::<f32>(
+            &device,
+            &config,
+            channels,
+            Arc::clone(&samples),
+            Arc::clone(hub),
+            conditioner,
+        )?,
+        SampleFormat::U16 => build_stream::<u16>(
+            &device,
+            &config,
+            channels,
+            Arc::clone(&samples),
+            Arc::clone(hub),
+            conditioner,
+        )?,
         other @ (SampleFormat::I8
         | SampleFormat::I24
         | SampleFormat::I32
@@ -5672,6 +5755,8 @@ fn start_recording(
     Ok(ActiveRecording {
         stream,
         samples,
+        conditioner: recording_conditioner,
+        hub: Arc::clone(hub),
         started_at: Instant::now(),
         sample_rate: config.sample_rate,
         warmup: DictationWarmup::default(),
@@ -8730,6 +8815,7 @@ fn build_stream<T>(
     channels: usize,
     samples: Arc<Mutex<Vec<i16>>>,
     hub: Arc<AudioHub>,
+    conditioner: Option<Arc<Mutex<AudioConditioner>>>,
 ) -> Result<Stream, AppError>
 where
     T: Sample + SizedSample,
@@ -8738,6 +8824,16 @@ where
     // The chunkers live inside the hub: capture starts before the wire
     // consumers exist, and the hub replays the buffered backlog into each
     // sink as it attaches (chunk size: see `chunk_samples_for`).
+    //
+    // The conditioner (when enabled) sits between cpal and every consumer
+    // here, so the master buffer's RMS decisions and the wire sinks all
+    // see conditioned samples only. Its lock is held for the whole handoff
+    // (mirroring the hub's own lock discipline on this callback): capture
+    // frames must be processed strictly in order, and finish_recording
+    // takes the same lock once to flush the sub-frame tail.
+    // Reused conditioned-output buffer: grows once to callback size, then
+    // every push reuses the capacity instead of re-allocating.
+    let mut staged: Vec<i16> = Vec::new();
     device
         .build_input_stream(
             config,
@@ -8748,10 +8844,36 @@ where
                     .copied()
                     .map(i16::from_sample)
                     .collect::<Vec<_>>();
+                // The guard lives no longer than this match: the closure's
+                // reused buffer, not the guard, backs the processed slice
+                // handed to both consumers below.
+                let processed: &[i16] =
+                    match conditioner.as_ref().and_then(|shared| shared.lock().ok()) {
+                        Some(mut apm) => {
+                            // Surface a mid-recording failure once, then
+                            // keep passing degraded audio through the
+                            // conditioner's own passthrough.
+                            let failure = apm.take_failure();
+                            let conditioned_now = apm.process(&mono);
+                            if let Some(failure) = failure {
+                                warn!(
+                                    "[audio] conditioning failed ({failure}); passthrough for the rest of the recording"
+                                );
+                            }
+                            staged.clear();
+                            staged.extend_from_slice(conditioned_now);
+                            &staged
+                        }
+                        // No conditioner (disabled or init failed), the
+                        // one-off tail flush holds the lock, or the lock
+                        // is poisoned: hand raw capture through so the
+                        // stream never drops samples.
+                        None => &mono,
+                    };
                 if let Ok(mut guard) = samples.try_lock() {
-                    guard.extend(mono.iter().copied());
+                    guard.extend_from_slice(processed);
                 }
-                hub.on_audio(&mono);
+                hub.on_audio(processed);
             },
             |error| {
                 warn!("audio callback failed: {error}");
