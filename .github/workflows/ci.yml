@@ -33,6 +33,8 @@ jobs:
         run: bash -n install.sh ensure-python-env.sh update.sh restart.sh start-bolo.command start-bolo.sh scripts/build-dmg.sh scripts/bundle-launcher.sh
       - name: Check Rust formatting
         run: cargo fmt --all -- --check
+      - name: Install native APM build tools
+        run: brew install meson ninja
       - name: Test Rust runtime
         run: cargo test --release
       - name: Test Python and onboarding scripts
