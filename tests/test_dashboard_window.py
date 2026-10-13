@@ -20,7 +20,7 @@ def fixture_dashboard(history=None, **overrides):
             "dictations": 244,
             "words": 15230,
             "recording_ms": 9000000,
-            "started_at_ms": 1733011200000,
+            "started_at_ms": 1732968000000,
         },
         "hotkey": "right_option",
         "microphone": "default",
