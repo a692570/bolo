@@ -14,3 +14,6 @@ icon_options/
 eval_results.json
 test-overlay.py
 chatwork/
+
+# Local preview/screenshot artifacts
+outputs/

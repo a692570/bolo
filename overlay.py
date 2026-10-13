@@ -179,7 +179,7 @@ def _overlay_mark_view_class(NSView):
     return _OverlayMarkView
 
 
-def run_overlay(preview=None):
+def run_overlay(preview=None, initial_phase=None, initial_text=""):
     """Build the panel and pump stdin until the runtime stops talking.
 
     Kept in one function so importing the module never touches AppKit
@@ -399,6 +399,12 @@ def run_overlay(preview=None):
     if preview_mode:
         phase = preview.get("phase") or "dictating"
         preview_text_value = preview.get("text") or ""
+    elif initial_phase:
+        # Live entry state sent by the runtime as its first stdin message:
+        # same phase vocabulary, but the panel orders front and keeps
+        # reading updates instead of returning.
+        phase = initial_phase
+        preview_text_value = initial_text or ""
     render(phase, preview_text_value)
     if not preview_mode:
         window.orderFrontRegardless()
@@ -442,6 +448,9 @@ if __name__ == "__main__":
     except ValueError:
         initial = {}
     if isinstance(initial, dict) and initial:
-        run_overlay({"phase": initial.get("phase", "dictating"), "text": initial.get("text", "")})
+        run_overlay(
+            initial_phase=initial.get("phase") or None,
+            initial_text=initial.get("text", ""),
+        )
     else:
         run_overlay()
