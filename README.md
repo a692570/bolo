@@ -167,6 +167,19 @@ export BOLO_AUDIO_CONDITIONING="off"
 
 Conditioning is on by default. It keeps the same number of samples and alignment as the raw stream; if the processing engine fails to initialize, Bolo logs it and records without conditioning.
 
+Bolo can also transcribe offline through a local whisper.cpp model. The tier trails the whole cloud ladder (`BOLO_LOCAL_STT=auto`, the default): it runs only when streaming, the streamed Dictation upload, and the batch retry all fail or return no words. To skip cloud entirely and dictate offline, set:
+
+```bash
+export BOLO_LOCAL_STT="on"
+```
+
+To never consult the local tier, set `BOLO_LOCAL_STT="off"`. Transcription runs on a Metal-accelerated local model (default: `ggml-small`, ~466 MB) stored under `~/.bolo/models`; fetch it with **Download Offline Model...** under the Bolo menu's More..., which verifies the download's sha256 against the published digest and logs progress every 10%. Dictations the offline tier rescues are marked `inserted_local` in the `[metrics] dictation_latency` log line, so latency attribution stays clean. To point at a different ggml model file already in `~/.bolo/models`, set:
+
+```bash
+export BOLO_LOCAL_WHISPER_MODEL="ggml-base.bin"
+```
+
+
 The default model is `assemblyai/universal-3-5-pro`, transcribed through AssemblyAI's Dictation API. One call returns the verbatim transcript plus a provider-cleaned version with fillers removed, self-corrections resolved, and punctuation applied. Bolo's local vocabulary aliases and replacements still run on top, and the separate LLM cleanup pass is skipped whenever the provider cleaned text is available.
 
 The Dictation endpoint caps audio at 120 seconds, so longer recordings automatically use AssemblyAI's async upload-and-poll path, which returns verbatim text only.

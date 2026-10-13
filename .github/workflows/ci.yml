@@ -34,7 +34,7 @@ jobs:
       - name: Check Rust formatting
         run: cargo fmt --all -- --check
       - name: Install native APM build tools
-        run: brew install meson ninja
+        run: brew install meson ninja cmake
       - name: Test Rust runtime
         run: cargo test --release
       - name: Test Python and onboarding scripts
