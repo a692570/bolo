@@ -1,7 +1,9 @@
 //! Bolo's Rust push-to-talk dictation runtime.
 
 mod audio_conditioning;
+mod local_whisper;
 mod recording_fsm;
+mod resample;
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -44,7 +46,9 @@ use tray_icon::menu::{
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
 use audio_conditioning::AudioConditioner;
+use local_whisper::{LocalSttMode, LocalWhisper, ModelStatus as LocalModelStatus};
 use recording_fsm::{Command as RecordingCommand, Event as RecordingEvent, RecordingFsm};
+use resample::mean_sample;
 
 const LOG_FILE: &str = "/tmp/bolo.log";
 const CHANNELS: u16 = 1;
@@ -260,6 +264,13 @@ struct Config {
     log_transcripts: bool,
     max_recording_seconds: u64,
     replacements: Vec<TextReplacement>,
+    /// Offline-tier policy from `BOLO_LOCAL_STT`: run whisper.cpp only
+    /// after every cloud path fails (`auto`, the default), skip cloud
+    /// entirely (`on`), or never consult the local tier (`off`).
+    local_stt: LocalSttMode,
+    /// File name of the offline whisper model inside `~/.bolo/models`,
+    /// from `BOLO_LOCAL_WHISPER_MODEL`; defaults to `ggml-small.bin`.
+    local_model_file: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -650,10 +661,14 @@ struct SttRequestParts {
 /// One STT outcome: `text` is the verbatim transcript every caller needs, and
 /// `llm_cleaned` carries the provider-side cleanup when the provider bundles
 /// one (`AssemblyAI` Dictation), so Bolo's own LLM cleanup pass can be skipped.
+/// `from_local` marks a transcript produced by the offline whisper tier so
+/// latency attribution can distinguish it without touching the metrics
+/// schema.
 #[derive(Clone, Debug, Default)]
 struct SttResult {
     text: String,
     llm_cleaned: Option<String>,
+    from_local: bool,
 }
 
 impl SttResult {
@@ -661,6 +676,17 @@ impl SttResult {
         Self {
             text,
             llm_cleaned: None,
+            from_local: false,
+        }
+    }
+
+    /// A verbatim transcript produced by the local whisper tier, so the
+    /// release path can mark the dictation outcome `inserted_local`.
+    const fn verbatim_local(text: String) -> Self {
+        Self {
+            text,
+            llm_cleaned: None,
+            from_local: true,
         }
     }
 }
@@ -1235,6 +1261,7 @@ impl DictationUpload {
         Ok(SttResult {
             text: verbatim,
             llm_cleaned: cleaned,
+            from_local: false,
         })
     }
 
@@ -1811,6 +1838,23 @@ struct App {
     /// happens, so the window never drops the pending-restart notice.
     dashboard_restart_pending: Mutex<bool>,
     event_proxy: Mutex<Option<EventLoopProxy<UserEvent>>>,
+    /// Offline-tier state: the lazily loaded whisper engine (cache cleared
+    /// by a model re-download) and the flag guarding the tray menu's
+    /// download item against double-clicks.
+    local_whisper: LocalWhisperHandle,
+}
+
+/// Interior-mutable offline-tier state owned by the App, kept out of the
+/// Config because it mutates at runtime, not at load.
+#[derive(Debug, Default)]
+struct LocalWhisperHandle {
+    /// Engine cache: `None` until the first local transcription, replaced
+    /// after a successful model re-download so the next dictation loads
+    /// the fresh bytes rather than stale weights.
+    engine: Mutex<Option<local_whisper::SharedLocalWhisper>>,
+    /// Set while the menu-triggered model download thread runs, so a
+    /// second click logs instead of starting a second transfer.
+    downloading: Mutex<bool>,
 }
 
 /// Cumulative usage counters, persisted at `~/.bolo/usage.json` with the same
@@ -1923,6 +1967,9 @@ enum UserEvent {
     HideOverlayAfter(Duration),
     HistoryChanged,
     CleanupStatusChanged,
+    /// The offline model's on-disk state changed (a menu-triggered
+    /// download finished), so the tray item label needs rebuilding.
+    OfflineModelChanged,
     RecordingWatchdog,
     ShowOnboarding,
     ShowStatus,
@@ -2013,6 +2060,7 @@ struct TrayUi {
     learned_words_item: MenuItem,
     show_dashboard_item: MenuItem,
     show_onboarding_item: MenuItem,
+    download_offline_model_item: MenuItem,
     quit_item: MenuItem,
 }
 
@@ -2724,6 +2772,11 @@ fn run_app_event_loop(app: Arc<App>) -> Result<(), AppError> {
                 }
                 refresh_dashboard_window(&app, &mut dashboard_window);
             }
+            TaoEvent::UserEvent(UserEvent::OfflineModelChanged) => {
+                if let Some(ui) = tray_ui.as_ref() {
+                    update_offline_model_item(&app, ui);
+                }
+            }
             TaoEvent::UserEvent(UserEvent::RecordingWatchdog) => {
                 let max_seconds = app.config.max_recording_seconds;
                 let stale = {
@@ -2887,6 +2940,7 @@ impl App {
             usage: Mutex::new(load_usage_counters()),
             dashboard_restart_pending: Mutex::new(false),
             event_proxy: Mutex::new(None),
+            local_whisper: LocalWhisperHandle::default(),
         })
     }
 
@@ -3104,7 +3158,22 @@ impl App {
         );
         metrics.outcome = "stt_failed";
         let stt_started = Instant::now();
-        let stt = if let Some(streaming) = recording.streaming {
+        // BOLO_LOCAL_STT=on dictates offline dictation: cloud transcription
+        // is skipped entirely and the insert path proceeds from the local
+        // model (the already-running streaming/upload threads unwind on
+        // their own when this capture drops). A missing model leaves the
+        // empty result to the unchanged failure handling below.
+        let stt = if matches!(self.config.local_stt, LocalSttMode::On) {
+            info!(
+                "[stt] local_only_mode_active {}",
+                serde_json::json!({
+                    "model": self.config.local_model_file,
+                    "recording_duration_ms": elapsed.as_millis(),
+                })
+            );
+            self.local_stt_attempt(&samples, recording.sample_rate, elapsed)
+                .map_or_else(SttResult::default, SttResult::verbatim_local)
+        } else if let Some(streaming) = recording.streaming {
             if preview_only_streaming(&self.config.stt_model, self.config.streaming_stt) {
                 self.preview_stt_result(streaming, recording.upload.take(), &wav, &recording.warmup)
             } else {
@@ -3126,13 +3195,39 @@ impl App {
                 }
             }
         } else {
-            match self.transcribe(&wav, &recording.warmup) {
+            let batch = self.transcribe(&wav, &recording.warmup);
+            match batch {
                 Ok(result) => result,
                 Err(error) => {
-                    save_failed_audio(&wav);
-                    return Err(error);
+                    // Auto is the offline tier's rung on the ladder: when
+                    // the batch path failed outright, the captured audio
+                    // gets one on-device attempt before the original
+                    // error and failure handling survive unchanged.
+                    let Some(text) =
+                        self.local_stt_auto_attempt(&samples, recording.sample_rate, elapsed)
+                    else {
+                        save_failed_audio(&wav);
+                        return Err(error);
+                    };
+                    SttResult::verbatim_local(text)
                 }
             }
+        };
+        // The offline tier's `auto` rung for every other composition: the
+        // paths above fold their failures into an empty transcript when
+        // no cloud source produced words (streaming empty, drained
+        // preview fallback, batch retry terminal), and this is the last
+        // chance before the shared empty handling gives up on the
+        // dictation. Clips shorter than the empty-retry gate keep their
+        // existing terminal behavior: a sub-second clip cannot prove the
+        // speaker said anything, local or cloud.
+        let stt = if stt.text.trim().is_empty()
+            && elapsed >= Duration::from_millis(EMPTY_RETRY_MIN_DURATION_MS)
+        {
+            self.local_stt_auto_attempt(&samples, recording.sample_rate, elapsed)
+                .map_or(stt, SttResult::verbatim_local)
+        } else {
+            stt
         };
         if stt.text.trim().is_empty() {
             save_failed_audio(&wav);
@@ -3209,10 +3304,178 @@ impl App {
             play_sound("Pop");
         }
         metrics.insert_duration = Some(insert_started.elapsed());
-        metrics.outcome = "inserted";
+        // The offline tier earned the transcript, so the latency log keeps
+        // the attribution clean: `inserted_local` marks dictations the
+        // on-device rung rescued while `inserted` stays cloud-sourced.
+        metrics.outcome = if stt.from_local {
+            "inserted_local"
+        } else {
+            "inserted"
+        };
         self.send_user_event(UserEvent::Overlay(OverlayPhase::Copied));
         self.send_user_event(UserEvent::HideOverlayAfter(POST_INSERT_OVERLAY_HOLD));
         Ok(())
+    }
+
+    /// Directory holding offline whisper models: `~/.bolo/models`.
+    fn local_models_dir() -> PathBuf {
+        home_path(".bolo/models")
+    }
+
+    /// On-disk state of the configured offline model.
+    fn local_model_status(&self) -> LocalModelStatus {
+        local_whisper::model_status(&Self::local_models_dir(), &self.config.local_model_file)
+    }
+
+    /// The whisper language pin for the local tier: the runtime's selected
+    /// STT language (the menu choice the cloud paths honor), falling back
+    /// to the configured hint, then mapped to whisper's primary-tag
+    /// form; `auto` maps to detection (`None`).
+    fn local_whisper_language(&self) -> Option<String> {
+        let configured = self
+            .stt_language()
+            .unwrap_or_else(|_| self.config.stt_language.clone());
+        local_whisper::whisper_language(&configured)
+    }
+
+    /// The cached offline engine, loading the shell on first use. The
+    /// model bytes themselves load inside the first transcription's
+    /// budget; a re-download clears the cache so the next dictation
+    /// picks up the fresh file.
+    fn local_engine(&self) -> Result<local_whisper::SharedLocalWhisper, AppError> {
+        let Ok(mut cached) = self.local_whisper.engine.lock() else {
+            return Err(AppError::PoisonedMutex(String::from(
+                "local whisper engine cache",
+            )));
+        };
+        if let Some(engine) = cached.as_ref() {
+            return Ok(Arc::clone(engine));
+        }
+        let engine = Arc::new(LocalWhisper::new(
+            Self::local_models_dir().join(&self.config.local_model_file),
+            self.local_whisper_language(),
+        ));
+        *cached = Some(Arc::clone(&engine));
+        Ok(engine)
+    }
+
+    /// The `auto`-mode gate around [`local_stt_attempt`]: the offline tier
+    /// is consulted only when `BOLO_LOCAL_STT=auto` (the default). The
+    /// `on` path resolves locally before any cloud work; `off` never
+    /// consults the model at all.
+    fn local_stt_auto_attempt(
+        &self,
+        samples: &[i16],
+        sample_rate: u32,
+        recording_duration: Duration,
+    ) -> Option<String> {
+        if matches!(self.config.local_stt, LocalSttMode::Auto) {
+            self.local_stt_attempt(samples, sample_rate, recording_duration)
+        } else {
+            None
+        }
+    }
+
+    /// The offline rung of the STT ladder: transcribe the captured
+    /// samples on-device through whisper.cpp, always on a worker thread
+    /// whose budget derives from the recording length (3x, 10 s floor),
+    /// so a hung model can never wedge the release path. `None` keeps
+    /// the caller's existing behavior: a missing or invalid model logs a
+    /// warning and the shared failure handling runs exactly as before.
+    fn local_stt_attempt(
+        &self,
+        samples: &[i16],
+        sample_rate: u32,
+        recording_duration: Duration,
+    ) -> Option<String> {
+        let models_dir = Self::local_models_dir();
+        match local_whisper::model_status(&models_dir, &self.config.local_model_file) {
+            LocalModelStatus::Ready => {}
+            LocalModelStatus::Missing => {
+                warn!(
+                    "[stt] local_fallback_model_missing {}",
+                    serde_json::json!({
+                        "model": self.config.local_model_file,
+                        "hint": "choose Download Offline Model in the Bolo menu to fetch it",
+                    })
+                );
+                return None;
+            }
+            LocalModelStatus::Invalid(reason) => {
+                warn!(
+                    "[stt] local_fallback_model_invalid {}",
+                    serde_json::json!({
+                        "model": self.config.local_model_file,
+                        "reason": reason,
+                    })
+                );
+                return None;
+            }
+        }
+        let budget = local_whisper::local_stt_budget(recording_duration);
+        let language = self.local_whisper_language();
+        info!(
+            "[stt] local_fallback_started {}",
+            serde_json::json!({
+                "model": self.config.local_model_file,
+                "language": language,
+                "sample_rate": sample_rate,
+                "recording_duration_ms": recording_duration.as_millis(),
+                "budget_ms": budget.as_millis(),
+            })
+        );
+        let Some(samples_16k) =
+            resample::resample_i16(samples, sample_rate, local_whisper::WHISPER_SAMPLE_RATE)
+        else {
+            warn!(
+                "[stt] local_fallback_resample_unavailable {}",
+                serde_json::json!({"sample_rate": sample_rate})
+            );
+            return None;
+        };
+        // whisper consumes f32 in [-1, 1]; dividing the i16 range by its
+        // full scale is the convention whisper.cpp's own examples use.
+        let pcm: Vec<f32> = samples_16k
+            .iter()
+            .map(|sample| f32::from(*sample) / 32_768.0)
+            .collect();
+        let started = Instant::now();
+        let Ok(engine) = self.local_engine() else {
+            warn!("[stt] local_fallback_engine_unavailable");
+            return None;
+        };
+        let result = local_whisper::call_with_budget("local_whisper", budget, move || {
+            engine.transcribe(&pcm)
+        });
+        match result {
+            Ok(text) if !text.trim().is_empty() => {
+                info!(
+                    "[stt] local_fallback_completed {}",
+                    serde_json::json!({
+                        "chars": text.chars().count(),
+                        "words": text.split_whitespace().count(),
+                        "elapsed_ms": started.elapsed().as_millis(),
+                    })
+                );
+                Some(text)
+            }
+            Ok(_) => {
+                info!(
+                    "[stt] local_fallback_empty {}",
+                    serde_json::json!({
+                        "elapsed_ms": started.elapsed().as_millis(),
+                    })
+                );
+                None
+            }
+            Err(error) => {
+                warn!(
+                    "[stt] local_fallback_failed {}",
+                    serde_json::json!({"error": error.to_string()})
+                );
+                None
+            }
+        }
     }
 
     /// Resolve the transcript for the preview-only streaming composition
@@ -3863,6 +4126,7 @@ impl App {
         Ok(SttResult {
             text: verbatim,
             llm_cleaned: cleaned,
+            from_local: false,
         })
     }
 
@@ -5508,6 +5772,11 @@ impl Config {
                 "BOLO_MAX_RECORDING_SECONDS",
                 DEFAULT_MAX_RECORDING_SECONDS,
             ),
+            local_stt: local_whisper::parse_local_stt_mode(
+                load_env_value("BOLO_LOCAL_STT").as_deref(),
+            ),
+            local_model_file: load_env_value("BOLO_LOCAL_WHISPER_MODEL")
+                .unwrap_or_else(|| String::from(local_whisper::DEFAULT_MODEL_FILE)),
         };
         if let Some(missing) = config.missing_required_key() {
             // A missing key is no longer fatal: the onboarding window shows
@@ -6279,6 +6548,14 @@ fn create_tray_ui(app: &App) -> Result<TrayUi, AppError> {
     let add_replacement_item =
         MenuItem::with_id("add-replacement-rule", "Replace a Phrase...", true, None);
     let show_onboarding_item = MenuItem::with_id("show-onboarding", "Set Up Bolo...", true, None);
+    // The offline model item's label states what clicking will do: a
+    // first download, or replacing the model already on disk.
+    let download_offline_model_item = MenuItem::with_id(
+        "download-offline-model",
+        offline_model_menu_label(app),
+        true,
+        None,
+    );
     let more_menu = Submenu::new("More...", true);
     for item in [
         &add_vocabulary_item,
@@ -6287,6 +6564,7 @@ fn create_tray_ui(app: &App) -> Result<TrayUi, AppError> {
         &clear_history_item,
         &health_check_item,
         &show_onboarding_item,
+        &download_offline_model_item,
     ] {
         more_menu
             .append(item)
@@ -6452,6 +6730,7 @@ fn create_tray_ui(app: &App) -> Result<TrayUi, AppError> {
         learned_words_item,
         show_dashboard_item,
         show_onboarding_item,
+        download_offline_model_item,
         quit_item,
     };
     update_history_menu(app, &mut ui)?;
@@ -6509,6 +6788,10 @@ fn handle_menu_event(
     }
     if event_id == tray_ui.update_item.id().as_ref() {
         check_for_updates_from_menu(app);
+        return;
+    }
+    if event_id == tray_ui.download_offline_model_item.id().as_ref() {
+        download_offline_model_from_menu(app);
         return;
     }
     if event_id == tray_ui.add_vocabulary_item.id().as_ref() {
@@ -6855,6 +7138,125 @@ fn check_for_updates_from_menu(app: &Arc<App>) {
     if let Err(error) = join_handle {
         warn!("failed to start updater thread: {error}");
     }
+}
+
+/// Menu label for the offline model item: the first download differs from
+/// replacing the model already on disk, and the tray library rebuilds
+/// this text whenever the download state changes.
+fn offline_model_menu_label(app: &App) -> String {
+    offline_model_menu_label_for(matches!(app.local_model_status(), LocalModelStatus::Ready))
+}
+
+/// Testable core of [`offline_model_menu_label`].
+fn offline_model_menu_label_for(model_present: bool) -> String {
+    if model_present {
+        String::from("Re-download Offline Model...")
+    } else {
+        String::from("Download Offline Model...")
+    }
+}
+
+/// Start (or acknowledge) the offline model download from the tray menu.
+/// A second click while a download is running logs and does nothing; a
+/// click with the model already present logs that instead of
+/// re-downloading. The transfer itself runs on a background thread with
+/// decile progress in the standard log, and on completion the menu label
+/// refreshes through the event loop so the item never goes stale.
+fn download_offline_model_from_menu(app: &Arc<App>) {
+    {
+        let Ok(mut downloading) = app.local_whisper.downloading.lock() else {
+            return;
+        };
+        if *downloading {
+            info!("[stt] offline model download already in progress; click ignored");
+            return;
+        }
+        *downloading = true;
+    }
+    let models_dir = App::local_models_dir();
+    let status = app.local_model_status();
+    match status {
+        LocalModelStatus::Ready => {
+            reset_download_flag(app);
+            info!(
+                "[stt] offline model already present at {}; nothing to do",
+                models_dir.join(&app.config.local_model_file).display()
+            );
+            return;
+        }
+        LocalModelStatus::Missing | LocalModelStatus::Invalid(_) => {
+            info!(
+                "[stt] offline model download starting {}",
+                serde_json::json!({
+                    "model": app.config.local_model_file,
+                    "status": status.to_string(),
+                })
+            );
+        }
+    }
+    // The thread takes its own Arc clone so a failed spawn can still
+    // clear the flag through one of the references held here.
+    let download_app = Arc::clone(app);
+    let spawn_failed_app = Arc::clone(app);
+    let join_handle = std::thread::Builder::new()
+        .name(String::from("bolo-model-download"))
+        .spawn(move || {
+            let spec = local_whisper::offline_model_spec(&download_app.config.local_model_file);
+            let outcome = local_whisper::download_client().and_then(|client| {
+                local_whisper::download_model(&client, &spec, &App::local_models_dir(), |percent| {
+                    if percent.is_multiple_of(10) {
+                        info!("[stt] offline model download progress: {percent}%");
+                    }
+                })
+            });
+            match outcome {
+                Ok(path) => {
+                    info!(
+                        "[stt] offline model download completed {}",
+                        serde_json::json!({"path": path.display().to_string()})
+                    );
+                    // Drop any engine built from the replaced file so the
+                    // next local dictation loads the fresh bytes.
+                    if let Ok(mut cached) = download_app.local_whisper.engine.lock() {
+                        *cached = None;
+                    }
+                    reset_download_flag(&download_app);
+                    show_notification(
+                        "Bolo Offline Model",
+                        "Offline transcription model downloaded. BOLO_LOCAL_STT can use it.",
+                    );
+                }
+                Err(error) => {
+                    warn!("[stt] offline model download failed: {error}");
+                    reset_download_flag(&download_app);
+                    show_notification(
+                        "Bolo Offline Model Failed",
+                        &short_menu_message(&error.to_string()),
+                    );
+                }
+            }
+            download_app.send_user_event(UserEvent::OfflineModelChanged);
+        });
+    if let Err(error) = join_handle {
+        warn!("failed to start model download thread: {error}");
+        reset_download_flag(&spawn_failed_app);
+    }
+}
+
+/// Clear the download-in-progress flag on every exit path of the
+/// download thread, including a failure to spawn.
+fn reset_download_flag(app: &Arc<App>) {
+    if let Ok(mut downloading) = app.local_whisper.downloading.lock() {
+        *downloading = false;
+    }
+}
+
+/// Refresh the offline model item's text from the on-disk state, called
+/// when a download completes and at menu construction.
+fn update_offline_model_item(app: &App, tray_ui: &TrayUi) {
+    tray_ui
+        .download_offline_model_item
+        .set_text(offline_model_menu_label(app));
 }
 
 fn run_bolo_update(root_dir: &Path) -> Result<UpdateOutcome, AppError> {
@@ -9155,17 +9557,6 @@ fn parse_wav_pcm16(wav: &[u8]) -> Option<ParsedWav> {
     })
 }
 
-/// Mean of a frame of `i16` samples. The mean of `i16` values always fits
-/// `i16`, so the `try_from` fallback is unreachable in practice.
-fn mean_sample(frame: &[i16]) -> i16 {
-    if frame.is_empty() {
-        return 0;
-    }
-    let sum: i32 = frame.iter().copied().map(i32::from).sum();
-    let len = i32::try_from(frame.len()).unwrap_or(i32::MAX);
-    i16::try_from(sum / len).unwrap_or(i16::MAX)
-}
-
 /// Collapse interleaved channels to mono by averaging each frame.
 fn collapse_to_mono(samples: &[i16], channels: u16) -> Vec<i16> {
     if channels <= 1 {
@@ -9177,55 +9568,14 @@ fn collapse_to_mono(samples: &[i16], channels: u16) -> Vec<i16> {
         .collect()
 }
 
-/// Linear resample for capture rates that do not divide evenly into the retry
-/// rate (44.1 kHz, for example). Only the 413 retry path uses this.
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_precision_loss,
-    clippy::cast_sign_loss
-)]
-fn linear_resample(samples: &[i16], source_rate: u32, target_rate: u32) -> Vec<i16> {
-    if samples.len() < 2 {
-        return samples.to_vec();
-    }
-    let step = f64::from(source_rate) / f64::from(target_rate);
-    let output_len = ((samples.len() - 1) as f64 / step) as usize + 1;
-    let mut resampled = Vec::with_capacity(output_len);
-    for index in 0..output_len {
-        let position = index as f64 * step;
-        let base = position.floor();
-        let start = base as usize;
-        if start + 1 >= samples.len() {
-            resampled.push(samples[samples.len() - 1]);
-            break;
-        }
-        let weight = position - base;
-        let start_value = f64::from(samples[start]);
-        let end_value = f64::from(samples[start + 1]);
-        let value = (end_value - start_value)
-            .mul_add(weight, start_value)
-            .round();
-        resampled.push(value.clamp(f64::from(i16::MIN), f64::from(i16::MAX)) as i16);
-    }
-    resampled
-}
-
-/// Resample to the 413 retry rate. Integer ratios decimate with a box filter
-/// (48 kHz -> 16 kHz averages every three samples, cutting the payload ~3x);
-/// rates that do not divide evenly get a linear resample; 16 kHz passes
-/// through untouched.
+/// Resample to the 413 retry rate. Integer ratios decimate with a box
+/// filter (48 kHz -> 16 kHz averages every three samples, cutting the
+/// payload ~3x); rates that do not divide evenly get a linear resample;
+/// 16 kHz passes through untouched. The implementation and its length
+/// math live in `src/resample.rs`, shared verbatim with the local
+/// whisper tier.
 fn resample_to_16k(samples: &[i16], source_rate: u32) -> Option<Vec<i16>> {
-    if source_rate == 0 {
-        return None;
-    }
-    if source_rate == STT_RETRY_SAMPLE_RATE {
-        return Some(samples.to_vec());
-    }
-    if source_rate.is_multiple_of(STT_RETRY_SAMPLE_RATE) {
-        let factor = usize::try_from(source_rate / STT_RETRY_SAMPLE_RATE).unwrap_or(usize::MAX);
-        return Some(samples.chunks(factor).map(mean_sample).collect());
-    }
-    Some(linear_resample(samples, source_rate, STT_RETRY_SAMPLE_RATE))
+    resample::resample_i16(samples, source_rate, STT_RETRY_SAMPLE_RATE)
 }
 
 /// Build the 16 kHz mono payload for the 413 retry: parse the recorded WAV,
@@ -13217,43 +13567,43 @@ mod tests {
         DashboardAction, DashboardRequestLine, DictationCommandKind, DictationUploadReader,
         DictationUploadRelease, DictationWarmup, EchoVerdict, EditLearningClaim, KeyEntrySpec,
         LEARNING_UNREADABLE_LINE, LEARNING_WINDOW_ROWS, LaunchRequestAction, LearnedPair,
-        LearnedVocabulary, MicrophoneDescriptor, MicrophoneSelection, ONBOARDING_MARKER_VERSION,
-        OnboardingStatus, PreparedText, PromptBinding, STREAMING_DRAIN_MIN, STT_RETRY_SAMPLE_RATE,
-        StreamingConnectionState, StreamingProvider, StreamingRecording, StreamingText,
-        StreamingTranscript, SttFallback, SttResult, TRANSCRIPT_HISTORY_LIMIT, TextReplacement,
-        TranscriptHistoryEntry, UpdateNotice, UpdateOutcome, UsageCounters, WindowRow, WizardSpec,
-        accessibility_fix_detail, apply_text_replacements,
-        apply_vocabulary_corrections_with_matches, assemblyai_direct_query_with,
-        assemblyai_language_code, batch_retry_plan, batch_transcript_after_echo,
-        build_cleanup_user_content, build_rewrite_user_content, build_stt_prompt,
-        canonicalize_known_terms, chunk_samples_for, cleanup_decision, cleanup_max_tokens,
-        cleanup_profile, cleanup_prompt, cleanup_prompt_overrides, cleanup_prompts_path,
-        consume_open_dashboard_request_at, contains_word_verbatim, dashboard_accessibility_state,
-        dashboard_cleanup_mode, dashboard_payload, dashboard_provider_label,
-        derive_word_correction, dictation_batch_config, dictation_upload_config,
-        dictation_upload_form, dictation_upload_release, dictation_upload_request_timeout,
-        downsample_wav_16k_mono, edit_distance, empty_transcript_error,
-        enforce_learned_vocabulary_cap, final_streaming_result_is_ready_elapsed,
-        finalize_accessibility_context, handle_dashboard_action, handle_launch_request_for_state,
-        handshake_with_deadline, is_blocklisted_correction, is_known_no_speech_transcript,
-        is_supported_hotkey, learning_window_payload_at, load_cleanup_prompt_file,
-        load_learned_vocabulary, load_usage_counters_at, load_vocabulary_usage,
-        load_vocabulary_with_learned, microphone_labels, non_empty_transcript,
-        normalize_microphone_value, onboarding_status_at, override_or_builtin_prompt_from,
-        parse_accessibility_trust, parse_command, parse_daemon_context_reply,
-        parse_daemon_paste_reply, parse_daemon_select_reply, parse_daemon_trust_reply,
-        parse_latest_release, parse_release_version, parse_replacements_json, parse_stt_fallbacks,
-        parse_u64_env_value, parse_update_outcome, parse_wav_pcm16, pcm_bytes,
-        preview_only_streaming, preview_release_stt, prompts_window_payload_at,
-        read_vocabulary_file, read_vocabulary_usage_file, record_learned_correction,
-        reload_is_busy, remove_bolo_env_value_at, remove_fillers, request_accessibility_daemon,
-        resolve_microphone_selection, retry_failed_primary, sanitize_transcript_history,
-        save_usage_counters_at, should_exit_for_key_reload, speech_stats,
-        stable_streaming_best_is_ready_elapsed, status_rows, streaming_batch_fallback_reason,
-        streaming_connection, streaming_preview_tail, streaming_provider_from_config,
-        streaming_status_label, strip_reasoning_tags, strip_vocabulary_echo,
-        stt_language_for_model, stt_model_config, telnyx_stream_query, transcript_log_value,
-        transcript_menu_preview, truncate_to_chars, typed_dashboard_action,
+        LearnedVocabulary, LocalSttMode, LocalWhisperHandle, MicrophoneDescriptor,
+        MicrophoneSelection, ONBOARDING_MARKER_VERSION, OnboardingStatus, PreparedText,
+        PromptBinding, STREAMING_DRAIN_MIN, STT_RETRY_SAMPLE_RATE, StreamingConnectionState,
+        StreamingProvider, StreamingRecording, StreamingText, StreamingTranscript, SttFallback,
+        SttResult, TRANSCRIPT_HISTORY_LIMIT, TextReplacement, TranscriptHistoryEntry, UpdateNotice,
+        UpdateOutcome, UsageCounters, WindowRow, WizardSpec, accessibility_fix_detail,
+        apply_text_replacements, apply_vocabulary_corrections_with_matches,
+        assemblyai_direct_query_with, assemblyai_language_code, batch_retry_plan,
+        batch_transcript_after_echo, build_cleanup_user_content, build_rewrite_user_content,
+        build_stt_prompt, canonicalize_known_terms, chunk_samples_for, cleanup_decision,
+        cleanup_max_tokens, cleanup_profile, cleanup_prompt, cleanup_prompt_overrides,
+        cleanup_prompts_path, consume_open_dashboard_request_at, contains_word_verbatim,
+        dashboard_accessibility_state, dashboard_cleanup_mode, dashboard_payload,
+        dashboard_provider_label, derive_word_correction, dictation_batch_config,
+        dictation_upload_config, dictation_upload_form, dictation_upload_release,
+        dictation_upload_request_timeout, downsample_wav_16k_mono, edit_distance,
+        empty_transcript_error, enforce_learned_vocabulary_cap,
+        final_streaming_result_is_ready_elapsed, finalize_accessibility_context,
+        handle_dashboard_action, handle_launch_request_for_state, handshake_with_deadline,
+        is_blocklisted_correction, is_known_no_speech_transcript, is_supported_hotkey,
+        learning_window_payload_at, load_cleanup_prompt_file, load_learned_vocabulary,
+        load_usage_counters_at, load_vocabulary_usage, load_vocabulary_with_learned,
+        microphone_labels, non_empty_transcript, normalize_microphone_value, onboarding_status_at,
+        override_or_builtin_prompt_from, parse_accessibility_trust, parse_command,
+        parse_daemon_context_reply, parse_daemon_paste_reply, parse_daemon_select_reply,
+        parse_daemon_trust_reply, parse_latest_release, parse_release_version,
+        parse_replacements_json, parse_stt_fallbacks, parse_u64_env_value, parse_update_outcome,
+        parse_wav_pcm16, pcm_bytes, preview_only_streaming, preview_release_stt,
+        prompts_window_payload_at, read_vocabulary_file, read_vocabulary_usage_file,
+        record_learned_correction, reload_is_busy, remove_bolo_env_value_at, remove_fillers,
+        request_accessibility_daemon, resolve_microphone_selection, retry_failed_primary,
+        sanitize_transcript_history, save_usage_counters_at, should_exit_for_key_reload,
+        speech_stats, stable_streaming_best_is_ready_elapsed, status_rows,
+        streaming_batch_fallback_reason, streaming_connection, streaming_preview_tail,
+        streaming_provider_from_config, streaming_status_label, strip_reasoning_tags,
+        strip_vocabulary_echo, stt_language_for_model, stt_model_config, telnyx_stream_query,
+        transcript_log_value, transcript_menu_preview, truncate_to_chars, typed_dashboard_action,
         upsert_learned_correction, upsert_replacement, version_is_newer, wait_for_daemon_reply,
         wav_bytes, wav_duration_ms, write_bolo_env_value_at, write_learned_vocabulary_file,
     };
@@ -14414,6 +14764,8 @@ mod tests {
             preserve_clipboard: true,
             log_transcripts: false,
             max_recording_seconds: 30,
+            local_stt: LocalSttMode::Auto,
+            local_model_file: String::from("ggml-small.bin"),
         };
 
         assert_eq!(config.llm_model(), "Kimi-K2.5");
@@ -14456,6 +14808,8 @@ mod tests {
             preserve_clipboard: true,
             log_transcripts: false,
             max_recording_seconds: 30,
+            local_stt: LocalSttMode::Auto,
+            local_model_file: String::from("ggml-small.bin"),
         };
 
         assert!(!cleanup_decision(&config, "got it thanks").0);
@@ -14490,6 +14844,8 @@ mod tests {
             preserve_clipboard: true,
             log_transcripts: false,
             max_recording_seconds: 30,
+            local_stt: LocalSttMode::Auto,
+            local_model_file: String::from("ggml-small.bin"),
         };
 
         assert!(cleanup_decision(&config, "got it thanks let me know").0);
@@ -14654,6 +15010,8 @@ mod tests {
             preserve_clipboard: true,
             log_transcripts: false,
             max_recording_seconds: 30,
+            local_stt: LocalSttMode::Auto,
+            local_model_file: String::from("ggml-small.bin"),
         }
     }
 
@@ -14864,6 +15222,7 @@ mod tests {
         let dictation = SttResult {
             text: String::from("the batch transcript"),
             llm_cleaned: None,
+            from_local: false,
         };
         let streaming_final = StreamingText {
             text: String::from("the streaming transcript"),
@@ -15030,6 +15389,7 @@ mod tests {
         let uploaded = SttResult {
             text: String::from("streamed transcript"),
             llm_cleaned: None,
+            from_local: false,
         };
         match dictation_upload_release(Some(Ok(uploaded))) {
             DictationUploadRelease::Uploaded(result) => {
@@ -15803,6 +16163,8 @@ mod tests {
                 preserve_clipboard: true,
                 log_transcripts: false,
                 max_recording_seconds: 30,
+                local_stt: LocalSttMode::Auto,
+                local_model_file: String::from("ggml-small.bin"),
             },
             http: reqwest::blocking::Client::new(),
             vocabulary: Mutex::new(vocabulary),
@@ -15818,6 +16180,7 @@ mod tests {
             usage: Mutex::new(UsageCounters::default()),
             dashboard_restart_pending: Mutex::new(false),
             event_proxy: Mutex::new(None),
+            local_whisper: LocalWhisperHandle::default(),
         };
         (app, usage_path)
     }
@@ -15844,6 +16207,8 @@ mod tests {
                 preserve_clipboard: true,
                 log_transcripts: false,
                 max_recording_seconds: 30,
+                local_stt: LocalSttMode::Auto,
+                local_model_file: String::from("ggml-small.bin"),
             },
             http: reqwest::blocking::Client::new(),
             vocabulary: Mutex::new(Vec::new()),
@@ -15859,6 +16224,7 @@ mod tests {
             usage: Mutex::new(UsageCounters::default()),
             dashboard_restart_pending: Mutex::new(false),
             event_proxy: Mutex::new(None),
+            local_whisper: LocalWhisperHandle::default(),
         };
 
         let prepared = app.prepare_text("tenlex ships", &DictationWarmup::default(), None)?;
@@ -15891,6 +16257,8 @@ mod tests {
                 preserve_clipboard: true,
                 log_transcripts: false,
                 max_recording_seconds: 30,
+                local_stt: LocalSttMode::Auto,
+                local_model_file: String::from("ggml-small.bin"),
             },
             http: reqwest::blocking::Client::new(),
             vocabulary: Mutex::new(Vec::new()),
@@ -15906,6 +16274,7 @@ mod tests {
             usage: Mutex::new(UsageCounters::default()),
             dashboard_restart_pending: Mutex::new(false),
             event_proxy: Mutex::new(None),
+            local_whisper: LocalWhisperHandle::default(),
         };
 
         // Short spoken commands like "Bolo, rewrite that make it formal." stay
@@ -15958,6 +16327,8 @@ mod tests {
                 preserve_clipboard: true,
                 log_transcripts: false,
                 max_recording_seconds: 30,
+                local_stt: LocalSttMode::Auto,
+                local_model_file: String::from("ggml-small.bin"),
             },
             http: reqwest::blocking::Client::new(),
             vocabulary: Mutex::new(Vec::new()),
@@ -15973,6 +16344,7 @@ mod tests {
             usage: Mutex::new(UsageCounters::default()),
             dashboard_restart_pending: Mutex::new(false),
             event_proxy: Mutex::new(None),
+            local_whisper: LocalWhisperHandle::default(),
         };
 
         let prepared = app.prepare_text(
@@ -16010,6 +16382,8 @@ mod tests {
                 preserve_clipboard: true,
                 log_transcripts: false,
                 max_recording_seconds: 30,
+                local_stt: LocalSttMode::Auto,
+                local_model_file: String::from("ggml-small.bin"),
             },
             http: reqwest::blocking::Client::new(),
             vocabulary: Mutex::new(Vec::new()),
@@ -16025,6 +16399,7 @@ mod tests {
             usage: Mutex::new(UsageCounters::default()),
             dashboard_restart_pending: Mutex::new(false),
             event_proxy: Mutex::new(None),
+            local_whisper: LocalWhisperHandle::default(),
         };
 
         let prepared = app.prepare_text(
@@ -16072,6 +16447,8 @@ mod tests {
                 preserve_clipboard: true,
                 log_transcripts: false,
                 max_recording_seconds: 30,
+                local_stt: LocalSttMode::Auto,
+                local_model_file: String::from("ggml-small.bin"),
             },
             http: reqwest::blocking::Client::new(),
             vocabulary: Mutex::new(Vec::new()),
@@ -16090,6 +16467,7 @@ mod tests {
             usage: Mutex::new(UsageCounters::default()),
             dashboard_restart_pending: Mutex::new(false),
             event_proxy: Mutex::new(None),
+            local_whisper: LocalWhisperHandle::default(),
         }
     }
 
@@ -16557,6 +16935,8 @@ mod tests {
                 preserve_clipboard: true,
                 log_transcripts: false,
                 max_recording_seconds: 30,
+                local_stt: LocalSttMode::Auto,
+                local_model_file: String::from("ggml-small.bin"),
             },
             http: reqwest::blocking::Client::new(),
             vocabulary: Mutex::new(Vec::new()),
@@ -16572,6 +16952,7 @@ mod tests {
             usage: Mutex::new(UsageCounters::default()),
             dashboard_restart_pending: Mutex::new(false),
             event_proxy: Mutex::new(None),
+            local_whisper: LocalWhisperHandle::default(),
         };
 
         app.remember_result("raw dictated text", "dictated text", None)?;
@@ -16611,6 +16992,8 @@ mod tests {
                 preserve_clipboard: true,
                 log_transcripts: false,
                 max_recording_seconds: 30,
+                local_stt: LocalSttMode::Auto,
+                local_model_file: String::from("ggml-small.bin"),
             },
             http: reqwest::blocking::Client::new(),
             vocabulary: Mutex::new(Vec::new()),
@@ -16626,6 +17009,7 @@ mod tests {
             usage: Mutex::new(UsageCounters::default()),
             dashboard_restart_pending: Mutex::new(false),
             event_proxy: Mutex::new(None),
+            local_whisper: LocalWhisperHandle::default(),
         });
         let prepared = PreparedText {
             text: String::from("dictated text"),
@@ -16668,6 +17052,8 @@ mod tests {
                 preserve_clipboard: true,
                 log_transcripts: false,
                 max_recording_seconds: 30,
+                local_stt: LocalSttMode::Auto,
+                local_model_file: String::from("ggml-small.bin"),
             },
             http: reqwest::blocking::Client::new(),
             vocabulary: Mutex::new(Vec::new()),
@@ -16690,6 +17076,7 @@ mod tests {
             usage: Mutex::new(UsageCounters::default()),
             dashboard_restart_pending: Mutex::new(false),
             event_proxy: Mutex::new(None),
+            local_whisper: LocalWhisperHandle::default(),
         };
 
         let latest = app.latest_transcript().ok().flatten();
@@ -16715,6 +17102,8 @@ mod tests {
                 preserve_clipboard: true,
                 log_transcripts: false,
                 max_recording_seconds: 30,
+                local_stt: LocalSttMode::Auto,
+                local_model_file: String::from("ggml-small.bin"),
             },
             http: reqwest::blocking::Client::new(),
             vocabulary: Mutex::new(Vec::new()),
@@ -16736,6 +17125,7 @@ mod tests {
             usage: Mutex::new(UsageCounters::default()),
             dashboard_restart_pending: Mutex::new(false),
             event_proxy: Mutex::new(None),
+            local_whisper: LocalWhisperHandle::default(),
         };
         let latest = history_app.latest_transcript().ok().flatten();
         assert_eq!(latest.as_deref(), Some("history transcript"));
@@ -17725,6 +18115,8 @@ mod tests {
                 preserve_clipboard: true,
                 log_transcripts: false,
                 max_recording_seconds: 30,
+                local_stt: LocalSttMode::Auto,
+                local_model_file: String::from("ggml-small.bin"),
             },
             http: reqwest::blocking::Client::new(),
             vocabulary: Mutex::new(Vec::new()),
@@ -17739,6 +18131,7 @@ mod tests {
             usage: Mutex::new(UsageCounters::default()),
             dashboard_restart_pending: Mutex::new(false),
             event_proxy: Mutex::new(None),
+            local_whisper: LocalWhisperHandle::default(),
             latest_release: Mutex::new(None),
         })
     }
