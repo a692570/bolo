@@ -497,8 +497,11 @@ struct ActiveRecording {
     conditioner: Option<Arc<Mutex<AudioConditioner>>>,
     /// Capture tee shared with the same callback; the flush needs it to
     /// deliver the tail to the wire sinks before the callback (and with it
-    /// the hub) is destroyed.
-    hub: Arc<AudioHub>,
+    /// the hub) is destroyed. `finish_recording` must set this to `None`
+    /// after dropping the stream: the upload request body reaches EOF only
+    /// when the last hub sender is gone, and a hub still referenced here
+    /// keeps the streamed dictation upload waiting out its full budget.
+    hub: Option<Arc<AudioHub>>,
     started_at: Instant,
     sample_rate: u32,
     warmup: DictationWarmup,
@@ -531,7 +534,9 @@ impl ActiveRecording {
         if let Ok(mut samples) = self.samples.lock() {
             samples.extend_from_slice(tail);
         }
-        self.hub.on_audio(tail);
+        if let Some(hub) = &self.hub {
+            hub.on_audio(tail);
+        }
     }
 }
 
@@ -3030,6 +3035,11 @@ impl App {
         // total-samples contract byte exact.
         recording.flush_conditioning_tail();
         drop(recording.stream);
+        // Release the recording's hub reference now that the callback is
+        // gone: the streamed dictation upload reaches EOF only when every
+        // hub sender is dropped, so leaving this Arc alive burns the
+        // upload's whole wait budget on every dictation.
+        recording.hub = None;
         info!(
             "[pipeline] trailing_capture {}",
             serde_json::json!({
@@ -5756,7 +5766,7 @@ fn start_recording(
         stream,
         samples,
         conditioner: recording_conditioner,
-        hub: Arc::clone(hub),
+        hub: Some(Arc::clone(hub)),
         started_at: Instant::now(),
         sample_rate: config.sample_rate,
         warmup: DictationWarmup::default(),
