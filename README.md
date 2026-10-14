@@ -161,7 +161,7 @@ export BOLO_AUDIO_CONDITIONING="off"
 
 Conditioning is on by default. It keeps the same number of samples and alignment as the raw stream; if the processing engine fails to initialize, Bolo logs it and records without conditioning.
 
-Bolo can also transcribe offline through a local whisper.cpp model. The tier trails the whole cloud ladder (`BOLO_LOCAL_STT=auto`, the default): it runs only when streaming, the streamed Dictation upload, and the batch retry all fail or return no words. To skip cloud entirely and dictate offline, set:
+Bolo can also transcribe offline through a local whisper.cpp model. The tier trails the whole cloud ladder (`BOLO_LOCAL_STT=auto`, the default): it runs only when streaming and the batch retry both fail or return no words. To skip cloud entirely and dictate offline, set:
 
 ```bash
 export BOLO_LOCAL_STT="on"
@@ -173,13 +173,19 @@ To never consult the local tier, set `BOLO_LOCAL_STT="off"`. Transcription runs 
 export BOLO_LOCAL_WHISPER_MODEL="ggml-base.bin"
 ```
 
+### Learned words and the copy-transcript popup
+
+Bolo learns your corrections. When a dictation lands and you edit it within 15 seconds — backspacing and retyping a word Bolo misheard — the next dictation you fix that way teaches Bolo the pair: it is saved to `~/.bolo/learned_vocabulary.json` (capped at 100 entries), applied on every future dictation at zero latency, and Bolo shows a "Bolo learned: X → Y" notification the first time a pair is saved. Only clean single-word substitutions are learned; deletions and full rewrites are deliberately ignored. The tray menu's **Learned Words** shows everything learned so far, and the dashboard counts them.
+
+When Bolo cannot find an editable paste target (no text field is focused, or the paste fails), it skips the blind paste, copies the transcript to the clipboard, and shows a popup with the transcript instead: edit it right there if you like, click **Copy** to take the edited version, or **Dismiss**. Edits made inside the popup are learned exactly like paste edits, so a correction you make in the popup follows every future dictation.
+
 
 The default model is `deepgram/nova-3`, transcribed through the Telnyx STT API. Bolo sends your vocabulary terms along as keyterms, and nova-3 requests carry smart formatting and punctuation on the provider side. The verbatim transcript then goes through Bolo's local pass (filler removal, vocabulary and replacements) plus the optional LLM cleanup below. The separate LLM cleanup pass always runs on the verbatim transcript when enabled.
 
 To test another model, set:
 
 ```bash
-export BOLO_STT_MODEL="assemblyai/universal-3-5-pro"
+export BOLO_STT_MODEL="deepgram/nova-2"
 export BOLO_STT_FALLBACK_MODEL="openai/whisper-large-v3-turbo"
 ```
 
