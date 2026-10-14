@@ -29,6 +29,7 @@ pkill -f "Bolo.app/Contents/Resources/hotkey.py" 2>/dev/null || true
 pkill -f "Bolo.app/Contents/Resources/accessibility_daemon.py" 2>/dev/null || true
 pkill -f "Bolo.app/Contents/Resources/overlay.py" 2>/dev/null || true
 pkill -f "$DIR/app_window.py" 2>/dev/null || true
+pkill -f "$DIR/transcript_popup.py" 2>/dev/null || true
 rm -f "$RUNTIME_DIR/bolo.pid" 2>/dev/null || true
 rm -rf "$LOCK_DIR" /tmp/bolo-instance.lock 2>/dev/null || true
 

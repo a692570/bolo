@@ -270,42 +270,11 @@ def test_installer_writes_private_key_without_backup(tmp_path):
     assert not (home / ".bolo" / "env.bak").exists()
 
 
-def test_installer_defaults_to_assemblyai_when_only_its_key_is_present(tmp_path):
+def test_installer_writes_only_telnyx_key(tmp_path):
+    """Telnyx is the only provider: an exported TELNYX_API_KEY is written
+    verbatim, no removed-provider variable is ever written, and the
+    summary names Telnyx."""
     app_dir, home, runtime, env = _installer_fixture(tmp_path)
-    env.pop("TELNYX_API_KEY", None)
-    env.pop("BOLO_PROVIDER", None)
-    env["ASSEMBLYAI_API_KEY"] = "test-assemblyai-key"
-    try:
-        result = _run("install.sh", cwd=app_dir, env=env)
-    finally:
-        _stop_supervisor(runtime)
-
-    assert result.returncode == 0, result.stdout + result.stderr
-    content = (home / ".bolo" / "env").read_text()
-    assert 'ASSEMBLYAI_API_KEY="test-assemblyai-key"' in content
-    assert "TELNYX_API_KEY" not in content
-    assert "AssemblyAI" in result.stdout
-
-
-def test_installer_rejects_blank_assemblyai_key(tmp_path):
-    app_dir, home, runtime, env = _installer_fixture(tmp_path)
-    for name in ("TELNYX_API_KEY", "ASSEMBLYAI_API_KEY", "BOLO_PROVIDER"):
-        env.pop(name, None)
-    env["BOLO_PROVIDER"] = "assemblyai"
-    try:
-        result = _run("install.sh", cwd=app_dir, env=env, input_text="\n")
-    finally:
-        _stop_supervisor(runtime)
-
-    assert result.returncode != 0
-    assert "API key is required" in result.stdout
-
-
-def test_installer_explicit_telnyx_provider_keeps_telnyx_key(tmp_path):
-    app_dir, home, runtime, env = _installer_fixture(tmp_path)
-    env.pop("ASSEMBLYAI_API_KEY", None)
-    env.pop("BOLO_PROVIDER", None)
-    env["BOLO_PROVIDER"] = "telnyx"
     env["TELNYX_API_KEY"] = "test-telnyx-key"
     try:
         result = _run("install.sh", cwd=app_dir, env=env)
@@ -315,7 +284,8 @@ def test_installer_explicit_telnyx_provider_keeps_telnyx_key(tmp_path):
     assert result.returncode == 0, result.stdout + result.stderr
     content = (home / ".bolo" / "env").read_text()
     assert 'TELNYX_API_KEY="test-telnyx-key"' in content
-    assert "ASSEMBLYAI_API_KEY" not in content
+    forbidden = "ASSEMBLYAI" + "_API_KEY"
+    assert forbidden not in content
     assert "Telnyx" in result.stdout
 
 

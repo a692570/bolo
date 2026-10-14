@@ -18,8 +18,14 @@ exactly one response line per request:
 * ``{"type":"select_before_caret","text":...}``
   -> ``{"type":"select_done","selected":<bool>}``
 * ``{"type":"read_context"}`` -> ``{"type":"context","app":...,
-  "bundle_id":...,"before_cursor":...,"selected_text":...}``, or
-  ``{"type":"context","app":null}`` when the read failed outright
+  "bundle_id":...,"before_cursor":...,"selected_text":...,"writable":
+  <bool>,"focused_pid":<int|null>}``, or ``{"type":"context","app":null}``
+  when the read failed outright. ``writable`` is False when nothing
+  editable was focused; the runtime treats an absent ``writable`` (older
+  daemon) as "unknown" and keeps pasting. ``focused_pid`` names the
+  process owning the focused element (used by the manual-copy fallback's
+  edit-learning probe to recognize its popup) and is absent on older
+  daemons.
 * ``{"type":"stop"}`` -> exits 0
 
 Unknown request types answer ``{"type":"error","message":...}`` and the loop
@@ -216,6 +222,14 @@ def handle_read_context(_request):
             "selected_text": ""
             if element is None or secure
             else accessibility_context.selected_text(element),
+            # Paste-target verdict: False (including no focused element and
+            # password fields) routes the insert to the manual-copy popup.
+            # Secured elements never have their value read on any path.
+            "writable": element is not None
+            and accessibility_context.is_writable_element(element),
+            # Owner of the focused element; the fallback edit-learning probe
+            # pins the manual-copy popup's process through it.
+            "focused_pid": accessibility_context.focused_element_pid(element),
         }
     except Exception as error:
         # The spawned helper would exit nonzero here, so signal "no context"

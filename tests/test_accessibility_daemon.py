@@ -155,6 +155,9 @@ def test_read_context_reports_context_shape(daemon):
     if reply["app"] is not None:
         for key in ("bundle_id", "before_cursor", "selected_text"):
             assert isinstance(reply[key], str)
+        # The paste-target verdict rides along: a bool (False when nothing
+        # editable is focused, including password fields), never missing.
+        assert isinstance(reply["writable"], bool)
 
 
 def test_unknown_request_type_answers_error_and_continues(daemon):

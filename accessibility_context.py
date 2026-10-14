@@ -17,6 +17,19 @@ LOG_FILE = "/tmp/bolo.log"
 SECURE_LABEL_KEYWORDS = ("password", "secure")
 SECURE_REFUSAL_LOG_LINE = "[accessibility] secure field focused; context withheld"
 
+# Conservative editable roles: the focused element is a paste target when
+# its AXRole is one of these. The list stays small on purpose, because a
+# false writable verdict silently drops the transcript (the Cmd+V lands
+# nowhere), while a false non-writable verdict merely shows the copy
+# popup and costs the user one manual paste.
+WRITABLE_ROLES = (
+    "AXTextArea",
+    "AXTextField",
+    "AXComboBox",
+    "AXTextGroup",
+    "AXSearchField",
+)
+
 
 def frontmost_app():
     try:
@@ -138,6 +151,24 @@ def focused_element():
     return element
 
 
+def focused_element_pid(element):
+    """Process id owning the focused element, or None when unreadable.
+
+    The manual-copy fallback's edit-learning probe pins the popup process
+    through this: the pid tells Bolo's runtime which app the caret context
+    came from without reading any field content.
+    """
+    if element is None:
+        return None
+    try:
+        error, pid = AX.AXUIElementGetPid(element, None)
+    except Exception:
+        return None
+    if error != 0:
+        return None
+    return int(pid)
+
+
 def is_secure_element(element):
     """Return True when the focused element must be treated as a password field.
 
@@ -174,6 +205,46 @@ def log_secure_refusal():
             log_file.write(f"{stamp} {SECURE_REFUSAL_LOG_LINE}\n")
     except Exception:
         pass
+
+
+def element_accepts_value_writes(element):
+    """True when the element accepts kAXValueAttribute set operations.
+
+    Never reads AXValue: AXUIElementIsAttributeSettable only reports
+    setability, so this stays safe even next to fields whose value must
+    not be read. Kept as its own seam so tests can stub it like
+    ``copy_attribute``.
+    """
+    try:
+        error, settable = AX.AXUIElementIsAttributeSettable(
+            element, AX.kAXValueAttribute, None
+        )
+    except Exception:
+        return False
+    return error == 0 and bool(settable)
+
+
+def is_writable_element(element):
+    """True when the focused element is an editable paste target.
+
+    The verdict feeds the insert-vs-copy decision: ``False`` routes the
+    dictation to the manual-copy popup instead of a blind Cmd+V. Kept
+    deliberately conservative (the small ``WRITABLE_ROLES`` list, then
+    setability of kAXValueAttribute) because over-claiming writable is the
+    error that loses text. Secure fields count as non-writable for this
+    purpose and are refused before any value attribute is touched, so the
+    CONTEXT withholding rules stay untouched.
+    """
+    if element is None:
+        return False
+    if is_secure_element(element):
+        # A password field accepts typing, but Bolo must not paste into it
+        # blind either: count it as non-writable and never read its value.
+        return False
+    role = copy_attribute(element, AX.kAXRoleAttribute)
+    if role is not None and str(role) in WRITABLE_ROLES:
+        return True
+    return element_accepts_value_writes(element)
 
 
 def text_before_cursor(element):
@@ -238,6 +309,13 @@ def main():
         "bundle_id": bundle_id,
         "text_before_cursor": "" if (element is None or secure) else text_before_cursor(element),
         "selected_text": "" if (element is None or secure) else selected_text(element),
+        # Paste-target verdict for the insert decision; absent field on a
+        # stale helper means "unknown" and the runtime keeps pasting.
+        "writable": element is not None and is_writable_element(element),
+        # Owner of the focused element (None when nothing is focused or a
+        # stale helper predates the field); probes use it to recognize the
+        # manual-copy popup's text view without reading field content.
+        "focused_pid": focused_element_pid(element),
     }
     print(json.dumps(context, ensure_ascii=True))
 

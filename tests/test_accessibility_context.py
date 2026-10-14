@@ -165,3 +165,94 @@ def test_refusal_log_writes_one_sanitized_line(monkeypatch, tmp_path):
     contents = log_path.read_text(encoding="utf-8")
     assert contents.count("\n") == 1
     assert "[accessibility] secure field focused; context withheld" in contents
+
+
+def stub_value_writes(monkeypatch, accepted):
+    """Replace the AXValue-setability seam used by the writable check.
+    Records how many elements were probed so tests can assert the probe
+    ran exactly once (and only after the role check missed)."""
+    calls = []
+
+    def fake(element):
+        calls.append(element)
+        return accepted
+
+    monkeypatch.setattr(
+        accessibility_context, "element_accepts_value_writes", fake
+    )
+    return calls
+
+
+def test_no_focused_element_is_not_writable():
+    assert accessibility_context.is_writable_element(None) is False
+
+
+@pytest.mark.parametrize(
+    "role",
+    [
+        "AXTextArea",
+        "AXTextField",
+        "AXComboBox",
+        "AXTextGroup",
+        "AXSearchField",
+    ],
+)
+def test_editable_roles_are_writable_targets(monkeypatch, role):
+    element = use_fake_element(monkeypatch, {"AXRole": role})
+    assert accessibility_context.is_writable_element(element) is True
+
+
+def test_value_settable_element_is_writable_even_off_the_role_list(monkeypatch):
+    # The WebArea role only becomes a paste target when AXValue accepts set
+    # operations: the setability probe is what proves it, and it runs
+    # exactly once after the role check missed.
+    element = use_fake_element(monkeypatch, {"AXRole": "AXWebArea"})
+    calls = stub_value_writes(monkeypatch, True)
+    assert accessibility_context.is_writable_element(element) is True
+    assert calls == [element]
+
+
+def test_plain_control_is_not_a_writable_target(monkeypatch):
+    element = use_fake_element(monkeypatch, {"AXRole": "AXButton", "AXValue": "OK"})
+    calls = stub_value_writes(monkeypatch, False)
+    assert accessibility_context.is_writable_element(element) is False
+    assert calls == [element]
+
+
+def test_secure_field_is_not_writable_and_its_value_is_never_read(
+    monkeypatch, refusal_log
+):
+    requested = []
+
+    def recording_copy(element, attribute):
+        requested.append(str(attribute))
+        return element.attributes.get(str(attribute))
+
+    monkeypatch.setattr(accessibility_context, "copy_attribute", recording_copy)
+    element = FakeElement({"AXSubrole": "AXSecureTextField", "AXValue": "hunter2"})
+    assert accessibility_context.is_writable_element(element) is False
+    assert "AXValue" not in requested
+
+
+def test_secure_field_reports_writable_false_without_leaking_context(
+    monkeypatch, capsys, refusal_log
+):
+    # main() emits writable alongside the context; a secure field reports
+    # non-writable while its value stays withheld from every output key.
+    element = use_fake_element(
+        monkeypatch,
+        {"AXSubrole": "AXSecureTextField", "AXValue": "hunter2"},
+    )
+    run_context_main(monkeypatch, element)
+    output = json.loads(capsys.readouterr().out)
+    assert output["writable"] is False
+    assert "hunter2" not in json.dumps(output)
+    assert refusal_log == [True]
+
+
+def test_ordinary_field_reports_writable_true(monkeypatch, capsys, refusal_log):
+    element = use_fake_element(monkeypatch, {"AXRole": "AXTextArea", "AXValue": "hi"})
+    run_context_main(monkeypatch, element)
+    output = json.loads(capsys.readouterr().out)
+    assert output["writable"] is True
+    assert refusal_log == []

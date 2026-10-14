@@ -27,7 +27,7 @@ def fixture_dashboard(history=None, **overrides):
         "microphones": ["MacBook Pro Microphone"],
         "cleanup_mode": "auto",
         "accessibility_state": "ok",
-        "provider": "AssemblyAI",
+        "provider": "Deepgram",
         "history_limit": 10,
         "saved_dictations": 3,
         "saved_words": 57,

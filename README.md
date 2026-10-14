@@ -24,7 +24,7 @@ git clone https://github.com/a692570/bolo.git && cd bolo && ./install.sh
 
 ## Install without a terminal (DMG)
 
-If a `Bolo-<version>.dmg` is attached to a [GitHub release](https://github.com/a692570/bolo/releases), open it, drag Bolo into Applications, and launch it. No Rust, no Python setup, no terminal. The app bundles a CPython runtime for both Intel and Apple Silicon Macs, creates its helper environment from wheels inside the bundle on first launch, registers itself as a login item, and collects your AssemblyAI API key in its onboarding window (paste the key and click Validate; nothing is transcribed for the check). One Accessibility grant covers Bolo and all of its helpers because macOS attributes them to the app bundle.
+If a `Bolo-<version>.dmg` is attached to a [GitHub release](https://github.com/a692570/bolo/releases), open it, drag Bolo into Applications, and launch it. No Rust, no Python setup, no terminal. The app bundles a CPython runtime for both Intel and Apple Silicon Macs, creates its helper environment from wheels inside the bundle on first launch, registers itself as a login item, and collects your Telnyx API key in its onboarding window (paste the key and click Validate; nothing is transcribed for the check). One Accessibility grant covers Bolo and all of its helpers because macOS attributes them to the app bundle.
 
 Two macOS caveats, both consequences of shipping without a paid Developer ID:
 
@@ -99,21 +99,15 @@ BOLO_AUTO_UPDATE=off
 
 ## Configuration
 
-Set your AssemblyAI API key as an environment variable:
+Bolo's speech pipeline runs entirely on Telnyx-hosted models. Set your Telnyx API key as an environment variable:
 
 ```bash
-export ASSEMBLYAI_API_KEY="your_key_here"
+export TELNYX_API_KEY="your_key_here"
 ```
 
-`ASSEMBLYAI_API_KEY` is required for the default configuration. Add it to your shell profile to persist it, or put it in `~/.bolo/env`. The install script writes prompted keys to `~/.bolo/env`.
+`TELNYX_API_KEY` is required: every streaming provider, every batch model, and the LLM cleanup fallback below run on it. Add it to your shell profile to persist it, or put it in `~/.bolo/env`. The install script writes prompted keys to `~/.bolo/env`.
 Bolo reads API keys from the process environment first, then falls back to `~/.bolo/env` and `~/.zshrc`.
 The installer keeps `~/.bolo` private to your macOS account and stores `~/.bolo/env` with owner-only permissions.
-
-### Choose your provider
-
-The install script asks which STT provider to use: 1 for AssemblyAI (default) or 2 for Telnyx. Set `BOLO_PROVIDER=assemblyai` or `BOLO_PROVIDER=telnyx` before running it to preselect the provider and skip the question. If exactly one API key is already exported, the installer selects the matching provider without asking.
-
-`TELNYX_API_KEY` is optional now. It is only required while a Telnyx-hosted provider is configured: Deepgram streaming through Telnyx, `assemblyai-telnyx` streaming, a Telnyx batch model set with `BOLO_STT_MODEL`, or a `telnyx:` entry in the fallback chain.
 
 Bolo redacts dictated text from `/tmp/bolo.log` by default. To temporarily log transcript text while debugging, set:
 
@@ -180,18 +174,16 @@ export BOLO_LOCAL_WHISPER_MODEL="ggml-base.bin"
 ```
 
 
-The default model is `assemblyai/universal-3-5-pro`, transcribed through AssemblyAI's Dictation API. One call returns the verbatim transcript plus a provider-cleaned version with fillers removed, self-corrections resolved, and punctuation applied. Bolo's local vocabulary aliases and replacements still run on top, and the separate LLM cleanup pass is skipped whenever the provider cleaned text is available.
-
-The Dictation endpoint caps audio at 120 seconds, so longer recordings automatically use AssemblyAI's async upload-and-poll path, which returns verbatim text only.
+The default model is `deepgram/nova-3`, transcribed through the Telnyx STT API. Bolo sends your vocabulary terms along as keyterms, and nova-3 requests carry smart formatting and punctuation on the provider side. The verbatim transcript then goes through Bolo's local pass (filler removal, vocabulary and replacements) plus the optional LLM cleanup below. The separate LLM cleanup pass always runs on the verbatim transcript when enabled.
 
 To test another model, set:
 
 ```bash
-export BOLO_STT_MODEL="deepgram/nova-3"
+export BOLO_STT_MODEL="assemblyai/universal-3-5-pro"
 export BOLO_STT_FALLBACK_MODEL="openai/whisper-large-v3-turbo"
 ```
 
-`assemblyai/*` models use the Dictation API and require `ASSEMBLYAI_API_KEY`. Any other model routes through the Telnyx STT API and requires `TELNYX_API_KEY`.
+Every `BOLO_STT_MODEL` value routes through the Telnyx STT API and requires `TELNYX_API_KEY`.
 
 For accent or language hints, set:
 
@@ -206,31 +198,38 @@ If a non-US language hint makes recognition slow, Bolo automatically switches ba
 For provider fallback, set a comma-separated chain:
 
 ```bash
-export BOLO_STT_FALLBACKS="xai,assemblyai,telnyx:openai/whisper-large-v3-turbo"
+export BOLO_STT_FALLBACKS="xai,telnyx:openai/whisper-large-v3-turbo"
 ```
 
 Supported fallback entries:
 
-- `telnyx:<model>` uses the existing Telnyx API key.
+- `telnyx:<model>` (or a bare model name) reuses the existing Telnyx API key with that model.
 - `xai` uses `XAI_API_KEY` and xAI's REST STT API.
-- `assemblyai` or `assemblyai:<speech_model>` uses `ASSEMBLYAI_API_KEY`. This uploads and polls, so it is best as an emergency fallback rather than the first low-latency backup.
 
-Set `BOLO_STT_FALLBACKS=off` to fail fast instead of retrying when the primary model is rate limited. `BOLO_STT_FALLBACK_MODEL` still works for a single fallback of any provider listed above.
+When neither `BOLO_STT_FALLBACKS` nor `BOLO_STT_FALLBACK_MODEL` is set, the default chain is `telnyx:openai/whisper-large-v3-turbo`. Set `BOLO_STT_FALLBACKS=off` to fail fast instead of retrying when the primary model is rate limited. `BOLO_STT_FALLBACK_MODEL` still works for a single fallback model of the same shape.
 
-Streaming starts sending audio while you speak and falls back to batch transcription when a complete result is not ready quickly enough after release. Streaming defaults to off for `assemblyai/*` models, since the Dictation API already returns formatted text, and defaults to Deepgram for the `deepgram/nova-3` batch model.
+Streaming starts sending audio while you speak and falls back to batch transcription when a complete result is not ready quickly enough after release. Streaming defaults to Deepgram for the `deepgram/nova-3` batch model and stays off for every other model unless you pick a provider explicitly.
 
 Set `BOLO_STT_STREAMING` to pick a provider explicitly:
 
 ```bash
-export BOLO_STT_STREAMING="assemblyai"
+export BOLO_STT_STREAMING="telnyx"
 ```
 
-Supported values:
+Supported values (all Telnyx-routed, all requiring `TELNYX_API_KEY`):
 
-- `assemblyai` (also `assembly`, `on`, or `true`): direct AssemblyAI streaming over the v3 WebSocket, using the dictation streaming model `universal-streaming-english`. Override the model with `BOLO_STT_STREAMING_MODEL`. Requires `ASSEMBLYAI_API_KEY`.
-- `assemblyai-telnyx`: legacy AssemblyAI Universal-Streaming routed through Telnyx. Requires `TELNYX_API_KEY`.
-- `deepgram` (also `nova-3`): legacy Deepgram Nova-3 streaming through Telnyx. Requires `TELNYX_API_KEY`.
+- `telnyx` (also `deepgram`, `nova-3`, or `nova3`): Deepgram Nova-3 streaming through the Telnyx websocket.
+- `assemblyai-telnyx` (also `assembly-telnyx`): AssemblyAI Universal-3.5 streaming routed through Telnyx, pinned to `assemblyai/universal-3-5-pro`.
 - `off`: always use batch transcription.
+
+Inside the Telnyx websocket, `BOLO_TELNYX_STREAMING_ENGINE` and `BOLO_TELNYX_STREAMING_MODEL` select the engine and model (defaults: `Deepgram` and `nova-3`):
+
+```bash
+export BOLO_TELNYX_STREAMING_ENGINE="Speechmatics"
+export BOLO_TELNYX_STREAMING_MODEL="streaming-exp"
+```
+
+The documented engines are Deepgram, Telnyx, Google, Azure, xAI, AssemblyAI, Speechmatics, Soniox, Parakeet, Cohere, Reson8, and Humain; unknown values pass through verbatim so new engines work without a code change. Live partial transcripts (interim results) come only from Deepgram, Speechmatics, and Soniox; the other engines return a single final transcript when you release. The `assemblyai-telnyx` provider ignores these two selectors and pins AssemblyAI's own engine and model.
 
 To keep dictated text on the clipboard after insertion, set:
 
@@ -267,7 +266,7 @@ export BOLO_LLM_CLEANUP="on"
 
 To disable LLM cleanup entirely, set `BOLO_LLM_CLEANUP="off"`.
 
-LLM cleanup and rewrites resolve their endpoint in this order: `LITELLM_BASE` (any OpenAI-compatible endpoint) first, using `Kimi-K2.5` unless `BOLO_LLM_MODEL` is set; then the AssemblyAI LLM Gateway (`https://llm-gateway.assemblyai.com/v1/chat/completions`), authenticated with the same `ASSEMBLYAI_API_KEY` and defaulting to `gemini-2.5-flash-lite` — the gateway's model providers must be enabled under Data Controls in the AssemblyAI dashboard; finally the Telnyx inference endpoint (`Qwen/Qwen3-235B-A22B`, thinking disabled) is used only while `TELNYX_API_KEY` is set. With no endpoint available at all, LLM cleanup is disabled and local cleanup still runs on its own, and voice rewrites report missing configuration. MiniMax is intentionally not used for cleanup because it can leak reasoning text into the output.
+LLM cleanup and rewrites resolve their endpoint in this order: `LITELLM_BASE` (any OpenAI-compatible endpoint) first, using `Kimi-K2.5` unless `BOLO_LLM_MODEL` is set; then the Telnyx inference endpoint (`Qwen/Qwen3-235B-A22B`, thinking disabled) is used only while `TELNYX_API_KEY` is set. With no endpoint available at all, LLM cleanup is disabled and local cleanup still runs on its own, and voice rewrites report missing configuration. MiniMax is intentionally not used for cleanup because it can leak reasoning text into the output.
 
 When LLM cleanup runs, Bolo also reads the frontmost app and nearby cursor text through macOS Accessibility so cleanup can choose natural spacing, capitalization, and continuation. That context is used only for cleanup prompting.
 
@@ -382,7 +381,7 @@ Yes. Set `BOLO_HOTKEY` to `right_control`, `right_shift`, `fn`, `f1` through `f1
 
 - Does it work offline?
 
-No. Bolo requires internet to reach Telnyx APIs.
+Only through the optional offline tier: `BOLO_LOCAL_STT="on"` dictates entirely through a local whisper.cpp model (see Configuration). The default cloud pipeline needs internet to reach Telnyx APIs.
 
 - Why Rust?
 
