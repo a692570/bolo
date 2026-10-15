@@ -71,7 +71,12 @@ def copy_reply(text):
     return json.dumps({"type": "copy_used", "text": text})
 
 
-LEFT_MOUSE_DOWN = 1
+# The left-mouse-down MASK for event monitors: `addGlobalMonitorForEventsMatchingMask_`
+# takes a mask (1 << 1), not the NSEventType constant (1). Passing the type
+# constant registered the monitor for the wrong bits, which is why the
+# outside-click monitors never fired (issue #33).
+LEFT_MOUSE_DOWN_MASK = 1 << 1
+KEY_ESCAPE = 53
 
 
 def popup_height(lines=BODY_LINES):
@@ -413,12 +418,27 @@ def run_popup(transcript, preview=False):
     # the local one clicks inside this process (e.g. the popup's own body).
     state["outside_monitor"] = (
         AppKit.NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(
-            LEFT_MOUSE_DOWN, outside_click
+            LEFT_MOUSE_DOWN_MASK, outside_click
         )
     )
     state["local_monitor"] = (
         AppKit.NSEvent.addLocalMonitorForEventsMatchingMask_handler_(
-            LEFT_MOUSE_DOWN, local_click
+            LEFT_MOUSE_DOWN_MASK, local_click
+        )
+    )
+
+    def escape_pressed(event):
+        # Local monitor only: Escape dismisses when the popup itself is
+        # key (the keyDown is destined for this process). Escape typed in
+        # other apps never reaches a local monitor.
+        if event.keyCode() == KEY_ESCAPE:
+            close()
+            return None
+        return event
+
+    state["escape_monitor"] = (
+        AppKit.NSEvent.addLocalMonitorForEventsMatchingMask_handler_(
+            AppKit.NSEventMaskKeyDown, escape_pressed
         )
     )
 
@@ -435,6 +455,19 @@ def run_popup(transcript, preview=False):
 
         if time.time() > deadline:
             close()
+
+        # Pump and dispatch events. runMode alone never dequeues application
+        # events, so buttons, the text view, and the outside-click monitors
+        # never saw input (issue #33): pull one event per tick and hand it
+        # to the app.
+        pending = app.nextEventMatchingMask_untilDate_inMode_dequeue_(
+            AppKit.NSEventMaskAny,
+            NSDate.dateWithTimeIntervalSinceNow_(0.02),
+            NSDefaultRunLoopMode,
+            True,
+        )
+        if pending is not None:
+            app.sendEvent_(pending)
 
         NSRunLoop.mainRunLoop().runMode_beforeDate_(
             NSDefaultRunLoopMode,
