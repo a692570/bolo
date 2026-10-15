@@ -1174,7 +1174,7 @@ fn telnyx_stream_engine_model(provider: StreamingProvider) -> (String, String) {
     let engine =
         load_env_value("BOLO_TELNYX_STREAMING_ENGINE").unwrap_or_else(|| String::from("Deepgram"));
     let model =
-        load_env_value("BOLO_TELNYX_STREAMING_MODEL").unwrap_or_else(|| String::from("nova-3"));
+        load_env_value("BOLO_TELNYX_STREAMING_MODEL").unwrap_or_else(|| String::from("flux-multi"));
     telnyx_stream_engine_model_with(provider, &engine, &model)
 }
 

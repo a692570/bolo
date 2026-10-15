@@ -228,7 +228,7 @@ Supported values (all Telnyx-routed, all requiring `TELNYX_API_KEY`):
 - `assemblyai-telnyx` (also `assembly-telnyx`): AssemblyAI Universal-3.5 streaming routed through Telnyx, pinned to `assemblyai/universal-3-5-pro`.
 - `off`: always use batch transcription.
 
-Inside the Telnyx websocket, `BOLO_TELNYX_STREAMING_ENGINE` and `BOLO_TELNYX_STREAMING_MODEL` select the engine and model (defaults: `Deepgram` and `nova-3`):
+Inside the Telnyx websocket, `BOLO_TELNYX_STREAMING_ENGINE` and `BOLO_TELNYX_STREAMING_MODEL` select the engine and model (defaults: `Deepgram` and `flux-multi` — the lowest-latency Deepgram family, with Hindi code-switching and vocabulary as keyterms):
 
 ```bash
 export BOLO_TELNYX_STREAMING_ENGINE="Speechmatics"
