@@ -180,7 +180,7 @@ Bolo learns your corrections. When a dictation lands and you edit it within 15 s
 When Bolo cannot find an editable paste target (no text field is focused, or the paste fails), it skips the blind paste, copies the transcript to the clipboard, and shows a popup with the transcript instead: edit it right there if you like, click **Copy** to take the edited version, or **Dismiss**. Edits made inside the popup are learned exactly like paste edits, so a correction you make in the popup follows every future dictation.
 
 
-The default model is `deepgram/nova-3`, transcribed through the Telnyx STT API. Bolo sends your vocabulary terms along as keyterms, and nova-3 requests carry smart formatting and punctuation on the provider side. The verbatim transcript then goes through Bolo's local pass (filler removal, vocabulary and replacements) plus the optional LLM cleanup below. The separate LLM cleanup pass always runs on the verbatim transcript when enabled.
+The default model is `openai/whisper-large-v3-turbo`, transcribed through the Telnyx STT API. Bolo sends your vocabulary terms along as a free-text prompt with an echo filter, and whisper models decode language automatically per segment so code-switched dictation keeps working. The verbatim transcript then goes through Bolo's local pass (filler removal, vocabulary and replacements) plus the optional LLM cleanup below. The separate LLM cleanup pass always runs on the verbatim transcript when enabled.
 
 To test another model, set:
 
@@ -214,7 +214,7 @@ Supported fallback entries:
 
 When neither `BOLO_STT_FALLBACKS` nor `BOLO_STT_FALLBACK_MODEL` is set, the default chain is `telnyx:openai/whisper-large-v3-turbo`. Set `BOLO_STT_FALLBACKS=off` to fail fast instead of retrying when the primary model is rate limited. `BOLO_STT_FALLBACK_MODEL` still works for a single fallback model of the same shape.
 
-Streaming starts sending audio while you speak and falls back to batch transcription when a complete result is not ready quickly enough after release. Streaming defaults to Deepgram for the `deepgram/nova-3` batch model and stays off for every other model unless you pick a provider explicitly.
+Streaming starts sending audio while you speak and falls back to batch transcription when a complete result is not ready quickly enough after release. Streaming defaults to Deepgram regardless of which batch model you pick; the live preview and the final transcript are deliberately decoupled (the 2026-10-17 measurement scored Deepgram flux streaming at 16.7% median WER and batch whisper-large-v3-turbo at 11.3% on 134 real dictations, so the stream stays the live preview while batch decides the final transcript).
 
 Set `BOLO_STT_STREAMING` to pick a provider explicitly:
 
@@ -236,6 +236,12 @@ export BOLO_TELNYX_STREAMING_MODEL="streaming-exp"
 ```
 
 The documented engines are Deepgram, Telnyx, Google, Azure, xAI, AssemblyAI, Speechmatics, Soniox, Parakeet, Cohere, Reson8, and Humain; unknown values pass through verbatim so new engines work without a code change. Live partial transcripts (interim results) come only from Deepgram, Speechmatics, and Soniox; the other engines return a single final transcript when you release. The `assemblyai-telnyx` provider ignores these two selectors and pins AssemblyAI's own engine and model.
+
+After a healthy streaming result, Bolo re-runs the batch model over the same audio inside a bounded window and inserts its transcript when it answers with words (`BOLO_FINAL_REFINE`, on by default). The streaming text ships unchanged when refine is disabled, times out after two seconds, or returns empty. Set `BOLO_FINAL_REFINE=off` to insert the streaming text directly and skip the round trip:
+
+```bash
+export BOLO_FINAL_REFINE="off"
+```
 
 To keep dictated text on the clipboard after insertion, set:
 

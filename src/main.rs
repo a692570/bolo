@@ -256,6 +256,11 @@ struct Config {
     /// File name of the offline whisper model inside `~/.bolo/models`,
     /// from `BOLO_LOCAL_WHISPER_MODEL`; defaults to `ggml-small.bin`.
     local_model_file: String,
+    /// Final-refine policy from `BOLO_FINAL_REFINE`: after a healthy
+    /// streaming result, re-run the batch endpoint and prefer its transcript
+    /// when it returns words inside the bounded window. The streaming text
+    /// ships unchanged when refine is off, times out, or returns empty.
+    final_refine: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1034,6 +1039,25 @@ fn streaming_batch_fallback_reason(
     match source {
         "final" | "stable_best_available" => None,
         _ => Some("non_final_streaming_result"),
+    }
+}
+
+/// Decide the final transcript when the streaming result is healthy: the
+/// batch model re-runs over the same audio inside the bounded window, and
+/// its transcript replaces the stream whenever it returns words.
+/// Selection rule measured on the 134-clip harness (laneE, 2026-10-17):
+/// whisper-large-v3-turbo wins even when it returns fewer words than the
+/// stream (17 clips vs 8), so the guard here is emptiness, not word count.
+/// `transcribe_with_model` already errors on empty transcripts and strips
+/// prompt echoes, so any `Err` keeps the streaming text unchanged. Pure
+/// function so the selection is testable without HTTP.
+fn final_refine_choice(
+    streaming_text: &str,
+    batch: Result<String, AppError>,
+) -> (&'static str, String) {
+    match batch {
+        Ok(batch) => ("final_refine_selected", batch),
+        Err(_) => ("final_refine_kept_streaming", streaming_text.to_owned()),
     }
 }
 
@@ -2740,7 +2764,7 @@ impl App {
                 .map_or_else(SttResult::default, SttResult::verbatim_local)
         } else if let Some(streaming) = recording.streaming {
             match streaming.finish() {
-                Some(streaming_text) => SttResult::verbatim(self.recheck_streaming_transcript(
+                Some(streaming_text) => SttResult::verbatim(self.refine_streaming_transcript(
                     streaming_text,
                     &wav,
                     elapsed,
@@ -3322,58 +3346,79 @@ impl App {
         }
     }
 
-    fn recheck_streaming_transcript(
+    fn refine_streaming_transcript(
         &self,
         streaming: StreamingText,
         wav: &[u8],
         recording_duration: Duration,
         warmup: &DictationWarmup,
     ) -> String {
-        let Some(reason) =
-            streaming_batch_fallback_reason(&streaming.text, streaming.source, recording_duration)
-        else {
-            return streaming.text;
-        };
-        warn!(
-            "[stt] streaming_suspicious_batch_fallback {}",
-            serde_json::json!({
-                "reason": reason,
-                "source": streaming.source,
-                "streaming_chars": streaming.text.chars().count(),
-                "streaming_words": streaming.text.split_whitespace().count(),
-                "recording_duration_ms": recording_duration.as_millis(),
-            })
-        );
-        match self.verify_streaming_transcript(wav, warmup) {
-            Ok(batch)
-                if batch.split_whitespace().count() > streaming.text.split_whitespace().count() =>
-            {
-                info!(
-                    "[stt] batch_fallback_selected {}",
-                    serde_json::json!({
-                        "reason": reason,
-                        "streaming_words": streaming.text.split_whitespace().count(),
-                        "batch_words": batch.split_whitespace().count(),
-                    })
-                );
-                batch
-            }
-            Ok(batch) => {
-                info!(
-                    "[stt] batch_fallback_discarded {}",
-                    serde_json::json!({
-                        "reason": reason,
-                        "streaming_words": streaming.text.split_whitespace().count(),
-                        "batch_words": batch.split_whitespace().count(),
-                    })
-                );
-                streaming.text
-            }
-            Err(error) => {
-                warn!("[stt] batch fallback after suspicious streaming failed: {error}");
-                streaming.text
+        let reason =
+            streaming_batch_fallback_reason(&streaming.text, streaming.source, recording_duration);
+        if let Some(reason) = reason {
+            warn!(
+                "[stt] streaming_suspicious_batch_fallback {}",
+                serde_json::json!({
+                    "reason": reason,
+                    "source": streaming.source,
+                    "streaming_chars": streaming.text.chars().count(),
+                    "streaming_words": streaming.text.split_whitespace().count(),
+                    "recording_duration_ms": recording_duration.as_millis(),
+                })
+            );
+            match self.verify_streaming_transcript(wav, warmup) {
+                Ok(batch)
+                    if batch.split_whitespace().count()
+                        > streaming.text.split_whitespace().count() =>
+                {
+                    info!(
+                        "[stt] batch_fallback_selected {}",
+                        serde_json::json!({
+                            "reason": reason,
+                            "streaming_words": streaming.text.split_whitespace().count(),
+                            "batch_words": batch.split_whitespace().count(),
+                        })
+                    );
+                    return batch;
+                }
+                Ok(batch) => {
+                    info!(
+                        "[stt] batch_fallback_discarded {}",
+                        serde_json::json!({
+                            "reason": reason,
+                            "streaming_words": streaming.text.split_whitespace().count(),
+                            "batch_words": batch.split_whitespace().count(),
+                        })
+                    );
+                    return streaming.text;
+                }
+                Err(error) => {
+                    warn!("[stt] batch fallback after suspicious streaming failed: {error}");
+                    return streaming.text;
+                }
             }
         }
+        // Healthy stream: always refine. The stream stays the live preview;
+        // batch decides the final transcript whenever it answers inside the
+        // bounded window. `BOLO_FINAL_REFINE=off` restores the pre-refine
+        // behavior for dictations where the extra round trip is not worth
+        // the accuracy gain.
+        if !self.config.final_refine {
+            return streaming.text;
+        }
+        let (label, text) = final_refine_choice(
+            &streaming.text,
+            self.verify_streaming_transcript(wav, warmup),
+        );
+        info!(
+            "[stt] {} {}",
+            label,
+            serde_json::json!({
+                "streaming_words": streaming.text.split_whitespace().count(),
+                "final_words": text.split_whitespace().count(),
+            })
+        );
+        text
     }
 
     fn start_dictation_warmup(&self) -> DictationWarmup {
@@ -5330,9 +5375,13 @@ impl Config {
                 value.to_owned(),
             ));
         }
-        let stt_model =
-            load_env_value("BOLO_STT_MODEL").unwrap_or_else(|| String::from("deepgram/nova-3"));
-        let streaming_stt = load_streaming_provider(&stt_model);
+        // Batch primary: `openai/whisper-large-v3-turbo` since the
+        // 2026-10-17 measurement (laneE, 134 real dictations): 11.3% median
+        // WER vs nova-3's 14.3% on the same harness. Streaming stays
+        // independent (see `streaming_provider_from_config`).
+        let stt_model = load_env_value("BOLO_STT_MODEL")
+            .unwrap_or_else(|| String::from("openai/whisper-large-v3-turbo"));
+        let streaming_stt = load_streaming_provider();
         let stt_fallbacks = load_stt_fallbacks();
         let config = Self {
             telnyx_api_key,
@@ -5359,6 +5408,7 @@ impl Config {
             local_stt: local_whisper::parse_local_stt_mode(
                 load_env_value("BOLO_LOCAL_STT").as_deref(),
             ),
+            final_refine: load_bool_env("BOLO_FINAL_REFINE", true),
             local_model_file: load_env_value("BOLO_LOCAL_WHISPER_MODEL")
                 .unwrap_or_else(|| String::from(local_whisper::DEFAULT_MODEL_FILE)),
         };
@@ -10499,6 +10549,14 @@ fn stt_model_config(model: &str, vocabulary: &[String]) -> Option<serde_json::Va
 }
 
 fn stt_language_for_model(model: &str, configured_language: &str) -> Option<String> {
+    // Whisper-family models decode language automatically per segment, and
+    // the 2026-10-17 measurement (laneE) scored them without a language
+    // hint: 11.3% median WER. Forcing the configured hint would break the
+    // code-switched dictations Bolo serves, so no language parameter is
+    // sent for whisper-family models; other engines keep the hint.
+    if model.starts_with("openai/whisper") {
+        return None;
+    }
     let language = configured_language.trim();
     if language.is_empty()
         || language.eq_ignore_ascii_case("off")
@@ -10517,21 +10575,17 @@ fn stt_language_for_model(model: &str, configured_language: &str) -> Option<Stri
     Some(language.to_owned())
 }
 
-fn load_streaming_provider(stt_model: &str) -> Option<StreamingProvider> {
+fn load_streaming_provider() -> Option<StreamingProvider> {
     let value =
         load_env_value("BOLO_STT_STREAMING").or_else(|| load_env_value("BOLO_STREAMING_STT"));
-    streaming_provider_from_config(value.as_deref(), stt_model)
+    streaming_provider_from_config(value.as_deref())
 }
 
-fn streaming_provider_from_config(
-    value: Option<&str>,
-    stt_model: &str,
-) -> Option<StreamingProvider> {
-    let default = if stt_model.eq_ignore_ascii_case("deepgram/nova-3") {
-        "deepgram"
-    } else {
-        "off"
-    };
+fn streaming_provider_from_config(value: Option<&str>) -> Option<StreamingProvider> {
+    // Streaming no longer keys off the batch model: the 2026-10-17 default
+    // moved the batch primary to whisper-large-v3-turbo while the live
+    // preview stays Deepgram flux. Explicit `off` still disables it.
+    let default = "deepgram";
     match value
         .unwrap_or(default)
         .trim()
@@ -13188,6 +13242,7 @@ mod tests {
         consume_open_dashboard_request_at, contains_word_verbatim, dashboard_accessibility_state,
         dashboard_cleanup_mode, dashboard_payload, dashboard_provider_label,
         derive_word_correction, downsample_wav_16k_mono, edit_distance,
+        final_refine_choice,
         edit_learning_context_diverged, empty_transcript_error, enforce_learned_vocabulary_cap,
         final_streaming_result_is_ready_elapsed, finalize_accessibility_context,
         handle_dashboard_action, handle_launch_request_for_state, handshake_with_deadline,
@@ -14428,6 +14483,7 @@ mod tests {
             max_recording_seconds: 30,
             local_stt: LocalSttMode::Auto,
             local_model_file: String::from("ggml-small.bin"),
+            final_refine: true,
         };
 
         assert_eq!(config.llm_model(), "Kimi-K2.5");
@@ -14473,6 +14529,7 @@ mod tests {
             max_recording_seconds: 30,
             local_stt: LocalSttMode::Auto,
             local_model_file: String::from("ggml-small.bin"),
+            final_refine: true,
         };
 
         assert!(!cleanup_decision(&config, "got it thanks").0);
@@ -14508,6 +14565,7 @@ mod tests {
             max_recording_seconds: 30,
             local_stt: LocalSttMode::Auto,
             local_model_file: String::from("ggml-small.bin"),
+            final_refine: true,
         };
 
         assert!(cleanup_decision(&config, "got it thanks let me know").0);
@@ -14617,39 +14675,34 @@ mod tests {
 
     #[test]
     fn streaming_provider_resolution_matches_the_config_values() {
+        // Streaming is decoupled from the batch model: every Telnyx-hosted
+        // batch model defaults to the Deepgram live preview, and explicit
+        // `off` still disables it. The 2026-10-17 default moved the batch
+        // primary to whisper-large-v3-turbo without touching streaming.
         assert_eq!(
-            streaming_provider_from_config(None, "deepgram/nova-3"),
+            streaming_provider_from_config(None),
             Some(StreamingProvider::Deepgram)
         );
-        // Only the Deepgram model defaults to streaming; every other batch
-        // model is off unless the provider is selected explicitly.
         assert_eq!(
-            streaming_provider_from_config(None, "openai/whisper-large-v3-turbo"),
+            streaming_provider_from_config(Some("off")),
             None
         );
         assert_eq!(
-            streaming_provider_from_config(Some("off"), "deepgram/nova-3"),
-            None
-        );
-        assert_eq!(
-            streaming_provider_from_config(Some("deepgram"), "openai/whisper-large-v3-turbo"),
+            streaming_provider_from_config(Some("deepgram")),
             Some(StreamingProvider::Deepgram)
         );
         // "telnyx" is an alias for the default Telnyx-hosted Deepgram
         // engine; the removed direct-AssemblyAI spelling stays unclaimed.
         assert_eq!(
-            streaming_provider_from_config(Some("telnyx"), "deepgram/nova-3"),
+            streaming_provider_from_config(Some("telnyx")),
             Some(StreamingProvider::Deepgram)
         );
         assert_eq!(
-            streaming_provider_from_config(Some("assemblyai"), "deepgram/nova-3"),
+            streaming_provider_from_config(Some("assemblyai")),
             None
         );
         assert_eq!(
-            streaming_provider_from_config(
-                Some("assemblyai-telnyx"),
-                "openai/whisper-large-v3-turbo"
-            ),
+            streaming_provider_from_config(Some("assemblyai-telnyx")),
             Some(StreamingProvider::AssemblyAi)
         );
     }
@@ -14680,6 +14733,7 @@ mod tests {
             max_recording_seconds: 30,
             local_stt: LocalSttMode::Auto,
             local_model_file: String::from("ggml-small.bin"),
+            final_refine: true,
         }
     }
 
@@ -15573,6 +15627,7 @@ mod tests {
                 max_recording_seconds: 30,
                 local_stt: LocalSttMode::Auto,
                 local_model_file: String::from("ggml-small.bin"),
+                final_refine: true,
             },
             http: reqwest::blocking::Client::new(),
             vocabulary: Mutex::new(vocabulary),
@@ -15617,6 +15672,7 @@ mod tests {
                 max_recording_seconds: 30,
                 local_stt: LocalSttMode::Auto,
                 local_model_file: String::from("ggml-small.bin"),
+                final_refine: true,
             },
             http: reqwest::blocking::Client::new(),
             vocabulary: Mutex::new(Vec::new()),
@@ -15667,6 +15723,7 @@ mod tests {
                 max_recording_seconds: 30,
                 local_stt: LocalSttMode::Auto,
                 local_model_file: String::from("ggml-small.bin"),
+                final_refine: true,
             },
             http: reqwest::blocking::Client::new(),
             vocabulary: Mutex::new(Vec::new()),
@@ -15737,6 +15794,7 @@ mod tests {
                 max_recording_seconds: 30,
                 local_stt: LocalSttMode::Auto,
                 local_model_file: String::from("ggml-small.bin"),
+                final_refine: true,
             },
             http: reqwest::blocking::Client::new(),
             vocabulary: Mutex::new(Vec::new()),
@@ -15792,6 +15850,7 @@ mod tests {
                 max_recording_seconds: 30,
                 local_stt: LocalSttMode::Auto,
                 local_model_file: String::from("ggml-small.bin"),
+                final_refine: true,
             },
             http: reqwest::blocking::Client::new(),
             vocabulary: Mutex::new(Vec::new()),
@@ -15857,6 +15916,7 @@ mod tests {
                 max_recording_seconds: 30,
                 local_stt: LocalSttMode::Auto,
                 local_model_file: String::from("ggml-small.bin"),
+                final_refine: true,
             },
             http: reqwest::blocking::Client::new(),
             vocabulary: Mutex::new(Vec::new()),
@@ -16347,6 +16407,7 @@ mod tests {
                 max_recording_seconds: 30,
                 local_stt: LocalSttMode::Auto,
                 local_model_file: String::from("ggml-small.bin"),
+                final_refine: true,
             },
             http: reqwest::blocking::Client::new(),
             vocabulary: Mutex::new(Vec::new()),
@@ -16404,6 +16465,7 @@ mod tests {
                 max_recording_seconds: 30,
                 local_stt: LocalSttMode::Auto,
                 local_model_file: String::from("ggml-small.bin"),
+                final_refine: true,
             },
             http: reqwest::blocking::Client::new(),
             vocabulary: Mutex::new(Vec::new()),
@@ -16464,6 +16526,7 @@ mod tests {
                 max_recording_seconds: 30,
                 local_stt: LocalSttMode::Auto,
                 local_model_file: String::from("ggml-small.bin"),
+                final_refine: true,
             },
             http: reqwest::blocking::Client::new(),
             vocabulary: Mutex::new(Vec::new()),
@@ -16514,6 +16577,7 @@ mod tests {
                 max_recording_seconds: 30,
                 local_stt: LocalSttMode::Auto,
                 local_model_file: String::from("ggml-small.bin"),
+                final_refine: true,
             },
             http: reqwest::blocking::Client::new(),
             vocabulary: Mutex::new(Vec::new()),
@@ -16716,7 +16780,45 @@ mod tests {
             stt_language_for_model("openai/whisper-large-v3-turbo", "auto"),
             None
         );
+        // Whisper-family models never carry a language hint: auto-detect
+        // per segment beats a forced hint on code-switched dictation, and
+        // the measured 11.3% came from a hint-free lane.
+        assert_eq!(
+            stt_language_for_model("openai/whisper-large-v3-turbo", "en-US"),
+            None
+        );
         assert!(stt_model_config("openai/whisper-large-v3-turbo", &[]).is_none());
+    }
+
+    #[test]
+    fn final_refine_prefers_batch_unless_it_fails() {
+        let streaming = String::from("hello world today");
+        let (label, text) = final_refine_choice(
+            &streaming,
+            Ok(String::from("hello world, today")),
+        );
+        assert_eq!((label, text.as_str()), ("final_refine_selected", "hello world, today"));
+
+        // Batch answering with fewer words still wins: the 134-clip harness
+        // measured whisper ahead of the stream even in that case (17 vs 8).
+        let (label, text) = final_refine_choice(&streaming, Ok(String::from("hello")));
+        assert_eq!((label, text.as_str()), ("final_refine_selected", "hello"));
+
+        // Every error path keeps the streaming text untouched, including
+        // the 200-empty-on-audible-audio variant that transcribe_with_model
+        // surfaces as an error.
+        for error in [
+            AppError::RateLimited,
+            AppError::EmptyTranscriptWithAudio {
+                duration_ms: 2_000,
+                rms: 0.01,
+            },
+            AppError::Transcription(String::from("boom")),
+        ] {
+            let (label, text) = final_refine_choice(&streaming, Err(error));
+            assert_eq!(label, "final_refine_kept_streaming");
+            assert_eq!(text, streaming);
+        }
     }
 
     #[test]
@@ -17539,6 +17641,7 @@ mod tests {
                 max_recording_seconds: 30,
                 local_stt: LocalSttMode::Auto,
                 local_model_file: String::from("ggml-small.bin"),
+                final_refine: true,
             },
             http: reqwest::blocking::Client::new(),
             vocabulary: Mutex::new(Vec::new()),
