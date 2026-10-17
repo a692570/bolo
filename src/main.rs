@@ -13242,22 +13242,21 @@ mod tests {
         consume_open_dashboard_request_at, contains_word_verbatim, dashboard_accessibility_state,
         dashboard_cleanup_mode, dashboard_payload, dashboard_provider_label,
         derive_word_correction, downsample_wav_16k_mono, edit_distance,
-        final_refine_choice,
         edit_learning_context_diverged, empty_transcript_error, enforce_learned_vocabulary_cap,
-        final_streaming_result_is_ready_elapsed, finalize_accessibility_context,
-        handle_dashboard_action, handle_launch_request_for_state, handshake_with_deadline,
-        insert_fallback_reason, is_blocklisted_correction, is_known_no_speech_transcript,
-        is_supported_hotkey, learning_window_payload_at, load_cleanup_prompt_file,
-        load_learned_vocabulary, load_usage_counters_at, load_vocabulary_usage,
-        load_vocabulary_with_learned, microphone_labels, non_empty_transcript,
-        normalize_microphone_value, onboarding_status_at, override_or_builtin_prompt_from,
-        parse_accessibility_trust, parse_command, parse_daemon_context_reply,
-        parse_daemon_paste_reply, parse_daemon_select_reply, parse_daemon_trust_reply,
-        parse_latest_release, parse_popup_copy_text, parse_release_version,
-        parse_replacements_json, parse_stt_fallbacks, parse_u64_env_value, parse_update_outcome,
-        paste_intact_in_context, prompts_window_payload_at, read_vocabulary_file,
-        read_vocabulary_usage_file, record_learned_correction, reload_is_busy,
-        remove_bolo_env_value_at, remove_fillers, request_accessibility_daemon,
+        final_refine_choice, final_streaming_result_is_ready_elapsed,
+        finalize_accessibility_context, handle_dashboard_action, handle_launch_request_for_state,
+        handshake_with_deadline, insert_fallback_reason, is_blocklisted_correction,
+        is_known_no_speech_transcript, is_supported_hotkey, learning_window_payload_at,
+        load_cleanup_prompt_file, load_learned_vocabulary, load_usage_counters_at,
+        load_vocabulary_usage, load_vocabulary_with_learned, microphone_labels,
+        non_empty_transcript, normalize_microphone_value, onboarding_status_at,
+        override_or_builtin_prompt_from, parse_accessibility_trust, parse_command,
+        parse_daemon_context_reply, parse_daemon_paste_reply, parse_daemon_select_reply,
+        parse_daemon_trust_reply, parse_latest_release, parse_popup_copy_text,
+        parse_release_version, parse_replacements_json, parse_stt_fallbacks, parse_u64_env_value,
+        parse_update_outcome, paste_intact_in_context, prompts_window_payload_at,
+        read_vocabulary_file, read_vocabulary_usage_file, record_learned_correction,
+        reload_is_busy, remove_bolo_env_value_at, remove_fillers, request_accessibility_daemon,
         resolve_microphone_selection, retry_failed_primary, sanitize_transcript_history,
         save_usage_counters_at, should_exit_for_key_reload, speech_stats,
         stable_streaming_best_is_ready_elapsed, status_rows, streaming_batch_fallback_reason,
@@ -14683,10 +14682,7 @@ mod tests {
             streaming_provider_from_config(None),
             Some(StreamingProvider::Deepgram)
         );
-        assert_eq!(
-            streaming_provider_from_config(Some("off")),
-            None
-        );
+        assert_eq!(streaming_provider_from_config(Some("off")), None);
         assert_eq!(
             streaming_provider_from_config(Some("deepgram")),
             Some(StreamingProvider::Deepgram)
@@ -14697,10 +14693,7 @@ mod tests {
             streaming_provider_from_config(Some("telnyx")),
             Some(StreamingProvider::Deepgram)
         );
-        assert_eq!(
-            streaming_provider_from_config(Some("assemblyai")),
-            None
-        );
+        assert_eq!(streaming_provider_from_config(Some("assemblyai")), None);
         assert_eq!(
             streaming_provider_from_config(Some("assemblyai-telnyx")),
             Some(StreamingProvider::AssemblyAi)
@@ -16793,11 +16786,11 @@ mod tests {
     #[test]
     fn final_refine_prefers_batch_unless_it_fails() {
         let streaming = String::from("hello world today");
-        let (label, text) = final_refine_choice(
-            &streaming,
-            Ok(String::from("hello world, today")),
+        let (label, text) = final_refine_choice(&streaming, Ok(String::from("hello world, today")));
+        assert_eq!(
+            (label, text.as_str()),
+            ("final_refine_selected", "hello world, today")
         );
-        assert_eq!((label, text.as_str()), ("final_refine_selected", "hello world, today"));
 
         // Batch answering with fewer words still wins: the 134-clip harness
         // measured whisper ahead of the stream even in that case (17 vs 8).
