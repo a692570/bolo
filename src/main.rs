@@ -265,6 +265,15 @@ struct Config {
     /// LLM cleanup output must carry the exact content tokens of its input
     /// (Devanagari dictations bypass it for the Hinglish transliteration).
     cleanup_gate: bool,
+    /// Refine model from `BOLO_FINAL_REFINE_MODEL`: the batch call that
+    /// upgrades a healthy streaming result, bounded by the 2s window. It
+    /// defaults to nova-3 because the 2026-10-17 live run measured
+    /// whisper-large-v3-turbo above 2s wall on the production connection,
+    /// which exhausts the window and falls back to the stream anyway; nova-3
+    /// answers in 1.0-1.3s and keeps the refine inside its budget. The
+    /// batch primary (`BOLO_STT_MODEL`, default whisper-large-v3-turbo)
+    /// stays the no-streaming path, where there is no window to blow.
+    final_refine_model: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3596,7 +3605,18 @@ impl App {
         warmup: &DictationWarmup,
     ) -> Result<String, AppError> {
         info!("sending bounded batch transcription verification");
-        let request = self.stt_request_parts(warmup);
+        // The refine runs on its own model under its own 2s window: it must
+        // answer inside the paste budget, which the 2026-10-17 live run
+        // showed whisper-large-v3-turbo cannot on this connection (>2s wall,
+        // every call timed out and fell back). The model carries its own
+        // language and vocabulary handling via SttRequestParts.
+        let request = SttRequestParts::new(
+            &self.config.final_refine_model,
+            &self
+                .stt_language()
+                .unwrap_or_else(|_| self.config.stt_language.clone()),
+            &self.vocabulary_snapshot().unwrap_or_default(),
+        );
         self.transcribe_with_model(
             wav,
             &request.primary_model,
@@ -5469,6 +5489,8 @@ impl Config {
             ),
             final_refine: load_bool_env("BOLO_FINAL_REFINE", true),
             cleanup_gate: load_bool_env("BOLO_CLEANUP_GATE", true),
+            final_refine_model: load_env_value("BOLO_FINAL_REFINE_MODEL")
+                .unwrap_or_else(|| String::from("deepgram/nova-3")),
             local_model_file: load_env_value("BOLO_LOCAL_WHISPER_MODEL")
                 .unwrap_or_else(|| String::from(local_whisper::DEFAULT_MODEL_FILE)),
         };
@@ -14696,6 +14718,7 @@ mod tests {
             local_model_file: String::from("ggml-small.bin"),
             final_refine: true,
             cleanup_gate: true,
+            final_refine_model: String::from("deepgram/nova-3"),
         };
 
         assert_eq!(config.llm_model(), "Kimi-K2.5");
@@ -14743,6 +14766,7 @@ mod tests {
             local_model_file: String::from("ggml-small.bin"),
             final_refine: true,
             cleanup_gate: true,
+            final_refine_model: String::from("deepgram/nova-3"),
         };
 
         assert!(!cleanup_decision(&config, "got it thanks").0);
@@ -14780,6 +14804,7 @@ mod tests {
             local_model_file: String::from("ggml-small.bin"),
             final_refine: true,
             cleanup_gate: true,
+            final_refine_model: String::from("deepgram/nova-3"),
         };
 
         assert!(cleanup_decision(&config, "got it thanks let me know").0);
@@ -14943,6 +14968,7 @@ mod tests {
             local_model_file: String::from("ggml-small.bin"),
             final_refine: true,
             cleanup_gate: true,
+            final_refine_model: String::from("deepgram/nova-3"),
         }
     }
 
@@ -15838,6 +15864,7 @@ mod tests {
                 local_model_file: String::from("ggml-small.bin"),
                 final_refine: true,
                 cleanup_gate: true,
+                final_refine_model: String::from("deepgram/nova-3"),
             },
             http: reqwest::blocking::Client::new(),
             vocabulary: Mutex::new(vocabulary),
@@ -15884,6 +15911,7 @@ mod tests {
                 local_model_file: String::from("ggml-small.bin"),
                 final_refine: true,
                 cleanup_gate: true,
+                final_refine_model: String::from("deepgram/nova-3"),
             },
             http: reqwest::blocking::Client::new(),
             vocabulary: Mutex::new(Vec::new()),
@@ -15936,6 +15964,7 @@ mod tests {
                 local_model_file: String::from("ggml-small.bin"),
                 final_refine: true,
                 cleanup_gate: true,
+                final_refine_model: String::from("deepgram/nova-3"),
             },
             http: reqwest::blocking::Client::new(),
             vocabulary: Mutex::new(Vec::new()),
@@ -16008,6 +16037,7 @@ mod tests {
                 local_model_file: String::from("ggml-small.bin"),
                 final_refine: true,
                 cleanup_gate: true,
+                final_refine_model: String::from("deepgram/nova-3"),
             },
             http: reqwest::blocking::Client::new(),
             vocabulary: Mutex::new(Vec::new()),
@@ -16065,6 +16095,7 @@ mod tests {
                 local_model_file: String::from("ggml-small.bin"),
                 final_refine: true,
                 cleanup_gate: true,
+                final_refine_model: String::from("deepgram/nova-3"),
             },
             http: reqwest::blocking::Client::new(),
             vocabulary: Mutex::new(Vec::new()),
@@ -16132,6 +16163,7 @@ mod tests {
                 local_model_file: String::from("ggml-small.bin"),
                 final_refine: true,
                 cleanup_gate: true,
+                final_refine_model: String::from("deepgram/nova-3"),
             },
             http: reqwest::blocking::Client::new(),
             vocabulary: Mutex::new(Vec::new()),
@@ -16624,6 +16656,7 @@ mod tests {
                 local_model_file: String::from("ggml-small.bin"),
                 final_refine: true,
                 cleanup_gate: true,
+                final_refine_model: String::from("deepgram/nova-3"),
             },
             http: reqwest::blocking::Client::new(),
             vocabulary: Mutex::new(Vec::new()),
@@ -16683,6 +16716,7 @@ mod tests {
                 local_model_file: String::from("ggml-small.bin"),
                 final_refine: true,
                 cleanup_gate: true,
+                final_refine_model: String::from("deepgram/nova-3"),
             },
             http: reqwest::blocking::Client::new(),
             vocabulary: Mutex::new(Vec::new()),
@@ -16745,6 +16779,7 @@ mod tests {
                 local_model_file: String::from("ggml-small.bin"),
                 final_refine: true,
                 cleanup_gate: true,
+                final_refine_model: String::from("deepgram/nova-3"),
             },
             http: reqwest::blocking::Client::new(),
             vocabulary: Mutex::new(Vec::new()),
@@ -16797,6 +16832,7 @@ mod tests {
                 local_model_file: String::from("ggml-small.bin"),
                 final_refine: true,
                 cleanup_gate: true,
+                final_refine_model: String::from("deepgram/nova-3"),
             },
             http: reqwest::blocking::Client::new(),
             vocabulary: Mutex::new(Vec::new()),
@@ -17958,6 +17994,7 @@ mod tests {
                 local_model_file: String::from("ggml-small.bin"),
                 final_refine: true,
                 cleanup_gate: true,
+                final_refine_model: String::from("deepgram/nova-3"),
             },
             http: reqwest::blocking::Client::new(),
             vocabulary: Mutex::new(Vec::new()),
