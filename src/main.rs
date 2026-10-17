@@ -10725,12 +10725,28 @@ fn starts_with_answer_preamble(text: &str) -> bool {
     .is_ok_and(|regex| regex.is_match(text))
 }
 
+/// Precompiled number-word matchers. `normalize_for_comparison` runs on
+/// thousands of tokens per dictation from the aligned-span fuzzy matcher,
+/// so compiling a fresh regex per call here cost ~2 seconds per dictation
+/// (2026-10-17: cleanup phase went 15ms to 1,968ms) before this cache.
+fn spoken_number_regexes() -> &'static [(Regex, &'static str)] {
+    static REGEXES: OnceLock<Vec<(Regex, &'static str)>> = OnceLock::new();
+    REGEXES.get_or_init(|| {
+        SPOKEN_NUMBERS
+            .iter()
+            .filter_map(|(word, digit)| {
+                Regex::new(&format!(r"\b{word}\b"))
+                    .ok()
+                    .map(|r| (r, *digit))
+            })
+            .collect()
+    })
+}
+
 fn normalize_for_comparison(text: &str) -> String {
     let mut result = text.to_ascii_lowercase();
-    for (word, digit) in SPOKEN_NUMBERS {
-        if let Ok(regex) = Regex::new(&format!(r"\b{word}\b")) {
-            result = regex.replace_all(&result, digit).into_owned();
-        }
+    for (regex, digit) in spoken_number_regexes() {
+        result = regex.replace_all(&result, *digit).into_owned();
     }
     result
 }
