@@ -136,7 +136,48 @@ def string_for_range(element, location, length):
     return str(text)
 
 
-def focused_element():
+# Pids whose Electron/Chromium accessibility already got the manual flag,
+# so repeated reads stay cheap. The flag is idempotent and harmless on apps
+# that ignore it, so the set only exists to skip redundant attribute writes.
+_web_ax_enabled: set = set()
+
+
+def enable_web_accessibility_once(pid=None):
+    """Force Chromium-based apps to expose their accessibility tree.
+
+    Electron apps (OpenChamber, Slack, Discord, Notion, WhatsApp and every
+    other Chromium shell) ship with their renderer accessibility OFF until an
+    assistive client asks for it. Without the flag the focused element is
+    None and every context read comes back empty, which is what produced all
+    the `no_words` edit-learning skips and left the per-app cleanup profiles
+    blind in exactly the apps people type into most. Setting the private
+    `AXManualAccessibility` attribute on the application element turns the
+    tree on; Chromium then builds it asynchronously (verified live
+    2026-10-17: the OpenChamber chat input resolved to AXTextArea with real
+    content about two seconds after the first flag write). The write runs on
+    every read for unseen pids and never blocks: the tree is simply missing
+    for the read that immediately follows a first-ever flag write.
+    """
+    try:
+        if pid is None:
+            app = NSWorkspace.sharedWorkspace().frontmostApplication()
+            if app is None:
+                return
+            pid = app.processIdentifier()
+        if not pid or pid in _web_ax_enabled:
+            return
+        _web_ax_enabled.add(pid)
+        app_element = AX.AXUIElementCreateApplication(pid)
+        AX.AXUIElementSetAttributeValue(
+            app_element,
+            "AXManualAccessibility",
+            AX.kCFBooleanTrue,
+        )
+    except Exception:
+        return
+
+
+def system_wide_focused_element():
     try:
         system = AX.AXUIElementCreateSystemWide()
         error, element = AX.AXUIElementCopyAttributeValue(
@@ -149,6 +190,43 @@ def focused_element():
     if error != 0:
         return None
     return element
+
+
+def app_level_focused_element():
+    """Focused element of the frontmost application, read at the app level.
+
+    Chromium builds its accessibility tree asynchronously after the manual
+    flag lands, and the system-wide focused-element query can stay None the
+    whole time even while the application element already reports its own
+    (verified live 2026-10-17 on OpenChamber). The app-level read is the
+    reliable path for those apps and a harmless repeat for native ones.
+    """
+    try:
+        app = NSWorkspace.sharedWorkspace().frontmostApplication()
+        if app is None:
+            return None
+        pid = app.processIdentifier()
+        if not pid:
+            return None
+        app_element = AX.AXUIElementCreateApplication(pid)
+        error, element = AX.AXUIElementCopyAttributeValue(
+            app_element,
+            AX.kAXFocusedUIElementAttribute,
+            None,
+        )
+    except Exception:
+        return None
+    if error != 0:
+        return None
+    return element
+
+
+def focused_element():
+    enable_web_accessibility_once()
+    element = system_wide_focused_element()
+    if element is not None:
+        return element
+    return app_level_focused_element()
 
 
 def focused_element_pid(element):

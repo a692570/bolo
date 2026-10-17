@@ -109,6 +109,8 @@ export TELNYX_API_KEY="your_key_here"
 Bolo reads API keys from the process environment first, then falls back to `~/.bolo/env` and `~/.zshrc`.
 The installer keeps `~/.bolo` private to your macOS account and stores `~/.bolo/env` with owner-only permissions.
 
+Chromium-based apps (OpenChamber, Slack, Discord, Notion, WhatsApp) ship with renderer accessibility off until an assistive client asks. Bolo sets the private `AXManualAccessibility` flag on those apps on first read, which turns on the tree Bolo and other assistive tools use for cursor context, per-app cleanup profiles, and edit learning. The first read after a new app launch may still come back empty; every read after it sees the tree.
+
 Bolo redacts dictated text from `/tmp/bolo.log` by default. To temporarily log transcript text while debugging, set:
 
 ```bash
@@ -132,7 +134,6 @@ Supported values:
 - `caps_lock`: Caps Lock key
 
 To paste the latest transcript again with a separate hotkey, set:
-the paste also opens the editable copy-transcript popup with edit-learning armed. Fixing a misheard word in that popup is the guaranteed feedback loop: Bolo owns the popup text, so the correction is learned even when the app you pasted into exposes no Accessibility context.
 
 ```bash
 export BOLO_PASTE_LAST_HOTKEY="f19"

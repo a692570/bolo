@@ -2784,10 +2784,9 @@ impl App {
             // unchanged while the upload shrinks roughly threefold.
             let refine_wav = downsample_wav_16k_mono(&wav).unwrap_or_else(|| wav.clone());
             let refine_app = Arc::clone(self);
-            let refine_warmup = recording.warmup.clone();
             let refine_handle = std::thread::Builder::new()
                 .name(String::from("bolo-final-refine"))
-                .spawn(move || refine_app.verify_streaming_transcript(&refine_wav, &refine_warmup))
+                .spawn(move || refine_app.verify_streaming_transcript(&refine_wav))
                 .ok();
             let joined = |handle: Option<JoinHandle<Result<String, AppError>>>| {
                 handle
@@ -3599,11 +3598,7 @@ impl App {
         }
     }
 
-    fn verify_streaming_transcript(
-        &self,
-        wav: &[u8],
-        warmup: &DictationWarmup,
-    ) -> Result<String, AppError> {
+    fn verify_streaming_transcript(&self, wav: &[u8]) -> Result<String, AppError> {
         info!("sending bounded batch transcription verification");
         // The refine runs on its own model under its own 2s window: it must
         // answer inside the paste budget, which the 2026-10-17 live run
@@ -4753,32 +4748,13 @@ impl App {
             .or_else(|| state.last_result.clone()))
     }
 
-    fn paste_last_transcript(self: &Arc<Self>) -> Result<(), AppError> {
+    fn paste_last_transcript(&self) -> Result<(), AppError> {
         let Some(text) = self.latest_transcript()? else {
             info!("paste-last-transcript skipped because history is empty");
             return Ok(());
         };
         paste_text(&self.config.root_dir, &text)?;
         info!("pasted last transcript");
-        // The popup turns the re-paste into a guaranteed edit-learning
-        // surface: Bolo owns the popup's text view, so a fix typed there
-        // always reaches the diff even when the target app exposes no
-        // Accessibility context (the chat-input case behind every
-        // `no_words` skip in today's learning logs). A fresh watch replaces
-        // whatever expired observation was pending, and the popup's process
-        // pid pins the poll probes so only this text view is learned from.
-        if text.trim().is_empty() {
-            return Ok(());
-        }
-        if let Ok(mut state) = self.lock_state() {
-            state.edit_learning = Some(EditLearningWatch::new(&text));
-        }
-        if let Some(pid) = self.show_copy_transcript_popup(&text)
-            && let Ok(mut state) = self.lock_state()
-            && let Some(learning) = state.edit_learning.as_mut()
-        {
-            learning.popup_pid = Some(pid);
-        }
         Ok(())
     }
 
