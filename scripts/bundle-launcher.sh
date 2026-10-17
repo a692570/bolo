@@ -250,6 +250,7 @@ pkill -f "$RESOURCES/accessibility_daemon.py" 2>/dev/null || true
 pkill -f "$RESOURCES/hotkey.py" 2>/dev/null || true
 pkill -f "$RESOURCES/overlay.py" 2>/dev/null || true
 pkill -f "$RESOURCES/app_window.py" 2>/dev/null || true
+pkill -f "$RESOURCES/parakeet_sidecar.py" 2>/dev/null || true
 
 # --- Supervise the runtime --------------------------------------------------------
 

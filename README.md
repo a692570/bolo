@@ -175,6 +175,22 @@ To never consult the local tier, set `BOLO_LOCAL_STT="off"`. Transcription runs 
 export BOLO_LOCAL_WHISPER_MODEL="ggml-base.bin"
 ```
 
+#### The parakeet rung (top of the offline tier)
+
+Before whisper.cpp, the offline ladder first tries **parakeet-mlx**, a resident MLX sidecar running `mlx-community/parakeet-tdt-0.6b-v3` on the Apple Silicon GPU. On the 134-clip dictation benchmark harness (2026-10-17, laneG), it measured a 13.6% median WER, beating Bolo's own cloud batch default (nova-3, 14.3%), at 0.086 s median per clip and 0.755 s cold start with a warm Hugging Face cache. It also formats natively (94.8% end punctuation, 100% capitalized sentence starts). Setup is one command, once:
+
+```bash
+./ensure-python-env.sh --parakeet
+```
+
+That creates `~/.bolo/parakeet-venv` (Python >= 3.10, required by parakeet-mlx 0.5.3; pinned MLX 0.32.4) and never runs at app startup. The rung is on by default and engages whenever the offline ladder runs and the dictation language hint starts with `en`; set `BOLO_LOCAL_PARAKEET="off"` to disable it and keep the whisper path unchanged.
+
+Three caveats from the benchmark, by design:
+
+- **English-only.** parakeet-tdt-0.6b-v3 is English-trained; it maps non-English speech onto the nearest English words instead of failing (a Devanagari clip came back as "Jeff."). The rung only engages for English hints, so `hi`, `auto`, and other languages keep whisper's multilingual detection.
+- **Noise gate.** Like every other engine measured, parakeet invents words on silent input (12/12 silent/noise clips produced hallucinated text). Both the Rust pipeline and the sidecar re-check the same speech-energy threshold (any 20 ms frame at RMS >= 0.006) before inference, so silence falls to the existing no-speech handling instead of inserting words.
+- **Memory.** The sidecar holds ~118 MB resident after load (the 2.4 GB weights are lazily mmapped) and peaks around 1.6 GB while transcribing. It starts lazily on the first offline dictation and dies with the app, so the cost is paid only while the offline tier is in use.
+
 ### Learned words and the copy-transcript popup
 
 Bolo learns your corrections. When a dictation lands and you edit it within 15 seconds — backspacing and retyping a word Bolo misheard — the next dictation you fix that way teaches Bolo the pair: it is saved to `~/.bolo/learned_vocabulary.json` (capped at 100 entries), applied on every future dictation at zero latency, and Bolo shows a "Bolo learned: X → Y" notification the first time a pair is saved. Only clean single-word substitutions are learned; deletions and full rewrites are deliberately ignored. The tray menu's **Learned Words** shows everything learned so far, and the dashboard counts them.
@@ -397,7 +413,7 @@ Yes. Set `BOLO_HOTKEY` to `right_control`, `right_shift`, `fn`, `f1` through `f1
 
 - Does it work offline?
 
-Only through the optional offline tier: `BOLO_LOCAL_STT="on"` dictates entirely through a local whisper.cpp model (see Configuration). The default cloud pipeline needs internet to reach Telnyx APIs.
+Only through the optional offline tier: `BOLO_LOCAL_STT="on"` dictates entirely on-device, trying the parakeet MLX sidecar first and falling back to a local whisper.cpp model (see Configuration). The default cloud pipeline needs internet to reach Telnyx APIs.
 
 - Why Rust?
 
