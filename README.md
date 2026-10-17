@@ -180,7 +180,7 @@ Bolo learns your corrections. When a dictation lands and you edit it within 15 s
 When Bolo cannot find an editable paste target (no text field is focused, or the paste fails), it skips the blind paste, copies the transcript to the clipboard, and shows a popup with the transcript instead: edit it right there if you like, click **Copy** to take the edited version, or **Dismiss**. Edits made inside the popup are learned exactly like paste edits, so a correction you make in the popup follows every future dictation.
 
 
-The default model is `openai/whisper-large-v3-turbo`, transcribed through the Telnyx STT API. Bolo sends your vocabulary terms along as a free-text prompt with an echo filter, and whisper models decode language automatically per segment so code-switched dictation keeps working. The verbatim transcript then goes through Bolo's local pass (filler removal, vocabulary and replacements) plus the optional LLM cleanup below. The separate LLM cleanup pass always runs on the verbatim transcript when enabled.
+The default model is `openai/whisper-large-v3-turbo`, transcribed through the Telnyx STT API. Bolo sends your vocabulary terms along as a free-text prompt with an echo filter, and whisper models decode language automatically per segment so code-switched dictation keeps working. The verbatim transcript then goes through Bolo's local pass (filler removal, vocabulary and replacements) plus the optional LLM cleanup below. The separate LLM cleanup pass always runs on the verbatim transcript when enabled. A deterministic formatter then polishes casing and punctuation spacing (capitalize sentence starts and standalone "i", tighten punctuation spacing) without changing any word, so final-transcript formatting stays at streaming quality regardless of which engine produced the words.
 
 To test another model, set:
 
@@ -268,7 +268,7 @@ Use **Clear Transcript History** from the menu bar to delete local transcript hi
 
 To rewrite text already in another app, select the text, open the Bolo menu bar icon, and choose **Rewrite Selected Text...**. Bolo captures the selected text through macOS Accessibility, asks what change you want, runs the same LLM backend, then pastes the replacement back into the original app.
 
-LLM cleanup defaults to `auto`: short clean dictations skip the LLM, while longer or messy dictations use the LLM for grammar, punctuation, contractions, and missing articles.
+LLM cleanup defaults to `auto`: short clean dictations skip the LLM, while longer or messy dictations get a formatting-only pass that fixes punctuation, capitalization, and paragraph breaks. It never adds, removes, replaces, or reorders words; a strict verbatim gate rejects any LLM output whose content tokens differ from the dictation and keeps the pasted text instead (the 2026-10-17 measurement showed word-level cleanup costs accuracy: 10.6% to 14.3% median WER on the best engine). Devanagari dictations bypass the gate so the built-in Hinglish transliteration still works. Set `BOLO_CLEANUP_GATE="off"` to restore the legacy permissive cleanup.
 
 To force LLM cleanup for every dictation, set:
 
