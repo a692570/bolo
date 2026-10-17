@@ -132,6 +132,7 @@ Supported values:
 - `caps_lock`: Caps Lock key
 
 To paste the latest transcript again with a separate hotkey, set:
+the paste also opens the editable copy-transcript popup with edit-learning armed. Fixing a misheard word in that popup is the guaranteed feedback loop: Bolo owns the popup text, so the correction is learned even when the app you pasted into exposes no Accessibility context.
 
 ```bash
 export BOLO_PASTE_LAST_HOTKEY="f19"
