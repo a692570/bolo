@@ -124,9 +124,7 @@ def test_validate_and_save_key_accepts_200_and_writes_env(tmp_path):
     assert verdict == "valid"
     assert "saved" in detail
     assert env.read_text() == (
-        'TELNYX_API_KEY="abc123"\n'
-        'BOLO_STT_MODEL="deepgram/nova-3"\n'
-    )
+        'TELNYX_API_KEY="abc123"\n'    )
     import stat
     assert stat.S_IMODE(env.stat().st_mode) == 0o600
 
@@ -179,9 +177,7 @@ def test_validate_and_save_key_replaces_existing_value(tmp_path):
     app_window.validate_and_save_key("new", env_path=str(env), fetch=fetch)
 
     assert env.read_text() == (
-        'TELNYX_API_KEY="new"\nBOLO_HOTKEY="right_option"\n'
-        'BOLO_STT_MODEL="deepgram/nova-3"\n'
-    )
+        'TELNYX_API_KEY="new"\nBOLO_HOTKEY="right_option"\n'    )
 
 
 def test_validate_and_save_key_telnyx_provider_writes_telnyx_env(tmp_path):
@@ -195,9 +191,7 @@ def test_validate_and_save_key_telnyx_provider_writes_telnyx_env(tmp_path):
     assert verdict == "valid"
     assert "saved" in detail
     assert env.read_text() == (
-        'TELNYX_API_KEY="KEY24601"\n'
-        'BOLO_STT_MODEL="deepgram/nova-3"\n'
-    )
+        'TELNYX_API_KEY="KEY24601"\n'    )
 
 
 def test_validate_and_save_key_telnyx_rejection_writes_nothing(tmp_path):
@@ -224,9 +218,7 @@ def test_validate_and_save_key_rejects_unknown_provider(tmp_path):
     # than writing a variable the runtime would never read.
     assert verdict == "valid"
     assert env.read_text() == (
-        'TELNYX_API_KEY="k"\n'
-        'BOLO_STT_MODEL="deepgram/nova-3"\n'
-    )
+        'TELNYX_API_KEY="k"\n'    )
 
 
 def test_provider_fetchers_map_to_each_provider():
@@ -272,9 +264,10 @@ def test_wizard_provider_choice_is_telnyx_only_with_defaults():
     assert app_window.WIZARD_PROVIDERS == ("telnyx",)
     assert app_window.WIZARD_PROVIDER_TITLES["telnyx"] == "Telnyx"
     assert app_window.WIZARD_PROVIDER_ENV_NAMES["telnyx"] == "TELNYX_API_KEY"
-    assert app_window.WIZARD_PROVIDER_STT_MODELS == {
-        "telnyx": "deepgram/nova-3",
-    }
+    # The speech model is intentionally not pinned at onboarding time: the
+    # shipped default lives in the Rust config loader, so env pins can no
+    # longer freeze installs on a superseded model.
+    assert "WIZARD_PROVIDER_STT_MODELS" not in app_window.__dict__
 
 
 def test_plan_layout_reserves_space_for_key_entry_field():

@@ -569,9 +569,9 @@ WIZARD_FINISH_LATER_W = 150
 WIZARD_FINISH_LATER_H = WIZARD_PRIMARY_H
 
 # Speech provider offered in onboarding: Telnyx only. Saving the key
-# writes TELNYX_API_KEY and pins BOLO_STT_MODEL to the Telnyx-hosted
-# Deepgram model, so the resolved pipeline follows the choice after
-# the runtime restarts.
+# writes TELNYX_API_KEY; the speech model intentionally follows the
+# shipped default in the Rust config loader, so future default changes
+# reach installs without an env pin freezing them.
 WIZARD_PROVIDERS = ("telnyx",)
 WIZARD_PROVIDER_TITLES = {
     "telnyx": "Telnyx",
@@ -581,9 +581,6 @@ WIZARD_PROVIDER_PLACEHOLDERS = {
 }
 WIZARD_PROVIDER_ENV_NAMES = {
     "telnyx": "TELNYX_API_KEY",
-}
-WIZARD_PROVIDER_STT_MODELS = {
-    "telnyx": "deepgram/nova-3",
 }
 WIZARD_PROVIDER_HOSTS = {
     "telnyx": "api.telnyx.com",
@@ -713,8 +710,8 @@ def wizard_body_paragraphs(screen, facts, practice_done=False):
         return [
             "Bolo sends audio to Telnyx to turn speech into text. "
             "Paste your API key below, then click Validate.",
-            "Bolo saves your key locally as TELNYX_API_KEY and pins "
-            "BOLO_STT_MODEL to deepgram/nova-3.",
+            "Bolo saves your key locally as TELNYX_API_KEY; the speech "
+            "model follows the shipped default (no env pin).",
         ]
     if screen == SCREEN_MICROPHONE:
         return [
@@ -1915,10 +1912,9 @@ def validate_and_save_key(
     """Validate the Telnyx API key and persist it when accepted.
 
     Returns ``(verdict, detail)`` where detail is display text for the
-    onboarding row. A valid key is written to ``TELNYX_API_KEY`` and
-    ``BOLO_STT_MODEL`` is pinned to the Telnyx-hosted Deepgram model, so
-    the resolved pipeline follows the choice after the runtime
-    restarts. `fetch` is injectable so tests cover the
+    onboarding row. A valid key is written to ``TELNYX_API_KEY``; the
+    speech model is intentionally not pinned, so the resolved pipeline
+    follows the shipped default after the runtime restarts. `fetch` is injectable so tests cover the
     200/401/other branches without network access; it must raise on
     transport errors. The default is Telnyx, the pipeline default.
     """
@@ -1949,11 +1945,11 @@ def validate_and_save_key(
         bolo_env.write_env_value(
             env_path, WIZARD_PROVIDER_ENV_NAMES[provider], key
         )
-        # The saved choice decides the resolved pipeline:
-        # Telnyx-hosted Deepgram, read at restart.
-        bolo_env.write_env_value(
-            env_path, "BOLO_STT_MODEL", WIZARD_PROVIDER_STT_MODELS[provider]
-        )
+        # The model is NOT pinned here on purpose: the shipped default lives
+        # in the Rust config loader, so future default changes reach new and
+        # existing installs instead of being frozen by an env pin written at
+        # onboarding time (that pin silently held every install on nova-3
+        # after the 2026-10-17 default change).
         print(
             "[app-window] key validation: valid ({0})".format(provider),
             file=sys.stderr,

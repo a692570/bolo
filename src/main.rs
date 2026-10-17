@@ -10109,6 +10109,15 @@ fn best_vocabulary_match<'a>(
             if spoken == term.term {
                 continue;
             }
+            // A partial span (fewer words than the term itself) must match
+            // exactly: "nova" sits within edit distance of "nova3", and
+            // letting it match re-expands the prefix while the trailing
+            // fragment reattaches as "nova-3-3" (live dictation,
+            // 2026-10-17). Full-span matches keep their fuzzy scoring.
+            let term_piece_count = word_pieces(term.term).len();
+            if word_count < term_piece_count && normalized != term.normalized {
+                continue;
+            }
             let candidate = VocabularyMatch {
                 term: term.term,
                 start,
@@ -13928,18 +13937,25 @@ mod tests {
     fn onboarding_provider_picks_pin_models_the_runtime_resolves()
     -> Result<(), Box<dyn std::error::Error>> {
         // Onboarding is Telnyx-only: the wizard writes TELNYX_API_KEY and
-        // pins BOLO_STT_MODEL to the Telnyx-hosted Deepgram model so the
-        // resolved pipeline follows the setup after restart. These exact
-        // strings are the cross-language contract; a drift in either file
-        // breaks the pipeline silently, so this test pins them against
-        // app_window.py, and forbids any reintroduction of the removed
-        // direct-AssemblyAI provider surface.
+        // deliberately does NOT pin BOLO_STT_MODEL. The shipped default
+        // lives in the Rust config loader, so a future default change must
+        // reach installs without an env pin freezing them on a superseded
+        // model (the pin silently held every install on nova-3 after the
+        // 2026-10-17 default change). These exact strings are the
+        // cross-language contract; a drift in either file breaks the
+        // pipeline silently, so this test pins them against app_window.py,
+        // and forbids any reintroduction of the removed direct-AssemblyAI
+        // provider surface.
         let manifest = env!("CARGO_MANIFEST_DIR");
         let source_path = Path::new(manifest).join("app_window.py");
         let source = fs::read_to_string(&source_path)?;
         assert!(
-            source.contains("\"telnyx\": \"deepgram/nova-3\""),
-            "wizard must pin the Telnyx-hosted Deepgram model"
+            !source.contains("write_env_value(\n            env_path, \"BOLO_STT_MODEL\""),
+            "the wizard must not pin BOLO_STT_MODEL; the code default owns it"
+        );
+        assert!(
+            !source.contains("WIZARD_PROVIDER_STT_MODELS"),
+            "the model-pin mapping must stay removed"
         );
         assert!(
             source.contains("\"telnyx\": \"TELNYX_API_KEY\""),
@@ -14498,6 +14514,23 @@ mod tests {
             canonicalize_known_terms("borO and cloud doc doc"),
             "Bolo and Claude doc doc"
         );
+    }
+
+    #[test]
+    fn vocabulary_correction_never_expands_a_hyphenated_term_prefix() {
+        let vocabulary = vec![String::from("nova-3")];
+        // The already-canonical form must pass through untouched: matching
+        // the "nova" prefix and re-expanding it produced "nova-3-3" in a
+        // live dictation on 2026-10-17.
+        let (out, matched) = apply_vocabulary_corrections_with_matches("nova-3", &vocabulary);
+        assert_eq!(out, "nova-3");
+        assert!(matched.is_empty());
+        // The full spoken span still corrects.
+        let (out, matched) = apply_vocabulary_corrections_with_matches("nova 3", &vocabulary);
+        assert_eq!(out, "nova-3");
+        // `matched` records the normalized term, which keeps the hyphen as
+        // a space.
+        assert_eq!(matched, vec![String::from("nova 3")]);
     }
 
     #[test]
