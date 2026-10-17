@@ -9,8 +9,8 @@ import ApplicationServices as AX
 from AppKit import NSWorkspace
 from Foundation import NSMakeRange, NSString
 
-MAX_TEXT_BEFORE_CURSOR = 500
-MAX_FALLBACK_TEXT = 500
+MAX_TEXT_BEFORE_CURSOR = 2048
+MAX_FALLBACK_TEXT = 2048
 MAX_SELECTED_TEXT = 8000
 
 LOG_FILE = "/tmp/bolo.log"
