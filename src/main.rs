@@ -2,6 +2,7 @@
 
 mod audio_conditioning;
 mod local_whisper;
+mod parakeet_sidecar;
 mod recording_fsm;
 mod resample;
 
@@ -256,6 +257,11 @@ struct Config {
     /// File name of the offline whisper model inside `~/.bolo/models`,
     /// from `BOLO_LOCAL_WHISPER_MODEL`; defaults to `ggml-small.bin`.
     local_model_file: String,
+    /// Parakeet rung policy from `BOLO_LOCAL_PARAKEET`: the MLX
+    /// parakeet-tdt-0.6b-v3 sidecar tries first whenever the offline
+    /// ladder runs (the default, matching `BOLO_LOCAL_STT=auto`); `off`
+    /// disables the rung and leaves the whisper path unchanged.
+    local_parakeet: bool,
     /// Final-refine policy from `BOLO_FINAL_REFINE`: after a healthy
     /// streaming result, re-run the batch endpoint and prefer its transcript
     /// when it returns words inside the bounded window. The streaming text
@@ -3287,81 +3293,100 @@ impl App {
         }
     }
 
-    /// The offline rung of the STT ladder: transcribe the captured
-    /// samples on-device through whisper.cpp, always on a worker thread
-    /// whose budget derives from the recording length (3x, 10 s floor),
-    /// so a hung model can never wedge the release path. `None` keeps
-    /// the caller's existing behavior: a missing or invalid model logs a
-    /// warning and the shared failure handling runs exactly as before.
-    fn local_stt_attempt(
+    /// The parakeet rung of the offline ladder: transcribe the captured
+    /// samples through the managed MLX sidecar on a worker thread under
+    /// the same recording-derived budget the whisper rung uses, feeding
+    /// it the 16 kHz mono WAV re-encode the laneG benchmark measured
+    /// (13.6% median WER, 0.086 s median per clip). `None` hands the
+    /// ladder to whisper: rung off via `BOLO_LOCAL_PARAKEET=off`,
+    /// non-English language hint (the model is English-trained), venv
+    /// not installed, sidecar failure, or empty text.
+    fn parakeet_attempt(
         &self,
         samples: &[i16],
         sample_rate: u32,
         recording_duration: Duration,
     ) -> Option<String> {
-        let models_dir = Self::local_models_dir();
-        match local_whisper::model_status(&models_dir, &self.config.local_model_file) {
-            LocalModelStatus::Ready => {}
-            LocalModelStatus::Missing => {
+        if !self.config.local_parakeet {
+            return None;
+        }
+        // The same resolved hint the whisper rung uses: the menu
+        // selection when set, else the configured default.
+        let language = self
+            .stt_language()
+            .unwrap_or_else(|_| self.config.stt_language.clone());
+        if !parakeet_sidecar::parakeet_language_eligible(&language) {
+            info!(
+                "[stt] local_parakeet_skipped_language {}",
+                serde_json::json!({
+                    "language": language,
+                    "reason": "parakeet is English-trained; multilingual hints keep whisper detection",
+                })
+            );
+            return None;
+        }
+        if !parakeet_sidecar::rung_available(&self.config.root_dir) {
+            let _hint_logged = PARAKEET_HINT_SHOWN.get_or_init(|| {
                 warn!(
-                    "[stt] local_fallback_model_missing {}",
+                    "[stt] parakeet_rung_unavailable {}",
                     serde_json::json!({
-                        "model": self.config.local_model_file,
-                        "hint": "choose Download Offline Model in the Bolo menu to fetch it",
+                        "hint": "run ./ensure-python-env.sh --parakeet to install ~/.bolo/parakeet-venv",
                     })
                 );
-                return None;
-            }
-            LocalModelStatus::Invalid(reason) => {
-                warn!(
-                    "[stt] local_fallback_model_invalid {}",
-                    serde_json::json!({
-                        "model": self.config.local_model_file,
-                        "reason": reason,
-                    })
-                );
-                return None;
-            }
+            });
+            return None;
+        }
+        let Some(samples_16k) =
+            resample::resample_i16(samples, sample_rate, local_whisper::WHISPER_SAMPLE_RATE)
+        else {
+            warn!(
+                "[stt] local_parakeet_resample_unavailable {}",
+                serde_json::json!({"sample_rate": sample_rate})
+            );
+            return None;
+        };
+        let Ok(wav) = wav_bytes(&samples_16k, local_whisper::WHISPER_SAMPLE_RATE) else {
+            warn!("[stt] local_parakeet_wav_encode_failed");
+            return None;
+        };
+        let Some(wav_path) = parakeet_sidecar::temp_recording_path() else {
+            warn!("[stt] local_parakeet_temp_path_unavailable");
+            return None;
+        };
+        if let Err(error) = fs::write(&wav_path, &wav) {
+            warn!(
+                "[stt] local_parakeet_temp_write_failed {}",
+                serde_json::json!({"error": error.to_string()})
+            );
+            return None;
         }
         let budget = local_whisper::local_stt_budget(recording_duration);
-        let language = self.local_whisper_language();
         info!(
-            "[stt] local_fallback_started {}",
+            "[stt] local_parakeet_started {}",
             serde_json::json!({
-                "model": self.config.local_model_file,
+                "model": parakeet_sidecar::PARAKEET_MODEL_ID,
                 "language": language,
                 "sample_rate": sample_rate,
                 "recording_duration_ms": recording_duration.as_millis(),
                 "budget_ms": budget.as_millis(),
             })
         );
-        let Some(samples_16k) =
-            resample::resample_i16(samples, sample_rate, local_whisper::WHISPER_SAMPLE_RATE)
-        else {
-            warn!(
-                "[stt] local_fallback_resample_unavailable {}",
-                serde_json::json!({"sample_rate": sample_rate})
-            );
-            return None;
-        };
-        // whisper consumes f32 in [-1, 1]; dividing the i16 range by its
-        // full scale is the convention whisper.cpp's own examples use.
-        let pcm: Vec<f32> = samples_16k
-            .iter()
-            .map(|sample| f32::from(*sample) / 32_768.0)
-            .collect();
         let started = Instant::now();
-        let Ok(engine) = self.local_engine() else {
-            warn!("[stt] local_fallback_engine_unavailable");
-            return None;
-        };
-        let result = local_whisper::call_with_budget("local_whisper", budget, move || {
-            engine.transcribe(&pcm)
+        let root_dir = self.config.root_dir.clone();
+        let request_path = wav_path.clone();
+        let result = local_whisper::call_with_budget("local_parakeet", budget, move || {
+            let outcome = parakeet_sidecar::transcribe_wav(&root_dir, &request_path);
+            // Remove the clip inside the worker so an abandoned attempt
+            // (budget timeout) still cleans up when the worker finishes.
+            if let Err(error) = fs::remove_file(&request_path) {
+                warn!("[stt] local_parakeet_temp_cleanup_failed: {error}");
+            }
+            outcome
         });
         match result {
             Ok(text) if !text.trim().is_empty() => {
                 info!(
-                    "[stt] local_fallback_completed {}",
+                    "[stt] local_parakeet_completed {}",
                     serde_json::json!({
                         "chars": text.chars().count(),
                         "words": text.split_whitespace().count(),
@@ -3372,7 +3397,7 @@ impl App {
             }
             Ok(_) => {
                 info!(
-                    "[stt] local_fallback_empty {}",
+                    "[stt] local_parakeet_empty {}",
                     serde_json::json!({
                         "elapsed_ms": started.elapsed().as_millis(),
                     })
@@ -3381,12 +3406,124 @@ impl App {
             }
             Err(error) => {
                 warn!(
-                    "[stt] local_fallback_failed {}",
+                    "[stt] local_parakeet_failed {}",
                     serde_json::json!({"error": error.to_string()})
                 );
                 None
             }
         }
+    }
+
+    /// The offline rung of the STT ladder: transcribe the captured
+    /// samples on-device through the parakeet sidecar first (the top
+    /// rung), then fall back to whisper.cpp when parakeet yields
+    /// nothing, always on a worker thread whose budget derives from the
+    /// recording length (3x, 10 s floor), so a hung model can never
+    /// wedge the release path. `None` keeps the caller's existing
+    /// behavior: a missing or invalid model logs a warning and the
+    /// shared failure handling runs exactly as before.
+    fn local_stt_attempt(
+        &self,
+        samples: &[i16],
+        sample_rate: u32,
+        recording_duration: Duration,
+    ) -> Option<String> {
+        // The rung order lives in complete_offline_ladder: only a None
+        // parakeet outcome consults whisper, so a warm parakeet rung
+        // never pays for a whisper model check it does not need.
+        let parakeet_outcome = self.parakeet_attempt(samples, sample_rate, recording_duration);
+        parakeet_sidecar::complete_offline_ladder(parakeet_outcome, || {
+            // The unchanged whisper.cpp fallback, named here so the
+            // ladder reads as policy and the rung stays one block.
+            let models_dir = Self::local_models_dir();
+            match local_whisper::model_status(&models_dir, &self.config.local_model_file) {
+                LocalModelStatus::Ready => {}
+                LocalModelStatus::Missing => {
+                    warn!(
+                        "[stt] local_fallback_model_missing {}",
+                        serde_json::json!({
+                            "model": self.config.local_model_file,
+                            "hint": "choose Download Offline Model in the Bolo menu to fetch it",
+                        })
+                    );
+                    return None;
+                }
+                LocalModelStatus::Invalid(reason) => {
+                    warn!(
+                        "[stt] local_fallback_model_invalid {}",
+                        serde_json::json!({
+                            "model": self.config.local_model_file,
+                            "reason": reason,
+                        })
+                    );
+                    return None;
+                }
+            }
+            let budget = local_whisper::local_stt_budget(recording_duration);
+            let language = self.local_whisper_language();
+            info!(
+                "[stt] local_fallback_started {}",
+                serde_json::json!({
+                    "model": self.config.local_model_file,
+                    "language": language,
+                    "sample_rate": sample_rate,
+                    "recording_duration_ms": recording_duration.as_millis(),
+                    "budget_ms": budget.as_millis(),
+                })
+            );
+            let Some(samples_16k) =
+                resample::resample_i16(samples, sample_rate, local_whisper::WHISPER_SAMPLE_RATE)
+            else {
+                warn!(
+                    "[stt] local_fallback_resample_unavailable {}",
+                    serde_json::json!({"sample_rate": sample_rate})
+                );
+                return None;
+            };
+            // whisper consumes f32 in [-1, 1]; dividing the i16 range by its
+            // full scale is the convention whisper.cpp's own examples use.
+            let pcm: Vec<f32> = samples_16k
+                .iter()
+                .map(|sample| f32::from(*sample) / 32_768.0)
+                .collect();
+            let started = Instant::now();
+            let Ok(engine) = self.local_engine() else {
+                warn!("[stt] local_fallback_engine_unavailable");
+                return None;
+            };
+            let result = local_whisper::call_with_budget("local_whisper", budget, move || {
+                engine.transcribe(&pcm)
+            });
+            match result {
+                Ok(text) if !text.trim().is_empty() => {
+                    info!(
+                        "[stt] local_fallback_completed {}",
+                        serde_json::json!({
+                            "chars": text.chars().count(),
+                            "words": text.split_whitespace().count(),
+                            "elapsed_ms": started.elapsed().as_millis(),
+                        })
+                    );
+                    Some(text)
+                }
+                Ok(_) => {
+                    info!(
+                        "[stt] local_fallback_empty {}",
+                        serde_json::json!({
+                            "elapsed_ms": started.elapsed().as_millis(),
+                        })
+                    );
+                    None
+                }
+                Err(error) => {
+                    warn!(
+                        "[stt] local_fallback_failed {}",
+                        serde_json::json!({"error": error.to_string()})
+                    );
+                    None
+                }
+            }
+        })
     }
 
     /// Choose the final transcript once both sources have answered. The
@@ -5488,6 +5625,9 @@ impl Config {
                 .unwrap_or_else(|| String::from("deepgram/nova-3")),
             local_model_file: load_env_value("BOLO_LOCAL_WHISPER_MODEL")
                 .unwrap_or_else(|| String::from(local_whisper::DEFAULT_MODEL_FILE)),
+            local_parakeet: parakeet_sidecar::parse_parakeet_enabled(
+                load_env_value("BOLO_LOCAL_PARAKEET").as_deref(),
+            ),
         };
         if let Some(missing) = config.missing_required_key() {
             // A missing key is no longer fatal: the onboarding window shows
@@ -5785,6 +5925,12 @@ impl std::fmt::Debug for MicrophoneCatalog {
 }
 
 static MICROPHONE_CATALOG: OnceLock<MicrophoneCatalog> = OnceLock::new();
+
+/// One-shot guard for the missing-parakeet-venv hint: the rung is on by
+/// default while the venv is a deliberate install, so the log explains
+/// `./ensure-python-env.sh --parakeet` exactly once per process instead
+/// of appending it to every offline dictation.
+static PARAKEET_HINT_SHOWN: OnceLock<()> = OnceLock::new();
 
 fn microphone_catalog() -> &'static MicrophoneCatalog {
     MICROPHONE_CATALOG.get_or_init(|| {
@@ -14874,6 +15020,7 @@ mod tests {
             max_recording_seconds: 30,
             local_stt: LocalSttMode::Auto,
             local_model_file: String::from("ggml-small.bin"),
+            local_parakeet: true,
             final_refine: true,
             cleanup_gate: true,
             final_refine_model: String::from("deepgram/nova-3"),
@@ -14922,6 +15069,7 @@ mod tests {
             max_recording_seconds: 30,
             local_stt: LocalSttMode::Auto,
             local_model_file: String::from("ggml-small.bin"),
+            local_parakeet: true,
             final_refine: true,
             cleanup_gate: true,
             final_refine_model: String::from("deepgram/nova-3"),
@@ -14960,6 +15108,7 @@ mod tests {
             max_recording_seconds: 30,
             local_stt: LocalSttMode::Auto,
             local_model_file: String::from("ggml-small.bin"),
+            local_parakeet: true,
             final_refine: true,
             cleanup_gate: true,
             final_refine_model: String::from("deepgram/nova-3"),
@@ -15124,6 +15273,7 @@ mod tests {
             max_recording_seconds: 30,
             local_stt: LocalSttMode::Auto,
             local_model_file: String::from("ggml-small.bin"),
+            local_parakeet: true,
             final_refine: true,
             cleanup_gate: true,
             final_refine_model: String::from("deepgram/nova-3"),
@@ -16020,6 +16170,7 @@ mod tests {
                 max_recording_seconds: 30,
                 local_stt: LocalSttMode::Auto,
                 local_model_file: String::from("ggml-small.bin"),
+                local_parakeet: true,
                 final_refine: true,
                 cleanup_gate: true,
                 final_refine_model: String::from("deepgram/nova-3"),
@@ -16067,6 +16218,7 @@ mod tests {
                 max_recording_seconds: 30,
                 local_stt: LocalSttMode::Auto,
                 local_model_file: String::from("ggml-small.bin"),
+                local_parakeet: true,
                 final_refine: true,
                 cleanup_gate: true,
                 final_refine_model: String::from("deepgram/nova-3"),
@@ -16120,6 +16272,7 @@ mod tests {
                 max_recording_seconds: 30,
                 local_stt: LocalSttMode::Auto,
                 local_model_file: String::from("ggml-small.bin"),
+                local_parakeet: true,
                 final_refine: true,
                 cleanup_gate: true,
                 final_refine_model: String::from("deepgram/nova-3"),
@@ -16193,6 +16346,7 @@ mod tests {
                 max_recording_seconds: 30,
                 local_stt: LocalSttMode::Auto,
                 local_model_file: String::from("ggml-small.bin"),
+                local_parakeet: true,
                 final_refine: true,
                 cleanup_gate: true,
                 final_refine_model: String::from("deepgram/nova-3"),
@@ -16251,6 +16405,7 @@ mod tests {
                 max_recording_seconds: 30,
                 local_stt: LocalSttMode::Auto,
                 local_model_file: String::from("ggml-small.bin"),
+                local_parakeet: true,
                 final_refine: true,
                 cleanup_gate: true,
                 final_refine_model: String::from("deepgram/nova-3"),
@@ -16319,6 +16474,7 @@ mod tests {
                 max_recording_seconds: 30,
                 local_stt: LocalSttMode::Auto,
                 local_model_file: String::from("ggml-small.bin"),
+                local_parakeet: true,
                 final_refine: true,
                 cleanup_gate: true,
                 final_refine_model: String::from("deepgram/nova-3"),
@@ -16812,6 +16968,7 @@ mod tests {
                 max_recording_seconds: 30,
                 local_stt: LocalSttMode::Auto,
                 local_model_file: String::from("ggml-small.bin"),
+                local_parakeet: true,
                 final_refine: true,
                 cleanup_gate: true,
                 final_refine_model: String::from("deepgram/nova-3"),
@@ -16872,6 +17029,7 @@ mod tests {
                 max_recording_seconds: 30,
                 local_stt: LocalSttMode::Auto,
                 local_model_file: String::from("ggml-small.bin"),
+                local_parakeet: true,
                 final_refine: true,
                 cleanup_gate: true,
                 final_refine_model: String::from("deepgram/nova-3"),
@@ -16935,6 +17093,7 @@ mod tests {
                 max_recording_seconds: 30,
                 local_stt: LocalSttMode::Auto,
                 local_model_file: String::from("ggml-small.bin"),
+                local_parakeet: true,
                 final_refine: true,
                 cleanup_gate: true,
                 final_refine_model: String::from("deepgram/nova-3"),
@@ -16988,6 +17147,7 @@ mod tests {
                 max_recording_seconds: 30,
                 local_stt: LocalSttMode::Auto,
                 local_model_file: String::from("ggml-small.bin"),
+                local_parakeet: true,
                 final_refine: true,
                 cleanup_gate: true,
                 final_refine_model: String::from("deepgram/nova-3"),
@@ -18150,6 +18310,7 @@ mod tests {
                 max_recording_seconds: 30,
                 local_stt: LocalSttMode::Auto,
                 local_model_file: String::from("ggml-small.bin"),
+                local_parakeet: true,
                 final_refine: true,
                 cleanup_gate: true,
                 final_refine_model: String::from("deepgram/nova-3"),
