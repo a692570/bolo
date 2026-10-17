@@ -2767,20 +2767,51 @@ impl App {
             self.local_stt_attempt(&samples, recording.sample_rate, elapsed)
                 .map_or_else(SttResult::default, SttResult::verbatim_local)
         } else if let Some(streaming) = recording.streaming {
+            // The refine batch call fires now, not after the drain: the
+            // audio is complete at release, so the upload and the
+            // provider-side processing overlap the streaming drain instead
+            // of waiting for it. The payload is the 16 kHz re-encode:
+            // whisper models resample to 16 kHz internally, so quality is
+            // unchanged while the upload shrinks roughly threefold.
+            let refine_wav = downsample_wav_16k_mono(&wav).unwrap_or_else(|| wav.clone());
+            let refine_app = Arc::clone(self);
+            let refine_warmup = recording.warmup.clone();
+            let refine_handle = std::thread::Builder::new()
+                .name(String::from("bolo-final-refine"))
+                .spawn(move || refine_app.verify_streaming_transcript(&refine_wav, &refine_warmup))
+                .ok();
+            let joined = |handle: Option<JoinHandle<Result<String, AppError>>>| {
+                handle
+                    .map(|thread| {
+                        thread.join().unwrap_or_else(|_| {
+                            Err(AppError::Transcription(String::from(
+                                "final refine thread panicked",
+                            )))
+                        })
+                    })
+                    .unwrap_or_else(|| {
+                        Err(AppError::Transcription(String::from(
+                            "final refine thread spawn failed",
+                        )))
+                    })
+            };
             match streaming.finish() {
-                Some(streaming_text) => SttResult::verbatim(self.refine_streaming_transcript(
+                Some(streaming_text) => SttResult::verbatim(self.select_streaming_outcome(
                     streaming_text,
-                    &wav,
                     elapsed,
-                    &recording.warmup,
+                    joined(refine_handle),
                 )),
                 None => {
                     warn!("[stt] streaming_empty_fallback");
-                    self.transcribe(&wav, &recording.warmup)
-                        .unwrap_or_else(|error| {
-                            warn!("batch fallback after streaming failed: {error}");
-                            SttResult::verbatim(String::new())
-                        })
+                    match joined(refine_handle) {
+                        Ok(text) if !text.trim().is_empty() => SttResult::verbatim(text),
+                        _ => self
+                            .transcribe(&wav, &recording.warmup)
+                            .unwrap_or_else(|error| {
+                                warn!("batch fallback after streaming failed: {error}");
+                                SttResult::verbatim(String::new())
+                            }),
+                    }
                 }
             }
         } else {
@@ -3350,12 +3381,20 @@ impl App {
         }
     }
 
-    fn refine_streaming_transcript(
+    /// Choose the final transcript once both sources have answered. The
+    /// batch call is spawned at release and overlaps the streaming drain,
+    /// so by the time the stream produces its final text the batch result
+    /// is usually ready. The suspicious branch keeps its exact pre-#35
+    /// semantics (batch wins only with strictly more words); the healthy
+    /// branch prefers the batch result whenever refine is enabled and it
+    /// returned words, because the 2026-10-17 measurement (laneE) showed
+    /// whisper-large-v3-turbo ahead of the stream even when it returns
+    /// fewer words (17 clips vs 8). Logging keeps the dashboard labels.
+    fn select_streaming_outcome(
         &self,
         streaming: StreamingText,
-        wav: &[u8],
         recording_duration: Duration,
-        warmup: &DictationWarmup,
+        batch: Result<String, AppError>,
     ) -> String {
         let reason =
             streaming_batch_fallback_reason(&streaming.text, streaming.source, recording_duration);
@@ -3370,7 +3409,7 @@ impl App {
                     "recording_duration_ms": recording_duration.as_millis(),
                 })
             );
-            match self.verify_streaming_transcript(wav, warmup) {
+            match batch {
                 Ok(batch)
                     if batch.split_whitespace().count()
                         > streaming.text.split_whitespace().count() =>
@@ -3402,18 +3441,12 @@ impl App {
                 }
             }
         }
-        // Healthy stream: always refine. The stream stays the live preview;
-        // batch decides the final transcript whenever it answers inside the
-        // bounded window. `BOLO_FINAL_REFINE=off` restores the pre-refine
-        // behavior for dictations where the extra round trip is not worth
-        // the accuracy gain.
+        // Healthy stream: prefer the refine result when it carries words.
+        // `BOLO_FINAL_REFINE=off` inserts the streaming text directly.
         if !self.config.final_refine {
             return streaming.text;
         }
-        let (label, text) = final_refine_choice(
-            &streaming.text,
-            self.verify_streaming_transcript(wav, warmup),
-        );
+        let (label, text) = final_refine_choice(&streaming.text, batch);
         info!(
             "[stt] {} {}",
             label,
