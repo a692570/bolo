@@ -1,0 +1,9 @@
+# The parakeet rung's offline transcription environment, installed into
+# ~/.bolo/parakeet-venv by ./ensure-python-env.sh --parakeet.
+# Pinned to the exact pair measured in the 2026-10-17 laneG benchmark
+# (~/.claude/output/whistle-eval/REPORT.md, "Lane G"): 13.6% median WER
+# on the 134-clip harness, 0.755s cold start with a warm HF cache.
+# parakeet-mlx needs Python >= 3.10, which is why this venv is separate
+# from the Python 3.9 helper venv at ~/.bolo/venv.
+parakeet-mlx==0.5.3
+mlx==0.32.4
