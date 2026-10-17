@@ -243,6 +243,8 @@ After a healthy streaming result, Bolo re-runs the batch model over the same aud
 export BOLO_FINAL_REFINE="off"
 ```
 
+The refine model is `deepgram/nova-3` by default (`BOLO_FINAL_REFINE_MODEL`): it must answer inside the paste budget, and the 2026-10-17 live run measured `whisper-large-v3-turbo` above 2 seconds wall on the production connection, which exhausts the window and falls back to the stream anyway. The batch primary (`BOLO_STT_MODEL`, default `openai/whisper-large-v3-turbo`) stays the no-streaming path, where no window applies.
+
 To keep dictated text on the clipboard after insertion, set:
 
 ```bash
