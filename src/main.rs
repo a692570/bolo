@@ -10086,6 +10086,87 @@ fn word_pieces(text: &str) -> Vec<WordPiece> {
     pieces
 }
 
+/// Tokens of a span, lowercased with number words unified to digits: the
+/// unit for per-token alignment.
+fn span_tokens(text: &str) -> Vec<String> {
+    word_pieces(text)
+        .iter()
+        .map(|piece| normalize_for_comparison(&text[piece.start..piece.end]))
+        .collect()
+}
+
+/// True when the two spans differ only by a trailing plural `s` on one
+/// token: "release notes" is not a mishearing of "release note", and
+/// snapping it would corrupt legitimate plurals.
+fn span_plural_variant(left: &str, right: &str) -> bool {
+    let left_tokens = span_tokens(left);
+    let right_tokens = span_tokens(right);
+    if left_tokens.len() != right_tokens.len() {
+        return false;
+    }
+    left_tokens
+        .iter()
+        .zip(&right_tokens)
+        .any(|(left_token, right_token)| {
+            left_token != right_token
+                && (left_token.strip_suffix('s') == Some(right_token.as_str())
+                    || right_token.strip_suffix('s') == Some(left_token.as_str()))
+        })
+}
+
+/// Per-token alignment between a spoken span and a vocabulary term: every
+/// token must match within its own edit allowance (lowercase, number words
+/// unified with digits), no pair may differ only by a trailing plural s,
+/// and the summed distance must stay inside the joined-span allowance.
+/// This catches the mishears the joined string comparison cannot ("ova
+/// three" for "nova three": per-token distance 1, joined distance 6)
+/// without adopting the plural-to-singular snap.
+fn aligned_span_score(spoken: &str, term: &str) -> Option<usize> {
+    let spoken_tokens = span_tokens(spoken);
+    let term_tokens = span_tokens(term);
+    if spoken_tokens.is_empty() || spoken_tokens.len() != term_tokens.len() {
+        return None;
+    }
+    let mut total = 0;
+    for (spoken_token, term_token) in spoken_tokens.iter().zip(&term_tokens) {
+        if spoken_token == term_token {
+            continue;
+        }
+        let spoken_len = spoken_token.chars().count();
+        let term_len = term_token.chars().count();
+        if spoken_len < 3 || term_len < 3 {
+            return None;
+        }
+        if spoken_token.strip_suffix('s') == Some(term_token.as_str())
+            || term_token.strip_suffix('s') == Some(spoken_token.as_str())
+        {
+            return None;
+        }
+        let per_token_allowed = match spoken_len.max(term_len) {
+            0..=3 => 0,
+            4..=5 => 1,
+            6..=9 => 2,
+            _ => 3,
+        };
+        let distance = bounded_levenshtein(spoken_token, term_token, per_token_allowed)?;
+        if distance > per_token_allowed {
+            return None;
+        }
+        total += distance;
+    }
+    // The joined allowance still caps the total so long spans cannot
+    // accumulate unbounded tolerance.
+    let joined_allowed = match spoken.chars().count().max(term.chars().count()) {
+        0..=5 => 1,
+        6..=9 => 2,
+        _ => 3,
+    };
+    if total > joined_allowed {
+        return None;
+    }
+    Some(total.saturating_mul(10).saturating_add(1))
+}
+
 fn best_vocabulary_match<'a>(
     text: &str,
     pieces: &[WordPiece],
@@ -10103,19 +10184,26 @@ fn best_vocabulary_match<'a>(
             continue;
         }
         for term in terms {
-            let Some(score) = vocabulary_match_score(&normalized, &term.normalized) else {
-                continue;
-            };
-            if spoken == term.term {
-                continue;
-            }
             // A partial span (fewer words than the term itself) must match
-            // exactly: "nova" sits within edit distance of "nova3", and
+            // exactly: "nova" sits within edit distance of "nova 3", and
             // letting it match re-expands the prefix while the trailing
             // fragment reattaches as "nova-3-3" (live dictation,
             // 2026-10-17). Full-span matches keep their fuzzy scoring.
             let term_piece_count = word_pieces(term.term).len();
             if word_count < term_piece_count && normalized != term.normalized {
+                continue;
+            }
+            // Plurals never snap: "release notes" is legitimate text, not
+            // a mishearing of "release note".
+            if word_count >= 2 && span_plural_variant(spoken, term.term) {
+                continue;
+            }
+            let score = vocabulary_match_score(&normalized, &term.normalized)
+                .or_else(|| aligned_span_score(spoken, term.term));
+            let Some(score) = score else {
+                continue;
+            };
+            if spoken == term.term {
                 continue;
             }
             let candidate = VocabularyMatch {
@@ -13472,7 +13560,7 @@ mod tests {
         StreamingConnectionState, StreamingProvider, StreamingRecording, StreamingTranscript,
         SttFallback, SttResult, TRANSCRIPT_HISTORY_LIMIT, TextReplacement, TranscriptHistoryEntry,
         UpdateNotice, UpdateOutcome, UsageCounters, WindowRow, WizardSpec,
-        accessibility_fix_detail, apply_text_replacements,
+        accessibility_fix_detail, aligned_span_score, apply_text_replacements,
         apply_vocabulary_corrections_with_matches, batch_retry_plan, batch_transcript_after_echo,
         build_cleanup_user_content, build_rewrite_user_content, build_stt_prompt,
         canonicalize_known_terms, chunk_samples_for, cleanup_decision, cleanup_max_tokens,
@@ -13496,7 +13584,7 @@ mod tests {
         read_vocabulary_file, read_vocabulary_usage_file, record_learned_correction,
         reload_is_busy, remove_bolo_env_value_at, remove_fillers, request_accessibility_daemon,
         resolve_microphone_selection, retry_failed_primary, sanitize_transcript_history,
-        save_usage_counters_at, should_exit_for_key_reload, speech_stats,
+        save_usage_counters_at, should_exit_for_key_reload, span_plural_variant, speech_stats,
         stable_streaming_best_is_ready_elapsed, status_rows, streaming_batch_fallback_reason,
         streaming_connection, streaming_preview_tail, streaming_provider_from_config,
         streaming_status_label, strip_reasoning_tags, strip_vocabulary_echo,
@@ -14531,6 +14619,32 @@ mod tests {
         // `matched` records the normalized term, which keeps the hyphen as
         // a space.
         assert_eq!(matched, vec![String::from("nova 3")]);
+    }
+
+    #[test]
+    fn aligned_span_score_matches_per_token_mishears() {
+        // A dropped first letter in one token: per-token distance 1, which
+        // the joined comparison (distance 6) can never see.
+        assert!(aligned_span_score("ova three", "nova-3").is_some());
+        // Curated mishears keep matching through the aligned path.
+        assert!(aligned_span_score("cloud code", "Claude Code").is_some());
+        assert!(aligned_span_score("wispr flo", "Wispr Flow").is_some());
+        // Token-count mismatches never align.
+        assert!(aligned_span_score("claude code base", "Claude Code").is_none());
+    }
+
+    #[test]
+    fn vocabulary_correction_snaps_term_variants_but_never_plurals() {
+        let vocabulary = vec![String::from("nova-3"), String::from("release note")];
+        // The dropped-first-letter variant snaps to the canonical term.
+        let (out, matched) =
+            apply_vocabulary_corrections_with_matches("check ova three config", &vocabulary);
+        assert_eq!(out, "check nova-3 config");
+        assert!(!matched.is_empty());
+        // A legitimate plural stays untouched.
+        let (out, _) =
+            apply_vocabulary_corrections_with_matches("review the release notes", &vocabulary);
+        assert_eq!(out, "review the release notes");
     }
 
     #[test]
