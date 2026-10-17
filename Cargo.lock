@@ -164,7 +164,7 @@ dependencies = [
 
 [[package]]
 name = "bolo"
-version = "1.9.8"
+version = "1.9.9"
 dependencies = [
  "arboard",
  "cpal",
