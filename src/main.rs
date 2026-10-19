@@ -135,6 +135,17 @@ const STT_REQUEST_TIMEOUT: Duration = Duration::from_secs(12);
 /// live replay during the 2026-09-09 gateway incident while the captured
 /// 48 kHz WAV was rejected nondeterministically with 413.
 const STT_RETRY_SAMPLE_RATE: u32 = 16_000;
+/// Cadence of the live offline preview: one trailing-window
+/// transcription per second while an offline-only session records. The
+/// sidecar round-trip measures 0.086 s median per clip on M4 Max, so it
+/// fits inside the interval; a slow call merely delays the next
+/// preview instead of queueing one.
+const OFFLINE_PREVIEW_INTERVAL: Duration = Duration::from_secs(1);
+/// Trailing audio the live offline preview transcribes each tick: the
+/// newest ~4 s only, because the preview's job is to mirror what the
+/// speaker just said. Release still transcribes the whole clip through
+/// the offline ladder, and that result wins over every preview.
+const OFFLINE_PREVIEW_WINDOW: Duration = Duration::from_secs(4);
 /// How many failed dictations keep their audio on disk before the oldest is dropped.
 const FAILED_AUDIO_KEEP: usize = 5;
 /// Share of the request budget an attempt must burn before a retry is judged
@@ -534,6 +545,11 @@ struct ActiveRecording {
     sample_rate: u32,
     warmup: DictationWarmup,
     streaming: Option<StreamingRecording>,
+    /// The live offline preview worker for offline-only sessions:
+    /// `None` whenever a streaming preview exists or the parakeet rung
+    /// cannot serve. The handle is inert; the worker ends on its own
+    /// when release drops the hub and the sink channel closes.
+    offline_preview: Option<OfflinePreview>,
 }
 
 impl ActiveRecording {
@@ -591,6 +607,14 @@ struct StreamingTranscript {
     latest_final: Option<String>,
     final_segments: Vec<String>,
     error: Option<String>,
+    /// Set the moment a stream that had completed its handshake fails
+    /// before release: the read loop errors, the server closes, or the
+    /// socket hits EOF while capture still feeds audio. Release checks
+    /// it once and routes the dictation straight to the offline ladder
+    /// instead of betting on the network a second time. Handshake
+    /// failures never set it: a stream that never connected keeps its
+    /// existing batch fallback.
+    stream_died_mid_session: bool,
 }
 
 #[derive(Debug)]
@@ -942,11 +966,46 @@ impl StreamingRecording {
             })
         }
     }
+
+    /// Whether the streaming session died after its handshake completed
+    /// and before release: the release routing reads this once, the
+    /// moment the pipeline starts, and skips every network path for the
+    /// offline ladder. An unreadable result reports no death, so a
+    /// poisoned mutex keeps the existing release behavior.
+    fn stream_died_mid_session(&self) -> bool {
+        self.result
+            .lock()
+            .map(|result| result.stream_died_mid_session)
+            .unwrap_or(false)
+    }
 }
 
 fn set_streaming_error(result: &Arc<Mutex<StreamingTranscript>>, error: String) {
     if let Ok(mut result) = result.lock() {
+        // An error on a session whose handshake completed is a
+        // mid-recording death: the release path reroutes to the offline
+        // ladder the moment it reads this flag. A pending or dead
+        // handshake failed before capture ever had a working stream, so
+        // those keep the existing batch fallback.
+        if result.connection == StreamingConnectionState::Connected {
+            result.stream_died_mid_session = true;
+        }
         result.error = Some(error);
+    }
+}
+
+/// Mark a connected stream that ended silently before release: a server
+/// close frame or socket EOF while capture still feeds audio. Unlike
+/// [`set_streaming_error`], the wire supplied no error text, so the
+/// reason comes from the call site. Sessions that were never connected
+/// stay unmarked: their release already skips the drain and falls back
+/// to batch today.
+fn mark_stream_died_mid_session(result: &Arc<Mutex<StreamingTranscript>>, reason: &str) {
+    if let Ok(mut result) = result.lock() {
+        if result.connection == StreamingConnectionState::Connected {
+            result.stream_died_mid_session = true;
+            result.error = Some(reason.to_owned());
+        }
     }
 }
 
@@ -1042,6 +1101,23 @@ fn stable_streaming_best_is_ready_elapsed(
     best_is_empty: bool,
 ) -> bool {
     !best_is_empty && total >= STREAMING_STABLE_RESULT_MAX && idle >= STREAMING_STABLE_RESULT_IDLE
+}
+
+/// The release-side empty-transcript retry gate: a clip long enough to
+/// carry recoverable speech gets one offline `auto` attempt before the
+/// shared failure handling gives up on the dictation. A session whose
+/// stream died mid-session is excluded: release already routed it to
+/// the offline ladder once, and with the wire dead nothing remains
+/// worth a second try of either kind. Pure so the route it decides is
+/// pinned by tests.
+fn empty_retry_engages(
+    stream_died_mid_session: bool,
+    transcript_is_empty: bool,
+    recording_duration: Duration,
+) -> bool {
+    !stream_died_mid_session
+        && transcript_is_empty
+        && recording_duration >= Duration::from_millis(EMPTY_RETRY_MIN_DURATION_MS)
 }
 
 fn streaming_batch_fallback_reason(
@@ -1187,6 +1263,15 @@ async fn run_stt_stream(
         match tokio::time::timeout(Duration::from_millis(20), read.next()).await {
             Ok(Some(Ok(message))) => {
                 if message.is_close() {
+                    // A close frame while capture still feeds audio is
+                    // the server hanging up mid-session; after release
+                    // drops the sender it is the clean session end.
+                    if !input_closed {
+                        mark_stream_died_mid_session(
+                            &result,
+                            "stream closed by the server mid-session",
+                        );
+                    }
                     return Ok(());
                 }
                 if let Message::Text(text) = message {
@@ -1201,7 +1286,15 @@ async fn run_stt_stream(
                 }
                 return Err(message);
             }
-            Ok(None) => return Ok(()),
+            Ok(None) => {
+                // Socket EOF before release is a mid-session death with
+                // no error text of its own; the marker supplies the
+                // reason the release routing will log.
+                if !input_closed {
+                    mark_stream_died_mid_session(&result, "stream socket ended mid-session");
+                }
+                return Ok(());
+            }
             Err(_) if input_closed => {}
             Err(_) => {}
         }
@@ -1571,6 +1664,11 @@ enum UserEvent {
     /// promote a connecting-phase overlay to the live REC cue.
     OverlayLive,
     OverlayPreview(String),
+    /// Release routed a dictation onto the offline ladder because the
+    /// streaming preview died mid-session: the overlay keeps the
+    /// thinking cue, and the note rides the transcript line so the wait
+    /// explains itself instead of sitting silent.
+    OverlayRecovery(String),
     HideOverlay,
     HideOverlayAfter(Duration),
     HistoryChanged,
@@ -2250,6 +2348,28 @@ fn run_app_event_loop(app: Arc<App>) -> Result<(), AppError> {
                     error!("{error}");
                 }
             }
+            TaoEvent::UserEvent(UserEvent::OverlayRecovery(note)) => {
+                // The release pipeline rerouted a dictation offline
+                // after the streaming preview died mid-session. The pill
+                // already moved to its thinking cue; this carries the
+                // recovery note on the transcript line while the local
+                // ladder runs, so the processing wait is never silent.
+                overlay_hide_at = None;
+                *control_flow = ControlFlow::Wait;
+                native_overlay_phase = Some(OverlayPhase::Thinking);
+                if let Err(error) = show_native_overlay(
+                    &mut native_overlay,
+                    &app.config.root_dir,
+                    OverlayPhase::Thinking,
+                    Some(&note),
+                ) {
+                    error!("{error}");
+                }
+                if let Some(ui) = tray_ui.as_ref() {
+                    ui.tray_icon
+                        .set_title(Some(OverlayPhase::Thinking.tray_title()));
+                }
+            }
             TaoEvent::UserEvent(UserEvent::HideOverlay) => {
                 overlay_hide_at = None;
                 native_overlay_phase = None;
@@ -2602,9 +2722,21 @@ impl App {
         // streaming thread once its handshake settles; decided here
         // because `streaming` moves into the recording below.
         let streaming_live = streaming.is_some();
+        // Offline-only sessions have no streaming partials to show, so
+        // the parakeet preview rung feeds the pill instead. The sink
+        // attaches before the seal frees the backlog, exactly like the
+        // streaming sink, and the rung stays independent of stream
+        // health: release recovery owns repairs, the preview owns live
+        // text.
+        let offline_preview = if offline_preview_enabled(self.config.local_stt, streaming_live) {
+            self.start_offline_preview_recording(&hub, recording.sample_rate)
+        } else {
+            None
+        };
         hub.seal();
         recording.warmup = self.start_dictation_warmup();
         recording.streaming = streaming;
+        recording.offline_preview = offline_preview;
         {
             let mut state = self.lock_state()?;
             state.active = Some(recording);
@@ -2765,6 +2897,15 @@ impl App {
             })
         );
         metrics.outcome = "stt_failed";
+        // A stream that died mid-session reroutes release before any
+        // network work: read the flag once here, before the arms below
+        // consume the streaming session (`finish` takes it by value).
+        // With the flag unset every path below behaves exactly as it
+        // did before the flag existed.
+        let stream_died_mid_session = recording
+            .streaming
+            .as_ref()
+            .is_some_and(|streaming| streaming.stream_died_mid_session());
         let stt_started = Instant::now();
         // BOLO_LOCAL_STT=on dictates offline dictation: cloud transcription
         // is skipped entirely and the insert path proceeds from the local
@@ -2782,49 +2923,72 @@ impl App {
             self.local_stt_attempt(&samples, recording.sample_rate, elapsed)
                 .map_or_else(SttResult::default, SttResult::verbatim_local)
         } else if let Some(streaming) = recording.streaming {
-            // The refine batch call fires now, not after the drain: the
-            // audio is complete at release, so the upload and the
-            // provider-side processing overlap the streaming drain instead
-            // of waiting for it. The payload is the 16 kHz re-encode:
-            // whisper models resample to 16 kHz internally, so quality is
-            // unchanged while the upload shrinks roughly threefold.
-            let refine_wav = downsample_wav_16k_mono(&wav).unwrap_or_else(|| wav.clone());
-            let refine_app = Arc::clone(self);
-            let refine_handle = std::thread::Builder::new()
-                .name(String::from("bolo-final-refine"))
-                .spawn(move || refine_app.verify_streaming_transcript(&refine_wav))
-                .ok();
-            let joined = |handle: Option<JoinHandle<Result<String, AppError>>>| {
-                handle
-                    .map(|thread| {
-                        thread.join().unwrap_or_else(|_| {
+            if stream_died_mid_session {
+                // The live stream died mid-recording, so every network
+                // path is a bet on the broken side: no refine call and
+                // no batch attempt, just the offline ladder over the
+                // whole clip. The overlay says what release is doing
+                // instead of sitting silent through a call that cannot
+                // answer.
+                info!(
+                    "[stt] stream_died_mid_session {}",
+                    serde_json::json!({
+                        "route": "offline_ladder",
+                        "refine_skipped": true,
+                        "batch_skipped": true,
+                        "recording_duration_ms": elapsed.as_millis(),
+                    })
+                );
+                self.send_user_event(UserEvent::OverlayRecovery(String::from(
+                    "Recovered offline",
+                )));
+                self.local_stt_auto_attempt(&samples, recording.sample_rate, elapsed)
+                    .map_or_else(SttResult::default, SttResult::verbatim_local)
+            } else {
+                // The refine batch call fires now, not after the drain: the
+                // audio is complete at release, so the upload and the
+                // provider-side processing overlap the streaming drain instead
+                // of waiting for it. The payload is the 16 kHz re-encode:
+                // whisper models resample to 16 kHz internally, so quality is
+                // unchanged while the upload shrinks roughly threefold.
+                let refine_wav = downsample_wav_16k_mono(&wav).unwrap_or_else(|| wav.clone());
+                let refine_app = Arc::clone(self);
+                let refine_handle = std::thread::Builder::new()
+                    .name(String::from("bolo-final-refine"))
+                    .spawn(move || refine_app.verify_streaming_transcript(&refine_wav))
+                    .ok();
+                let joined = |handle: Option<JoinHandle<Result<String, AppError>>>| {
+                    handle
+                        .map(|thread| {
+                            thread.join().unwrap_or_else(|_| {
+                                Err(AppError::Transcription(String::from(
+                                    "final refine thread panicked",
+                                )))
+                            })
+                        })
+                        .unwrap_or_else(|| {
                             Err(AppError::Transcription(String::from(
-                                "final refine thread panicked",
+                                "final refine thread spawn failed",
                             )))
                         })
-                    })
-                    .unwrap_or_else(|| {
-                        Err(AppError::Transcription(String::from(
-                            "final refine thread spawn failed",
-                        )))
-                    })
-            };
-            match streaming.finish() {
-                Some(streaming_text) => SttResult::verbatim(self.select_streaming_outcome(
-                    streaming_text,
-                    elapsed,
-                    joined(refine_handle),
-                )),
-                None => {
-                    warn!("[stt] streaming_empty_fallback");
-                    match joined(refine_handle) {
-                        Ok(text) if !text.trim().is_empty() => SttResult::verbatim(text),
-                        _ => self
-                            .transcribe(&wav, &recording.warmup)
-                            .unwrap_or_else(|error| {
-                                warn!("batch fallback after streaming failed: {error}");
-                                SttResult::verbatim(String::new())
-                            }),
+                };
+                match streaming.finish() {
+                    Some(streaming_text) => SttResult::verbatim(self.select_streaming_outcome(
+                        streaming_text,
+                        elapsed,
+                        joined(refine_handle),
+                    )),
+                    None => {
+                        warn!("[stt] streaming_empty_fallback");
+                        match joined(refine_handle) {
+                            Ok(text) if !text.trim().is_empty() => SttResult::verbatim(text),
+                            _ => self
+                                .transcribe(&wav, &recording.warmup)
+                                .unwrap_or_else(|error| {
+                                    warn!("batch fallback after streaming failed: {error}");
+                                    SttResult::verbatim(String::new())
+                                }),
+                        }
                     }
                 }
             }
@@ -2854,15 +3018,17 @@ impl App {
         // handling gives up on the dictation. Clips shorter than the
         // empty-retry gate keep their existing terminal behavior: a
         // sub-second clip cannot prove the speaker said anything, local
-        // or cloud.
-        let stt = if stt.text.trim().is_empty()
-            && elapsed >= Duration::from_millis(EMPTY_RETRY_MIN_DURATION_MS)
-        {
-            self.local_stt_auto_attempt(&samples, recording.sample_rate, elapsed)
-                .map_or(stt, SttResult::verbatim_local)
-        } else {
-            stt
-        };
+        // or cloud. A session the stream-death flag already rescued is
+        // excluded: its offline ladder answered once above, and with the
+        // wire dead there is nothing left for a retry of either kind to
+        // reach.
+        let stt =
+            if empty_retry_engages(stream_died_mid_session, stt.text.trim().is_empty(), elapsed) {
+                self.local_stt_auto_attempt(&samples, recording.sample_rate, elapsed)
+                    .map_or(stt, SttResult::verbatim_local)
+            } else {
+                stt
+            };
         if stt.text.trim().is_empty() {
             save_failed_audio(&wav);
             return Err(AppError::Transcription(String::from(
@@ -3687,6 +3853,64 @@ impl App {
             hub.attach("streaming_preview", sender, sample_rate);
         }
         Some(recording)
+    }
+
+    /// Start the live offline preview for an offline-only dictation:
+    /// attach the dedicated hub sink and spawn the per-session worker.
+    /// The gates mirror [`App::parakeet_attempt`] (rung enabled,
+    /// English-eligible language, rung installed), decided at press so
+    /// an unavailable rung costs nothing during the recording.
+    fn start_offline_preview_recording(
+        &self,
+        hub: &AudioHub,
+        sample_rate: u32,
+    ) -> Option<OfflinePreview> {
+        if !self.config.local_parakeet {
+            info!("[stt] offline_preview_skipped_rung_disabled");
+            return None;
+        }
+        let language = self
+            .stt_language()
+            .unwrap_or_else(|_| self.config.stt_language.clone());
+        if !parakeet_sidecar::parakeet_language_eligible(&language) {
+            info!(
+                "[stt] offline_preview_skipped_language {}",
+                serde_json::json!({"language": language})
+            );
+            return None;
+        }
+        if !parakeet_sidecar::rung_available(&self.config.root_dir) {
+            info!("[stt] offline_preview_skipped_rung_unavailable");
+            return None;
+        }
+        let Some(proxy) = self
+            .event_proxy
+            .lock()
+            .ok()
+            .and_then(|proxy| proxy.as_ref().cloned())
+        else {
+            return None;
+        };
+        let (sender, receiver) = mpsc::channel::<Vec<i16>>();
+        hub.attach("offline_preview", sender, sample_rate);
+        let root_dir = self.config.root_dir.clone();
+        let thread = std::thread::Builder::new()
+            .name(String::from("bolo-offline-preview"))
+            .spawn(move || run_offline_preview_worker(root_dir, sample_rate, receiver, proxy))
+            .map_err(|error| {
+                warn!("offline preview thread failed to start: {error}");
+                error
+            })
+            .ok()?;
+        info!(
+            "[stt] offline_preview_started {}",
+            serde_json::json!({
+                "sample_rate": sample_rate,
+                "interval_ms": OFFLINE_PREVIEW_INTERVAL.as_millis(),
+                "window_ms": OFFLINE_PREVIEW_WINDOW.as_millis(),
+            })
+        );
+        Some(OfflinePreview { _thread: thread })
     }
 
     fn accessibility_context_for_cleanup(
@@ -5848,6 +6072,7 @@ fn start_recording(
         sample_rate: config.sample_rate,
         warmup: DictationWarmup::default(),
         streaming: None,
+        offline_preview: None,
     })
 }
 
@@ -9258,6 +9483,186 @@ impl AudioHub {
         };
         state.buffering = false;
         state.backlog = Vec::new();
+    }
+}
+
+/// The live-preview rung for offline-only dictation (`BOLO_LOCAL_STT=on`
+/// with no streaming preview attached): one worker thread per session
+/// transcribes a trailing window of the captured audio through the
+/// parakeet sidecar roughly once a second and pushes each answer onto
+/// the same overlay-preview channel streaming partials use, so the
+/// pill's dictating line shows live text instead of a bare REC cue.
+/// Like streaming partials, previews are never final: release still
+/// runs the offline ladder over the whole clip, and that result wins.
+///
+/// The worker never touches the master capture buffer's mutex: it owns
+/// one dedicated AudioHub sink, so the audio callback pays only the
+/// sink push it already pays for streaming. Termination is
+/// sink-driven: release drops the stream and the hub, the sink channel
+/// closes, and the worker's next tick observes EOF and exits, which
+/// bounds the rung to one sidecar round-trip in flight and keeps a
+/// stale preview from pushing after the release's thinking cue.
+#[derive(Debug)]
+struct OfflinePreview {
+    /// Detached like the streaming thread: bounded by the hub sink's
+    /// lifetime, not by this handle.
+    _thread: JoinHandle<()>,
+}
+
+/// One preview round-trip through the managed sidecar: write the
+/// trailing window as a 16 kHz mono WAV, exchange it with the same
+/// resident child the release ladder's parakeet rung uses (a warm
+/// preview keeps the child warm for release), and remove the clip. The
+/// sidecar's own request timeout bounds the exchange; the worker's
+/// ~1 s cadence means no second call queues behind this one.
+fn offline_preview_round_trip(root_dir: &Path, samples: &[i16]) -> Result<String, String> {
+    let wav_path = parakeet_sidecar::temp_recording_path().ok_or_else(|| {
+        warn!("[stt] offline_preview_temp_path_unavailable");
+        String::from("temp path unavailable")
+    })?;
+    let wav = wav_bytes(samples, local_whisper::WHISPER_SAMPLE_RATE)
+        .map_err(|error| error.to_string())?;
+    if let Err(error) = fs::write(&wav_path, &wav) {
+        warn!("[stt] offline_preview_temp_write_failed: {error}");
+        return Err(error.to_string());
+    }
+    let outcome = parakeet_sidecar::transcribe_wav(root_dir, &wav_path);
+    if let Err(error) = fs::remove_file(&wav_path) {
+        warn!("[stt] offline_preview_temp_cleanup_failed: {error}");
+    }
+    match outcome {
+        // An empty answer is silence, not a failure: the pill keeps its
+        // previous line and the next tick runs anyway.
+        Ok(text) => Ok(text),
+        Err(_) => {
+            // `transcribe_wav` already logged its own failure reason;
+            // stopping the worker is the decision left to make here.
+            Err(String::from("sidecar round-trip failed"))
+        }
+    }
+}
+
+/// Whether a press should run the live offline preview: only an
+/// offline-only session wants it. `on` plus no streaming sink is the
+/// offline session (a live stream already feeds the pill partials);
+/// `auto` and `off` keep the streaming preview they have. The gate is
+/// independent of mid-session stream health on purpose: a stream that
+/// dies mid-session is release routing's recovery, not the preview
+/// rung's business.
+fn offline_preview_enabled(local_stt: LocalSttMode, streaming_live: bool) -> bool {
+    matches!(local_stt, LocalSttMode::On) && !streaming_live
+}
+
+/// Trailing samples one preview transcribes: the newest `window` of
+/// `sample_rate` audio. Millisecond bridging keeps sub-second windows
+/// exact; the counts stay tiny (a 4 s window at 48 kHz is 192k
+/// samples), so even absurd rates cannot overflow.
+fn preview_trailing_window_samples(sample_rate: u32, window: Duration) -> usize {
+    let window_ms = window.as_millis();
+    let samples = u128::from(sample_rate.max(1)).saturating_mul(window_ms) / 1_000;
+    usize::try_from(samples).unwrap_or(usize::MAX)
+}
+
+/// Slice the newest `window_samples` out of captured audio: the whole
+/// clip until it outruns the window, the trailing cut afterwards. Only
+/// the preview sees this slice: the release ladder always gets the
+/// full clip, so long dictations never pay preview cost in accuracy.
+fn preview_trailing_window(samples: &[i16], window_samples: usize) -> &[i16] {
+    if samples.len() <= window_samples {
+        samples
+    } else {
+        &samples[samples.len() - window_samples..]
+    }
+}
+
+/// The dedup gate for preview pushes: an empty answer never replaces
+/// the line the pill already shows, and identical consecutive windows
+/// (a held pause, a repeated trailing cut) never spam the overlay
+/// channel. Compares trimmed text, so a reply from the sidecar
+/// differing only in padding still dedups.
+fn preview_text_is_new(previous: Option<&str>, next: &str) -> bool {
+    let next = next.trim();
+    if next.is_empty() {
+        return false;
+    }
+    previous.is_none_or(|value| value.trim() != next)
+}
+
+/// The preview worker loop. One thread, so at most one sidecar
+/// round-trip is ever in flight: a slow call delays the next preview
+/// rather than queueing one, matching the bounded-cost contract.
+fn run_offline_preview_worker(
+    root_dir: PathBuf,
+    sample_rate: u32,
+    receiver: Receiver<Vec<i16>>,
+    proxy: EventLoopProxy<UserEvent>,
+) {
+    let window_samples = preview_trailing_window_samples(sample_rate, OFFLINE_PREVIEW_WINDOW);
+    let mut tail: Vec<i16> = Vec::with_capacity(window_samples);
+    let mut last_preview: Option<String> = None;
+    loop {
+        std::thread::sleep(OFFLINE_PREVIEW_INTERVAL);
+        // Drain everything the sink queued since the last tick. EOF
+        // means release tore the capture down: the worker ends without
+        // pushing, so the release's thinking cue is the last word.
+        let mut disconnected = false;
+        loop {
+            match receiver.try_recv() {
+                Ok(chunk) => tail.extend_from_slice(&chunk),
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    disconnected = true;
+                    break;
+                }
+            }
+        }
+        if disconnected {
+            return;
+        }
+        // Keep only the trailing window in memory.
+        if tail.len() > window_samples {
+            drop(tail.drain(..tail.len() - window_samples));
+        }
+        let preview_source = preview_trailing_window(&tail, window_samples);
+        if preview_source.is_empty() {
+            continue;
+        }
+        let Some(samples_16k) = resample::resample_i16(
+            preview_source,
+            sample_rate,
+            local_whisper::WHISPER_SAMPLE_RATE,
+        ) else {
+            warn!(
+                "[stt] offline_preview_resample_unavailable {}",
+                serde_json::json!({"sample_rate": sample_rate})
+            );
+            return;
+        };
+        match offline_preview_round_trip(&root_dir, &samples_16k) {
+            // Silent window: the pill keeps the live line it shows.
+            Ok(text) if text.trim().is_empty() => {}
+            Ok(text) => {
+                // The same single-line shaping streaming previews get,
+                // so dictation renders one way regardless of source.
+                let preview = streaming_preview_tail(&text);
+                if !preview_text_is_new(last_preview.as_deref(), &preview) {
+                    continue;
+                }
+                drop(proxy.send_event(UserEvent::OverlayPreview(preview.clone())));
+                last_preview = Some(preview);
+            }
+            Err(_) => {
+                // One failed round-trip ends the preview for the
+                // session: the release ladder still runs (with its own
+                // budget and fallbacks), and a broken rung must not
+                // cold-start a 2.4 GB model child every second.
+                info!(
+                    "[stt] offline_preview_stopped {}",
+                    serde_json::json!({"reason": "sidecar_round_trip_failed"})
+                );
+                return;
+            }
+        }
     }
 }
 
@@ -13714,11 +14119,11 @@ mod tests {
         AppError, AppState, AppWindowPayload, AudioHub, BatchEcho, BatchRetry,
         CLEANUP_PROMPT_CAP_CHARS, CleanupMode, CleanupProfile, CleanupPromptCache,
         CleanupPromptEntry, CleanupPromptFile, Config, CorrectionOutcome, DashboardAction,
-        DashboardRequestLine, DictationCommandKind, DictationWarmup, EchoVerdict,
-        EditLearningClaim, KeyEntrySpec, LEARNING_UNREADABLE_LINE, LEARNING_WINDOW_ROWS,
-        LaunchRequestAction, LearnedPair, LearnedVocabulary, LocalSttMode, LocalWhisperHandle,
-        MicrophoneDescriptor, MicrophoneSelection, ONBOARDING_MARKER_VERSION, OnboardingStatus,
-        PreparedText, PromptBinding, STREAMING_DRAIN_MIN, STT_RETRY_SAMPLE_RATE,
+        DashboardRequestLine, DictationCommandKind, DictationWarmup, EMPTY_RETRY_MIN_DURATION_MS,
+        EchoVerdict, EditLearningClaim, KeyEntrySpec, LEARNING_UNREADABLE_LINE,
+        LEARNING_WINDOW_ROWS, LaunchRequestAction, LearnedPair, LearnedVocabulary, LocalSttMode,
+        LocalWhisperHandle, MicrophoneDescriptor, MicrophoneSelection, ONBOARDING_MARKER_VERSION,
+        OnboardingStatus, PreparedText, PromptBinding, STREAMING_DRAIN_MIN, STT_RETRY_SAMPLE_RATE,
         StreamingConnectionState, StreamingProvider, StreamingRecording, StreamingTranscript,
         SttFallback, SttResult, TRANSCRIPT_HISTORY_LIMIT, TextReplacement, TranscriptHistoryEntry,
         UpdateNotice, UpdateOutcome, UsageCounters, WindowRow, WizardSpec,
@@ -13730,23 +14135,27 @@ mod tests {
         consume_open_dashboard_request_at, contains_devanagari, contains_word_verbatim,
         content_words, dashboard_accessibility_state, dashboard_cleanup_mode, dashboard_payload,
         dashboard_provider_label, derive_word_correction, downsample_wav_16k_mono, edit_distance,
-        edit_learning_context_diverged, empty_transcript_error, enforce_learned_vocabulary_cap,
-        final_refine_choice, final_streaming_result_is_ready_elapsed,
-        finalize_accessibility_context, format_transcript_style, handle_dashboard_action,
-        handle_launch_request_for_state, handshake_with_deadline, insert_fallback_reason,
-        is_blocklisted_correction, is_known_no_speech_transcript, is_supported_hotkey,
-        learning_window_payload_at, load_cleanup_prompt_file, load_learned_vocabulary,
-        load_usage_counters_at, load_vocabulary_usage, load_vocabulary_with_learned,
-        microphone_labels, non_empty_transcript, normalize_microphone_value, onboarding_status_at,
-        override_or_builtin_prompt_from, parse_accessibility_trust, parse_command,
-        parse_daemon_context_reply, parse_daemon_paste_reply, parse_daemon_select_reply,
-        parse_daemon_trust_reply, parse_latest_release, parse_popup_copy_text,
-        parse_release_version, parse_replacements_json, parse_stt_fallbacks, parse_u64_env_value,
-        parse_update_outcome, paste_intact_in_context, prompts_window_payload_at,
-        read_vocabulary_file, read_vocabulary_usage_file, record_learned_correction,
-        reload_is_busy, remove_bolo_env_value_at, remove_fillers, request_accessibility_daemon,
+        edit_learning_context_diverged, empty_retry_engages, empty_transcript_error,
+        enforce_learned_vocabulary_cap, final_refine_choice,
+        final_streaming_result_is_ready_elapsed, finalize_accessibility_context,
+        format_transcript_style, handle_dashboard_action, handle_launch_request_for_state,
+        handshake_with_deadline, insert_fallback_reason, is_blocklisted_correction,
+        is_known_no_speech_transcript, is_supported_hotkey, learning_window_payload_at,
+        load_cleanup_prompt_file, load_learned_vocabulary, load_usage_counters_at,
+        load_vocabulary_usage, load_vocabulary_with_learned, mark_stream_died_mid_session,
+        microphone_labels, non_empty_transcript, normalize_microphone_value,
+        offline_preview_enabled, onboarding_status_at, override_or_builtin_prompt_from,
+        parse_accessibility_trust, parse_command, parse_daemon_context_reply,
+        parse_daemon_paste_reply, parse_daemon_select_reply, parse_daemon_trust_reply,
+        parse_latest_release, parse_popup_copy_text, parse_release_version,
+        parse_replacements_json, parse_stt_fallbacks, parse_u64_env_value, parse_update_outcome,
+        paste_intact_in_context, preview_text_is_new, preview_trailing_window,
+        preview_trailing_window_samples, prompts_window_payload_at, read_vocabulary_file,
+        read_vocabulary_usage_file, record_learned_correction, reload_is_busy,
+        remove_bolo_env_value_at, remove_fillers, request_accessibility_daemon,
         resolve_microphone_selection, retry_failed_primary, sanitize_transcript_history,
-        save_usage_counters_at, should_exit_for_key_reload, span_plural_variant, speech_stats,
+        save_usage_counters_at, set_streaming_connection, set_streaming_error,
+        should_exit_for_key_reload, span_plural_variant, speech_stats,
         stable_streaming_best_is_ready_elapsed, status_rows, streaming_batch_fallback_reason,
         streaming_connection, streaming_preview_tail, streaming_provider_from_config,
         streaming_status_label, strip_reasoning_tags, strip_vocabulary_echo,
@@ -18129,6 +18538,181 @@ mod tests {
         assert_eq!(text, "final streaming text");
         assert_eq!(source, "final");
         assert!(started.elapsed() >= STREAMING_DRAIN_MIN);
+    }
+
+    // ==== Mid-session stream death (instant offline recovery) ====
+
+    #[test]
+    fn an_error_after_the_handshake_marks_the_death_mid_session() {
+        // A stream that connected and then failed release-side errors
+        // carries the mid-session flag, so release routes offline
+        // instead of betting on a second network call.
+        let result = Arc::new(Mutex::new(StreamingTranscript::default()));
+        set_streaming_connection(&result, StreamingConnectionState::Connected);
+
+        set_streaming_error(&result, String::from("websocket read failed"));
+
+        let state = result.lock().unwrap();
+        assert!(state.stream_died_mid_session);
+        assert_eq!(state.error.as_deref(), Some("websocket read failed"));
+    }
+
+    #[test]
+    fn handshake_failures_never_read_as_mid_session_death() {
+        // Never connected: the failure happened before any transcript
+        // could exist, which keeps the existing batch fallback.
+        let pending = Arc::new(Mutex::new(StreamingTranscript::default()));
+        set_streaming_error(&pending, String::from("connect refused"));
+        assert!(!pending.lock().unwrap().stream_died_mid_session);
+
+        // Dead handshake: the wrapper records the error after the state
+        // already moved to Dead, which must not reclassify the session.
+        let dead = Arc::new(Mutex::new(StreamingTranscript::default()));
+        set_streaming_connection(&dead, StreamingConnectionState::Dead);
+        set_streaming_error(&dead, String::from("524"));
+        assert!(!dead.lock().unwrap().stream_died_mid_session);
+    }
+
+    #[test]
+    fn a_clean_mid_session_close_marks_the_death_for_release_routing() {
+        // A close frame or EOF while capture still feeds audio is the
+        // quiet version of the stream dying: no error text arrives, so
+        // the marker supplies the reason the release log will show.
+        let result = Arc::new(Mutex::new(StreamingTranscript::default()));
+        set_streaming_connection(&result, StreamingConnectionState::Connected);
+
+        mark_stream_died_mid_session(&result, "stream closed by the server mid-session");
+
+        let state = result.lock().unwrap();
+        assert!(state.stream_died_mid_session);
+        assert_eq!(
+            state.error.as_deref(),
+            Some("stream closed by the server mid-session")
+        );
+    }
+
+    #[test]
+    fn the_mid_session_marker_ignores_streams_that_never_connected() {
+        // Pending and dead handshakes stay unmarked: their release
+        // already skips the drain and falls back to batch today.
+        let pending = Arc::new(Mutex::new(StreamingTranscript::default()));
+        mark_stream_died_mid_session(&pending, "late close frame");
+        assert!(!pending.lock().unwrap().stream_died_mid_session);
+        assert!(pending.lock().unwrap().error.is_none());
+
+        let dead = Arc::new(Mutex::new(StreamingTranscript::default()));
+        set_streaming_connection(&dead, StreamingConnectionState::Dead);
+        mark_stream_died_mid_session(&dead, "late close frame");
+        assert!(!dead.lock().unwrap().stream_died_mid_session);
+        assert!(dead.lock().unwrap().error.is_none());
+    }
+
+    #[test]
+    fn the_recording_reader_exposes_the_mid_session_death() {
+        let recording = streaming_recording(
+            StreamingConnectionState::Connected,
+            StreamingTranscript {
+                stream_died_mid_session: true,
+                ..StreamingTranscript::default()
+            },
+        );
+        assert!(recording.stream_died_mid_session());
+
+        // The healthy default: no flag, no behavior change.
+        let healthy = streaming_recording(
+            StreamingConnectionState::Connected,
+            StreamingTranscript::default(),
+        );
+        assert!(!healthy.stream_died_mid_session());
+    }
+
+    #[test]
+    fn the_empty_retry_gate_skips_sessions_recovered_offline() {
+        // A mid-session stream death routes release to the offline
+        // ladder once; the gate must not re-run anything after it.
+        let long = std::time::Duration::from_secs(5);
+        assert!(!empty_retry_engages(true, true, long));
+        // Unset flag keeps the shipped gate: an empty clip long enough
+        // to carry recoverable speech gets its one auto attempt.
+        assert!(empty_retry_engages(false, true, long));
+        // Short clips stay terminal, and non-empty transcripts never
+        // engaged the gate.
+        assert!(!empty_retry_engages(
+            false,
+            true,
+            std::time::Duration::from_millis(200)
+        ));
+        assert!(!empty_retry_engages(false, false, long));
+        // The boundary stays at the shipped constant.
+        let boundary = std::time::Duration::from_millis(EMPTY_RETRY_MIN_DURATION_MS);
+        assert!(empty_retry_engages(false, true, boundary));
+    }
+
+    // ==== Offline live preview (live partials for offline-only dictation) ====
+
+    #[test]
+    fn the_offline_preview_runs_only_without_a_streaming_preview() {
+        // Only an offline-only press pays for the preview rung: on mode
+        // plus no streaming sink. A live stream already feeds the pill.
+        assert!(offline_preview_enabled(LocalSttMode::On, false));
+        assert!(!offline_preview_enabled(LocalSttMode::On, true));
+        assert!(!offline_preview_enabled(LocalSttMode::Auto, false));
+        assert!(!offline_preview_enabled(LocalSttMode::Off, false));
+    }
+
+    #[test]
+    fn the_preview_trailing_window_covers_the_latest_four_seconds() {
+        assert_eq!(
+            preview_trailing_window_samples(48_000, std::time::Duration::from_secs(4)),
+            192_000
+        );
+        assert_eq!(
+            preview_trailing_window_samples(16_000, std::time::Duration::from_secs(4)),
+            64_000
+        );
+        // Sub-second windows stay exact, and degenerate rates or windows
+        // resolve to bounded counts instead of panicking.
+        assert_eq!(
+            preview_trailing_window_samples(44_100, std::time::Duration::from_millis(500)),
+            22_050
+        );
+        assert_eq!(
+            preview_trailing_window_samples(0, std::time::Duration::from_secs(4)),
+            4
+        );
+        assert_eq!(
+            preview_trailing_window_samples(48_000, std::time::Duration::ZERO),
+            0
+        );
+    }
+
+    #[test]
+    fn the_preview_trailing_window_slices_the_tail_of_capture() {
+        // Shorter than the window: transcribe everything captured.
+        let short: Vec<i16> = (1..=5_i16).collect();
+        assert_eq!(preview_trailing_window(&short, 10), &short[..]);
+        // Longer than the window: only the newest samples survive.
+        let long: Vec<i16> = (0..10_i16).collect();
+        assert_eq!(preview_trailing_window(&long, 3), &[7_i16, 8, 9]);
+        // A zero window cuts no preview at all.
+        let empty: &[i16] = &[];
+        assert_eq!(preview_trailing_window(&long, 0), empty);
+    }
+
+    #[test]
+    fn identical_or_empty_previews_never_reach_the_overlay() {
+        // The first real text always lands, and a different window
+        // replaces the line the pill shows.
+        assert!(preview_text_is_new(None, "hello there"));
+        assert!(preview_text_is_new(Some("old line"), "hello there"));
+        // Identical consecutive windows (a held pause, a repeated cut)
+        // dedup, padding differences included.
+        assert!(!preview_text_is_new(Some("hello there"), "hello there"));
+        assert!(!preview_text_is_new(Some("hello there"), "  hello there  "));
+        // Empty answers never replace the live line.
+        assert!(!preview_text_is_new(Some("hello there"), ""));
+        assert!(!preview_text_is_new(Some("hello there"), "   "));
+        assert!(!preview_text_is_new(None, ""));
     }
 
     // ==== Audio hub (press-to-capture backlog replay) ====

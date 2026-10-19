@@ -163,11 +163,13 @@ export BOLO_AUDIO_CONDITIONING="off"
 
 Conditioning is on by default. It keeps the same number of samples and alignment as the raw stream; if the processing engine fails to initialize, Bolo logs it and records without conditioning.
 
-Bolo can also transcribe offline through a local whisper.cpp model. The tier trails the whole cloud ladder (`BOLO_LOCAL_STT=auto`, the default): it runs only when streaming and the batch retry both fail or return no words. To skip cloud entirely and dictate offline, set:
+Bolo can also transcribe offline through a local whisper.cpp model. The tier trails the whole cloud ladder (`BOLO_LOCAL_STT=auto`, the default): it runs only when streaming and the batch retry both fail or return no words. A streaming session that dies mid-dictation routes release straight to the offline tier: the WebSocket's death is itself the failure signal, so no refine call or batch attempt runs, and the overlay shows a "Recovered offline" note while the local ladder works. To skip cloud entirely and dictate offline, set:
 
 ```bash
 export BOLO_LOCAL_STT="on"
 ```
+
+Offline-only dictations get live partials too: while the key is held, the parakeet rung transcribes a trailing ~4-second window of the capture about once per second and shows it on the recording pill, so fully offline dictation still shows text growing as you speak. Previews are never final, and one failed sidecar call ends the preview for that dictation; the full-clip release ladder still runs, and its result wins.
 
 To never consult the local tier, set `BOLO_LOCAL_STT="off"`. Transcription runs on a Metal-accelerated local model (default: `ggml-small`, ~466 MB) stored under `~/.bolo/models`; fetch it with **Download Offline Model...** under the Bolo menu's More..., which verifies the download's sha256 against the published digest and logs progress every 10%. Dictations the offline tier rescues are marked `inserted_local` in the `[metrics] dictation_latency` log line, so latency attribution stays clean. To point at a different ggml model file already in `~/.bolo/models`, set:
 

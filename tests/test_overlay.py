@@ -51,10 +51,23 @@ def test_pill_width_stays_inside_bounds_and_grows_with_text():
     assert overlay.MIN_WIDTH <= wide <= overlay.MAX_WIDTH
     wide_clamped = overlay.pill_width(" ".join(["word"] * 60), "dictating")
     assert wide_clamped == overlay.MAX_WIDTH
-    # A non-dictating phase never sizes for a transcript.
-    assert overlay.pill_width("anything", "thinking") <= overlay.pill_width(
-        "anything", "dictating"
+    # A phase carrying a payload sizes for the payload the same way the
+    # dictating pill does: once the payload outweighs either label the
+    # widths match, so recovery notes get room, not a truncated cue.
+    payload = overlay.preview_text("Recovered offline after the stream died")
+    assert overlay.pill_width(payload, "thinking") == overlay.pill_width(
+        payload, "dictating"
     )
+
+
+def test_pill_width_keeps_payloadless_phases_compact():
+    # The recovery note widens the thinking pill past its payloadless
+    # width, and the note never blows past the max width.
+    bare = overlay.pill_width("", "thinking")
+    noted = overlay.pill_width("Recovered offline", "thinking")
+    assert noted > bare
+    assert noted <= overlay.MAX_WIDTH
+    assert bare >= overlay.MIN_WIDTH
 
 
 def test_frame_contains_handles_edges_and_open_right_side():
@@ -193,6 +206,17 @@ def test_overlay_phase_frames_never_overlap():
         assert phase.stringValue() == "Thinking"
         assert transcript.isHidden() is True
         assert phase.frame().origin.y > 0
+        # The recovery note: a thinking cue with a text payload shows
+        # the same two-line layout dictating uses for its partial.
+        ui["render"]("thinking", "Recovered offline")
+        assert phase.stringValue() == "Thinking"
+        assert transcript.isHidden() is False
+        assert transcript.stringValue() == "Recovered offline"
+        assert phase.frame().origin.y >= (
+            transcript.frame().origin.y + transcript.frame().size.height
+        )
+        ui["render"]("thinking", "")
+        assert transcript.isHidden() is True
     finally:
         window.close()
 

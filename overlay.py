@@ -4,8 +4,10 @@
 Compact nonactivating panel near the bottom of the main display's safe
 area: it never takes keyboard focus, so the user keeps typing or holding
 the dictation key while it is visible. Every state has a clear label
-with a colored cue dot; dictating also shows the live partial transcript
-as a secondary line when one is available. The pill wears the shared
+with a colored cue dot; a phase carrying a text payload shows it as the
+secondary line: the live partial transcript while dictating, and the
+recovery note while release transcribes offline after the stream died.
+The pill wears the shared
 warm palette from bolo_brand (ink surface, ivory text, clay accents,
 moss for success, the failure red for retry) and carries the same
 custom b mark the setup window shows, so dictation and setup read as
@@ -89,9 +91,11 @@ def is_error_phase(phase):
 
 
 def pill_width(preview, phase):
-    """Width for one state: long live previews clamp, short labels stay
-    compact instead of stretching to the maximum width."""
-    text = preview_text(preview) if phase == "dictating" else ""
+    """Width for one state: text payloads clamp, short labels stay
+    compact instead of stretching to the maximum width. Any phase that
+    carries a note (the dictating partial, the recovery line) sizes for
+    its text; payload-less phases size for their label alone."""
+    text = preview_text(preview)
     label = phase_label(phase)
     measured = max(len(text), len(label))
     width = MIN_WIDTH + measured * 6
@@ -354,17 +358,18 @@ def run_overlay(preview=None, initial_phase=None, initial_text=""):
         window.setFrame_display_(new_frame, True)
 
     def render(phase, preview=""):
-        """Show one state: the phase label always, plus the live
-        transcript tail while dictating.
+        """Show one state: the phase label always, plus the text
+        payload the runtime sent with it (the transcript tail while
+        dictating, the recovery note while thinking).
 
-        With a live preview the label moves to the top line and the
-        transcript to the bottom, so the two never overlap inside the
+        With a text line the label moves to the top line and the
+        payload to the bottom, so the two never overlap inside the
         44pt pill; without one the label stays vertically centered and
         the transcript line is empty.
         """
         text = phase_label(phase)
         accent = phase_color(phase)
-        line = preview_text(preview) if phase == "dictating" else ""
+        line = preview_text(preview)
         label.setStringValue_(text)
         transcript.setStringValue_(line)
         if line:
@@ -421,7 +426,10 @@ def run_overlay(preview=None, initial_phase=None, initial_text=""):
                 except json.JSONDecodeError:
                     message = {}
                 phase = message.get("phase", phase)
-                preview = message.get("text", "") if phase == "dictating" else ""
+                # The runtime may attach a text line to any phase: the
+                # partial while dictating, the recovery note while
+                # thinking. Empty text renders as no line at all.
+                preview = message.get("text", "")
                 render(phase, preview)
                 last_message_at = time.time()
 
