@@ -5381,6 +5381,13 @@ impl App {
     /// for this session. Returns whether a brand-new pair was learned, so
     /// the caller can announce it; count bumps of a known pair stay silent.
     fn learn_correction(&self, path: &Path, misheard: &str, corrected: &str) -> bool {
+        if !is_valid_learned_pair(misheard, corrected) {
+            warn!(
+                "[learning] rejected pair {:?}->{:?}: common word or fragment",
+                misheard, corrected
+            );
+            return false;
+        }
         let (saved, is_new_pair) = match record_learned_correction(path, misheard, corrected) {
             Ok((file, is_new_pair)) => {
                 let aliases = learned_aliases_from_file(&file);
@@ -11978,7 +11985,7 @@ struct LearnedCorrectionEntry {
 }
 
 fn load_learned_vocabulary(path: &Path) -> LearnedVocabulary {
-    match fs::read_to_string(path) {
+    let parsed = match fs::read_to_string(path) {
         Ok(text) => serde_json::from_str::<LearnedVocabulary>(&text).unwrap_or_else(|error| {
             // A corrupt file never takes the feature down and is preserved
             // on disk: the load only warns, and the next successful save
@@ -11991,7 +11998,76 @@ fn load_learned_vocabulary(path: &Path) -> LearnedVocabulary {
             warn!("learned vocabulary file ignored: {error}");
             LearnedVocabulary::default()
         }
+    };
+    sanitize_learned_vocabulary(parsed)
+}
+
+/// Drop learned pairs that are common-word or fragment poisons: their
+/// corrected terms join the keyterms prompt, so a junk pair both rewrites
+/// dictations and biases recognition (the 2026-10-18 purge removed
+/// audience->line, wasn't->wast and actually->lly, which had accumulated
+/// months of prompt bias). Filtering at load means a legacy or hand-edited
+/// file self-heals without waiting for the next save.
+fn sanitize_learned_vocabulary(mut file: LearnedVocabulary) -> LearnedVocabulary {
+    let before = file.corrections.len();
+    file.corrections
+        .retain(|misheard, entry| is_valid_learned_pair(misheard, &entry.corrected));
+    if file.corrections.len() != before {
+        warn!(
+            "[learning] dropped {} poisoned learned pair(s) on load",
+            before - file.corrections.len()
+        );
     }
+    file
+}
+
+/// Words too common to belong to a learned correction: a pair touching one of
+/// these is either a misattribution of the user's edit or, once promoted into
+/// the keyterms prompt, an active recognizer bias. Sorted for stable diffs.
+const LEARNED_CORRECTION_STOPWORDS: &[&str] = &[
+    "a", "about", "actually", "again", "all", "also", "an", "and", "any", "are", "at", "be", "but",
+    "by", "call", "called", "can", "can't", "come", "could", "did", "didn't", "do", "does",
+    "don't", "even", "for", "from", "get", "got", "had", "has", "have", "he", "her", "here", "him",
+    "his", "how", "i", "i'm", "i've", "if", "in", "is", "it", "it's", "just", "know", "like",
+    "line", "make", "many", "may", "me", "more", "most", "much", "must", "my", "need", "no", "not",
+    "now", "of", "on", "one", "only", "or", "other", "our", "out", "over", "point", "really",
+    "right", "said", "say", "see", "she", "should", "so", "some", "still", "take", "that",
+    "that's", "the", "their", "them", "then", "there", "these", "they", "thing", "things", "think",
+    "this", "time", "to", "too", "two", "up", "us", "use", "very", "want", "was", "wasn't", "way",
+    "we", "well", "went", "were", "what", "when", "which", "who", "why", "will", "with", "would",
+    "you", "you're", "your",
+];
+
+/// A learned pair must be a term-like fix: both sides non-empty, the corrected
+/// side at least three characters and vowel-bearing (ASCII sense; non-Latin
+/// scripts such as Devanagari pass the vowel gate), either side matching no
+/// common word, and the sides differing once normalized.
+fn is_valid_learned_pair(misheard: &str, corrected: &str) -> bool {
+    let misheard = misheard.trim();
+    let corrected = corrected.trim();
+    if misheard.is_empty() || corrected.is_empty() {
+        return false;
+    }
+    if corrected.chars().count() < 3 {
+        return false;
+    }
+    let corrected_has_vowel = corrected.chars().any(|character| {
+        if character.is_ascii() {
+            "aeiou".contains(character.to_ascii_lowercase())
+        } else {
+            true
+        }
+    });
+    if !corrected_has_vowel {
+        return false;
+    }
+    if normalize_for_matching(misheard) == normalize_for_matching(corrected) {
+        return false;
+    }
+    let misheard_key = misheard.to_ascii_lowercase();
+    let corrected_key = corrected.to_ascii_lowercase();
+    !LEARNED_CORRECTION_STOPWORDS.contains(&misheard_key.as_str())
+        && !LEARNED_CORRECTION_STOPWORDS.contains(&corrected_key.as_str())
 }
 
 /// Upsert one correction. The same misheard->corrected pair bumps the count; a
@@ -19549,6 +19625,57 @@ mod tests {
                 .get("zzmishrd")
                 .map(|entry| entry.count),
             Some(2)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn learn_correction_rejects_common_words_and_fragments() -> Result<(), AppError> {
+        let app = edit_learning_test_app(Vec::new(), Vec::new(), Vec::new());
+        let learned_path = temp_learned_vocabulary_path();
+        // The 2026-10-18 purge class: common-word and fragment pairs poison
+        // both the transcript rewrite and the keyterms prompt.
+        assert!(!app.learn_correction(&learned_path, "audience", "line"));
+        assert!(!app.learn_correction(&learned_path, "wasn't", "wast"));
+        assert!(!app.learn_correction(&learned_path, "actually", "lly"));
+        // Fragment: too short, no vowel.
+        assert!(!app.learn_correction(&learned_path, "hello", "zz"));
+        assert!(!app.learn_correction(&learned_path, "hello", "xyz"));
+        // No-op pairs never learn.
+        assert!(!app.learn_correction(&learned_path, "actually", "Actually"));
+        // Nothing leaked into the store or the engine.
+        assert!(
+            load_learned_vocabulary(&learned_path)
+                .corrections
+                .is_empty()
+        );
+        assert!(app.learned_aliases_snapshot().is_empty());
+        // A genuine term pair still learns.
+        assert!(app.learn_correction(&learned_path, "parakeet sidecar", "parakeet rung"));
+        assert_eq!(load_learned_vocabulary(&learned_path).corrections.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn load_learned_vocabulary_self_heals_poisoned_files() -> Result<(), AppError> {
+        let path = temp_learned_vocabulary_path();
+        let poisoned = r#"{
+  "corrections": {
+    "audience": {"corrected": "line", "count": 3, "last_used": 1792085241},
+    "wasn't": {"corrected": "wast", "count": 2, "last_used": 1791936896},
+    "zzmishrd": {"corrected": "zzlearnedterm", "count": 1, "last_used": 1}
+  }
+}"#;
+        fs::write(&path, poisoned)?;
+        let loaded = load_learned_vocabulary(&path);
+        // The poison pairs vanish; the genuine pair survives.
+        assert_eq!(loaded.corrections.len(), 1);
+        assert_eq!(
+            loaded
+                .corrections
+                .get("zzmishrd")
+                .map(|entry| entry.corrected.as_str()),
+            Some("zzlearnedterm")
         );
         Ok(())
     }
