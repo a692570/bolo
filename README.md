@@ -193,6 +193,16 @@ Three caveats from the benchmark, by design:
 - **Noise gate.** Like every other engine measured, parakeet invents words on silent input (12/12 silent/noise clips produced hallucinated text). Both the Rust pipeline and the sidecar re-check the same speech-energy threshold (any 20 ms frame at RMS >= 0.006) before inference, so silence falls to the existing no-speech handling instead of inserting words.
 - **Memory.** The sidecar holds ~118 MB resident after load (the 2.4 GB weights are lazily mmapped) and peaks around 1.6 GB while transcribing. It starts lazily on the first offline dictation and dies with the app, so the cost is paid only while the offline tier is in use.
 
+#### The qwen rung (multilingual accuracy + long clips)
+
+When parakeet cannot serve a clip (a Hindi dictation, `auto` detection, a missing parakeet venv, or an empty parakeet answer), the ladder next tries **qwen3-asr-0.6B** (package `qwen3-asr-mlx`), a resident MLX sidecar running `mlx-community/Qwen3-ASR-0.6B-bf16`. On the same audio, the 2026-10-18 benchmark measured the best conversational Hindi of every candidate (52.0% WER with native Devanagari output; whisper-small 60.4%, whisper-large-v3-turbo 68.5%, parakeet romanizes and is disqualified) with English content accuracy on par with whisper-large-v3-turbo, at 0.166 s warm per clip and ~0.34 s load from a warm Hugging Face cache. Clips 6 seconds or longer lead with qwen ahead of parakeet (the accuracy rung), while shorter clips keep parakeet's 0.116 s speed. Setup mirrors the parakeet rung:
+
+```bash
+./ensure-python-env.sh --qwen
+```
+
+That creates `~/.bolo/qwen-venv` (Python >= 3.10, pinned qwen3-asr-mlx 0.3.0) and never runs at app startup. The rung is on by default and engages for `en`, `hi`, and `auto` language hints; set `BOLO_LOCAL_QWEN="off"` to disable it, or `BOLO_QWEN_MODEL` to point at a different HF snapshot. The ~1.2 GB weights download on first use through huggingface_hub (the same cache parakeet rides), or up front from **Download Qwen ASR Model...** under More.... The sidecar re-runs the exact same speech-energy gate before inference, mirrors parakeet's lazy-spawn lifecycle, and frees the model on exit; Bolo's vocabulary rides as the model's context prompt (the same first-50-terms cap as the cloud prompt).
+
 ### Learned words and the copy-transcript popup
 
 Bolo learns your corrections. When a dictation lands and you edit it within 15 seconds — backspacing and retyping a word Bolo misheard — the next dictation you fix that way teaches Bolo the pair: it is saved to `~/.bolo/learned_vocabulary.json` (capped at 100 entries), applied on every future dictation at zero latency, and Bolo shows a "Bolo learned: X → Y" notification the first time a pair is saved. Only clean single-word substitutions are learned; deletions and full rewrites are deliberately ignored. The tray menu's **Learned Words** shows everything learned so far, and the dashboard counts them.
@@ -415,7 +425,7 @@ Yes. Set `BOLO_HOTKEY` to `right_control`, `right_shift`, `fn`, `f1` through `f1
 
 - Does it work offline?
 
-Only through the optional offline tier: `BOLO_LOCAL_STT="on"` dictates entirely on-device, trying the parakeet MLX sidecar first and falling back to a local whisper.cpp model (see Configuration). The default cloud pipeline needs internet to reach Telnyx APIs.
+Only through the optional offline tier: `BOLO_LOCAL_STT="on"` dictates entirely on-device, trying the parakeet MLX sidecar first, then the qwen3-asr MLX sidecar, and finally a local whisper.cpp model (see Configuration). The default cloud pipeline needs internet to reach Telnyx APIs.
 
 - Why Rust?
 

@@ -3,6 +3,7 @@
 mod audio_conditioning;
 mod local_whisper;
 mod parakeet_sidecar;
+mod qwen_sidecar;
 mod recording_fsm;
 mod resample;
 
@@ -273,6 +274,15 @@ struct Config {
     /// ladder runs (the default, matching `BOLO_LOCAL_STT=auto`); `off`
     /// disables the rung and leaves the whisper path unchanged.
     local_parakeet: bool,
+    /// Qwen rung policy from `BOLO_LOCAL_QWEN`: the MLX qwen3-asr-0.6B
+    /// sidecar (the multilingual accuracy rung: native Devanagari Hindi
+    /// plus English on par with whisper-large-v3-turbo, benchmark
+    /// 2026-10-18) engages after parakeet declines a clip, and leads the
+    /// ladder on long clips (the default); `off` disables the rung.
+    local_qwen: bool,
+    /// HF repo id of the qwen rung's model from `BOLO_QWEN_MODEL`,
+    /// defaulting to the benchmark model `mlx-community/Qwen3-ASR-0.6B-bf16`.
+    qwen_model_id: String,
     /// Final-refine policy from `BOLO_FINAL_REFINE`: after a healthy
     /// streaming result, re-run the batch endpoint and prefer its transcript
     /// when it returns words inside the bounded window. The streaming text
@@ -1771,6 +1781,7 @@ struct TrayUi {
     show_dashboard_item: MenuItem,
     show_onboarding_item: MenuItem,
     download_offline_model_item: MenuItem,
+    download_qwen_model_item: MenuItem,
     quit_item: MenuItem,
 }
 
@@ -2507,6 +2518,7 @@ fn run_app_event_loop(app: Arc<App>) -> Result<(), AppError> {
             TaoEvent::UserEvent(UserEvent::OfflineModelChanged) => {
                 if let Some(ui) = tray_ui.as_ref() {
                     update_offline_model_item(&app, ui);
+                    update_qwen_model_item(&app, ui);
                 }
             }
             TaoEvent::UserEvent(UserEvent::RecordingWatchdog) => {
@@ -3580,10 +3592,147 @@ impl App {
         }
     }
 
+    /// The qwen rung of the offline ladder: transcribe the captured
+    /// samples through the managed qwen3-asr MLX sidecar on a worker
+    /// thread under the same recording-derived budget the other rungs
+    /// use, feeding it the 16 kHz mono WAV re-encode and Bolo's
+    /// vocabulary as the model's context prompt. `None` hands the
+    /// ladder to whisper: rung off via `BOLO_LOCAL_QWEN=off`, a
+    /// language hint qwen has not been measured for (anything but
+    /// `en`/`hi`/auto), venv not installed, sidecar failure, or empty
+    /// text.
+    fn qwen_attempt(
+        &self,
+        samples: &[i16],
+        sample_rate: u32,
+        recording_duration: Duration,
+    ) -> Option<String> {
+        if !self.config.local_qwen {
+            return None;
+        }
+        let language = self
+            .stt_language()
+            .unwrap_or_else(|_| self.config.stt_language.clone());
+        if !qwen_sidecar::qwen_language_eligible(&language) {
+            info!(
+                "[stt] local_qwen_skipped_language {}",
+                serde_json::json!({
+                    "language": language,
+                    "reason": "qwen rung covers en/hi/auto only; other hints keep whisper detection",
+                })
+            );
+            return None;
+        }
+        if !qwen_sidecar::rung_available(&self.config.root_dir) {
+            let _hint_logged = QWEN_HINT_SHOWN.get_or_init(|| {
+                warn!(
+                    "[stt] qwen_rung_unavailable {}",
+                    serde_json::json!({
+                        "hint": "run ./ensure-python-env.sh --qwen to install ~/.bolo/qwen-venv",
+                    })
+                );
+            });
+            return None;
+        }
+        let Some(samples_16k) =
+            resample::resample_i16(samples, sample_rate, local_whisper::WHISPER_SAMPLE_RATE)
+        else {
+            warn!(
+                "[stt] local_qwen_resample_unavailable {}",
+                serde_json::json!({"sample_rate": sample_rate})
+            );
+            return None;
+        };
+        let Ok(wav) = wav_bytes(&samples_16k, local_whisper::WHISPER_SAMPLE_RATE) else {
+            warn!("[stt] local_qwen_wav_encode_failed");
+            return None;
+        };
+        let Some(wav_path) = qwen_sidecar::temp_recording_path() else {
+            warn!("[stt] local_qwen_temp_path_unavailable");
+            return None;
+        };
+        if let Err(error) = fs::write(&wav_path, &wav) {
+            warn!(
+                "[stt] local_qwen_temp_write_failed {}",
+                serde_json::json!({"error": error.to_string()})
+            );
+            return None;
+        }
+        // The vocabulary rides as qwen's context prompt, the same
+        // first-50-terms cap the cloud rung's prompt uses.
+        let context =
+            qwen_sidecar::vocabulary_context(&self.vocabulary_snapshot().unwrap_or_default());
+        let budget = local_whisper::local_stt_budget(recording_duration);
+        info!(
+            "[stt] local_qwen_started {}",
+            serde_json::json!({
+                "model": self.config.qwen_model_id,
+                "language": language,
+                "context_terms": context.is_some(),
+                "sample_rate": sample_rate,
+                "recording_duration_ms": recording_duration.as_millis(),
+                "budget_ms": budget.as_millis(),
+            })
+        );
+        let started = Instant::now();
+        let root_dir = self.config.root_dir.clone();
+        let model_id = self.config.qwen_model_id.clone();
+        let language_for_worker = language.clone();
+        let request_path = wav_path.clone();
+        let context_for_worker = context.clone();
+        let result = local_whisper::call_with_budget("local_qwen", budget, move || {
+            let outcome = qwen_sidecar::transcribe_wav(
+                &root_dir,
+                &model_id,
+                &request_path,
+                Some(&language_for_worker),
+                context_for_worker.as_deref(),
+            );
+            // Remove the clip inside the worker so an abandoned attempt
+            // (budget timeout) still cleans up when the worker finishes.
+            if let Err(error) = fs::remove_file(&request_path) {
+                warn!("[stt] local_qwen_temp_cleanup_failed: {error}");
+            }
+            outcome
+        });
+        match result {
+            Ok(text) if !text.trim().is_empty() => {
+                info!(
+                    "[stt] local_qwen_completed {}",
+                    serde_json::json!({
+                        "chars": text.chars().count(),
+                        "words": text.split_whitespace().count(),
+                        "elapsed_ms": started.elapsed().as_millis(),
+                    })
+                );
+                Some(text)
+            }
+            Ok(_) => {
+                info!(
+                    "[stt] local_qwen_empty {}",
+                    serde_json::json!({
+                        "elapsed_ms": started.elapsed().as_millis(),
+                    })
+                );
+                None
+            }
+            Err(error) => {
+                warn!(
+                    "[stt] local_qwen_failed {}",
+                    serde_json::json!({"error": error.to_string()})
+                );
+                None
+            }
+        }
+    }
+
     /// The offline rung of the STT ladder: transcribe the captured
-    /// samples on-device through the parakeet sidecar first (the top
-    /// rung), then fall back to whisper.cpp when parakeet yields
-    /// nothing, always on a worker thread whose budget derives from the
+    /// samples on-device through the parakeet rung first (short clips:
+    /// the speed rung, also the rung feeding the live offline preview),
+    /// then the qwen rung (the multilingual accuracy rung, which also
+    /// leads the ladder on long clips per the ladder-order decision),
+    /// then fall back to whisper.cpp when both MLX rungs yield nothing,
+    /// always on a worker thread whose budget derives from the
     /// recording length (3x, 10 s floor), so a hung model can never
     /// wedge the release path. `None` keeps the caller's existing
     /// behavior: a missing or invalid model logs a warning and the
@@ -3594,102 +3743,110 @@ impl App {
         sample_rate: u32,
         recording_duration: Duration,
     ) -> Option<String> {
-        // The rung order lives in complete_offline_ladder: only a None
-        // parakeet outcome consults whisper, so a warm parakeet rung
-        // never pays for a whisper model check it does not need.
-        let parakeet_outcome = self.parakeet_attempt(samples, sample_rate, recording_duration);
-        parakeet_sidecar::complete_offline_ladder(parakeet_outcome, || {
-            // The unchanged whisper.cpp fallback, named here so the
-            // ladder reads as policy and the rung stays one block.
-            let models_dir = Self::local_models_dir();
-            match local_whisper::model_status(&models_dir, &self.config.local_model_file) {
-                LocalModelStatus::Ready => {}
-                LocalModelStatus::Missing => {
-                    warn!(
-                        "[stt] local_fallback_model_missing {}",
-                        serde_json::json!({
-                            "model": self.config.local_model_file,
-                            "hint": "choose Download Offline Model in the Bolo menu to fetch it",
-                        })
-                    );
-                    return None;
+        // The rung order lives in complete_offline_ladder: outcomes
+        // surface lazily so a clip only ever runs the rungs it needs;
+        // short clips keep parakeet's speed, and clips at qwen's
+        // long-clip threshold lead with the accuracy rung instead.
+        let qwen_leads = qwen_sidecar::qwen_runs_first(recording_duration);
+        qwen_sidecar::complete_offline_ladder(
+            || self.parakeet_attempt(samples, sample_rate, recording_duration),
+            || self.qwen_attempt(samples, sample_rate, recording_duration),
+            qwen_leads,
+            || {
+                // The unchanged whisper.cpp fallback, named here so the
+                // ladder reads as policy and the rung stays one block.
+                let models_dir = Self::local_models_dir();
+                match local_whisper::model_status(&models_dir, &self.config.local_model_file) {
+                    LocalModelStatus::Ready => {}
+                    LocalModelStatus::Missing => {
+                        warn!(
+                            "[stt] local_fallback_model_missing {}",
+                            serde_json::json!({
+                                "model": self.config.local_model_file,
+                                "hint": "choose Download Offline Model in the Bolo menu to fetch it",
+                            })
+                        );
+                        return None;
+                    }
+                    LocalModelStatus::Invalid(reason) => {
+                        warn!(
+                            "[stt] local_fallback_model_invalid {}",
+                            serde_json::json!({
+                                "model": self.config.local_model_file,
+                                "reason": reason,
+                            })
+                        );
+                        return None;
+                    }
                 }
-                LocalModelStatus::Invalid(reason) => {
-                    warn!(
-                        "[stt] local_fallback_model_invalid {}",
-                        serde_json::json!({
-                            "model": self.config.local_model_file,
-                            "reason": reason,
-                        })
-                    );
-                    return None;
-                }
-            }
-            let budget = local_whisper::local_stt_budget(recording_duration);
-            let language = self.local_whisper_language();
-            info!(
-                "[stt] local_fallback_started {}",
-                serde_json::json!({
-                    "model": self.config.local_model_file,
-                    "language": language,
-                    "sample_rate": sample_rate,
-                    "recording_duration_ms": recording_duration.as_millis(),
-                    "budget_ms": budget.as_millis(),
-                })
-            );
-            let Some(samples_16k) =
-                resample::resample_i16(samples, sample_rate, local_whisper::WHISPER_SAMPLE_RATE)
-            else {
-                warn!(
-                    "[stt] local_fallback_resample_unavailable {}",
-                    serde_json::json!({"sample_rate": sample_rate})
+                let budget = local_whisper::local_stt_budget(recording_duration);
+                let language = self.local_whisper_language();
+                info!(
+                    "[stt] local_fallback_started {}",
+                    serde_json::json!({
+                        "model": self.config.local_model_file,
+                        "language": language,
+                        "sample_rate": sample_rate,
+                        "recording_duration_ms": recording_duration.as_millis(),
+                        "budget_ms": budget.as_millis(),
+                    })
                 );
-                return None;
-            };
-            // whisper consumes f32 in [-1, 1]; dividing the i16 range by its
-            // full scale is the convention whisper.cpp's own examples use.
-            let pcm: Vec<f32> = samples_16k
-                .iter()
-                .map(|sample| f32::from(*sample) / 32_768.0)
-                .collect();
-            let started = Instant::now();
-            let Ok(engine) = self.local_engine() else {
-                warn!("[stt] local_fallback_engine_unavailable");
-                return None;
-            };
-            let result = local_whisper::call_with_budget("local_whisper", budget, move || {
-                engine.transcribe(&pcm)
-            });
-            match result {
-                Ok(text) if !text.trim().is_empty() => {
-                    info!(
-                        "[stt] local_fallback_completed {}",
-                        serde_json::json!({
-                            "chars": text.chars().count(),
-                            "words": text.split_whitespace().count(),
-                            "elapsed_ms": started.elapsed().as_millis(),
-                        })
-                    );
-                    Some(text)
-                }
-                Ok(_) => {
-                    info!(
-                        "[stt] local_fallback_empty {}",
-                        serde_json::json!({
-                            "elapsed_ms": started.elapsed().as_millis(),
-                        })
-                    );
-                    None
-                }
-                Err(error) => {
+                let Some(samples_16k) = resample::resample_i16(
+                    samples,
+                    sample_rate,
+                    local_whisper::WHISPER_SAMPLE_RATE,
+                ) else {
                     warn!(
-                        "[stt] local_fallback_failed {}",
-                        serde_json::json!({"error": error.to_string()})
+                        "[stt] local_fallback_resample_unavailable {}",
+                        serde_json::json!({"sample_rate": sample_rate})
                     );
-                    None
+                    return None;
+                };
+                // whisper consumes f32 in [-1, 1]; dividing the i16 range by its
+                // full scale is the convention whisper.cpp's own examples use.
+                let pcm: Vec<f32> = samples_16k
+                    .iter()
+                    .map(|sample| f32::from(*sample) / 32_768.0)
+                    .collect();
+                let started = Instant::now();
+                let Ok(engine) = self.local_engine() else {
+                    warn!("[stt] local_fallback_engine_unavailable");
+                    return None;
+                };
+                let result = local_whisper::call_with_budget("local_whisper", budget, move || {
+                    engine.transcribe(&pcm)
+                });
+                match result {
+                    Ok(text) if !text.trim().is_empty() => {
+                        info!(
+                            "[stt] local_fallback_completed {}",
+                            serde_json::json!({
+                                "chars": text.chars().count(),
+                                "words": text.split_whitespace().count(),
+                                "elapsed_ms": started.elapsed().as_millis(),
+                            })
+                        );
+                        Some(text)
+                    }
+                    Ok(_) => {
+                        info!(
+                            "[stt] local_fallback_empty {}",
+                            serde_json::json!({
+                                "elapsed_ms": started.elapsed().as_millis(),
+                            })
+                        );
+                        None
+                    }
+                    Err(error) => {
+                        warn!(
+                            "[stt] local_fallback_failed {}",
+                            serde_json::json!({"error": error.to_string()})
+                        );
+                        None
+                    }
                 }
-            }
-        })
+            },
+        )
     }
 
     /// Choose the final transcript once both sources have answered. The
@@ -5859,6 +6016,11 @@ impl Config {
             local_parakeet: parakeet_sidecar::parse_parakeet_enabled(
                 load_env_value("BOLO_LOCAL_PARAKEET").as_deref(),
             ),
+            local_qwen: qwen_sidecar::parse_qwen_enabled(
+                load_env_value("BOLO_LOCAL_QWEN").as_deref(),
+            ),
+            qwen_model_id: load_env_value("BOLO_QWEN_MODEL")
+                .unwrap_or_else(|| String::from(qwen_sidecar::QWEN_MODEL_ID)),
         };
         if let Some(missing) = config.missing_required_key() {
             // A missing key is no longer fatal: the onboarding window shows
@@ -6163,6 +6325,17 @@ static MICROPHONE_CATALOG: OnceLock<MicrophoneCatalog> = OnceLock::new();
 /// `./ensure-python-env.sh --parakeet` exactly once per process instead
 /// of appending it to every offline dictation.
 static PARAKEET_HINT_SHOWN: OnceLock<()> = OnceLock::new();
+
+/// The same one-shot hint pattern as [`PARAKEET_HINT_SHOWN`], for the
+/// qwen rung's venv (`./ensure-python-env.sh --qwen`).
+static QWEN_HINT_SHOWN: OnceLock<()> = OnceLock::new();
+
+/// Guard against a second menu-triggered qwen weights download: the
+/// flag is process-wide like the sidecar slots, so a menu rebuild can
+/// never spawn a concurrent transfer. Atomic because the download runs
+/// on its own thread while every menu click reads it on the event loop.
+static QWEN_MODEL_DOWNLOADING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 fn microphone_catalog() -> &'static MicrophoneCatalog {
     MICROPHONE_CATALOG.get_or_init(|| {
@@ -6594,10 +6767,17 @@ fn create_tray_ui(app: &App) -> Result<TrayUi, AppError> {
         MenuItem::with_id("add-replacement-rule", "Replace a Phrase...", true, None);
     let show_onboarding_item = MenuItem::with_id("show-onboarding", "Set Up Bolo...", true, None);
     // The offline model item's label states what clicking will do: a
-    // first download, or replacing the model already on disk.
+    // first download, or replacing the model already on disk. The qwen
+    // item mirrors it for the multilingual rung's HF snapshot.
     let download_offline_model_item = MenuItem::with_id(
         "download-offline-model",
         offline_model_menu_label(app),
+        true,
+        None,
+    );
+    let download_qwen_model_item = MenuItem::with_id(
+        "download-qwen-model",
+        qwen_model_menu_label(app),
         true,
         None,
     );
@@ -6610,6 +6790,7 @@ fn create_tray_ui(app: &App) -> Result<TrayUi, AppError> {
         &health_check_item,
         &show_onboarding_item,
         &download_offline_model_item,
+        &download_qwen_model_item,
     ] {
         more_menu
             .append(item)
@@ -6776,6 +6957,7 @@ fn create_tray_ui(app: &App) -> Result<TrayUi, AppError> {
         show_dashboard_item,
         show_onboarding_item,
         download_offline_model_item,
+        download_qwen_model_item,
         quit_item,
     };
     update_history_menu(app, &mut ui)?;
@@ -6837,6 +7019,10 @@ fn handle_menu_event(
     }
     if event_id == tray_ui.download_offline_model_item.id().as_ref() {
         download_offline_model_from_menu(app);
+        return;
+    }
+    if event_id == tray_ui.download_qwen_model_item.id().as_ref() {
+        download_qwen_model_from_menu(app);
         return;
     }
     if event_id == tray_ui.add_vocabulary_item.id().as_ref() {
@@ -7302,6 +7488,155 @@ fn update_offline_model_item(app: &App, tray_ui: &TrayUi) {
     tray_ui
         .download_offline_model_item
         .set_text(offline_model_menu_label(app));
+}
+
+/// On-disk state of the qwen weights snapshot, for the tray item's
+/// label. `Downloading` reflects the menu-triggered transfer in
+/// flight; the sidecar's own first-use download still shows whatever
+/// the cache reports while it loads.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum QwenModelMenuState {
+    /// The HF snapshot resolves from the cache.
+    Ready,
+    /// No usable snapshot in the cache.
+    Missing,
+    /// A menu-triggered snapshot_download is running right now.
+    Downloading,
+}
+
+/// Menu label for the qwen model item: presence states the download,
+/// the in-flight transfer freezes the label so the state is readable,
+/// and ready keeps the re-download affordance the whisper item has.
+fn qwen_model_menu_label(app: &App) -> String {
+    let downloading = QWEN_MODEL_DOWNLOADING.load(std::sync::atomic::Ordering::SeqCst);
+    qwen_model_menu_label_for(if downloading {
+        QwenModelMenuState::Downloading
+    } else if qwen_sidecar::model_present(&app.config.qwen_model_id) {
+        QwenModelMenuState::Ready
+    } else {
+        QwenModelMenuState::Missing
+    })
+}
+
+/// Testable core of [`qwen_model_menu_label`].
+fn qwen_model_menu_label_for(state: QwenModelMenuState) -> String {
+    match state {
+        QwenModelMenuState::Ready => String::from("Re-download Qwen ASR Model..."),
+        QwenModelMenuState::Missing => String::from("Download Qwen ASR Model..."),
+        QwenModelMenuState::Downloading => String::from("Qwen ASR Model: Downloading..."),
+    }
+}
+
+/// Start (or decline) the qwen weights download from the tray menu.
+/// Mirrors [`download_offline_model_from_menu`]: a second click while a
+/// download runs logs and does nothing; a click with the snapshot
+/// already cached logs that instead of re-downloading. The transfer is
+/// the sidecar venv's own huggingface_hub `snapshot_download` (the same
+/// code path the sidecar takes on first use), run on a background
+/// thread because ~1.2 GB does not fit an event-loop click.
+fn download_qwen_model_from_menu(app: &Arc<App>) {
+    use std::sync::atomic::Ordering;
+
+    if QWEN_MODEL_DOWNLOADING
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        info!("[stt] qwen model download already in progress; click ignored");
+        return;
+    }
+    let Some(python) = qwen_sidecar::qwen_python_executable() else {
+        QWEN_MODEL_DOWNLOADING.store(false, Ordering::SeqCst);
+        warn!(
+            "[stt] qwen model download refused {}",
+            serde_json::json!({
+                "hint": "run ./ensure-python-env.sh --qwen to install ~/.bolo/qwen-venv",
+            })
+        );
+        show_notification(
+            "Bolo Qwen ASR Unavailable",
+            "Install the qwen environment first: ./ensure-python-env.sh --qwen",
+        );
+        return;
+    };
+    if qwen_sidecar::model_present(&app.config.qwen_model_id) {
+        QWEN_MODEL_DOWNLOADING.store(false, Ordering::SeqCst);
+        info!(
+            "[stt] qwen model already cached ({}); nothing to do",
+            app.config.qwen_model_id
+        );
+        return;
+    }
+    let model_id = app.config.qwen_model_id.clone();
+    info!(
+        "[stt] qwen model download starting {}",
+        serde_json::json!({"model": model_id})
+    );
+    let download_app = Arc::clone(app);
+    let join_handle = std::thread::Builder::new()
+        .name(String::from("bolo-qwen-model-download"))
+        .spawn(move || {
+            let outcome = Command::new(&python)
+                .arg("-c")
+                .arg(format!(
+                    "from huggingface_hub import snapshot_download; print(snapshot_download({model_id:?}))"
+                ))
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output();
+            match outcome {
+                Ok(output) if output.status.success() => {
+                    // The child prints the resolved snapshot path.
+                    let text = String::from_utf8_lossy(&output.stdout);
+                    info!(
+                        "[stt] qwen model download completed {}",
+                        serde_json::json!({
+                            "model": model_id,
+                            "path": text.trim(),
+                        })
+                    );
+                    show_notification(
+                        "Bolo Qwen ASR Model",
+                        "Offline Hindi and English transcription model downloaded.",
+                    );
+                }
+                Ok(output) => {
+                    let text = String::from_utf8_lossy(&output.stderr);
+                    warn!(
+                        "[stt] qwen model download failed {}",
+                        serde_json::json!({
+                            "model": model_id,
+                            "stderr": short_menu_message(&text),
+                        })
+                    );
+                    show_notification(
+                        "Bolo Qwen ASR Model Failed",
+                        &short_menu_message(&text),
+                    );
+                }
+                Err(error) => {
+                    warn!("[stt] qwen model download failed to run: {error}");
+                    show_notification(
+                        "Bolo Qwen ASR Model Failed",
+                        &short_menu_message(&error.to_string()),
+                    );
+                }
+            }
+            QWEN_MODEL_DOWNLOADING.store(false, Ordering::SeqCst);
+            download_app.send_user_event(UserEvent::OfflineModelChanged);
+        });
+    if let Err(error) = join_handle {
+        warn!("failed to start qwen model download thread: {error}");
+        QWEN_MODEL_DOWNLOADING.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Refresh the qwen model item's text from the on-disk state, called
+/// alongside [`update_offline_model_item`] when an offline-model event
+/// lands and at menu construction.
+fn update_qwen_model_item(app: &App, tray_ui: &TrayUi) {
+    tray_ui
+        .download_qwen_model_item
+        .set_text(qwen_model_menu_label(app));
 }
 
 fn run_bolo_update(root_dir: &Path) -> Result<UpdateOutcome, AppError> {
@@ -15506,6 +15841,8 @@ mod tests {
             local_stt: LocalSttMode::Auto,
             local_model_file: String::from("ggml-small.bin"),
             local_parakeet: true,
+            local_qwen: true,
+            qwen_model_id: String::from("mlx-community/Qwen3-ASR-0.6B-bf16"),
             final_refine: true,
             cleanup_gate: true,
             final_refine_model: String::from("deepgram/nova-3"),
@@ -15555,6 +15892,8 @@ mod tests {
             local_stt: LocalSttMode::Auto,
             local_model_file: String::from("ggml-small.bin"),
             local_parakeet: true,
+            local_qwen: true,
+            qwen_model_id: String::from("mlx-community/Qwen3-ASR-0.6B-bf16"),
             final_refine: true,
             cleanup_gate: true,
             final_refine_model: String::from("deepgram/nova-3"),
@@ -15594,6 +15933,8 @@ mod tests {
             local_stt: LocalSttMode::Auto,
             local_model_file: String::from("ggml-small.bin"),
             local_parakeet: true,
+            local_qwen: true,
+            qwen_model_id: String::from("mlx-community/Qwen3-ASR-0.6B-bf16"),
             final_refine: true,
             cleanup_gate: true,
             final_refine_model: String::from("deepgram/nova-3"),
@@ -15759,6 +16100,8 @@ mod tests {
             local_stt: LocalSttMode::Auto,
             local_model_file: String::from("ggml-small.bin"),
             local_parakeet: true,
+            local_qwen: true,
+            qwen_model_id: String::from("mlx-community/Qwen3-ASR-0.6B-bf16"),
             final_refine: true,
             cleanup_gate: true,
             final_refine_model: String::from("deepgram/nova-3"),
@@ -16656,6 +16999,8 @@ mod tests {
                 local_stt: LocalSttMode::Auto,
                 local_model_file: String::from("ggml-small.bin"),
                 local_parakeet: true,
+                local_qwen: true,
+                qwen_model_id: String::from("mlx-community/Qwen3-ASR-0.6B-bf16"),
                 final_refine: true,
                 cleanup_gate: true,
                 final_refine_model: String::from("deepgram/nova-3"),
@@ -16704,6 +17049,8 @@ mod tests {
                 local_stt: LocalSttMode::Auto,
                 local_model_file: String::from("ggml-small.bin"),
                 local_parakeet: true,
+                local_qwen: true,
+                qwen_model_id: String::from("mlx-community/Qwen3-ASR-0.6B-bf16"),
                 final_refine: true,
                 cleanup_gate: true,
                 final_refine_model: String::from("deepgram/nova-3"),
@@ -16758,6 +17105,8 @@ mod tests {
                 local_stt: LocalSttMode::Auto,
                 local_model_file: String::from("ggml-small.bin"),
                 local_parakeet: true,
+                local_qwen: true,
+                qwen_model_id: String::from("mlx-community/Qwen3-ASR-0.6B-bf16"),
                 final_refine: true,
                 cleanup_gate: true,
                 final_refine_model: String::from("deepgram/nova-3"),
@@ -16832,6 +17181,8 @@ mod tests {
                 local_stt: LocalSttMode::Auto,
                 local_model_file: String::from("ggml-small.bin"),
                 local_parakeet: true,
+                local_qwen: true,
+                qwen_model_id: String::from("mlx-community/Qwen3-ASR-0.6B-bf16"),
                 final_refine: true,
                 cleanup_gate: true,
                 final_refine_model: String::from("deepgram/nova-3"),
@@ -16891,6 +17242,8 @@ mod tests {
                 local_stt: LocalSttMode::Auto,
                 local_model_file: String::from("ggml-small.bin"),
                 local_parakeet: true,
+                local_qwen: true,
+                qwen_model_id: String::from("mlx-community/Qwen3-ASR-0.6B-bf16"),
                 final_refine: true,
                 cleanup_gate: true,
                 final_refine_model: String::from("deepgram/nova-3"),
@@ -16960,6 +17313,8 @@ mod tests {
                 local_stt: LocalSttMode::Auto,
                 local_model_file: String::from("ggml-small.bin"),
                 local_parakeet: true,
+                local_qwen: true,
+                qwen_model_id: String::from("mlx-community/Qwen3-ASR-0.6B-bf16"),
                 final_refine: true,
                 cleanup_gate: true,
                 final_refine_model: String::from("deepgram/nova-3"),
@@ -17454,6 +17809,8 @@ mod tests {
                 local_stt: LocalSttMode::Auto,
                 local_model_file: String::from("ggml-small.bin"),
                 local_parakeet: true,
+                local_qwen: true,
+                qwen_model_id: String::from("mlx-community/Qwen3-ASR-0.6B-bf16"),
                 final_refine: true,
                 cleanup_gate: true,
                 final_refine_model: String::from("deepgram/nova-3"),
@@ -17515,6 +17872,8 @@ mod tests {
                 local_stt: LocalSttMode::Auto,
                 local_model_file: String::from("ggml-small.bin"),
                 local_parakeet: true,
+                local_qwen: true,
+                qwen_model_id: String::from("mlx-community/Qwen3-ASR-0.6B-bf16"),
                 final_refine: true,
                 cleanup_gate: true,
                 final_refine_model: String::from("deepgram/nova-3"),
@@ -17579,6 +17938,8 @@ mod tests {
                 local_stt: LocalSttMode::Auto,
                 local_model_file: String::from("ggml-small.bin"),
                 local_parakeet: true,
+                local_qwen: true,
+                qwen_model_id: String::from("mlx-community/Qwen3-ASR-0.6B-bf16"),
                 final_refine: true,
                 cleanup_gate: true,
                 final_refine_model: String::from("deepgram/nova-3"),
@@ -17633,6 +17994,8 @@ mod tests {
                 local_stt: LocalSttMode::Auto,
                 local_model_file: String::from("ggml-small.bin"),
                 local_parakeet: true,
+                local_qwen: true,
+                qwen_model_id: String::from("mlx-community/Qwen3-ASR-0.6B-bf16"),
                 final_refine: true,
                 cleanup_gate: true,
                 final_refine_model: String::from("deepgram/nova-3"),
@@ -18971,6 +19334,8 @@ mod tests {
                 local_stt: LocalSttMode::Auto,
                 local_model_file: String::from("ggml-small.bin"),
                 local_parakeet: true,
+                local_qwen: true,
+                qwen_model_id: String::from("mlx-community/Qwen3-ASR-0.6B-bf16"),
                 final_refine: true,
                 cleanup_gate: true,
                 final_refine_model: String::from("deepgram/nova-3"),

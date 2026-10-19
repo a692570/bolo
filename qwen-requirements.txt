@@ -1,0 +1,15 @@
+# The qwen rung's offline transcription environment, installed into
+# ~/.bolo/qwen-venv by ./ensure-python-env.sh --qwen.
+# Pinned to the exact stack measured in the 2026-10-18 benchmark
+# (~/Projects/bolo-model-bench/RESULTS.md): qwen3-asr-0.6B produced native
+# Devanagari Hindi at 52.0% WER (best of the field; whisper-small 60.4%,
+# large-v3-turbo 68.5%, parakeet romanizes) with English content accuracy
+# on par with whisper-large-v3-turbo, at 0.166 s warm per clip and ~0.34 s
+# load from the warmed HF cache.
+# qwen3-asr-mlx needs Python >= 3.10, which is why this venv is separate
+# from the Python 3.9 helper venv at ~/.bolo/venv (it mirrors
+# ~/.bolo/parakeet-venv). huggingface_hub is pinned because the sidecar
+# itself calls snapshot_download on first use.
+qwen3-asr-mlx==0.3.0
+mlx==0.32.4
+huggingface_hub==2.2.0

@@ -335,8 +335,9 @@ lipo -archs "$APP/Contents/MacOS/bolo" | grep -q x86_64 \
 for helper in hotkey.py accessibility_daemon.py overlay.py insert_text.py \
     accessibility_context.py accessibility_trusted.py app_window.py \
     dashboard_window.py onboarding.py bolo_env.py bolo_brand.py \
-    transcript_popup.py parakeet_sidecar.py \
-    ensure-python-env.sh helper-requirements.txt parakeet-requirements.txt vocabulary.json; do
+    transcript_popup.py parakeet_sidecar.py qwen_sidecar.py \
+    ensure-python-env.sh helper-requirements.txt parakeet-requirements.txt \
+    qwen-requirements.txt vocabulary.json; do
     cp "$ROOT/$helper" "$APP/Contents/Resources/" || fail "missing bundle helper: $helper"
 done
 cp "$ROOT/Third-Party Notices.txt" "$APP/Contents/Resources/Third-Party Notices.txt" \

@@ -42,8 +42,44 @@ elif [ "${1:-}" = "--parakeet" ]; then
     fi
     printf '%s\n' "$BOLO_PARAKEET_VENV/bin/python3"
     exit 0
+elif [ "${1:-}" = "--qwen" ]; then
+    # Opt-in mode: create/refresh the offline-transcription venv for the
+    # qwen rung (multilingual accuracy + Hindi) and exit. Mirrors the
+    # --parakeet shape exactly: never run at app startup; qwen (MLX +
+    # 1.2GB weights in the HF cache) is a one-time, user-initiated
+    # install.
+    BOLO_QWEN_VENV="${BOLO_QWEN_VENV:-$HOME/.bolo/qwen-venv}"
+    mkdir -p "$HOME/.bolo"
+    # qwen3-asr-mlx 0.3.0 needs Python >= 3.10; probe newest first.
+    QWEN_BOOTSTRAP="${BOLO_QWEN_BOOTSTRAP:-}"
+    if [ -z "$QWEN_BOOTSTRAP" ]; then
+        for candidate in python3.13 python3.12 python3.11 python3; do
+            if command -v "$candidate" >/dev/null 2>&1 \
+                && "$candidate" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)'; then
+                QWEN_BOOTSTRAP="$candidate"
+                break
+            fi
+        done
+    fi
+    if [ -z "$QWEN_BOOTSTRAP" ]; then
+        echo "ERROR: the qwen rung needs Python >= 3.10 (qwen3-asr-mlx 0.3.0 requirement)." >&2
+        echo "Install one from https://www.python.org/downloads/macos/ or set BOLO_QWEN_BOOTSTRAP." >&2
+        exit 1
+    fi
+    echo "Installing Bolo's qwen transcription environment with $QWEN_BOOTSTRAP..." >&2
+    if [ ! -x "$BOLO_QWEN_VENV/bin/python3" ]; then
+        "$QWEN_BOOTSTRAP" -m venv "$BOLO_QWEN_VENV"
+    fi
+    "$BOLO_QWEN_VENV/bin/python3" -m pip install --disable-pip-version-check \
+        -r "$BOLO_DIR/qwen-requirements.txt" >&2
+    if ! "$BOLO_QWEN_VENV/bin/python3" -c 'import qwen3_asr_mlx' >/dev/null 2>&1; then
+        echo "ERROR: the qwen venv exists but qwen3_asr_mlx does not import: $BOLO_QWEN_VENV" >&2
+        exit 1
+    fi
+    printf '%s\n' "$BOLO_QWEN_VENV/bin/python3"
+    exit 0
 elif [ -n "${1:-}" ]; then
-    echo "Usage: ./ensure-python-env.sh [--sync] [--parakeet]" >&2
+    echo "Usage: ./ensure-python-env.sh [--sync] [--parakeet] [--qwen]" >&2
     exit 2
 fi
 

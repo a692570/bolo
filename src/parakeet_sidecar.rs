@@ -503,18 +503,6 @@ pub(crate) fn rung_available(root_dir: &Path) -> bool {
     parakeet_python_executable().is_some() && parakeet_script_path(root_dir).exists()
 }
 
-/// The offline ladder's rung order: the parakeet outcome wins outright,
-/// and only a `None` outcome (rung off, non-English hint, missing venv,
-/// sidecar failure, empty text) consults the whisper rung. Split out as
-/// a named function so the fallback contract is testable and exists in
-/// exactly one place.
-pub(crate) fn complete_offline_ladder(
-    parakeet: Option<String>,
-    whisper: impl FnOnce() -> Option<String>,
-) -> Option<String> {
-    parakeet.or_else(whisper)
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -721,8 +709,9 @@ elif MODE == "silent":
     }
 
     /// The ladder-fallback contract at the rung level: a sidecar that dies
-    /// mid-request returns `Err` (the ladder then consults whisper), and
-    /// the dead child is retired so the next attempt meets a fresh spawn.
+    /// mid-request returns `Err` (the ladder then consults the next
+    /// rung), and the dead child is retired so the next attempt meets a
+    /// fresh spawn.
     #[test]
     fn dead_child_falls_back_then_the_slot_respawns() {
         let _guard = slot_guard().lock().unwrap();
@@ -811,30 +800,5 @@ elif MODE == "silent":
             text
         };
         assert_eq!(record, expected);
-    }
-
-    #[test]
-    fn ladder_skips_whisper_when_parakeet_answers() {
-        let mut whisper_consulted = false;
-        let outcome = super::complete_offline_ladder(Some(String::from("parakeet text")), || {
-            whisper_consulted = true;
-            Some(String::from("whisper text"))
-        });
-        assert_eq!(outcome.as_deref(), Some("parakeet text"));
-        assert!(
-            !whisper_consulted,
-            "whisper must not run after a parakeet answer"
-        );
-    }
-
-    #[test]
-    fn ladder_falls_to_whisper_when_parakeet_yields_nothing() {
-        let outcome = super::complete_offline_ladder(None, || Some(String::from("whisper text")));
-        assert_eq!(outcome.as_deref(), Some("whisper text"));
-        let empty = super::complete_offline_ladder(None, || None);
-        assert_eq!(
-            empty, None,
-            "both rungs empty means the ladder yields nothing"
-        );
     }
 }
