@@ -249,6 +249,7 @@ struct Config {
     llm_cleanup: CleanupMode,
     litellm_base: Option<String>,
     litellm_key: Option<String>,
+    llm_model: Option<String>,
     stt_model: String,
     stt_language: String,
     streaming_stt: Option<StreamingProvider>,
@@ -5987,6 +5988,7 @@ impl Config {
             llm_cleanup,
             litellm_base: load_env_value("LITELLM_BASE"),
             litellm_key: load_env_value("LITELLM_KEY"),
+            llm_model: load_env_value("BOLO_LLM_MODEL"),
             stt_model,
             stt_language: load_env_value("BOLO_STT_LANGUAGE")
                 .unwrap_or_else(|| String::from("en-US")),
@@ -6091,8 +6093,8 @@ impl Config {
     }
 
     fn llm_model(&self) -> String {
-        if let Some(model) = load_env_value("BOLO_LLM_MODEL") {
-            return model;
+        if let Some(model) = &self.llm_model {
+            return model.clone();
         }
         if self.litellm_base.is_some() {
             String::from("Kimi-K2.5")
@@ -15832,6 +15834,7 @@ mod tests {
             microphone: None,
             microphone_id: None,
             replacements: Vec::new(),
+            llm_model: None,
             root_dir: PathBuf::new(),
             hotkey: String::from("right_option"),
             paste_last_hotkey: None,
@@ -15883,6 +15886,7 @@ mod tests {
             microphone: None,
             microphone_id: None,
             replacements: Vec::new(),
+            llm_model: None,
             root_dir: PathBuf::new(),
             hotkey: String::from("right_option"),
             paste_last_hotkey: None,
@@ -15924,6 +15928,7 @@ mod tests {
             microphone: None,
             microphone_id: None,
             replacements: Vec::new(),
+            llm_model: None,
             root_dir: PathBuf::new(),
             hotkey: String::from("right_option"),
             paste_last_hotkey: None,
@@ -16091,6 +16096,7 @@ mod tests {
             microphone: None,
             microphone_id: None,
             replacements: Vec::new(),
+            llm_model: None,
             root_dir: PathBuf::new(),
             hotkey: String::from("right_option"),
             paste_last_hotkey: None,
@@ -16983,6 +16989,7 @@ mod tests {
                 llm_cleanup: CleanupMode::Off,
                 litellm_base: None,
                 litellm_key: None,
+                llm_model: None,
                 stt_model: String::from("deepgram/nova-3"),
                 stt_language: String::from("en-US"),
                 streaming_stt: None,
@@ -17033,6 +17040,7 @@ mod tests {
                 llm_cleanup: CleanupMode::Off,
                 litellm_base: None,
                 litellm_key: None,
+                llm_model: None,
                 stt_model: String::from("deepgram/nova-3"),
                 stt_language: String::from("en-US"),
                 streaming_stt: None,
@@ -17089,6 +17097,7 @@ mod tests {
                 llm_cleanup: CleanupMode::Auto,
                 litellm_base: None,
                 litellm_key: None,
+                llm_model: None,
                 stt_model: String::from("deepgram/nova-3"),
                 stt_language: String::from("en-US"),
                 streaming_stt: None,
@@ -17162,6 +17171,7 @@ mod tests {
                 llm_cleanup: CleanupMode::Auto,
                 litellm_base: None,
                 litellm_key: None,
+                llm_model: None,
                 stt_model: String::from("deepgram/nova-3"),
                 stt_language: String::from("en-US"),
                 streaming_stt: None,
@@ -17226,6 +17236,7 @@ mod tests {
                 llm_cleanup: CleanupMode::Auto,
                 litellm_base: None,
                 litellm_key: None,
+                llm_model: None,
                 stt_model: String::from("deepgram/nova-3"),
                 stt_language: String::from("en-US"),
                 streaming_stt: None,
@@ -17294,6 +17305,7 @@ mod tests {
                 llm_cleanup,
                 litellm_base: None,
                 litellm_key: None,
+                llm_model: None,
                 stt_model: String::from("deepgram/nova-3"),
                 stt_language: String::from("en-US"),
                 streaming_stt: None,
@@ -17793,6 +17805,7 @@ mod tests {
                 llm_cleanup: CleanupMode::Off,
                 litellm_base: None,
                 litellm_key: None,
+                llm_model: None,
                 stt_model: String::from("deepgram/nova-3"),
                 stt_language: String::from("en-US"),
                 streaming_stt: None,
@@ -17856,6 +17869,7 @@ mod tests {
                 llm_cleanup: CleanupMode::Off,
                 litellm_base: None,
                 litellm_key: None,
+                llm_model: None,
                 stt_model: String::from("deepgram/nova-3"),
                 stt_language: String::from("en-US"),
                 streaming_stt: None,
@@ -17922,6 +17936,7 @@ mod tests {
                 llm_cleanup: CleanupMode::Off,
                 litellm_base: None,
                 litellm_key: None,
+                llm_model: None,
                 stt_model: String::from("deepgram/nova-3"),
                 stt_language: String::from("en-US"),
                 streaming_stt: None,
@@ -17978,6 +17993,7 @@ mod tests {
                 llm_cleanup: CleanupMode::Off,
                 litellm_base: None,
                 litellm_key: None,
+                llm_model: None,
                 stt_model: String::from("deepgram/nova-3"),
                 stt_language: String::from("en-US"),
                 streaming_stt: None,
@@ -19318,6 +19334,7 @@ mod tests {
                 llm_cleanup: CleanupMode::Off,
                 litellm_base: None,
                 litellm_key: None,
+                llm_model: None,
                 stt_model: String::from("deepgram/nova-3"),
                 stt_language: String::from("en-US"),
                 streaming_stt: None,
