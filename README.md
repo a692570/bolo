@@ -109,6 +109,10 @@ export TELNYX_API_KEY="your_key_here"
 Bolo reads API keys from the process environment first, then falls back to `~/.bolo/env` and `~/.zshrc`.
 The installer keeps `~/.bolo` private to your macOS account and stores `~/.bolo/env` with owner-only permissions.
 
+## Boot arbitration
+
+Bolo takes a cross-install instance lock with its version and binary path. When a starting instance finds a live lock holder, it arbitrates by version: an older copy refuses to start with a notification naming the newer one, a newer copy terminates the stale instance, takes the lock, and notifies, and equal versions keep the first-wins rule. Locks from pre-arbitration builds carry no version, so a fresh install replaces a legacy running copy. This makes the 2026-10-19 failure class impossible: a stale DMG bundle can no longer win the microphone from the current build after a reboot.
+
 Chromium-based apps (OpenChamber, Slack, Discord, Notion, WhatsApp) ship with renderer accessibility off until an assistive client asks. Bolo sets the private `AXManualAccessibility` flag on those apps on first read, which turns on the tree Bolo and other assistive tools use for cursor context, per-app cleanup profiles, and edit learning. The first read after a new app launch may still come back empty; every read after it sees the tree.
 
 Bolo redacts dictated text from `/tmp/bolo.log` by default. To temporarily log transcript text while debugging, set:
