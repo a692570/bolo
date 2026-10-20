@@ -221,6 +221,14 @@ enum AppError {
     Json(#[from] serde_json::Error),
     #[error("another Bolo instance is already running")]
     AlreadyRunning,
+    /// A boot attempt lost version arbitration to a newer running instance:
+    /// the older copy refuses to start so the newest install always owns
+    /// the microphone. The supervisor treats this as a terminal startup
+    /// error and stops relaunching the loser.
+    #[error(
+        "an older Bolo copy refused to start: Bolo v{version} is already running from {binary}"
+    )]
+    OlderInstanceRunning { version: String, binary: String },
     #[error("STT primary model is rate limited")]
     RateLimited,
     #[error("transcription failed: {0}")]
@@ -2030,39 +2038,184 @@ fn check_accessibility_at_startup(root_dir: &Path) {
 
 impl AppLock {
     fn acquire() -> Result<Self, AppError> {
-        let path = PathBuf::from(LOCK_DIR);
-        match fs::create_dir(&path) {
-            Ok(()) => {
-                Self::write_pid(&path)?;
-                Ok(Self { path })
+        Self::acquire_at(PathBuf::from(LOCK_DIR), env!("CARGO_PKG_VERSION"))
+    }
+
+    /// Take the cross-install instance lock, arbitrating by version. The
+    /// 2026-10-19 reboot incident: a stale DMG bundle won the lock first
+    /// while the current build exited with `AlreadyRunning` silently, and
+    /// the stale copy held the microphone all day failing every dictation.
+    /// Arbitration makes the newest install always win: an older copy
+    /// refuses to start with a visible notification, and a newer copy
+    /// takes over from a stale one, terminating it with a notification.
+    fn acquire_at(path: PathBuf, my_version: &str) -> Result<Self, AppError> {
+        let holder = LockMeta::read(&path);
+        let alive = holder
+            .as_ref()
+            .is_some_and(|meta| process_is_running(meta.pid));
+        match arbitrate(my_version, holder, alive) {
+            Arbitration::Acquire => Self::fresh_lock(path),
+            Arbitration::AlreadyRunning => Err(AppError::AlreadyRunning),
+            Arbitration::Refuse { version, binary } => {
+                #[cfg(not(test))]
+                show_notification(
+                    "Bolo",
+                    &format!(
+                        "A newer Bolo (v{version}) is already running; this older copy will not start."
+                    ),
+                );
+                info!("[arbitration] refused {} from {}", version, binary);
+                Err(AppError::OlderInstanceRunning { version, binary })
             }
-            Err(error) if error.kind() == ErrorKind::AlreadyExists => {
-                if Self::lock_is_stale(&path) {
-                    fs::remove_dir_all(&path)?;
-                    fs::create_dir(&path)?;
-                    Self::write_pid(&path)?;
-                    Ok(Self { path })
-                } else {
-                    Err(AppError::AlreadyRunning)
-                }
+            Arbitration::TakeOver {
+                version,
+                binary,
+                pid,
+            } => {
+                terminate_holder(pid);
+                let holder_version = Some(version);
+                Self::take_over(path, my_version, holder_version, Some(binary))
             }
-            Err(error) => Err(AppError::Io(error)),
+            Arbitration::TakeOverLegacy { pid } => {
+                terminate_holder(pid);
+                Self::take_over(path, my_version, None, None)
+            }
         }
     }
 
-    fn write_pid(path: &Path) -> Result<(), AppError> {
-        fs::write(path.join("pid"), std::process::id().to_string())?;
-        Ok(())
+    fn take_over(
+        path: PathBuf,
+        my_version: &str,
+        holder_version: Option<String>,
+        holder_binary: Option<String>,
+    ) -> Result<Self, AppError> {
+        #[cfg(not(test))]
+        show_notification(
+            "Bolo",
+            &match &holder_version {
+                Some(version) => {
+                    format!("Upgraded Bolo (v{my_version}) took over from v{version}.")
+                }
+                None => {
+                    format!("Upgraded Bolo (v{my_version}) took over from an older running copy.")
+                }
+            },
+        );
+        info!(
+            "[arbitration] v{my_version} took over from {} at {}",
+            holder_version.as_deref().unwrap_or("an unknown version"),
+            holder_binary.as_deref().unwrap_or("an unknown path"),
+        );
+        if let Err(error) = fs::remove_dir_all(&path) {
+            warn!("arbitration lock cleanup failed: {error}");
+        }
+        Self::fresh_lock(path)
     }
 
-    fn lock_is_stale(path: &Path) -> bool {
-        let Some(pid) = fs::read_to_string(path.join("pid"))
+    fn fresh_lock(path: PathBuf) -> Result<Self, AppError> {
+        fs::create_dir(&path)?;
+        Self::write_metadata(&path)?;
+        Ok(Self { path })
+    }
+
+    fn write_metadata(path: &Path) -> Result<(), AppError> {
+        fs::write(path.join("pid"), std::process::id().to_string())?;
+        fs::write(path.join("version"), env!("CARGO_PKG_VERSION"))?;
+        let binary = env::current_exe()
             .ok()
-            .and_then(|text| text.trim().parse::<u32>().ok())
-        else {
-            return true;
-        };
-        !process_is_running(pid)
+            .and_then(|exe| exe.to_str().map(str::to_owned))
+            .unwrap_or_default();
+        fs::write(path.join("binary"), binary)?;
+        Ok(())
+    }
+}
+
+/// Owner metadata of the instance lock: which PID holds it, which version
+/// and binary path it runs from. Version and binary are optional because
+/// locks written by pre-arbitration builds carry only the pid.
+#[derive(Clone, Debug, PartialEq)]
+struct LockMeta {
+    pid: u32,
+    version: Option<String>,
+    binary: Option<String>,
+}
+
+impl LockMeta {
+    fn read(path: &Path) -> Option<Self> {
+        let pid = fs::read_to_string(path.join("pid"))
+            .ok()
+            .and_then(|text| text.trim().parse::<u32>().ok())?;
+        let version = fs::read_to_string(path.join("version"))
+            .ok()
+            .map(|text| text.trim().to_owned());
+        let binary = fs::read_to_string(path.join("binary"))
+            .ok()
+            .map(|text| text.trim().to_owned());
+        Some(Self {
+            pid,
+            version,
+            binary,
+        })
+    }
+}
+
+/// What a starting instance should do about a live lock holder. Pure so
+/// every branch is unit-testable without processes or filesystem state.
+#[derive(Clone, Debug, PartialEq)]
+enum Arbitration {
+    /// No live holder: acquire the lock.
+    Acquire,
+    /// A holder of the same version is live: keep today's first-wins rule.
+    AlreadyRunning,
+    /// The holder is a newer build: this older copy refuses to start.
+    Refuse { version: String, binary: String },
+    /// The holder is an older build: take over, terminating it.
+    TakeOver {
+        version: String,
+        binary: String,
+        pid: u32,
+    },
+    /// The holder predates version metadata: treat it as older and take
+    /// over (the upgrade path: a fresh install replacing a legacy running
+    /// copy).
+    TakeOverLegacy { pid: u32 },
+}
+
+fn arbitrate(my_version: &str, holder: Option<LockMeta>, holder_alive: bool) -> Arbitration {
+    let Some(meta) = holder else {
+        return Arbitration::Acquire;
+    };
+    if !holder_alive {
+        return Arbitration::Acquire;
+    }
+    let Some(holder_version) = meta.version else {
+        return Arbitration::TakeOverLegacy { pid: meta.pid };
+    };
+    // `version_is_newer(candidate, against)` answers "against is newer
+    // than candidate": the parameter name reads backwards, so the branches
+    // below use it with that convention. Refuse when this copy is the
+    // older one; take over when it is the newer one.
+    if version_is_newer(my_version, &holder_version) {
+        Arbitration::Refuse {
+            version: holder_version,
+            binary: meta.binary.unwrap_or_default(),
+        }
+    } else if version_is_newer(&holder_version, my_version) {
+        Arbitration::TakeOver {
+            version: holder_version,
+            binary: meta.binary.unwrap_or_default(),
+            pid: meta.pid,
+        }
+    } else {
+        Arbitration::AlreadyRunning
+    }
+}
+
+/// Terminate the holder of the lock: SIGTERM through `kill`, matching the
+/// signal the supervisor loops treat as a clean stop.
+fn terminate_holder(pid: u32) {
+    if let Err(error) = Command::new("kill").arg(pid.to_string()).status() {
+        warn!("arbitration: terminating pid {pid} failed: {error}");
     }
 }
 
@@ -14529,25 +14682,26 @@ mod tests {
     use super::{
         ACCESS_DAEMON_ACTION_TIMEOUT, ACCESS_DAEMON_QUERY_TIMEOUT, ACCESS_DAEMON_STARTUP_TIMEOUT,
         AccessDaemonFailure, AccessDaemonRequest, AccessibilityContext, AccessibilityTrust, App,
-        AppError, AppState, AppWindowPayload, AudioHub, BatchEcho, BatchRetry,
-        CLEANUP_PROMPT_CAP_CHARS, CleanupMode, CleanupProfile, CleanupPromptCache,
+        AppError, AppLock, AppState, AppWindowPayload, Arbitration, AudioHub, BatchEcho,
+        BatchRetry, CLEANUP_PROMPT_CAP_CHARS, CleanupMode, CleanupProfile, CleanupPromptCache,
         CleanupPromptEntry, CleanupPromptFile, Config, CorrectionOutcome, DashboardAction,
         DashboardRequestLine, DictationCommandKind, DictationWarmup, EMPTY_RETRY_MIN_DURATION_MS,
         EchoVerdict, EditLearningClaim, KeyEntrySpec, LEARNING_UNREADABLE_LINE,
         LEARNING_WINDOW_ROWS, LaunchRequestAction, LearnedPair, LearnedVocabulary, LocalSttMode,
-        LocalWhisperHandle, MicrophoneDescriptor, MicrophoneSelection, ONBOARDING_MARKER_VERSION,
-        OnboardingStatus, PreparedText, PromptBinding, STREAMING_DRAIN_MIN, STT_RETRY_SAMPLE_RATE,
-        StreamingConnectionState, StreamingProvider, StreamingRecording, StreamingTranscript,
-        SttFallback, SttResult, TRANSCRIPT_HISTORY_LIMIT, TextReplacement, TranscriptHistoryEntry,
-        UpdateNotice, UpdateOutcome, UsageCounters, WindowRow, WizardSpec,
-        accessibility_fix_detail, aligned_span_score, apply_text_replacements,
-        apply_vocabulary_corrections_with_matches, batch_retry_plan, batch_transcript_after_echo,
-        build_cleanup_user_content, build_rewrite_user_content, build_stt_prompt,
-        canonicalize_known_terms, chunk_samples_for, cleanup_decision, cleanup_max_tokens,
-        cleanup_profile, cleanup_prompt, cleanup_prompt_overrides, cleanup_prompts_path,
-        consume_open_dashboard_request_at, contains_devanagari, contains_word_verbatim,
-        content_words, dashboard_accessibility_state, dashboard_cleanup_mode, dashboard_payload,
-        dashboard_provider_label, derive_word_correction, downsample_wav_16k_mono, edit_distance,
+        LocalWhisperHandle, LockMeta, MicrophoneDescriptor, MicrophoneSelection,
+        ONBOARDING_MARKER_VERSION, OnboardingStatus, PreparedText, PromptBinding,
+        STREAMING_DRAIN_MIN, STT_RETRY_SAMPLE_RATE, StreamingConnectionState, StreamingProvider,
+        StreamingRecording, StreamingTranscript, SttFallback, SttResult, TRANSCRIPT_HISTORY_LIMIT,
+        TextReplacement, TranscriptHistoryEntry, UpdateNotice, UpdateOutcome, UsageCounters,
+        WindowRow, WizardSpec, accessibility_fix_detail, aligned_span_score,
+        apply_text_replacements, apply_vocabulary_corrections_with_matches, arbitrate,
+        batch_retry_plan, batch_transcript_after_echo, build_cleanup_user_content,
+        build_rewrite_user_content, build_stt_prompt, canonicalize_known_terms, chunk_samples_for,
+        cleanup_decision, cleanup_max_tokens, cleanup_profile, cleanup_prompt,
+        cleanup_prompt_overrides, cleanup_prompts_path, consume_open_dashboard_request_at,
+        contains_word_verbatim, content_words, dashboard_accessibility_state,
+        dashboard_cleanup_mode, dashboard_payload, dashboard_provider_label,
+        derive_word_correction, downsample_wav_16k_mono, edit_distance,
         edit_learning_context_diverged, empty_retry_engages, empty_transcript_error,
         enforce_learned_vocabulary_cap, final_refine_choice,
         final_streaming_result_is_ready_elapsed, finalize_accessibility_context,
@@ -14568,15 +14722,14 @@ mod tests {
         remove_bolo_env_value_at, remove_fillers, request_accessibility_daemon,
         resolve_microphone_selection, retry_failed_primary, sanitize_transcript_history,
         save_usage_counters_at, set_streaming_connection, set_streaming_error,
-        should_exit_for_key_reload, span_plural_variant, speech_stats,
-        stable_streaming_best_is_ready_elapsed, status_rows, streaming_batch_fallback_reason,
-        streaming_connection, streaming_preview_tail, streaming_provider_from_config,
-        streaming_status_label, strip_reasoning_tags, strip_vocabulary_echo,
-        stt_language_for_model, stt_model_config, telnyx_stream_engine_model_with,
-        telnyx_stream_query, telnyx_stream_query_with, transcript_log_value,
-        transcript_menu_preview, typed_dashboard_action, upsert_learned_correction,
-        upsert_replacement, verbatim_word_mismatch, version_is_newer, wait_for_daemon_reply,
-        wav_bytes, write_bolo_env_value_at, write_learned_vocabulary_file,
+        should_exit_for_key_reload, speech_stats, stable_streaming_best_is_ready_elapsed,
+        status_rows, streaming_batch_fallback_reason, streaming_connection, streaming_preview_tail,
+        streaming_provider_from_config, streaming_status_label, strip_reasoning_tags,
+        strip_vocabulary_echo, stt_language_for_model, stt_model_config,
+        telnyx_stream_engine_model_with, telnyx_stream_query, telnyx_stream_query_with,
+        transcript_log_value, transcript_menu_preview, typed_dashboard_action,
+        upsert_learned_correction, upsert_replacement, verbatim_word_mismatch, version_is_newer,
+        wait_for_daemon_reply, wav_bytes, write_bolo_env_value_at, write_learned_vocabulary_file,
     };
     use std::collections::{HashMap, VecDeque};
     use std::path::{Path, PathBuf};
@@ -16048,6 +16201,123 @@ mod tests {
             &pasted,
             "hello team\nSend the release note today "
         ));
+    }
+
+    #[test]
+    fn arbitration_decides_by_version_across_every_branch() {
+        let holder_newer = LockMeta {
+            pid: 1,
+            version: Some(String::from("1.9.9")),
+            binary: Some(String::from("/Applications/Bolo.app")),
+        };
+        let holder_older = LockMeta {
+            pid: 1,
+            version: Some(String::from("1.9.6")),
+            binary: Some(String::from("/Applications/Bolo.app")),
+        };
+        // I am older than the live holder: refuse, naming the newer copy.
+        assert_eq!(
+            arbitrate("1.9.8", Some(holder_newer.clone()), true),
+            Arbitration::Refuse {
+                version: String::from("1.9.9"),
+                binary: String::from("/Applications/Bolo.app"),
+            }
+        );
+        // I am newer than the live holder: take over, terminating it.
+        assert_eq!(
+            arbitrate("1.9.9", Some(holder_older.clone()), true),
+            Arbitration::TakeOver {
+                version: String::from("1.9.6"),
+                binary: String::from("/Applications/Bolo.app"),
+                pid: 1,
+            }
+        );
+        // Same version: today's first-wins rule.
+        assert_eq!(
+            arbitrate("1.9.9", Some(holder_newer.clone()), true),
+            Arbitration::AlreadyRunning
+        );
+        // The holder is dead: its lock is stale, acquire it.
+        assert_eq!(
+            arbitrate("1.9.9", Some(holder_older.clone()), false),
+            Arbitration::Acquire
+        );
+        // No holder at all: acquire.
+        assert_eq!(arbitrate("1.9.9", None, false), Arbitration::Acquire);
+        // A pre-arbitration holder (no version metadata): take over so an
+        // upgrade replaces the legacy running copy.
+        assert_eq!(
+            arbitrate(
+                "1.9.9",
+                Some(LockMeta {
+                    pid: 1,
+                    version: None,
+                    binary: None,
+                }),
+                true,
+            ),
+            Arbitration::TakeOverLegacy { pid: 1 }
+        );
+    }
+
+    /// The simulated stale-lock verification: a live holder presenting an
+    /// older version is terminated and replaced, and a live holder with a
+    /// newer version survives while the older binary refuses to start.
+    #[test]
+    fn stale_lock_simulation_refuses_older_and_takes_over_newer() {
+        use std::process::Command;
+        let dir = env::temp_dir().join(format!("bolo-arbitration-sim-{}", process::id()));
+        drop(fs::remove_dir_all(&dir));
+
+        // Branch 1: live holder claims v1.9.6; this instance is newer, so
+        // it takes over and the stale holder dies.
+        fs::create_dir_all(&dir).expect("create sim lock dir");
+        let mut sleeper = Command::new("/bin/sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn holder");
+        fs::write(dir.join("pid"), sleeper.id().to_string()).expect("write pid");
+        fs::write(dir.join("version"), "1.9.6").expect("write version");
+        fs::write(dir.join("binary"), "/Applications/Bolo.app").expect("write binary");
+        let lock = AppLock::acquire_at(dir.clone(), "9.9.9").expect("take over the stale lock");
+        // The takeover SIGTERMs the holder; wait() reaps the child, which
+        // is what makes `kill -0` report it gone afterward.
+        let _status = sleeper.wait().expect("reap the terminated holder");
+        assert!(
+            !super::process_is_running(sleeper.id()),
+            "the stale holder should be terminated by the takeover"
+        );
+        assert!(
+            dir.join("version").exists(),
+            "the lock carries version metadata"
+        );
+        drop(lock);
+
+        // Branch 2: live holder claims v99.0.0; this older instance refuses
+        // with OlderInstanceRunning and the holder survives untouched.
+        drop(fs::remove_dir_all(&dir));
+        fs::create_dir_all(&dir).expect("recreate sim lock dir");
+        let newer = Command::new("/bin/sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn newer holder");
+        fs::write(dir.join("pid"), newer.id().to_string()).expect("write pid");
+        fs::write(dir.join("version"), "99.0.0").expect("write version");
+        let refused = AppLock::acquire_at(dir.clone(), "9.9.9");
+        assert!(
+            matches!(
+                refused,
+                Err(AppError::OlderInstanceRunning { ref version, .. }) if version == "99.0.0"
+            ),
+            "the older binary must refuse to start"
+        );
+        assert!(
+            super::process_is_running(newer.id()),
+            "the newer holder must survive the refusal"
+        );
+        // Cleanup: release the simulated holder and its lock.
+        drop(Command::new("kill").arg(newer.id().to_string()).status());
+        drop(fs::remove_dir_all(&dir));
     }
 
     #[test]

@@ -87,6 +87,16 @@ on run argv
   tell application "System Events"
     repeat with loginItem in every login item
       try
+        -- Install hygiene: a stale DMG bundle's login item must never
+        -- race this launcher at boot (2026-10-19 incident: the bundle
+        -- launched first, held the microphone, and failed every
+        -- dictation). Only the app-bundle spelling is removed; the
+        -- command launcher being registered below is this script's own.
+        if path of loginItem is "/Applications/Bolo.app" then delete loginItem
+      end try
+    end repeat
+    repeat with loginItem in every login item
+      try
         if path of loginItem is commandPath then delete loginItem
       end try
     end repeat
