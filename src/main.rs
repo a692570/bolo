@@ -1882,6 +1882,13 @@ struct AccessibilityContext {
 fn main() -> Result<(), AppError> {
     let _guard = setup_logging()?;
     let _lock = AppLock::acquire()?;
+    let lock_watch_path = PathBuf::from(LOCK_DIR);
+    if let Err(error) = std::thread::Builder::new()
+        .name(String::from("bolo-lock-watch"))
+        .spawn(move || run_lock_watch(lock_watch_path))
+    {
+        warn!("lock watcher failed to start: {error}");
+    }
     ensure_python_helpers_at_startup()?;
     run_onboarding_if_needed();
     let app = Arc::new(App::new()?);
@@ -2208,6 +2215,59 @@ fn arbitrate(my_version: &str, holder: Option<LockMeta>, holder_alive: bool) -> 
         }
     } else {
         Arbitration::AlreadyRunning
+    }
+}
+
+/// The pid of the live process that took the lock from `my_pid`, if any.
+/// `None` when the lock is still ours, missing (the caller retakes it), or
+/// held by a dead pid (the caller retakes it too).
+fn lock_taken_by_other(path: &Path, my_pid: u32) -> Option<u32> {
+    let Some(meta) = LockMeta::read(path) else {
+        return None;
+    };
+    if meta.pid == my_pid {
+        return None;
+    }
+    process_is_running(meta.pid).then_some(meta.pid)
+}
+
+/// Watch the instance lock every two seconds and keep the
+/// one-instance guarantee under every path: if another live instance takes
+/// the lock (a takeover, a second launcher, an external replacement), this
+/// instance ends itself with a notification; if the lock is missing or
+/// held by a dead pid, this instance reclaims it. The 2026-10-19 live
+/// verification left exactly this gap: a lockless orphan survived when the
+/// lock directory was replaced underneath it.
+fn run_lock_watch(path: PathBuf) {
+    let my_pid = std::process::id();
+    loop {
+        std::thread::sleep(Duration::from_secs(2));
+        if let Some(winner) = lock_taken_by_other(&path, my_pid) {
+            info!(
+                "[arbitration] the lock moved to live pid {winner}; this instance ends so exactly one Bolo runs"
+            );
+            #[cfg(not(test))]
+            show_notification(
+                "Bolo",
+                "Another Bolo instance took over; this copy is shutting down.",
+            );
+            std::process::exit(1);
+        }
+        let need_retake = match LockMeta::read(&path) {
+            Some(meta) => meta.pid != my_pid && !process_is_running(meta.pid),
+            None => true,
+        };
+        if need_retake {
+            if path.exists()
+                && let Err(error) = fs::remove_dir_all(&path)
+            {
+                warn!("[arbitration] reclaiming the lock failed: {error}");
+                continue;
+            }
+            if let Err(error) = AppLock::fresh_lock(path.clone()) {
+                warn!("[arbitration] reclaiming the lock failed: {error}");
+            }
+        }
     }
 }
 
@@ -16201,6 +16261,32 @@ mod tests {
             &pasted,
             "hello team\nSend the release note today "
         ));
+    }
+
+    #[test]
+    fn lock_taken_by_other_covers_mine_other_and_missing() {
+        use std::process::Command;
+        let dir = env::temp_dir().join(format!("bolo-lock-watch-{}", process::id()));
+        drop(fs::remove_dir_all(&dir));
+        let mut sleeper = Command::new("/bin/sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn holder");
+        let my_pid = 999_999;
+        fs::create_dir_all(&dir).expect("create lock dir");
+        // Another live instance owns the lock: reported as taken.
+        fs::write(dir.join("pid"), sleeper.id().to_string()).expect("write pid");
+        assert_eq!(super::lock_taken_by_other(&dir, my_pid), Some(sleeper.id()));
+        // A dead holder is not a takeover: retake, not exit.
+        drop(Command::new("kill").arg(sleeper.id().to_string()).status());
+        drop(sleeper.wait());
+        assert_eq!(super::lock_taken_by_other(&dir, my_pid), None);
+        // The lock is ours: not taken.
+        fs::write(dir.join("pid"), my_pid.to_string()).expect("write pid");
+        assert_eq!(super::lock_taken_by_other(&dir, my_pid), None);
+        // The lock is missing: not a takeover.
+        drop(fs::remove_dir_all(&dir));
+        assert_eq!(super::lock_taken_by_other(&dir, my_pid), None);
     }
 
     #[test]
