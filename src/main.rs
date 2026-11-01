@@ -1,6 +1,7 @@
 //! Bolo's Rust push-to-talk dictation runtime.
 
 mod audio_conditioning;
+mod entity_repair;
 mod local_whisper;
 mod parakeet_sidecar;
 mod qwen_sidecar;
@@ -3377,6 +3378,18 @@ impl App {
                         self.remember_result(&stt.text, &prepared.text, Some(&prepared))?;
                         #[cfg(not(test))]
                         {
+                            // Context-aware name repair runs after paste so
+                            // it never adds paste latency; a validated fix
+                            // swaps the text in place about a second later.
+                            let app = Arc::clone(self);
+                            let repair_text = prepared.text.clone();
+                            let repair_context = warmup_context.clone();
+                            if let Err(error) = std::thread::Builder::new()
+                                .name(String::from("bolo-entity-repair"))
+                                .spawn(move || app.run_entity_repair(&repair_text, repair_context))
+                            {
+                                warn!("[repair] thread failed to start: {error}");
+                            }
                             // Poll watcher: detects post-paste edits by
                             // reading the accessibility caret context on a
                             // fixed cadence, so learning works without the
@@ -4855,6 +4868,139 @@ impl App {
             })
         );
         Ok(sanitized)
+    }
+
+    /// Ask the LLM for name swaps in a pasted transcript, keep the ones
+    /// `entity_repair::validate` accepts, and swap the text on screen when
+    /// the paste still sits untouched before the caret. The edit-learning
+    /// watch is re-aimed at the repaired text first, so the swap never reads
+    /// as a user edit (a model fix must not become a learned alias). Off with
+    /// `BOLO_ENTITY_REPAIR=off`; `BOLO_REPAIR_MODEL` overrides the cleanup
+    /// model (the 2026-11-01 eval ran Qwen3.8-27B-nothink, DeepSeek-V4.1-Flash,
+    /// and MiniMax-M3 at 0.6-0.8 s p50, with zero wrong swaps past the gate).
+    #[cfg_attr(test, allow(dead_code))]
+    fn run_entity_repair(&self, pasted: &str, context: Option<AccessibilityContext>) {
+        if !load_bool_env("BOLO_ENTITY_REPAIR", true) || pasted.split_whitespace().count() < 2 {
+            return;
+        }
+        let Some(endpoint) = self.config.llm_endpoint() else {
+            return;
+        };
+        let started = Instant::now();
+        let screen = context
+            .as_ref()
+            .map(|context| context.text_before_cursor.clone())
+            .unwrap_or_default();
+        let vocabulary = self.vocabulary_snapshot().unwrap_or_default();
+        let mut allowed = vocabulary.clone();
+        for term in entity_repair::screen_terms(&screen, is_english_word) {
+            if !allowed
+                .iter()
+                .any(|known| known.eq_ignore_ascii_case(&term))
+            {
+                allowed.push(term);
+            }
+        }
+        let model = load_env_value("BOLO_REPAIR_MODEL").unwrap_or_else(|| self.config.llm_model());
+        let user_content = serde_json::json!({
+            "transcript": pasted,
+            "vocabulary": vocabulary,
+            "screen": screen,
+        })
+        .to_string();
+        let request = ChatRequest {
+            model: &model,
+            messages: vec![
+                ChatMessageRequest {
+                    role: "system",
+                    content: entity_repair::PROMPT,
+                },
+                ChatMessageRequest {
+                    role: "user",
+                    content: &user_content,
+                },
+            ],
+            max_tokens: 300,
+            temperature: 0,
+            enable_thinking: endpoint.legacy_qwen,
+        };
+        let mut builder = self
+            .http
+            .post(&endpoint.url)
+            .timeout(Duration::from_secs(4))
+            .json(&request);
+        if let Some(key) = endpoint.key.as_deref() {
+            builder = if endpoint.bearer {
+                builder.bearer_auth(key)
+            } else {
+                builder.header(AUTHORIZATION, key)
+            };
+        }
+        let output = match builder.send() {
+            Ok(response) if response.status().is_success() => response
+                .json::<ChatResponse>()
+                .ok()
+                .and_then(|parsed| parsed.choices.into_iter().next())
+                .and_then(|choice| choice.message.content)
+                .unwrap_or_default(),
+            Ok(response) => {
+                info!("[repair] skipped status_{}", response.status().as_u16());
+                return;
+            }
+            Err(error) => {
+                info!("[repair] skipped request_failed: {error}");
+                return;
+            }
+        };
+        let proposed = entity_repair::parse_fixes(&strip_reasoning_tags(&output));
+        let accepted = entity_repair::validate(pasted, &proposed, &allowed);
+        let llm_ms = started.elapsed().as_millis();
+        if accepted.is_empty() {
+            info!(
+                "[repair] none {}",
+                serde_json::json!({"llm_ms": llm_ms, "proposed": proposed.len(), "model": &model})
+            );
+            return;
+        }
+        let repaired = entity_repair::apply(pasted, &accepted);
+        let fixes = accepted
+            .iter()
+            .map(|fix| format!("{} -> {}", self.log_text(&fix.span), fix.term))
+            .collect::<Vec<_>>();
+        // Re-aim learning before the swap; restore it if the swap fails.
+        let aim_learning = |text: &str| {
+            if let Ok(mut state) = self.lock_state()
+                && let Some(learning) = state.edit_learning.as_mut()
+                && !learning.captured
+            {
+                learning.pasted_text = text.to_owned();
+            }
+        };
+        aim_learning(&repaired);
+        let swapped = matches!(
+            select_text_before_caret(&self.config.root_dir, pasted),
+            Ok(true)
+        ) && paste_text(&self.config.root_dir, &repaired).is_ok();
+        if !swapped {
+            aim_learning(pasted);
+        }
+        let history_updated = self
+            .replace_latest_history_entry(pasted, repaired.clone())
+            .unwrap_or(false);
+        if swapped && let Ok(mut state) = self.lock_state() {
+            state.last_result = Some(repaired);
+        }
+        info!(
+            "[repair] applied {}",
+            serde_json::json!({
+                "fixes": fixes,
+                "on_screen": swapped,
+                "history_updated": history_updated,
+                "llm_ms": llm_ms,
+                "total_ms": started.elapsed().as_millis(),
+                "model": &model,
+            })
+        );
     }
 
     fn start_deferred_cleanup(
