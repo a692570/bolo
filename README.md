@@ -209,7 +209,16 @@ That creates `~/.bolo/qwen-venv` (Python >= 3.10, pinned qwen3-asr-mlx 0.3.0) an
 
 ### Learned words and the copy-transcript popup
 
-Bolo learns your corrections. When a dictation lands and you edit it within 15 seconds — backspacing and retyping a word Bolo misheard — the next dictation you fix that way teaches Bolo the pair: it is saved to `~/.bolo/learned_vocabulary.json` (capped at 100 entries), applied on every future dictation at zero latency, and Bolo shows a "Bolo learned: X → Y" notification the first time a pair is saved. Only clean single-word substitutions are learned; deletions and full rewrites are deliberately ignored. The tray menu's **Learned Words** shows everything learned so far, and the dashboard counts them.
+Bolo learns your corrections. When a dictation lands and you edit it within 15 seconds, backspacing and retyping a word Bolo misheard, Bolo saves the pair to `~/.bolo/learned_vocabulary.json` (capped at 100 entries). A pair starts applying once you have made the same fix twice: from then on it is applied to every future dictation at zero latency, and Bolo shows a "Bolo learned: X → Y" notification at that moment. Only clean single-word substitutions are learned; deletions, full rewrites, and fragments of the original word ("separate" to "eparate") are ignored. Edits in terminal emulators (Ghostty, Terminal, iTerm2, Warp, kitty, Alacritty, WezTerm) are never learned, because their accessibility text is a re-rendered screen rather than an edit buffer. The tray menu's **Learned Words** shows everything learned so far, and the dashboard counts them.
+
+### Name repair after paste
+
+After a dictation is pasted, Bolo asks the LLM whether any span is a misheard name, for example "Ormis has been acting up" for "Hermes has been acting up". The model only proposes swaps; Bolo applies one only when the replacement is in your vocabulary or visible on screen, the span appears in the transcript as whole words (three at most), and the two sound alike. When the pasted text is still untouched before the caret, Bolo swaps it in place; otherwise, and in apps that refuse the selection (most terminals), only the transcript history is updated. Paste latency is unaffected because the repair runs after paste. The swap never counts as your edit, so it is never learned.
+
+```bash
+export BOLO_ENTITY_REPAIR="off"                 # disable name repair
+export BOLO_REPAIR_MODEL="Qwen3.8-27B-nothink"  # model for the repair call (defaults to BOLO_LLM_MODEL)
+```
 
 When Bolo cannot find an editable paste target (no text field is focused, or the paste fails), it skips the blind paste, copies the transcript to the clipboard, and shows a popup with the transcript instead: edit it right there if you like, click **Copy** to take the edited version, or **Dismiss**. Edits made inside the popup are learned exactly like paste edits, so a correction you make in the popup follows every future dictation.
 
@@ -262,16 +271,26 @@ Supported values (all Telnyx-routed, all requiring `TELNYX_API_KEY`):
 - `assemblyai-telnyx` (also `assembly-telnyx`): AssemblyAI Universal-3.5 streaming routed through Telnyx, pinned to `assemblyai/universal-3-5-pro`.
 - `off`: always use batch transcription.
 
-Inside the Telnyx websocket, `BOLO_TELNYX_STREAMING_ENGINE` and `BOLO_TELNYX_STREAMING_MODEL` select the engine and model (defaults: `Deepgram` and `flux-multi` — the lowest-latency Deepgram family, with Hindi code-switching and vocabulary as keyterms):
+Inside the Telnyx websocket, `BOLO_TELNYX_STREAMING_ENGINE` and `BOLO_TELNYX_STREAMING_MODEL` select the engine and model (defaults: `Deepgram` and `flux-multi`, the lowest-latency Deepgram family, with Hindi code-switching and vocabulary as keyterms):
 
 ```bash
 export BOLO_TELNYX_STREAMING_ENGINE="Speechmatics"
 export BOLO_TELNYX_STREAMING_MODEL="streaming-exp"
 ```
 
+To stream through AssemblyAI Universal-3.6 Pro (the most accurate engine in the 2026-10-30 bake-off of 10 Telnyx streaming configs on 134 real dictations: 11.1% median WER, against 16.7% for `flux-multi`):
+
+```bash
+export BOLO_TELNYX_STREAMING_ENGINE="AssemblyAI"
+export BOLO_TELNYX_STREAMING_MODEL="assemblyai/universal-3-6-pro"
+export BOLO_FINAL_REFINE="off"
+```
+
+Bolo streams 16 kHz `linear16` to every engine, resampling the microphone capture: the Telnyx-routed AssemblyAI engine rejects 48 kHz with error 40005 and closes the socket. AssemblyAI through Telnyx does not take vocabulary keyterms; only Deepgram nova-3 and flux do.
+
 The documented engines are Deepgram, Telnyx, Google, Azure, xAI, AssemblyAI, Speechmatics, Soniox, Parakeet, Cohere, Reson8, and Humain; unknown values pass through verbatim so new engines work without a code change. Live partial transcripts (interim results) come only from Deepgram, Speechmatics, and Soniox; the other engines return a single final transcript when you release. The `assemblyai-telnyx` provider ignores these two selectors and pins AssemblyAI's own engine and model.
 
-After a healthy streaming result, Bolo re-runs the batch model over the same audio inside a bounded window and inserts its transcript when it answers with words (`BOLO_FINAL_REFINE`, on by default). The streaming text ships unchanged when refine is disabled, times out after two seconds, or returns empty. Set `BOLO_FINAL_REFINE=off` to insert the streaming text directly and skip the round trip:
+After a healthy streaming result, Bolo re-runs the batch model over the same audio inside a bounded window and inserts its transcript when it answers with words (`BOLO_FINAL_REFINE`, on by default). The streaming text ships unchanged when refine is disabled, times out after two seconds, or returns empty. Set `BOLO_FINAL_REFINE=off` to insert the streaming text directly without waiting on the round trip (the batch call then only backs up a stream that looks broken, such as two words for a ten-second recording):
 
 ```bash
 export BOLO_FINAL_REFINE="off"
@@ -355,6 +374,8 @@ You can also teach Bolo common mishears with alias objects:
 ```
 
 Bolo merges that with its built-in vocabulary and uses it to preserve known terms more reliably. Aliases are applied locally before LLM cleanup, so common accent or model mistakes are fixed without adding latency.
+
+Beyond exact aliases, Bolo snaps close mishearings of a vocabulary term ("telnix" to "Telnyx", "Higgs field" to "Higgsfield"). A word that is an ordinary English word or name, an all-caps acronym, or a plural or possessive of the term never snaps, and a phrase only joins into a term when its letters match exactly, so "post", "API", and "based on" stay as spoken. Real words that are mishearings in your world ("chrome" for "cron") belong in aliases.
 
 You can add vocabulary from the menu bar with **Add Vocabulary Term...** and add mishear aliases with **Add Vocabulary Alias...**. New terms are saved to `~/.bolo_vocabulary.json` and start applying immediately.
 
