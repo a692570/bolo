@@ -1,6 +1,7 @@
 //! Bolo's Rust push-to-talk dictation runtime.
 
 mod audio_conditioning;
+mod entity_repair;
 mod local_whisper;
 mod parakeet_sidecar;
 mod qwen_sidecar;
@@ -130,7 +131,13 @@ const STREAMING_DRAIN_MAX: Duration = Duration::from_millis(2_500);
 /// marks the session dead long before that so release never waits on it.
 const STREAMING_HANDSHAKE_DEADLINE: Duration = Duration::from_secs(3);
 const STREAMING_BATCH_VERIFY_TIMEOUT: Duration = Duration::from_secs(2);
-const STREAMING_SAMPLE_RATE: u32 = 48_000;
+/// Wire rate for the Telnyx streaming websocket. The capture stays at the
+/// device rate and the streaming sink resamples each chunk to this rate.
+/// The Telnyx-routed `AssemblyAI` engine rejects 48 kHz `linear16` with
+/// 40005 "Valid rates: 8000, 16000" and closes the socket, which killed
+/// both live `AssemblyAI` sessions on 2026-10-21. Every other engine
+/// streams 16 kHz at the same accuracy (2026-10-30 bake-off).
+const STREAMING_SAMPLE_RATE: u32 = 16_000;
 const STT_REQUEST_TIMEOUT: Duration = Duration::from_secs(12);
 /// Sample rate of the payload-reduced batch retry. A 16 kHz re-encode passed
 /// live replay during the 2026-09-09 gateway incident while the captured
@@ -3199,11 +3206,33 @@ impl App {
                         })
                 };
                 match streaming.finish() {
-                    Some(streaming_text) => SttResult::verbatim(self.select_streaming_outcome(
-                        streaming_text,
-                        elapsed,
-                        joined(refine_handle),
-                    )),
+                    Some(streaming_text) => {
+                        // With refine off, a healthy stream never reads the
+                        // batch result, so release must not wait on it
+                        // (live 2026-11-01: a 0.46 s drain still pasted at
+                        // 1.73 s because the join waited for nova-3). The
+                        // batch thread keeps running only as the backstop
+                        // for suspicious streams.
+                        let needs_batch = self.config.final_refine
+                            || streaming_batch_fallback_reason(
+                                &streaming_text.text,
+                                streaming_text.source,
+                                elapsed,
+                            )
+                            .is_some();
+                        let batch = if needs_batch {
+                            joined(refine_handle)
+                        } else {
+                            Err(AppError::Transcription(String::from(
+                                "final refine off; batch not awaited",
+                            )))
+                        };
+                        SttResult::verbatim(self.select_streaming_outcome(
+                            streaming_text,
+                            elapsed,
+                            batch,
+                        ))
+                    }
                     None => {
                         warn!("[stt] streaming_empty_fallback");
                         match joined(refine_handle) {
@@ -3349,6 +3378,18 @@ impl App {
                         self.remember_result(&stt.text, &prepared.text, Some(&prepared))?;
                         #[cfg(not(test))]
                         {
+                            // Context-aware name repair runs after paste so
+                            // it never adds paste latency; a validated fix
+                            // swaps the text in place about a second later.
+                            let app = Arc::clone(self);
+                            let repair_text = prepared.text.clone();
+                            let repair_context = warmup_context.clone();
+                            if let Err(error) = std::thread::Builder::new()
+                                .name(String::from("bolo-entity-repair"))
+                                .spawn(move || app.run_entity_repair(&repair_text, repair_context))
+                            {
+                                warn!("[repair] thread failed to start: {error}");
+                            }
                             // Poll watcher: detects post-paste edits by
                             // reading the accessibility caret context on a
                             // fixed cadence, so learning works without the
@@ -4221,7 +4262,12 @@ impl App {
         // everything captured so far so the stream starts with the user's
         // first word, not mid-sentence.
         if let Some(sender) = recording.sender.as_ref().cloned() {
-            hub.attach("streaming_preview", sender, sample_rate);
+            hub.attach(
+                "streaming_preview",
+                sender,
+                sample_rate,
+                STREAMING_SAMPLE_RATE,
+            );
         }
         Some(recording)
     }
@@ -4263,7 +4309,7 @@ impl App {
             return None;
         };
         let (sender, receiver) = mpsc::channel::<Vec<i16>>();
-        hub.attach("offline_preview", sender, sample_rate);
+        hub.attach("offline_preview", sender, sample_rate, sample_rate);
         let root_dir = self.config.root_dir.clone();
         let thread = std::thread::Builder::new()
             .name(String::from("bolo-offline-preview"))
@@ -4824,6 +4870,139 @@ impl App {
         Ok(sanitized)
     }
 
+    /// Ask the LLM for name swaps in a pasted transcript, keep the ones
+    /// `entity_repair::validate` accepts, and swap the text on screen when
+    /// the paste still sits untouched before the caret. The edit-learning
+    /// watch is re-aimed at the repaired text first, so the swap never reads
+    /// as a user edit (a model fix must not become a learned alias). Off with
+    /// `BOLO_ENTITY_REPAIR=off`; `BOLO_REPAIR_MODEL` overrides the cleanup
+    /// model (the 2026-11-01 eval ran Qwen3.8-27B-nothink, DeepSeek-V4.1-Flash,
+    /// and MiniMax-M3 at 0.6-0.8 s p50, with zero wrong swaps past the gate).
+    #[cfg_attr(test, allow(dead_code))]
+    fn run_entity_repair(&self, pasted: &str, context: Option<AccessibilityContext>) {
+        if !load_bool_env("BOLO_ENTITY_REPAIR", true) || pasted.split_whitespace().count() < 2 {
+            return;
+        }
+        let Some(endpoint) = self.config.llm_endpoint() else {
+            return;
+        };
+        let started = Instant::now();
+        let screen = context
+            .as_ref()
+            .map(|context| context.text_before_cursor.clone())
+            .unwrap_or_default();
+        let vocabulary = self.vocabulary_snapshot().unwrap_or_default();
+        let mut allowed = vocabulary.clone();
+        for term in entity_repair::screen_terms(&screen, is_english_word) {
+            if !allowed
+                .iter()
+                .any(|known| known.eq_ignore_ascii_case(&term))
+            {
+                allowed.push(term);
+            }
+        }
+        let model = load_env_value("BOLO_REPAIR_MODEL").unwrap_or_else(|| self.config.llm_model());
+        let user_content = serde_json::json!({
+            "transcript": pasted,
+            "vocabulary": vocabulary,
+            "screen": screen,
+        })
+        .to_string();
+        let request = ChatRequest {
+            model: &model,
+            messages: vec![
+                ChatMessageRequest {
+                    role: "system",
+                    content: entity_repair::PROMPT,
+                },
+                ChatMessageRequest {
+                    role: "user",
+                    content: &user_content,
+                },
+            ],
+            max_tokens: 300,
+            temperature: 0,
+            enable_thinking: endpoint.legacy_qwen,
+        };
+        let mut builder = self
+            .http
+            .post(&endpoint.url)
+            .timeout(Duration::from_secs(4))
+            .json(&request);
+        if let Some(key) = endpoint.key.as_deref() {
+            builder = if endpoint.bearer {
+                builder.bearer_auth(key)
+            } else {
+                builder.header(AUTHORIZATION, key)
+            };
+        }
+        let output = match builder.send() {
+            Ok(response) if response.status().is_success() => response
+                .json::<ChatResponse>()
+                .ok()
+                .and_then(|parsed| parsed.choices.into_iter().next())
+                .and_then(|choice| choice.message.content)
+                .unwrap_or_default(),
+            Ok(response) => {
+                info!("[repair] skipped status_{}", response.status().as_u16());
+                return;
+            }
+            Err(error) => {
+                info!("[repair] skipped request_failed: {error}");
+                return;
+            }
+        };
+        let proposed = entity_repair::parse_fixes(&strip_reasoning_tags(&output));
+        let accepted = entity_repair::validate(pasted, &proposed, &allowed);
+        let llm_ms = started.elapsed().as_millis();
+        if accepted.is_empty() {
+            info!(
+                "[repair] none {}",
+                serde_json::json!({"llm_ms": llm_ms, "proposed": proposed.len(), "model": &model})
+            );
+            return;
+        }
+        let repaired = entity_repair::apply(pasted, &accepted);
+        let fixes = accepted
+            .iter()
+            .map(|fix| format!("{} -> {}", self.log_text(&fix.span), fix.term))
+            .collect::<Vec<_>>();
+        // Re-aim learning before the swap; restore it if the swap fails.
+        let aim_learning = |text: &str| {
+            if let Ok(mut state) = self.lock_state()
+                && let Some(learning) = state.edit_learning.as_mut()
+                && !learning.captured
+            {
+                learning.pasted_text = text.to_owned();
+            }
+        };
+        aim_learning(&repaired);
+        let swapped = matches!(
+            select_text_before_caret(&self.config.root_dir, pasted),
+            Ok(true)
+        ) && paste_text(&self.config.root_dir, &repaired).is_ok();
+        if !swapped {
+            aim_learning(pasted);
+        }
+        let history_updated = self
+            .replace_latest_history_entry(pasted, repaired.clone())
+            .unwrap_or(false);
+        if swapped && let Ok(mut state) = self.lock_state() {
+            state.last_result = Some(repaired);
+        }
+        info!(
+            "[repair] applied {}",
+            serde_json::json!({
+                "fixes": fixes,
+                "on_screen": swapped,
+                "history_updated": history_updated,
+                "llm_ms": llm_ms,
+                "total_ms": started.elapsed().as_millis(),
+                "model": &model,
+            })
+        );
+    }
+
     fn start_deferred_cleanup(
         self: &Arc<Self>,
         cleanup_input: String,
@@ -5332,6 +5511,10 @@ impl App {
             info!("[learning] skipped context_unavailable");
             return;
         };
+        if is_terminal_app(&context.bundle_id) {
+            info!("[learning] skipped terminal_app");
+            return;
+        }
         info!(
             "[learning] edit_observed {}",
             serde_json::json!({
@@ -5352,8 +5535,9 @@ impl App {
                         self.log_text(&misheard),
                         self.log_text(&corrected)
                     );
-                    // A brand-new pair gets one plain confirmation so learning
-                    // is never invisible; count bumps stay silent.
+                    // The confirmation that activates a pair gets one plain
+                    // notice so learning is never invisible; first sightings
+                    // and later bumps stay silent.
                     if self.learn_correction(&learned_vocabulary_path(), &misheard, &corrected) {
                         show_notification(
                             "Bolo",
@@ -5747,10 +5931,11 @@ impl App {
     /// Persist one learned correction and fold it into the in-memory engine:
     /// the corrected term joins the vocabulary list (and the keyterms prompt)
     /// ranked by the existing usage mechanism, and the misheard->corrected
-    /// pair becomes an alias applied after user configuration. A failed
-    /// persist only logs: the in-memory engine still applies the correction
-    /// for this session. Returns whether a brand-new pair was learned, so
-    /// the caller can announce it; count bumps of a known pair stay silent.
+    /// pair becomes an alias applied after user configuration, both only once
+    /// the pair reaches `LEARNED_MIN_CONFIRMATIONS`. A failed persist only
+    /// logs and applies nothing. Returns whether this confirmation activated
+    /// the pair, so the caller can announce it; first sightings and later
+    /// bumps stay silent.
     fn learn_correction(&self, path: &Path, misheard: &str, corrected: &str) -> bool {
         if !is_valid_learned_pair(misheard, corrected) {
             warn!(
@@ -5759,31 +5944,32 @@ impl App {
             );
             return false;
         }
-        let (saved, is_new_pair) = match record_learned_correction(path, misheard, corrected) {
-            Ok((file, is_new_pair)) => {
+        // A pair applies only once confirmed: the first sighting is stored
+        // and logged, and the confirmation that reaches
+        // LEARNED_MIN_CONFIRMATIONS activates it (and is what the caller
+        // announces).
+        let activated = match record_learned_correction(path, misheard, corrected) {
+            Ok((file, _)) => {
                 let aliases = learned_aliases_from_file(&file);
                 if let Ok(mut learned) = self.learned_aliases.lock() {
                     *learned = aliases;
                 }
-                (true, is_new_pair)
+                file.corrections
+                    .get(&misheard.trim().to_ascii_lowercase())
+                    .is_some_and(|entry| entry.count == LEARNED_MIN_CONFIRMATIONS)
             }
             Err(error) => {
                 warn!("[learning] save failed: {error}");
-                (false, false)
+                false
             }
         };
-        if !saved && let Ok(mut learned) = self.learned_aliases.lock() {
-            upsert_replacement(
-                &mut learned,
-                TextReplacement {
-                    spoken: misheard.to_owned(),
-                    replacement: corrected.to_owned(),
-                },
-            );
+        if !activated {
+            info!("[learning] pair_pending_confirmation");
+            return false;
         }
         {
             let Ok(mut vocabulary) = self.vocabulary.lock() else {
-                return is_new_pair;
+                return true;
             };
             let key = corrected.to_ascii_lowercase();
             if !vocabulary
@@ -5794,7 +5980,7 @@ impl App {
             }
         }
         self.record_vocabulary_usage(&[normalize_for_matching(corrected)]);
-        is_new_pair
+        true
     }
 
     /// Reload the learned pairs (and the vocabulary lists they feed) from
@@ -9891,15 +10077,27 @@ struct StreamingAudioChunker {
     sender: mpsc::Sender<Vec<i16>>,
     buffer: Vec<i16>,
     chunk_samples: usize,
+    source_rate: u32,
+    wire_rate: u32,
 }
 
 impl StreamingAudioChunker {
-    fn new(sender: mpsc::Sender<Vec<i16>>, chunk_samples: usize) -> Self {
+    fn new(sender: mpsc::Sender<Vec<i16>>, source_rate: u32, wire_rate: u32) -> Self {
+        let chunk_samples = chunk_samples_for(source_rate);
         Self {
             sender,
             buffer: Vec::with_capacity(chunk_samples),
             chunk_samples,
+            source_rate,
+            wire_rate,
         }
+    }
+
+    /// Resample one capture-rate chunk to the wire rate. A 60 ms chunk at
+    /// 48 kHz is 2,880 samples, which the box filter turns into exactly 960
+    /// at 16 kHz, so chunks never straddle a decimation frame.
+    fn to_wire(&self, chunk: Vec<i16>) -> Vec<i16> {
+        resample::resample_i16(&chunk, self.source_rate, self.wire_rate).unwrap_or(chunk)
     }
 
     /// Append captured samples, cutting them into fixed-size chunks for the
@@ -9910,7 +10108,7 @@ impl StreamingAudioChunker {
         while self.buffer.len() >= self.chunk_samples {
             let remainder = self.buffer.split_off(self.chunk_samples);
             let chunk = std::mem::replace(&mut self.buffer, remainder);
-            if self.sender.send(chunk).is_err() {
+            if self.sender.send(self.to_wire(chunk)).is_err() {
                 self.buffer.clear();
                 break;
             }
@@ -9922,7 +10120,7 @@ impl Drop for StreamingAudioChunker {
     fn drop(&mut self) {
         if !self.buffer.is_empty() {
             let chunk = std::mem::take(&mut self.buffer);
-            drop(self.sender.send(chunk));
+            drop(self.sender.send(self.to_wire(chunk)));
         }
     }
 }
@@ -10005,8 +10203,15 @@ impl AudioHub {
     /// under, so the consumer sees the backlog in order followed by live
     /// audio with no frame gaps or duplicates. `label` only names the sink
     /// in the log line that records how much audio the consumer opened
-    /// late.
-    fn attach(&self, label: &str, sender: mpsc::Sender<Vec<i16>>, sample_rate: u32) {
+    /// late. `wire_rate` is the rate the consumer receives; chunks are cut
+    /// at the capture `sample_rate` and resampled when the two differ.
+    fn attach(
+        &self,
+        label: &str,
+        sender: mpsc::Sender<Vec<i16>>,
+        sample_rate: u32,
+        wire_rate: u32,
+    ) {
         let Ok(mut state) = self.state.lock() else {
             return;
         };
@@ -10019,7 +10224,7 @@ impl AudioHub {
             .saturating_mul(1_000)
             .checked_div(u64::from(sample_rate.max(1)))
             .unwrap_or_default();
-        let mut sink = StreamingAudioChunker::new(sender, chunk_samples_for(sample_rate));
+        let mut sink = StreamingAudioChunker::new(sender, sample_rate, wire_rate);
         sink.push(&backlog);
         info!(
             "[warmup] sink_attached {}",
@@ -11075,20 +11280,18 @@ fn canonicalize_known_terms(text: &str) -> String {
             r"(?i)\bcloud\s+(code|doc|docs|topic|agent|web|brave)\b",
             "Claude $1",
         ),
-        (r"(?i)\bchrome\b|\bcrone\b|\bcrohn\b", "cron"),
-        (r"(?i)\bspending for us\b", "pending for us"),
         (r"(?i)\blinear ticket\b", "Linear ticket"),
         (r"(?i)\bdo 1 thing\b", "do one thing"),
         (r"(?i)\bokay ish\b", "okay-ish"),
-        (r"(?i)\bremotion\b|\bemotion\b|\bemotions\b", "Remotion"),
+        (r"(?i)\bremotion\b", "Remotion"),
         (r"(?i)\bnova[ -]three\b|\bnova 3\b", "nova-3"),
-        (r"(?i)\bquen\b|\bqueue when\b|\bkyuen\b|\bkwan\b", "Qwen"),
+        (r"(?i)\bquen\b|\bkyuen\b", "Qwen"),
         (
             r"(?i)\bbrave search api\b|\bbrief search api\b",
             "Brave Search API",
         ),
-        (r"(?i)\btabily\b|\btabby\b|\btavoli\b|\btavily\b", "Tavily"),
-        (r"(?i)\bkimmy\b|\bkimmi\b|\bkimi\b", "Kimi"),
+        (r"(?i)\btabily\b|\btavoli\b|\btavily\b", "Tavily"),
+        (r"(?i)\bkimmi\b|\bkimi\b", "Kimi"),
     ];
     let mut result = text.to_owned();
     for (pattern, replacement) in replacements {
@@ -11275,6 +11478,68 @@ fn aligned_span_score(spoken: &str, term: &str) -> Option<usize> {
     Some(total.saturating_mul(10).saturating_add(1))
 }
 
+/// The macOS system dictionary (Webster's 2nd at /usr/share/dict/words,
+/// 236k words), lowercased, including proper names such as "Linda" so a real
+/// name never fuzzy-snaps to a term. Empty when the file is missing, which
+/// turns the English-word snap guard off instead of blocking every snap.
+fn english_words() -> &'static HashSet<String> {
+    static WORDS: OnceLock<HashSet<String>> = OnceLock::new();
+    WORDS.get_or_init(|| {
+        fs::read_to_string("/usr/share/dict/words")
+            .map(|text| text.lines().map(str::to_ascii_lowercase).collect())
+            .unwrap_or_default()
+    })
+}
+
+/// Whether one spoken word may fuzzy-snap to a one-word term. Replaying
+/// Willow's 3,984 transcripts against the personal vocabulary (2026-11-01)
+/// found every false snap in one of these classes: a real word or name
+/// ("post" -> "paste", "Linda" -> "Linear"), an acronym ("API" -> "Vapi",
+/// 76 times), a plural or possessive ("Telnyx's"), or a different opening
+/// sound ("mini" -> "Gemini"). V/W and C/K stay interchangeable so
+/// "wapicon" still reaches "VapiCon".
+fn single_word_snap_allowed(spoken: &str, normalized: &str, term: &str) -> bool {
+    let letters = spoken
+        .chars()
+        .filter(|character| character.is_alphabetic())
+        .collect::<Vec<_>>();
+    // A trailing lowercase "s" keeps a plural acronym an acronym ("RSVPs").
+    let stem_letters = match letters.split_last() {
+        Some((&'s', rest)) if rest.len() >= 2 => rest,
+        _ => letters.as_slice(),
+    };
+    let acronym = stem_letters.len() >= 2
+        && stem_letters
+            .iter()
+            .all(|character| character.is_uppercase());
+    let plural_or_possessive =
+        normalized.strip_suffix('s') == Some(term) || term.strip_suffix('s') == Some(normalized);
+    let onset = |text: &str| match text.chars().next() {
+        Some('w') => Some('v'),
+        Some('k') => Some('c'),
+        other => other,
+    };
+    !acronym
+        && !plural_or_possessive
+        && !is_english_word(spoken)
+        && onset(normalized) == onset(term)
+}
+
+/// Whether `word` is an ordinary English word, allowing the common
+/// inflections the dictionary does not list ("rights", "snapped",
+/// "assembling" via "assemble").
+fn is_english_word(word: &str) -> bool {
+    let words = english_words();
+    let lower = word.to_ascii_lowercase();
+    let base = lower.split('\'').next().unwrap_or_default();
+    words.contains(base)
+        || ["s", "es", "ed", "ing", "ly"].iter().any(|suffix| {
+            base.strip_suffix(suffix).is_some_and(|stem| {
+                stem.len() >= 3 && (words.contains(stem) || words.contains(&format!("{stem}e")))
+            })
+        })
+}
+
 fn best_vocabulary_match<'a>(
     text: &str,
     pieces: &[WordPiece],
@@ -11289,6 +11554,11 @@ fn best_vocabulary_match<'a>(
         let spoken = &text[start..end];
         let normalized = normalize_for_matching(spoken);
         if normalized.is_empty() {
+            continue;
+        }
+        // A span that already is a term verbatim stays: skipping only that
+        // term let a phonetic neighbor win, so "OpenCode" became "OpenClaw".
+        if terms.iter().any(|term| spoken == term.term) {
             continue;
         }
         for term in terms {
@@ -11306,8 +11576,27 @@ fn best_vocabulary_match<'a>(
             if word_count >= 2 && span_plural_variant(spoken, term.term) {
                 continue;
             }
-            let score = vocabulary_match_score(&normalized, &term.normalized)
-                .or_else(|| aligned_span_score(spoken, term.term));
+            // Exact matches only take the term's casing, and never on a real
+            // English word. A span longer than
+            // the term must join into it exactly ("Higgs field", "Tor box"):
+            // fuzzy joins swallowed neighbors ("a linear" -> "Linear",
+            // "based on" -> "Baseten"). Multi-word terms align word by word,
+            // so "the agent" never reaches "swe agent". Real-word,
+            // acronym, and plural mishearings are left to context-aware
+            // repair (see `single_word_snap_allowed`).
+            let score = if normalized == term.normalized {
+                // "linear ticket" is not always the Linear app.
+                (word_count > 1 || !is_english_word(spoken)).then_some(0)
+            } else if word_count > term_piece_count {
+                (normalized.replace(' ', "") == term.normalized.replace(' ', "")).then_some(1)
+            } else if word_count >= 2 {
+                aligned_span_score(spoken, term.term)
+            } else if single_word_snap_allowed(spoken, &normalized, &term.normalized) {
+                vocabulary_match_score(&normalized, &term.normalized)
+                    .or_else(|| aligned_span_score(spoken, term.term))
+            } else {
+                None
+            };
             let Some(score) = score else {
                 continue;
             };
@@ -11994,7 +12283,10 @@ fn stt_model_config(model: &str, vocabulary: &[String]) -> Option<serde_json::Va
     Some(serde_json::json!({
         "smart_format": true,
         "punctuate": true,
-        "keyterms": vocabulary.iter().take(50).collect::<Vec<_>>()
+        // Singular, as Deepgram names it: the plural spelling is silently
+        // dropped (2026-10-29 probe: 76% term recall with `keyterms`, 95%
+        // with `keyterm`).
+        "keyterm": vocabulary.iter().take(50).collect::<Vec<_>>()
     }))
 }
 
@@ -12591,7 +12883,8 @@ const LEARNED_CORRECTION_STOPWORDS: &[&str] = &[
 /// A learned pair must be a term-like fix: both sides non-empty, the corrected
 /// side at least three characters and vowel-bearing (ASCII sense; non-Latin
 /// scripts such as Devanagari pass the vowel gate), either side matching no
-/// common word, and the sides differing once normalized.
+/// common word, and the sides more than a case, punctuation, prefix, or
+/// suffix variant of each other.
 fn is_valid_learned_pair(misheard: &str, corrected: &str) -> bool {
     let misheard = misheard.trim();
     let corrected = corrected.trim();
@@ -12611,7 +12904,8 @@ fn is_valid_learned_pair(misheard: &str, corrected: &str) -> bool {
     if !corrected_has_vowel {
         return false;
     }
-    if normalize_for_matching(misheard) == normalize_for_matching(corrected) {
+    // Covers the no-op pair too: equal normalized forms are a trivial variant.
+    if is_trivial_word_variant(misheard, corrected) {
         return false;
     }
     let misheard_key = misheard.to_ascii_lowercase();
@@ -12710,9 +13004,16 @@ fn record_learned_correction(
 
 /// Learned pairs as misheard->corrected aliases, in the file's sorted key
 /// order.
+/// Confirmations a learned pair needs before it rewrites dictations or joins
+/// the vocabulary. One sighting applied immediately let single bad captures
+/// ("stuff" -> "shift", "post" -> "paste") corrupt every later dictation; a
+/// real fix repeats, a bad capture rarely repeats identically.
+const LEARNED_MIN_CONFIRMATIONS: u64 = 2;
+
 fn learned_aliases_from_file(file: &LearnedVocabulary) -> Vec<TextReplacement> {
     file.corrections
         .iter()
+        .filter(|(_, entry)| entry.count >= LEARNED_MIN_CONFIRMATIONS)
         .map(|(misheard, entry)| TextReplacement {
             spoken: misheard.clone(),
             replacement: entry.corrected.clone(),
@@ -13102,16 +13403,36 @@ fn derive_word_correction(inserted: &str, context_tail: &str) -> CorrectionOutco
     CorrectionOutcome::Learned { pairs: learned }
 }
 
-/// Case-only, punctuation-only, and prefix-only rewrites are not mishearings:
-/// "Tim" -> "tim" only capitalizes, "dont" -> "don't" only adds an
-/// apostrophe, and "meeting" -> "meetings" is one keystroke apart, so none of
-/// them are safe aliases to apply to every future dictation.
+/// Terminal emulators expose a re-rendered screen, not an edit buffer, so a
+/// caret-context diff there is screen churn rather than the user's fix:
+/// every bad pair learned before 2026-11-01 came from Ghostty.
+fn is_terminal_app(bundle_id: &str) -> bool {
+    matches!(
+        bundle_id,
+        "com.mitchellh.ghostty"
+            | "com.apple.Terminal"
+            | "com.googlecode.iterm2"
+            | "dev.warp.Warp-Stable"
+            | "net.kovidgoyal.kitty"
+            | "org.alacritty"
+            | "com.github.wez.wezterm"
+    )
+}
+
+/// Case-only, punctuation-only, prefix-only, and suffix-only rewrites are not
+/// mishearings: "Tim" -> "tim" only capitalizes, "dont" -> "don't" only adds
+/// an apostrophe, "meeting" -> "meetings" is one keystroke apart, and
+/// "separate" -> "eparate" is a caret context that starts mid-word (learned
+/// live 2026-10-29, with "english" -> "glish" after it), so none of them are
+/// safe aliases to apply to every future dictation.
 fn is_trivial_word_variant(old_word: &str, new_word: &str) -> bool {
     let old_normalized = normalize_for_matching(old_word);
     let new_normalized = normalize_for_matching(new_word);
     old_normalized == new_normalized
         || old_normalized.starts_with(&new_normalized)
         || new_normalized.starts_with(&old_normalized)
+        || old_normalized.ends_with(&new_normalized)
+        || new_normalized.ends_with(&old_normalized)
 }
 
 fn load_vocabulary(root_dir: &Path) -> LoadedVocabulary {
@@ -13143,6 +13464,9 @@ fn load_vocabulary_with_learned(root_dir: &Path, learned_path: &Path) -> LoadedV
     // and the pairs become aliases in their own set so explicit user
     // configuration always wins.
     for (misheard, entry) in load_learned_vocabulary(learned_path).corrections {
+        if entry.count < LEARNED_MIN_CONFIRMATIONS {
+            continue;
+        }
         let key = entry.corrected.to_ascii_lowercase();
         if !seen.contains(&key) {
             seen.push(key);
@@ -15754,20 +16078,26 @@ mod tests {
 
         let accent_terms =
             canonicalize_known_terms("boro heard cloud doc chrome and clock talk as crohn");
+        // Real words survive: "chrome", "crohn", and "spending" were rewritten
+        // unconditionally before 2026-11-01, so a real Chrome never made it.
         assert_eq!(
             accent_terms,
-            "Bolo heard Claude doc cron and ClawdTalk as cron"
+            "Bolo heard Claude doc chrome and ClawdTalk as crohn"
         );
         assert_eq!(
             canonicalize_known_terms("telenex has spending for us"),
-            "Telnyx has pending for us"
+            "Telnyx has spending for us"
+        );
+        assert_eq!(
+            canonicalize_known_terms("my emotions about the tabby cat"),
+            "my emotions about the tabby cat"
         );
         assert_eq!(
             canonicalize_known_terms("do 1 thing with the linear ticket, it was okay ish"),
             "do one thing with the Linear ticket, it was okay-ish"
         );
         assert_eq!(
-            canonicalize_known_terms("ask kimmy about that tavoli cron thing"),
+            canonicalize_known_terms("ask kimmi about that tavoli cron thing"),
             "ask Kimi about that Tavily cron thing"
         );
 
@@ -15854,11 +16184,76 @@ mod tests {
 
         assert_eq!(
             apply_vocabulary_corrections_with_matches(
-                "open cloud code, then check chrome and charge b",
+                "open cloud code, then check chrome and charge bee",
                 &vocabulary,
             )
             .0,
-            "open Claude Code, then check cron and Chargebee"
+            "open Claude Code, then check chrome and Chargebee"
+        );
+        // A real English word never fuzzy-snaps: "post" stayed "paste" live
+        // before the guard, and "chrome" became "cron".
+        assert_eq!(
+            apply_vocabulary_corrections_with_matches(
+                "post it, then check the crone",
+                &[String::from("paste"), String::from("cron")],
+            )
+            .0,
+            "post it, then check the crone"
+        );
+        // False snaps found replaying Willow's transcripts against the
+        // personal vocabulary: acronyms, phrases joined fuzzily into a
+        // term, swallowed neighbors, word-by-word misalignment, names, and
+        // a different opening sound all stay as spoken.
+        let personal = [
+            "Vapi",
+            "Baseten",
+            "Linear",
+            "swe agent",
+            "HeyGen",
+            "Gemini",
+            "Higgsfield",
+            "Telnyx",
+            "AssemblyAI",
+            "RevOps",
+        ]
+        .map(String::from);
+        for spoken in [
+            "email API docs",
+            "based on that",
+            "a linear ticket",
+            "the agent browser",
+            "if he can help",
+            "GPT mini model",
+            "ask Linda about it",
+            "start assembling the PDF",
+            "the webinar RSVPs",
+            "Telnyx's carousel",
+        ] {
+            assert_eq!(
+                apply_vocabulary_corrections_with_matches(spoken, &personal).0,
+                spoken,
+                "{spoken} must not snap"
+            );
+        }
+        // A word that already is a term never moves to a neighbor term.
+        let neighbors = ["OpenCode", "OpenClaw"].map(String::from);
+        assert_eq!(
+            apply_vocabulary_corrections_with_matches("tweak OpenCode now", &neighbors).0,
+            "tweak OpenCode now"
+        );
+        // Split brand names that join exactly still snap.
+        assert_eq!(
+            apply_vocabulary_corrections_with_matches("our Higgs field plan", &personal).0,
+            "our Higgsfield plan"
+        );
+        // A non-word mishearing still snaps.
+        assert_eq!(
+            apply_vocabulary_corrections_with_matches(
+                "ask telnix about it",
+                &[String::from("Telnyx")]
+            )
+            .0,
+            "ask Telnyx about it"
         );
         assert_eq!(
             apply_vocabulary_corrections_with_matches("cloud storage is different", &vocabulary).0,
@@ -15872,13 +16267,13 @@ mod tests {
             vocabulary_usage_test_app(vec![String::from("Chargebee")], HashMap::new());
 
         let (corrected, matched) = apply_vocabulary_corrections_with_matches(
-            "check charge b",
+            "check charge bee",
             &[String::from("Chargebee")],
         );
         assert_eq!(corrected, "check Chargebee");
         assert_eq!(matched, vec![String::from("chargebee")]);
 
-        let prepared = app.prepare_text("check charge b", &DictationWarmup::default(), None)?;
+        let prepared = app.prepare_text("check charge bee", &DictationWarmup::default(), None)?;
         assert_eq!(prepared.text, "Check Chargebee");
 
         let usage = match app.vocabulary_usage.lock() {
@@ -16171,10 +16566,12 @@ mod tests {
     #[test]
     fn builds_telnyx_stream_queries() {
         let vocabulary = vec![String::from("Telnyx"), String::from("Claude Code")];
-        let deepgram = telnyx_stream_query(StreamingProvider::Deepgram, "en-US", &vocabulary);
+        // Engine and model are passed in, not read from ~/.bolo/env, so the
+        // test holds on a machine whose env selects another engine.
+        let deepgram = telnyx_stream_query_with("Deepgram", "nova-3", "en-US", &vocabulary);
         assert!(deepgram.contains("transcription_engine=Deepgram"));
         assert!(deepgram.contains("input_format=linear16"));
-        assert!(deepgram.contains("sample_rate=48000"));
+        assert!(deepgram.contains("sample_rate=16000"));
         assert!(deepgram.contains("interim_results=true"));
         assert!(deepgram.contains("keyterm=Telnyx,Claude%20Code"));
 
@@ -16183,6 +16580,15 @@ mod tests {
         assert!(assembly.contains("input_format=linear16"));
         assert!(!assembly.contains("keyterm="));
         assert!(!assembly.contains("interim_results=true"));
+
+        let routed = telnyx_stream_query_with(
+            "AssemblyAI",
+            "assemblyai/universal-3-6-pro",
+            "en-IN",
+            &vocabulary,
+        );
+        assert!(routed.contains("sample_rate=16000"));
+        assert!(!routed.contains("keyterm="));
     }
 
     #[test]
@@ -19544,7 +19950,7 @@ mod tests {
         let hub = AudioHub::new(std::time::Instant::now());
         hub.on_audio(&(1..=60).collect::<Vec<_>>());
         let (sender, receiver) = mpsc::channel();
-        hub.attach("streaming_preview", sender, 1_000);
+        hub.attach("streaming_preview", sender, 1_000, 1_000);
         hub.on_audio(&(61..=90).collect::<Vec<_>>());
         drop(hub); // flushes the chunker's partial chunk
 
@@ -19560,9 +19966,9 @@ mod tests {
         let hub = AudioHub::new(std::time::Instant::now());
         hub.on_audio(&[1; 60]);
         let (preview_sender, preview_receiver) = mpsc::channel();
-        hub.attach("streaming_preview", preview_sender, 1_000);
+        hub.attach("streaming_preview", preview_sender, 1_000, 1_000);
         let (second_sender, second_receiver) = mpsc::channel();
-        hub.attach("second_sink", second_sender, 1_000);
+        hub.attach("second_sink", second_sender, 1_000, 1_000);
         hub.seal();
         hub.on_audio(&[2; 60]);
 
@@ -19578,7 +19984,7 @@ mod tests {
         hub.seal();
         hub.on_audio(&[9; 30]);
         let (sender, receiver) = mpsc::channel();
-        hub.attach("streaming_preview", sender, 1_000);
+        hub.attach("streaming_preview", sender, 1_000, 1_000);
         hub.on_audio(&[5; 10]);
         drop(hub);
 
@@ -19588,6 +19994,37 @@ mod tests {
         // silently reintroduce the lost-audio bug. Post-attach audio flows
         // to the sink live.
         assert_eq!(hub_samples(&receiver), vec![5; 10]);
+    }
+
+    #[test]
+    fn terminals_never_learn_and_batch_boost_uses_the_singular_field() {
+        assert!(super::is_terminal_app("com.mitchellh.ghostty"));
+        assert!(super::is_terminal_app("com.apple.Terminal"));
+        assert!(!super::is_terminal_app("com.tinyspeck.slackmacgap"));
+        let config = stt_model_config("deepgram/nova-3", &[String::from("Telnyx")]);
+        let config = config.unwrap_or_default();
+        assert_eq!(config["keyterm"], serde_json::json!(["Telnyx"]));
+        assert!(config.get("keyterms").is_none());
+    }
+
+    #[test]
+    fn streaming_sink_resamples_48k_capture_to_16k_wire_chunks() {
+        // The Telnyx AssemblyAI bridge accepts only 8 or 16 kHz linear16.
+        // A 48 kHz capture must reach the wire as 60 ms chunks of 960
+        // samples, with the box filter averaging each group of three.
+        let hub = AudioHub::new(std::time::Instant::now());
+        let (sender, receiver) = mpsc::channel();
+        hub.attach(
+            "streaming_preview",
+            sender,
+            48_000,
+            super::STREAMING_SAMPLE_RATE,
+        );
+        hub.on_audio(&[300; 2_880 * 2]);
+        let chunks: Vec<Vec<i16>> = receiver.try_iter().collect();
+        assert_eq!(chunks.len(), 2);
+        assert!(chunks.iter().all(|chunk| chunk.len() == 960));
+        assert!(chunks.iter().flatten().all(|&sample| sample == 300));
     }
 
     #[test]
@@ -20223,15 +20660,38 @@ mod tests {
             r#"[{"text": "UserTerm", "aliases": ["zzcollide"]}, "zzroottterm"]"#,
         )?;
         let learned_path = temp_learned_vocabulary_path();
-        let (learned_file, _) =
-            record_learned_correction(&learned_path, "zzmishrd", "zzlearnedterm")?;
-        assert_eq!(learned_file.corrections.len(), 1);
+        // Pairs load once confirmed (LEARNED_MIN_CONFIRMATIONS sightings).
+        for _ in 0..2 {
+            drop(record_learned_correction(
+                &learned_path,
+                "zzmishrd",
+                "zzlearnedterm",
+            )?);
+        }
         // A learned pair for a source word the user also configured must not
         // win: explicit user configuration always has priority.
         let (clash_file, _) = record_learned_correction(&learned_path, "zzcollide", "zzwrong")?;
         assert_eq!(clash_file.corrections.len(), 2);
+        drop(record_learned_correction(
+            &learned_path,
+            "zzcollide",
+            "zzwrong",
+        )?);
+        // A single sighting stays pending: no term, no alias.
+        drop(record_learned_correction(
+            &learned_path,
+            "zzonce",
+            "zzpendingterm",
+        )?);
 
         let loaded = load_vocabulary_with_learned(&root, &learned_path);
+        assert!(!loaded.terms.iter().any(|term| term == "zzpendingterm"));
+        assert!(
+            !loaded
+                .learned_aliases
+                .iter()
+                .any(|alias| alias.spoken == "zzonce")
+        );
         // The corrected term joined the vocabulary list (and so the keyterms
         // prompt), and the misheard word is not a term on its own.
         assert!(loaded.terms.iter().any(|term| term == "zzlearnedterm"));
@@ -20325,7 +20785,15 @@ mod tests {
     fn learn_correction_updates_engine_state_and_persists() -> Result<(), AppError> {
         let app = edit_learning_test_app(Vec::new(), Vec::new(), Vec::new());
         let learned_path = temp_learned_vocabulary_path();
-        // A brand-new pair announces itself to the caller.
+        // A first sighting is stored but neither applies nor announces.
+        assert!(!app.learn_correction(&learned_path, "zzmishrd", "zzlearnedterm"));
+        assert!(app.learned_aliases_snapshot().is_empty());
+        assert!(
+            !app.vocabulary_snapshot()?
+                .iter()
+                .any(|term| term == "zzlearnedterm")
+        );
+        // The confirmation activates the pair and announces itself.
         assert!(app.learn_correction(&learned_path, "zzmishrd", "zzlearnedterm"));
 
         // The corrected term joined the ranked vocabulary list.
@@ -20353,7 +20821,7 @@ mod tests {
         );
 
         // Re-learning the same pair bumps the count instead of duplicating,
-        // and the count bump stays unannounced.
+        // and later bumps stay unannounced.
         assert!(!app.learn_correction(&learned_path, "zzmishrd", "zzlearnedterm"));
         let confirmed = load_learned_vocabulary(&learned_path);
         assert_eq!(confirmed.corrections.len(), 1);
@@ -20362,7 +20830,7 @@ mod tests {
                 .corrections
                 .get("zzmishrd")
                 .map(|entry| entry.count),
-            Some(2)
+            Some(3)
         );
         Ok(())
     }
@@ -20388,7 +20856,12 @@ mod tests {
                 .is_empty()
         );
         assert!(app.learned_aliases_snapshot().is_empty());
-        // A genuine term pair still learns.
+        // Fragments of either end never learn: the caret context that starts
+        // mid-word produced "separate" -> "eparate" live.
+        assert!(!app.learn_correction(&learned_path, "separate", "eparate"));
+        // A genuine term pair is stored on first sight and activates on the
+        // confirmation.
+        assert!(!app.learn_correction(&learned_path, "parakeet sidecar", "parakeet rung"));
         assert!(app.learn_correction(&learned_path, "parakeet sidecar", "parakeet rung"));
         assert_eq!(load_learned_vocabulary(&learned_path).corrections.len(), 1);
         Ok(())
@@ -20425,6 +20898,11 @@ mod tests {
         fs::write(root.join("vocabulary.json"), "[]")?;
         let app = edit_learning_test_app_with_root(root, Vec::new(), Vec::new(), Vec::new());
         let path = temp_learned_vocabulary_path();
+        drop(record_learned_correction(
+            &path,
+            "zzmishrd",
+            "zzlearnedterm",
+        )?);
         let (file, _) = record_learned_correction(&path, "zzmishrd", "zzlearnedterm")?;
         assert_eq!(file.corrections.len(), 1);
 
@@ -20458,8 +20936,13 @@ mod tests {
         fs::write(root.join("vocabulary.json"), "[]")?;
         let app = edit_learning_test_app_with_root(root, Vec::new(), Vec::new(), Vec::new());
         let path = temp_learned_vocabulary_path();
-        let (seeded, _) = record_learned_correction(&path, "zzmishrd", "zzlearnedterm")?;
-        drop(seeded);
+        for _ in 0..2 {
+            drop(record_learned_correction(
+                &path,
+                "zzmishrd",
+                "zzlearnedterm",
+            )?);
+        }
 
         // First check loads the file; the cache now holds its mtime.
         app.refresh_learned_vocabulary_at(&path);
