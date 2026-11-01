@@ -299,10 +299,12 @@ struct Config {
     /// HF repo id of the qwen rung's model from `BOLO_QWEN_MODEL`,
     /// defaulting to the benchmark model `mlx-community/Qwen3-ASR-0.6B-bf16`.
     qwen_model_id: String,
-    /// Final-refine policy from `BOLO_FINAL_REFINE`: after a healthy
-    /// streaming result, re-run the batch endpoint and prefer its transcript
-    /// when it returns words inside the bounded window. The streaming text
-    /// ships unchanged when refine is off, times out, or returns empty.
+    /// Final-refine policy from `BOLO_FINAL_REFINE` (off by default since the
+    /// AssemblyAI stream outscored the nova-3 refine, 11.1% vs 14.3% median
+    /// WER): after a healthy streaming result, re-run the batch endpoint and
+    /// prefer its transcript when it returns words inside the bounded window.
+    /// The streaming text ships unchanged when refine is off, times out, or
+    /// returns empty.
     final_refine: bool,
     /// Formatting-only cleanup gate from `BOLO_CLEANUP_GATE`: the deferred
     /// LLM cleanup output must carry the exact content tokens of its input
@@ -1327,16 +1329,24 @@ async fn run_stt_stream(
     }
 }
 
-/// Resolve the engine and model for the Telnyx-routed stream. Defaults to
-/// Deepgram nova-3; `BOLO_TELNYX_STREAMING_ENGINE` and
-/// `BOLO_TELNYX_STREAMING_MODEL` select any engine the Telnyx websocket
-/// documents (Deepgram, Soniox, Speechmatics, AssemblyAI, ...). The
-/// AssemblyAI route keeps its own engine and model alias.
+/// Default engine and model for the Telnyx-routed stream: AssemblyAI
+/// Universal-3.6 Pro, the most accurate of 10 Telnyx streaming configs in
+/// the 2026-10-30 bake-off: 11.1% median WER on 134 real dictations and 91%
+/// recall on a 43-clip name set, against 16.7% and 79% for Deepgram
+/// `flux-multi`, the previous default.
+const DEFAULT_STREAMING_ENGINE: &str = "AssemblyAI";
+const DEFAULT_STREAMING_MODEL: &str = "assemblyai/universal-3-6-pro";
+
+/// Resolve the engine and model for the Telnyx-routed stream.
+/// `BOLO_TELNYX_STREAMING_ENGINE` and `BOLO_TELNYX_STREAMING_MODEL` select
+/// any engine the Telnyx websocket documents (Deepgram, Soniox,
+/// Speechmatics, AssemblyAI, ...). The AssemblyAI route keeps its own
+/// engine and model.
 fn telnyx_stream_engine_model(provider: StreamingProvider) -> (String, String) {
-    let engine =
-        load_env_value("BOLO_TELNYX_STREAMING_ENGINE").unwrap_or_else(|| String::from("Deepgram"));
-    let model =
-        load_env_value("BOLO_TELNYX_STREAMING_MODEL").unwrap_or_else(|| String::from("flux-multi"));
+    let engine = load_env_value("BOLO_TELNYX_STREAMING_ENGINE")
+        .unwrap_or_else(|| String::from(DEFAULT_STREAMING_ENGINE));
+    let model = load_env_value("BOLO_TELNYX_STREAMING_MODEL")
+        .unwrap_or_else(|| String::from(DEFAULT_STREAMING_MODEL));
     telnyx_stream_engine_model_with(provider, &engine, &model)
 }
 
@@ -1347,8 +1357,8 @@ fn telnyx_stream_engine_model_with(
 ) -> (String, String) {
     if provider == StreamingProvider::AssemblyAi {
         return (
-            String::from("AssemblyAI"),
-            String::from("assemblyai/universal-3-5-pro"),
+            String::from(DEFAULT_STREAMING_ENGINE),
+            String::from(DEFAULT_STREAMING_MODEL),
         );
     }
     // Canonical engine casing as the Telnyx docs document it; unknown
@@ -6408,7 +6418,7 @@ impl Config {
             local_stt: local_whisper::parse_local_stt_mode(
                 load_env_value("BOLO_LOCAL_STT").as_deref(),
             ),
-            final_refine: load_bool_env("BOLO_FINAL_REFINE", true),
+            final_refine: load_bool_env("BOLO_FINAL_REFINE", false),
             cleanup_gate: load_bool_env("BOLO_CLEANUP_GATE", true),
             final_refine_model: load_env_value("BOLO_FINAL_REFINE_MODEL")
                 .unwrap_or_else(|| String::from("deepgram/nova-3")),
@@ -12324,9 +12334,10 @@ fn load_streaming_provider() -> Option<StreamingProvider> {
 }
 
 fn streaming_provider_from_config(value: Option<&str>) -> Option<StreamingProvider> {
-    // Streaming no longer keys off the batch model: the 2026-10-17 default
-    // moved the batch primary to whisper-large-v3-turbo while the live
-    // preview stays Deepgram flux. Explicit `off` still disables it.
+    // Streaming no longer keys off the batch model. The default is the
+    // Telnyx websocket route, whose engine comes from
+    // `telnyx_stream_engine_model` (AssemblyAI by default). Explicit `off`
+    // still disables it.
     let default = "deepgram";
     match value
         .unwrap_or(default)
@@ -16576,7 +16587,7 @@ mod tests {
         assert!(deepgram.contains("keyterm=Telnyx,Claude%20Code"));
 
         let assembly = telnyx_stream_query(StreamingProvider::AssemblyAi, "auto", &vocabulary);
-        assert!(assembly.contains("model=assemblyai%2Funiversal-3-5-pro"));
+        assert!(assembly.contains("model=assemblyai%2Funiversal-3-6-pro"));
         assert!(assembly.contains("input_format=linear16"));
         assert!(!assembly.contains("keyterm="));
         assert!(!assembly.contains("interim_results=true"));
@@ -16614,8 +16625,16 @@ mod tests {
             ),
             (
                 String::from("AssemblyAI"),
-                String::from("assemblyai/universal-3-5-pro")
+                String::from("assemblyai/universal-3-6-pro")
             )
+        );
+        // Unset env falls back to the bake-off winner.
+        assert_eq!(
+            (
+                super::DEFAULT_STREAMING_ENGINE,
+                super::DEFAULT_STREAMING_MODEL
+            ),
+            ("AssemblyAI", "assemblyai/universal-3-6-pro")
         );
     }
 
@@ -16637,7 +16656,7 @@ mod tests {
         // Engines without interim results never stream partials.
         let assembly_routed = telnyx_stream_query_with(
             "AssemblyAI",
-            "assemblyai/universal-3-5-pro",
+            "assemblyai/universal-3-6-pro",
             "en-IN",
             &vocabulary,
         );

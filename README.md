@@ -257,7 +257,7 @@ Supported fallback entries:
 
 When neither `BOLO_STT_FALLBACKS` nor `BOLO_STT_FALLBACK_MODEL` is set, the default chain is `telnyx:openai/whisper-large-v3-turbo`. Set `BOLO_STT_FALLBACKS=off` to fail fast instead of retrying when the primary model is rate limited. `BOLO_STT_FALLBACK_MODEL` still works for a single fallback model of the same shape.
 
-Streaming starts sending audio while you speak and falls back to batch transcription when a complete result is not ready quickly enough after release. Streaming defaults to Deepgram regardless of which batch model you pick; the live preview and the final transcript are deliberately decoupled (the 2026-10-17 measurement scored Deepgram flux streaming at 16.7% median WER and batch whisper-large-v3-turbo at 11.3% on 134 real dictations, so the stream stays the live preview while batch decides the final transcript).
+Streaming starts sending audio while you speak and falls back to batch transcription when a complete result is not ready quickly enough after release. Streaming defaults to AssemblyAI Universal-3.6 Pro through the Telnyx websocket, regardless of which batch model you pick, and its final transcript is what gets pasted. In the 2026-10-30 bake-off of 10 Telnyx streaming configs, it scored 11.1% median WER on 134 real dictations (Deepgram `flux-multi`, the previous default: 16.7%) and caught 91% of names on a separate 43-clip name set with no vocabulary (`flux-multi`: 79%).
 
 Set `BOLO_STT_STREAMING` to pick a provider explicitly:
 
@@ -267,33 +267,25 @@ export BOLO_STT_STREAMING="telnyx"
 
 Supported values (all Telnyx-routed, all requiring `TELNYX_API_KEY`):
 
-- `telnyx` (also `deepgram`, `nova-3`, or `nova3`): Deepgram Nova-3 streaming through the Telnyx websocket.
-- `assemblyai-telnyx` (also `assembly-telnyx`): AssemblyAI Universal-3.5 streaming routed through Telnyx, pinned to `assemblyai/universal-3-5-pro`.
+- `telnyx` (also `deepgram`, `nova-3`, or `nova3`): the Telnyx websocket, with the engine and model below.
+- `assemblyai-telnyx` (also `assembly-telnyx`): AssemblyAI streaming routed through Telnyx, pinned to `assemblyai/universal-3-6-pro`.
 - `off`: always use batch transcription.
 
-Inside the Telnyx websocket, `BOLO_TELNYX_STREAMING_ENGINE` and `BOLO_TELNYX_STREAMING_MODEL` select the engine and model (defaults: `Deepgram` and `flux-multi`, the lowest-latency Deepgram family, with Hindi code-switching and vocabulary as keyterms):
+Inside the Telnyx websocket, `BOLO_TELNYX_STREAMING_ENGINE` and `BOLO_TELNYX_STREAMING_MODEL` select the engine and model (defaults: `AssemblyAI` and `assemblyai/universal-3-6-pro`). To go back to Deepgram `flux-multi`, which code-switches into Hindi and takes your vocabulary as keyterms:
 
 ```bash
-export BOLO_TELNYX_STREAMING_ENGINE="Speechmatics"
-export BOLO_TELNYX_STREAMING_MODEL="streaming-exp"
-```
-
-To stream through AssemblyAI Universal-3.6 Pro (the most accurate engine in the 2026-10-30 bake-off of 10 Telnyx streaming configs on 134 real dictations: 11.1% median WER, against 16.7% for `flux-multi`):
-
-```bash
-export BOLO_TELNYX_STREAMING_ENGINE="AssemblyAI"
-export BOLO_TELNYX_STREAMING_MODEL="assemblyai/universal-3-6-pro"
-export BOLO_FINAL_REFINE="off"
+export BOLO_TELNYX_STREAMING_ENGINE="Deepgram"
+export BOLO_TELNYX_STREAMING_MODEL="flux-multi"
 ```
 
 Bolo streams 16 kHz `linear16` to every engine, resampling the microphone capture: the Telnyx-routed AssemblyAI engine rejects 48 kHz with error 40005 and closes the socket. AssemblyAI through Telnyx does not take vocabulary keyterms; only Deepgram nova-3 and flux do.
 
 The documented engines are Deepgram, Telnyx, Google, Azure, xAI, AssemblyAI, Speechmatics, Soniox, Parakeet, Cohere, Reson8, and Humain; unknown values pass through verbatim so new engines work without a code change. Live partial transcripts (interim results) come only from Deepgram, Speechmatics, and Soniox; the other engines return a single final transcript when you release. The `assemblyai-telnyx` provider ignores these two selectors and pins AssemblyAI's own engine and model.
 
-After a healthy streaming result, Bolo re-runs the batch model over the same audio inside a bounded window and inserts its transcript when it answers with words (`BOLO_FINAL_REFINE`, on by default). The streaming text ships unchanged when refine is disabled, times out after two seconds, or returns empty. Set `BOLO_FINAL_REFINE=off` to insert the streaming text directly without waiting on the round trip (the batch call then only backs up a stream that looks broken, such as two words for a ten-second recording):
+Final refine is off by default: Bolo pastes the stream's final transcript as soon as it arrives, and the batch call only backs up a stream that looks broken, such as two words for a ten-second recording. With `BOLO_FINAL_REFINE=on`, Bolo re-runs the batch model over the same audio inside a two-second window after every healthy stream and inserts the batch transcript when it answers with words. That suits a weaker stream such as `flux-multi`; with AssemblyAI it only adds wait time, because the refine model scored worse than the stream (14.3% vs 11.1% median WER):
 
 ```bash
-export BOLO_FINAL_REFINE="off"
+export BOLO_FINAL_REFINE="on"
 ```
 
 The refine model is `deepgram/nova-3` by default (`BOLO_FINAL_REFINE_MODEL`): it must answer inside the paste budget, and the 2026-10-17 live run measured `whisper-large-v3-turbo` above 2 seconds wall on the production connection, which exhausts the window and falls back to the stream anyway. The batch primary (`BOLO_STT_MODEL`, default `openai/whisper-large-v3-turbo`) stays the no-streaming path, where no window applies.
