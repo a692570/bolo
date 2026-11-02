@@ -146,11 +146,45 @@ fi
 [ -x "$AARCH64_BIN" ] || fail "aarch64 binary missing after build"
 
 log "building the Rust runtime for x86_64-apple-darwin"
+# webrtc-audio-processing-sys (bundled) runs a native meson build that ignores
+# the cargo target, so on an arm64 host its C++ came out arm64 and the x86_64
+# link failed. A meson wrapper on PATH adds an x86_64 cross file to `setup`.
+X86_PATH="$PATH"
+if [ "$(uname -m)" = "arm64" ]; then
+    MESON_X86="$BUILD/meson-x86_64"
+    REAL_MESON="$(command -v meson)" || fail "meson not found (brew install meson ninja)"
+    mkdir -p "$MESON_X86"
+    cat > "$MESON_X86/x86_64-darwin.ini" <<'INI'
+[binaries]
+c = ['clang', '-arch', 'x86_64']
+cpp = ['clang++', '-arch', 'x86_64']
+objc = ['clang', '-arch', 'x86_64']
+objcpp = ['clang++', '-arch', 'x86_64']
+ar = 'ar'
+strip = 'strip'
+pkg-config = 'false'
+
+[host_machine]
+system = 'darwin'
+subsystem = 'macos'
+kernel = 'xnu'
+cpu_family = 'x86_64'
+cpu = 'x86_64'
+endian = 'little'
+INI
+    cat > "$MESON_X86/meson" <<SH
+#!/bin/bash
+if [ "\$1" = "setup" ]; then exec "$REAL_MESON" setup --cross-file "$MESON_X86/x86_64-darwin.ini" "\${@:2}"; fi
+exec "$REAL_MESON" "\$@"
+SH
+    chmod +x "$MESON_X86/meson"
+    X86_PATH="$MESON_X86:$PATH"
+fi
 if [ -n "$X86_CARGO" ]; then
-    RUSTUP_HOME="$RUSTUP_HOME" CARGO_HOME="$CARGO_HOME_X86" "$X86_CARGO" build \
+    PATH="$X86_PATH" RUSTUP_HOME="$RUSTUP_HOME" CARGO_HOME="$CARGO_HOME_X86" "$X86_CARGO" build \
         --release --target x86_64-apple-darwin || fail "x86_64 Rust build failed"
 else
-    cargo build --release --target x86_64-apple-darwin || fail "x86_64 Rust build failed"
+    PATH="$X86_PATH" cargo build --release --target x86_64-apple-darwin || fail "x86_64 Rust build failed"
 fi
 X86_64_BIN="$ROOT/target/x86_64-apple-darwin/release/bolo"
 [ -x "$X86_64_BIN" ] || fail "x86_64 binary missing after build"
