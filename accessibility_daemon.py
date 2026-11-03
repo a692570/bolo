@@ -15,6 +15,10 @@ exactly one response line per request:
 * ``{"type":"trust_check"}`` -> ``{"type":"trust","trusted":<bool>}``
   (``"prompt": true`` also opens the System Settings pane when untrusted)
 * ``{"type":"paste","text":...}`` -> ``{"type":"paste_done","ok":<bool>}``
+* ``{"type":"type","text":...}`` -> ``{"type":"type_done","ok":<bool>}``,
+  sent once every keystroke is posted. ``ok`` False means nothing was typed
+  (the events failed to build), and the runtime falls back to the
+  manual-copy popup.
 * ``{"type":"select_before_caret","text":...}``
   -> ``{"type":"select_done","selected":<bool>}``
 * ``{"type":"read_context"}`` -> ``{"type":"context","app":...,
@@ -191,6 +195,15 @@ def _finalize_paste_off_loop(generation, state):
     print(f"[daemon] paste restore {outcome}", file=sys.stderr, flush=True)
 
 
+def handle_type(request):
+    text = request.get("text")
+    if not isinstance(text, str):
+        return {"type": "type_done", "ok": False}
+    # Typing never touches the pasteboard, so it cannot race a pending paste
+    # restore and needs no PASTE_RESTORE sequencing.
+    return {"type": "type_done", "ok": bool(insert_text.type_text(text))}
+
+
 def handle_select_before_caret(request):
     target = request.get("text")
     if not isinstance(target, str):
@@ -243,6 +256,7 @@ HANDLERS = {
     "ping": handle_ping,
     "trust_check": handle_trust_check,
     "paste": handle_paste,
+    "type": handle_type,
     "select_before_caret": handle_select_before_caret,
     "read_context": handle_read_context,
 }

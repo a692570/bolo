@@ -424,3 +424,46 @@ def test_select_before_caret_refuses_a_target_that_is_not_there(daemon):
     reply = daemon.request({"type": "select_before_caret", "text": "zz-not-present-zz"})
     assert reply["type"] == "select_done"
     assert reply["selected"] is False
+
+
+# ---------------------------------------------------------------------------
+# Direct typing over the daemon protocol. In-process tests stub type_text,
+# so no keystroke is posted into the focused app.
+
+
+def test_type_request_replies_with_the_typing_outcome(monkeypatch):
+    daemon_module, insert_module = _in_process_daemon()
+    typed = []
+
+    def fake_type_text(text):
+        typed.append(text)
+        return text != "refuse"
+
+    monkeypatch.setattr(insert_module, "type_text", fake_type_text)
+    assert daemon_module.HANDLERS["type"] is daemon_module.handle_type
+    assert daemon_module.handle_type({"type": "type", "text": "hi\nthere"}) == {
+        "type": "type_done",
+        "ok": True,
+    }
+    assert daemon_module.handle_type({"type": "type", "text": "refuse"}) == {
+        "type": "type_done",
+        "ok": False,
+    }
+    assert typed == ["hi\nthere", "refuse"]
+
+
+def test_non_string_type_payload_is_refused_without_typing(monkeypatch):
+    daemon_module, insert_module = _in_process_daemon()
+    monkeypatch.setattr(
+        insert_module, "type_text", lambda _text: pytest.fail("must not type")
+    )
+    assert daemon_module.handle_type({"type": "type", "text": 7}) == {
+        "type": "type_done",
+        "ok": False,
+    }
+
+
+def test_empty_type_is_a_successful_no_op(daemon):
+    # The real daemon process: an empty payload posts no event at all.
+    reply = daemon.request({"type": "type", "text": ""})
+    assert reply == {"type": "type_done", "ok": True}

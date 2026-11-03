@@ -230,6 +230,14 @@ export BOLO_REPAIR_MODEL="Qwen3.8-27B-nothink"  # model for the repair call (def
 
 When Bolo cannot find an editable paste target (no text field is focused, or the paste fails), it skips the blind paste, copies the transcript to the clipboard, and shows a popup with the transcript instead: edit it right there if you like, click **Copy** to take the edited version, or **Dismiss**. Edits made inside the popup are learned exactly like paste edits, so a correction you make in the popup follows every future dictation.
 
+Some targets ignore a synthetic Cmd+V: remote desktop and VM windows, and some terminals. To type the transcript as keystrokes instead of pasting it, set:
+
+```bash
+export BOLO_PASTE_METHOD="type"
+```
+
+Typing leaves the clipboard alone, sends line breaks as Shift+Return (a new line in chat apps instead of sending the message), and builds every keystroke before posting the first, so a failure shows the popup with the full transcript rather than leaving half of it typed. Without the setting, Bolo still pastes, and tries typing once when the paste itself fails before falling back to the popup. Name repair after paste is skipped for typed text, because its swap relies on Cmd+V.
+
 
 The default model is `openai/whisper-large-v3-turbo`, transcribed through the Telnyx STT API. Bolo sends your vocabulary terms along as a free-text prompt with an echo filter, and whisper models decode language automatically per segment so code-switched dictation keeps working. The verbatim transcript then goes through Bolo's local pass (filler removal, vocabulary and replacements) plus the optional LLM cleanup below. The separate LLM cleanup pass always runs on the verbatim transcript when enabled. A deterministic formatter then polishes casing and punctuation spacing (capitalize sentence starts and standalone "i", tighten punctuation spacing) without changing any word, so final-transcript formatting stays at streaming quality regardless of which engine produced the words.
 

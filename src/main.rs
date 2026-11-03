@@ -1928,6 +1928,7 @@ fn main() -> Result<(), AppError> {
     start_accessibility_daemon(&app.config.root_dir);
     check_accessibility_at_startup(&app.config.root_dir);
     quiet_audio::start(load_bool_env("BOLO_QUIET_AUDIO", false));
+    let _insert_method = insert_method();
     spawn_release_check(Arc::clone(&app));
     let daemon_root_dir = app.config.root_dir.clone();
     match std::thread::Builder::new()
@@ -3399,9 +3400,16 @@ impl App {
                     manual_copy_outcome = Some(reason);
                     self.manual_copy_fallback(&stt.text, &prepared.text, reason, ax_confirmed)?;
                 }
-                None => match paste_text(&self.config.root_dir, &prepared.text) {
-                    Ok(()) => {
+                None => match insert_into_focused_app(&self.config.root_dir, &prepared.text) {
+                    Ok(inserted_by) => {
                         self.remember_result(&stt.text, &prepared.text, Some(&prepared))?;
+                        // Name repair swaps text with select-then-Cmd+V,
+                        // the very mechanism a typed insert routed around,
+                        // so typed text is left as typed.
+                        let run_repair = inserted_by == InsertedBy::Paste;
+                        if !run_repair {
+                            info!("[repair] skipped reason=typed_insert");
+                        }
                         #[cfg(not(test))]
                         {
                             // Context-aware name repair runs after paste so
@@ -3410,9 +3418,12 @@ impl App {
                             let app = Arc::clone(self);
                             let repair_text = prepared.text.clone();
                             let repair_context = warmup_context.clone();
-                            if let Err(error) = std::thread::Builder::new()
-                                .name(String::from("bolo-entity-repair"))
-                                .spawn(move || app.run_entity_repair(&repair_text, repair_context))
+                            if run_repair
+                                && let Err(error) = std::thread::Builder::new()
+                                    .name(String::from("bolo-entity-repair"))
+                                    .spawn(move || {
+                                        app.run_entity_repair(&repair_text, repair_context);
+                                    })
                             {
                                 warn!("[repair] thread failed to start: {error}");
                             }
@@ -3434,11 +3445,11 @@ impl App {
                         }
                     }
                     Err(error) => {
-                        // paste_text exhausted the insert mechanics
+                        // The insert ladder exhausted its mechanics
                         // (untrusted accessibility, dead helper, refused
-                        // pasteboard). The transcript must not die with it:
-                        // route to the same popup instead of only showing
-                        // paste_text's failure notification.
+                        // pasteboard, failed typing). The transcript must
+                        // not die with it: route to the same popup instead
+                        // of only showing the failure notification.
                         warn!("[insert] paste failed: {error}; routing to manual copy");
                         manual_copy_outcome = Some("paste_failed");
                         self.manual_copy_fallback(
@@ -14160,6 +14171,7 @@ enum AccessDaemonRequest {
     Ping,
     TrustCheck { prompt: bool },
     Paste { text: String },
+    Type { text: String },
     SelectBeforeCaret { text: String },
     ReadContext,
 }
@@ -14170,6 +14182,7 @@ impl AccessDaemonRequest {
             Self::Ping => "ping",
             Self::TrustCheck { .. } => "trust_check",
             Self::Paste { .. } => "paste",
+            Self::Type { .. } => "type",
             Self::SelectBeforeCaret { .. } => "select_before_caret",
             Self::ReadContext => "read_context",
         }
@@ -14184,6 +14197,7 @@ impl AccessDaemonRequest {
                 serde_json::json!({"type": "trust_check", "prompt": prompt}).to_string()
             }
             Self::Paste { text } => serde_json::json!({"type": "paste", "text": text}).to_string(),
+            Self::Type { text } => serde_json::json!({"type": "type", "text": text}).to_string(),
             Self::SelectBeforeCaret { text } => {
                 serde_json::json!({"type": "select_before_caret", "text": text}).to_string()
             }
@@ -14191,11 +14205,17 @@ impl AccessDaemonRequest {
         }
     }
 
-    const fn timeout(&self) -> Duration {
+    fn timeout(&self) -> Duration {
         match self {
             Self::Ping => ACCESS_DAEMON_STARTUP_TIMEOUT,
             Self::TrustCheck { .. } | Self::ReadContext => ACCESS_DAEMON_QUERY_TIMEOUT,
             Self::Paste { .. } | Self::SelectBeforeCaret { .. } => ACCESS_DAEMON_ACTION_TIMEOUT,
+            // The typing reply comes after the last keystroke, so the budget
+            // grows with the text: one event pair per 20 UTF-16 units, with a
+            // 4ms pause each, stays well inside a millisecond per byte.
+            Self::Type { text } => ACCESS_DAEMON_ACTION_TIMEOUT.saturating_add(
+                Duration::from_millis(u64::try_from(text.len()).unwrap_or(u64::MAX)),
+            ),
         }
     }
 }
@@ -14494,6 +14514,14 @@ fn parse_daemon_paste_reply(reply: &serde_json::Value) -> Option<bool> {
     reply.get("ok").and_then(serde_json::Value::as_bool)
 }
 
+/// `{"type":"type_done","ok":<bool>}` from the daemon.
+fn parse_daemon_type_reply(reply: &serde_json::Value) -> Option<bool> {
+    if reply.get("type").and_then(serde_json::Value::as_str) != Some("type_done") {
+        return None;
+    }
+    reply.get("ok").and_then(serde_json::Value::as_bool)
+}
+
 /// `{"type":"select_done","selected":<bool>}` from the daemon.
 fn parse_daemon_select_reply(reply: &serde_json::Value) -> Option<bool> {
     if reply.get("type").and_then(serde_json::Value::as_str) != Some("select_done") {
@@ -14568,7 +14596,131 @@ fn finalize_accessibility_context(
     }
 }
 
-fn paste_text(root_dir: &Path, text: &str) -> Result<(), AppError> {
+/// How a transcript reaches the focused app, from `BOLO_PASTE_METHOD`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InsertMethod {
+    /// Clipboard plus Cmd+V (the default).
+    Paste,
+    /// Synthetic Unicode keystrokes (`BOLO_PASTE_METHOD=type`), for remote
+    /// desktops, VMs and terminals that ignore a synthetic Cmd+V.
+    Type,
+}
+
+impl InsertMethod {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Paste => "paste",
+            Self::Type => "type",
+        }
+    }
+}
+
+/// `type` selects direct typing; anything else, including unset, keeps the
+/// Cmd+V paste so a typo never changes how normal apps receive text.
+fn parse_insert_method(value: Option<&str>) -> InsertMethod {
+    match value
+        .map(|value| value.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("type") => InsertMethod::Type,
+        _ => InsertMethod::Paste,
+    }
+}
+
+static INSERT_METHOD: OnceLock<InsertMethod> = OnceLock::new();
+
+/// The configured insert method, read once (startup warms it) so the paste
+/// path never pays for an env-file read.
+fn insert_method() -> InsertMethod {
+    *INSERT_METHOD.get_or_init(|| {
+        let configured = load_env_value("BOLO_PASTE_METHOD");
+        let method = parse_insert_method(configured.as_deref());
+        info!(
+            "[insert] method {}",
+            serde_json::json!({"method": method.label(), "configured": configured})
+        );
+        method
+    })
+}
+
+/// Which mechanism put a transcript into the focused app.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InsertedBy {
+    Paste,
+    Typing,
+}
+
+/// Whether a failed paste may fall through to direct typing. Typing posts
+/// the same synthetic events Cmd+V needs, so a helper macOS does not trust
+/// cannot type either; every other paste failure (refused pasteboard, dead
+/// helper, failed osascript) leaves typing worth one try.
+const fn typing_rung_allowed(paste_error: &AppError) -> bool {
+    !matches!(paste_error, AppError::AccessibilityNotGranted)
+}
+
+/// The live insert ladder: Cmd+V paste by default, or direct typing when
+/// `BOLO_PASTE_METHOD=type`. A paste whose mechanics fail gets one typing
+/// attempt before the caller's manual-copy popup. A Cmd+V the target
+/// silently ignores still reports success here: nothing observable fails,
+/// which is why the explicit `type` mode exists.
+fn insert_into_focused_app(root_dir: &Path, text: &str) -> Result<InsertedBy, AppError> {
+    match insert_method() {
+        InsertMethod::Type => {
+            ensure_insert_trust(root_dir)?;
+            type_text(text)?;
+            Ok(InsertedBy::Typing)
+        }
+        InsertMethod::Paste => match paste_text(root_dir, text) {
+            Ok(()) => Ok(InsertedBy::Paste),
+            Err(error) if typing_rung_allowed(&error) => {
+                warn!("[insert] paste failed: {error}; trying direct typing");
+                match type_text(text) {
+                    Ok(()) => Ok(InsertedBy::Typing),
+                    Err(type_error) => {
+                        warn!("[insert] direct typing failed: {type_error}");
+                        Err(error)
+                    }
+                }
+            }
+            Err(error) => Err(error),
+        },
+    }
+}
+
+/// Type `text` into the focused app through the accessibility daemon.
+/// There is no per-call spawn fallback: the daemon builds and checks every
+/// event before posting the first, but a fresh process retrying after a
+/// timed-out attempt could type the start of the text twice. A failure
+/// here sends the full transcript to the manual-copy popup instead.
+fn type_text(text: &str) -> Result<(), AppError> {
+    let reply = request_accessibility_daemon(&AccessDaemonRequest::Type {
+        text: text.to_owned(),
+    })
+    .ok_or_else(|| {
+        AppError::Io(std::io::Error::other(
+            "accessibility daemon unavailable for typing",
+        ))
+    })?;
+    match parse_daemon_type_reply(&reply) {
+        Some(true) => {
+            info!(
+                "typed {} chars via accessibility daemon",
+                text.chars().count()
+            );
+            Ok(())
+        }
+        Some(false) => Err(AppError::Io(std::io::Error::other(
+            "typing helper could not build the keystrokes",
+        ))),
+        None => Err(AppError::Io(std::io::Error::other(
+            "typing helper sent an unexpected reply",
+        ))),
+    }
+}
+
+/// Fail fast, with the fix-it notification, when the helper that posts
+/// keystrokes is not trusted for Accessibility.
+fn ensure_insert_trust(root_dir: &Path) -> Result<(), AppError> {
     match accessibility_trust(root_dir, false) {
         AccessibilityTrust::Trusted => {}
         AccessibilityTrust::Untrusted => {
@@ -14593,6 +14745,11 @@ fn paste_text(root_dir: &Path, text: &str) -> Result<(), AppError> {
             return Err(AppError::AccessibilityNotGranted);
         }
     }
+    Ok(())
+}
+
+fn paste_text(root_dir: &Path, text: &str) -> Result<(), AppError> {
+    ensure_insert_trust(root_dir)?;
     if let Some(reply) = request_accessibility_daemon(&AccessDaemonRequest::Paste {
         text: text.to_owned(),
     }) && let Some(ok) = parse_daemon_paste_reply(&reply)
@@ -15100,7 +15257,7 @@ mod tests {
         BatchRetry, CLEANUP_PROMPT_CAP_CHARS, CleanupMode, CleanupProfile, CleanupPromptCache,
         CleanupPromptEntry, CleanupPromptFile, Config, CorrectionOutcome, DashboardAction,
         DashboardRequestLine, DictationCommandKind, DictationWarmup, EMPTY_RETRY_MIN_DURATION_MS,
-        EchoVerdict, EditLearningClaim, KeyEntrySpec, LEARNING_UNREADABLE_LINE,
+        EchoVerdict, EditLearningClaim, InsertMethod, KeyEntrySpec, LEARNING_UNREADABLE_LINE,
         LEARNING_WINDOW_ROWS, LaunchRequestAction, LearnedPair, LearnedVocabulary, LocalSttMode,
         LocalWhisperHandle, LockMeta, MicrophoneDescriptor, MicrophoneSelection,
         ONBOARDING_MARKER_VERSION, OnboardingStatus, PreparedText, PromptBinding,
@@ -15128,12 +15285,12 @@ mod tests {
         offline_preview_enabled, onboarding_status_at, override_or_builtin_prompt_from,
         parse_accessibility_trust, parse_command, parse_daemon_context_reply,
         parse_daemon_paste_reply, parse_daemon_select_reply, parse_daemon_trust_reply,
-        parse_latest_release, parse_popup_copy_text, parse_release_version,
-        parse_replacements_json, parse_stt_fallbacks, parse_u64_env_value, parse_update_outcome,
-        paste_intact_in_context, preview_text_is_new, preview_trailing_window,
-        preview_trailing_window_samples, prompts_window_payload_at, read_vocabulary_file,
-        read_vocabulary_usage_file, record_learned_correction, reload_is_busy,
-        remove_bolo_env_value_at, remove_fillers, request_accessibility_daemon,
+        parse_daemon_type_reply, parse_insert_method, parse_latest_release, parse_popup_copy_text,
+        parse_release_version, parse_replacements_json, parse_stt_fallbacks, parse_u64_env_value,
+        parse_update_outcome, paste_intact_in_context, preview_text_is_new,
+        preview_trailing_window, preview_trailing_window_samples, prompts_window_payload_at,
+        read_vocabulary_file, read_vocabulary_usage_file, record_learned_correction,
+        reload_is_busy, remove_bolo_env_value_at, remove_fillers, request_accessibility_daemon,
         resolve_microphone_selection, retry_failed_primary, sanitize_transcript_history,
         save_usage_counters_at, set_streaming_connection, set_streaming_error,
         should_exit_for_key_reload, speech_stats, stable_streaming_best_is_ready_elapsed,
@@ -15141,7 +15298,7 @@ mod tests {
         streaming_provider_from_config, streaming_status_label, strip_reasoning_tags,
         strip_vocabulary_echo, stt_language_for_model, stt_model_config,
         telnyx_stream_engine_model_with, telnyx_stream_query, telnyx_stream_query_with,
-        transcript_log_value, transcript_menu_preview, typed_dashboard_action,
+        transcript_log_value, transcript_menu_preview, typed_dashboard_action, typing_rung_allowed,
         upsert_learned_correction, upsert_replacement, verbatim_word_mismatch, version_is_newer,
         wait_for_daemon_reply, wav_bytes, write_bolo_env_value_at, write_learned_vocabulary_file,
     };
@@ -15881,6 +16038,78 @@ mod tests {
         // No test starts the daemon, so the process-wide slot is empty and
         // every request reports the per-call spawn fallback.
         assert!(request_accessibility_daemon(&AccessDaemonRequest::ReadContext).is_none());
+    }
+
+    #[test]
+    fn paste_method_type_selects_typing_and_everything_else_keeps_paste() {
+        assert_eq!(parse_insert_method(Some("type")), InsertMethod::Type);
+        assert_eq!(parse_insert_method(Some(" TYPE ")), InsertMethod::Type);
+        assert_eq!(parse_insert_method(None), InsertMethod::Paste);
+        assert_eq!(parse_insert_method(Some("paste")), InsertMethod::Paste);
+        // A typo must never change how normal apps receive text.
+        assert_eq!(parse_insert_method(Some("typing")), InsertMethod::Paste);
+        assert_eq!(parse_insert_method(Some("")), InsertMethod::Paste);
+    }
+
+    #[test]
+    fn a_failed_paste_falls_through_to_typing_unless_accessibility_is_missing() {
+        assert!(!typing_rung_allowed(&AppError::AccessibilityNotGranted));
+        assert!(typing_rung_allowed(&AppError::Clipboard(String::from(
+            "pasteboard refused"
+        ))));
+        assert!(typing_rung_allowed(&AppError::Io(std::io::Error::other(
+            "osascript failed"
+        ))));
+    }
+
+    #[test]
+    fn type_request_is_one_line_and_its_budget_grows_with_the_text() {
+        let text = "line one\nline two \u{1F600}";
+        let line = AccessDaemonRequest::Type {
+            text: String::from(text),
+        }
+        .line();
+        assert!(!line.contains('\n'));
+        let request: serde_json::Value = serde_json::from_str(&line).unwrap_or_default();
+        assert_eq!(request["type"], "type");
+        assert_eq!(request["text"], text);
+        assert_eq!(
+            AccessDaemonRequest::Type {
+                text: String::new()
+            }
+            .timeout(),
+            ACCESS_DAEMON_ACTION_TIMEOUT
+        );
+        assert_eq!(
+            AccessDaemonRequest::Type {
+                text: "a".repeat(5_000)
+            }
+            .timeout(),
+            ACCESS_DAEMON_ACTION_TIMEOUT + std::time::Duration::from_secs(5)
+        );
+    }
+
+    #[test]
+    fn type_reply_parses_or_signals_failure() {
+        assert_eq!(
+            parse_daemon_type_reply(&serde_json::json!({"type": "type_done", "ok": true})),
+            Some(true)
+        );
+        assert_eq!(
+            parse_daemon_type_reply(&serde_json::json!({"type": "type_done", "ok": false})),
+            Some(false)
+        );
+        // A daemon predating the type handler answers with an error line.
+        assert_eq!(
+            parse_daemon_type_reply(
+                &serde_json::json!({"type": "error", "message": "unknown request type: 'type'"})
+            ),
+            None
+        );
+        assert_eq!(
+            parse_daemon_type_reply(&serde_json::json!({"type": "paste_done", "ok": true})),
+            None
+        );
     }
 
     #[test]
