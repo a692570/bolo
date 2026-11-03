@@ -191,6 +191,43 @@ def parent_is_alive():
     return True
 
 
+def raise_scheduling_priority():
+    """Keep the key poll responsive when the machine is busy.
+
+    The helper polls the keyboard every POLL_INTERVAL and needs
+    RECHECK_REQUIRED_SAMPLES matching samples, so a late wake-up delays every
+    press. Measured 2026-11-03 under a load average above 20: press-to-app
+    went from a median of 86 ms to 206 ms (max 424 ms). Asking macOS for the
+    user-interactive QoS class and opting out of App Nap keeps the poll on
+    time. Best effort: a failure leaves the default scheduling.
+    """
+    try:
+        import ctypes
+
+        libsystem = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+        qos_class_user_interactive = 0x21
+        rc = libsystem.pthread_set_qos_class_self_np(qos_class_user_interactive, 0)
+        if rc != 0:
+            print(f"[hotkey] qos raise failed rc={rc}", file=sys.stderr, flush=True)
+    except Exception as error:
+        print(f"[hotkey] qos raise unavailable: {error}", file=sys.stderr, flush=True)
+    try:
+        from Foundation import NSProcessInfo
+
+        # NSActivityUserInitiatedAllowingIdleSystemSleep: UserInitiated minus
+        # IdleSystemSleepDisabled, so it stops App Nap without blocking sleep.
+        options = 0x00FFFFFF & ~(1 << 20)
+        global _activity_token
+        _activity_token = NSProcessInfo.processInfo().beginActivityWithOptions_reason_(
+            options, "Bolo hotkey polling"
+        )
+    except Exception as error:
+        print(f"[hotkey] activity opt-out unavailable: {error}", file=sys.stderr, flush=True)
+
+
+_activity_token = None
+raise_scheduling_priority()
+
 app = NSApplication.sharedApplication()
 app.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
 app.finishLaunching()
