@@ -70,6 +70,11 @@ const SPEECH_FRAME_MS: usize = 20;
 /// Minimum drain after release: the audio callback hands over whole buffers, so
 /// tearing the stream down immediately throws away whatever is already in flight.
 const AUDIO_RELEASE_DRAIN: Duration = Duration::from_millis(120);
+/// Floor for the adaptive drain (`BOLO_ADAPTIVE_DRAIN=on`): the drain never
+/// returns sooner than this, even when a buffer lands right after release.
+const ADAPTIVE_DRAIN_FLOOR: Duration = Duration::from_millis(20);
+/// How often the adaptive drain checks for a newly delivered buffer.
+const ADAPTIVE_DRAIN_POLL: Duration = Duration::from_millis(5);
 /// How long the tail must stay quiet before trailing capture stops.
 const TRAILING_QUIET_TO_STOP: Duration = Duration::from_millis(250);
 /// Hard ceiling on trailing capture. A room that never goes quiet must not hold
@@ -1674,6 +1679,17 @@ fn load_usage_counters_at(path: &Path) -> UsageCounters {
     }
 }
 
+/// Write the usage counters to disk, logging a failure. Skipped in tests so
+/// they never touch the real `~/.bolo/usage.json`.
+fn persist_usage_counters(counters: UsageCounters) {
+    #[cfg(not(test))]
+    if let Err(error) = save_usage_counters(counters) {
+        warn!("usage counter save failed: {error}");
+    }
+    #[cfg(test)]
+    let _ = counters;
+}
+
 fn usage_counters_path() -> PathBuf {
     home_path(".bolo/usage.json")
 }
@@ -3081,6 +3097,7 @@ impl App {
             "[pipeline] trailing_capture {}",
             serde_json::json!({
                 "stop_reason": trailing.stop_reason,
+                "drain_ms": trailing.drain.as_millis(),
                 "extra_ms": trailing.extra.as_millis(),
                 "release_rms": trailing.release_rms,
                 "threshold_rms": trailing.threshold_rms,
@@ -3357,7 +3374,7 @@ impl App {
             // HistoryChanged, so a live dashboard refresh cannot land between
             // the history update and the usage update and render one stale
             // block. Only reached after the insert succeeded.
-            self.record_successful_dictation(
+            let usage_after_dictation = self.record_successful_dictation(
                 &stt.text,
                 elapsed.as_millis().try_into().unwrap_or(u64::MAX),
             );
@@ -3434,10 +3451,15 @@ impl App {
                     }
                 },
             }
-            // The usage counters were recorded above, before
+            // The usage counters were recorded in memory above, before
             // remember_result fired HistoryChanged, so the first live
             // dashboard refresh after this dictation sees the usage block
-            // already updated. Deferred cleanup never adds to the counters.
+            // already updated. Only the disk write waits until here: the file
+            // write sat on the release-to-paste path for no reason, and the
+            // save writes the whole cumulative struct, so a later dictation
+            // repairs a skipped save. Deferred cleanup never adds to the
+            // counters.
+            persist_usage_counters(usage_after_dictation);
             if let Some(cleanup_input) = prepared.cleanup_input {
                 self.start_deferred_cleanup(cleanup_input, pasted_text, &recording.warmup)?;
             }
@@ -5594,20 +5616,14 @@ impl App {
     /// exactly once per completed dictation pipeline, on the pipeline thread
     /// after the insert, never from the audio frame callback and never from
     /// the history refresh or deferred-cleanup paths.
-    fn record_successful_dictation(&self, stt_text: &str, recording_ms: u64) {
-        let updated = {
-            let Ok(mut usage) = self.usage.lock() else {
-                return;
-            };
-            *usage = usage.record_dictation(UsageCounters::stt_word_count(stt_text), recording_ms);
-            *usage
+    /// Update the in-memory usage counters and return them. The caller
+    /// persists them with [`persist_usage_counters`] after the paste.
+    fn record_successful_dictation(&self, stt_text: &str, recording_ms: u64) -> UsageCounters {
+        let Ok(mut usage) = self.usage.lock() else {
+            return UsageCounters::default();
         };
-        #[cfg(not(test))]
-        if let Err(error) = save_usage_counters(updated) {
-            warn!("usage counter save failed: {error}");
-        }
-        #[cfg(test)]
-        let _ = updated;
+        *usage = usage.record_dictation(UsageCounters::stt_word_count(stt_text), recording_ms);
+        *usage
     }
 
     fn set_cleanup_status(&self, status: String) {
@@ -10758,6 +10774,37 @@ struct TrailingCaptureReport {
     floor_rms: f32,
     release_rms: f32,
     stop_reason: &'static str,
+    /// How long the post-release drain actually waited.
+    drain: Duration,
+}
+
+/// Wait for the audio callback to hand over what was in flight at release.
+///
+/// The fixed mode sleeps `AUDIO_RELEASE_DRAIN`. The adaptive mode returns once
+/// the callback has delivered at least one buffer after release (the sample
+/// count grew), but never sooner than `ADAPTIVE_DRAIN_FLOOR` and never later
+/// than the fixed drain, so it can only be faster than the fixed mode.
+fn wait_for_release_drain(samples: &Mutex<Vec<i16>>, adaptive: bool) -> Duration {
+    let started = Instant::now();
+    if !adaptive {
+        std::thread::sleep(AUDIO_RELEASE_DRAIN);
+        return started.elapsed();
+    }
+    let len_at_release = samples.lock().map_or(0, |samples| samples.len());
+    loop {
+        std::thread::sleep(ADAPTIVE_DRAIN_POLL);
+        let waited = started.elapsed();
+        if waited >= AUDIO_RELEASE_DRAIN {
+            return waited;
+        }
+        if waited >= ADAPTIVE_DRAIN_FLOOR
+            && samples
+                .lock()
+                .is_ok_and(|samples| samples.len() > len_at_release)
+        {
+            return waited;
+        }
+    }
 }
 
 /// Keeps the microphone open past key release until the tail actually goes quiet.
@@ -10770,7 +10817,10 @@ struct TrailingCaptureReport {
 /// `TRAILING_QUIET_TO_STOP` of quiet or `TRAILING_CAPTURE_CAP`, whichever lands
 /// first.
 fn capture_trailing_audio(recording: &ActiveRecording) -> Result<TrailingCaptureReport, AppError> {
-    std::thread::sleep(AUDIO_RELEASE_DRAIN);
+    let drain = wait_for_release_drain(
+        &recording.samples,
+        load_bool_env("BOLO_ADAPTIVE_DRAIN", false),
+    );
     let sample_rate = recording.sample_rate;
     let release_window = frame_len_for(sample_rate).saturating_mul(6);
 
@@ -10794,6 +10844,7 @@ fn capture_trailing_audio(recording: &ActiveRecording) -> Result<TrailingCapture
             floor_rms: floor_rms.unwrap_or_default(),
             release_rms,
             stop_reason: "room_too_loud",
+            drain,
         });
     };
     let mut report = TrailingCaptureReport {
@@ -10802,6 +10853,7 @@ fn capture_trailing_audio(recording: &ActiveRecording) -> Result<TrailingCapture
         floor_rms: floor_rms.unwrap_or_default(),
         release_rms,
         stop_reason: "settled",
+        drain,
     };
     if release_rms < threshold {
         return Ok(report);
@@ -21599,5 +21651,53 @@ mod tests {
         assert!(matches!(normalize_microphone_value("uid:offline-id", &[]),
             Ok(MicrophoneSelection::Device(descriptor)) if descriptor.id.as_deref() == Some("offline-id")));
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod adaptive_drain_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn fixed_drain_waits_the_full_window() {
+        let samples = Mutex::new(Vec::<i16>::new());
+        let waited = wait_for_release_drain(&samples, false);
+        assert!(waited >= AUDIO_RELEASE_DRAIN);
+    }
+
+    #[test]
+    fn adaptive_drain_returns_after_the_next_buffer_lands() {
+        let samples = Arc::new(Mutex::new(vec![0_i16; 480]));
+        let producer = Arc::clone(&samples);
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            producer.lock().unwrap().extend(vec![1_i16; 480]);
+        });
+        let waited = wait_for_release_drain(&samples, true);
+        handle.join().unwrap();
+        assert!(waited >= ADAPTIVE_DRAIN_FLOOR, "waited {waited:?}");
+        assert!(waited < AUDIO_RELEASE_DRAIN, "waited {waited:?}");
+    }
+
+    #[test]
+    fn adaptive_drain_never_waits_longer_than_the_fixed_window() {
+        let samples = Mutex::new(vec![0_i16; 480]);
+        let waited = wait_for_release_drain(&samples, true);
+        assert!(waited >= AUDIO_RELEASE_DRAIN);
+        assert!(waited < AUDIO_RELEASE_DRAIN + Duration::from_millis(40));
+    }
+
+    #[test]
+    fn adaptive_drain_respects_the_floor_when_a_buffer_lands_immediately() {
+        let samples = Arc::new(Mutex::new(vec![0_i16; 480]));
+        let producer = Arc::clone(&samples);
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(2));
+            producer.lock().unwrap().extend(vec![1_i16; 480]);
+        });
+        let waited = wait_for_release_drain(&samples, true);
+        handle.join().unwrap();
+        assert!(waited >= ADAPTIVE_DRAIN_FLOOR, "waited {waited:?}");
     }
 }
