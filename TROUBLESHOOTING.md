@@ -9,8 +9,11 @@ the tail attached.
 **Cause:** macOS Accessibility is off for Bolo. This permission never shows a
 popup; it must be enabled by hand.
 **Fix:** Open System Settings > Privacy & Security > Accessibility and enable
-Bolo, then quit Bolo from its menu bar and open it again. The setup window's
-Accessibility row does this for you (Open Accessibility Settings).
+Bolo. The setup window's Accessibility step opens that pane for you. Bolo
+checks again every two seconds while it is untrusted and starts pasting by
+itself once the grant lands, with a "Bolo can paste now" notification; there
+is no need to quit and reopen it. A dictation made right after the grant is
+checked once more before it falls back to the copy popup.
 
 ## Dictations come back empty, or the overlay says no speech
 
