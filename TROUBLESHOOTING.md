@@ -9,8 +9,23 @@ the tail attached.
 **Cause:** macOS Accessibility is off for Bolo. This permission never shows a
 popup; it must be enabled by hand.
 **Fix:** Open System Settings > Privacy & Security > Accessibility and enable
-Bolo, then quit Bolo from its menu bar and open it again. The setup window's
-Accessibility row does this for you (Open Accessibility Settings).
+Bolo. The setup window's Accessibility step opens that pane for you. Bolo
+checks again every two seconds while it is untrusted and starts pasting by
+itself once the grant lands, with a "Bolo can paste now" notification; there
+is no need to quit and reopen it. A dictation made right after the grant is
+checked once more before it falls back to the copy popup.
+
+## Bolo shows as on in Accessibility but still cannot paste
+
+**Cause:** the entry belongs to an earlier Bolo build. Each preview build has
+a new code signature, so macOS keeps showing the old entry as on but does not
+apply it to the new build.
+**Fix:** open the Bolo menu bar menu and choose More > Fix Accessibility
+Permission. It resets only Bolo's own Accessibility entry (the same as
+`tccutil reset Accessibility com.a692570.bolo`), opens the Accessibility
+list, and tells you to add Bolo with the plus button and turn it on. Bolo
+starts pasting by itself once you do. If Bolo is already trusted, the action
+changes nothing.
 
 ## Dictations come back empty, or the overlay says no speech
 

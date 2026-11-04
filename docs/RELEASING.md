@@ -44,7 +44,7 @@ Read this before trusting a release build:
 
 ## Corrupted bundles are never repaired
 
-The helper does not re-sign a bundle that fails `codesign --verify`. A bundle whose signature does not verify exits with a notification telling the user to reinstall from the latest DMG. The check runs before the supervisor lock is taken. The offline venv may already exist; it is a user-level cache. The runtime is supervised with an explicit child PID. A quit signal is forwarded to that child and waited on. Signals received during startup are recorded until cleanup is installed. Global lock cleanup requires both the supervisor and runtime PID files to name the current processes.
+The helper does not re-sign a bundle that fails `codesign --verify`. A bundle whose signature does not verify exits with a notification that says files inside Bolo.app changed after install (running the bundled Python is the common cause, because it writes cache files into the sealed app) and tells the user to reinstall from the DMG. Reinstalling the same build restores the same code signature, so macOS keeps its permission grants. The check runs before the supervisor lock is taken. The offline venv may already exist; it is a user-level cache. The runtime is supervised with an explicit child PID. A quit signal is forwarded to that child and waited on. Signals received during startup are recorded until cleanup is installed. Global lock cleanup requires both the supervisor and runtime PID files to name the current processes.
 
 ## Finder presentation
 

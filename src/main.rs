@@ -1,5 +1,6 @@
 //! Bolo's Rust push-to-talk dictation runtime.
 
+mod accessibility_recovery;
 mod audio_conditioning;
 mod entity_repair;
 mod local_whisper;
@@ -49,6 +50,11 @@ use tray_icon::menu::{
 };
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
+use accessibility_recovery::{
+    FixPermissionPlan, FreshCheckGate, RecheckOutcome, TRUST_RECHECK_INTERVAL, TrustWatch,
+    WatchOutcome, fix_permission_notice, fix_permission_plan, recheck_with, run_fix_permission,
+    watch_until_trusted,
+};
 use audio_conditioning::AudioConditioner;
 use local_whisper::{LocalSttMode, LocalWhisper, ModelStatus as LocalModelStatus};
 use recording_fsm::{Command as RecordingCommand, Event as RecordingEvent, RecordingFsm};
@@ -1812,6 +1818,7 @@ struct TrayUi {
     learned_words_item: MenuItem,
     show_dashboard_item: MenuItem,
     show_onboarding_item: MenuItem,
+    fix_accessibility_item: MenuItem,
     download_offline_model_item: MenuItem,
     download_qwen_model_item: MenuItem,
     quit_item: MenuItem,
@@ -1926,6 +1933,10 @@ fn main() -> Result<(), AppError> {
         );
     }
     start_accessibility_daemon(&app.config.root_dir);
+    // Before the startup check, so an untrusted reading there arms a
+    // watcher that is already running and the notification can promise
+    // the grant is picked up without a restart.
+    start_trust_watcher(&app.config.root_dir);
     check_accessibility_at_startup(&app.config.root_dir);
     quiet_audio::start(load_bool_env("BOLO_QUIET_AUDIO", false));
     let _insert_method = insert_method();
@@ -2030,7 +2041,8 @@ fn ensure_python_helpers_at_startup() -> Result<(), AppError> {
 
 /// Verify Accessibility trust once at startup and surface an actionable
 /// notification when missing. The macOS prompt only fires when the toggle is
-/// genuinely off; subsequent restarts after granting will pass silently.
+/// genuinely off. An untrusted reading arms the trust watch, which picks up
+/// the grant later without a restart.
 fn check_accessibility_at_startup(root_dir: &Path) {
     let bundle = bundle_mode();
     match accessibility_trust(root_dir, true) {
@@ -2039,7 +2051,7 @@ fn check_accessibility_at_startup(root_dir: &Path) {
         }
         AccessibilityTrust::Untrusted => {
             let python3 = python3_executable_path();
-            let fix = accessibility_fix_detail(bundle, &python3);
+            let fix = accessibility_fix_detail(bundle, &python3, trust_watcher_running());
             warn!("[accessibility] NOT TRUSTED at startup. Text will not paste. {fix}");
             if !bundle {
                 warn!(
@@ -3383,10 +3395,13 @@ impl App {
             // the manual-copy popup first. Only the warmup context decides
             // (it was read at press time and stored in DictationWarmup), so
             // a missing or stale reading always keeps the insert behavior.
-            let warmup_context = match recording.warmup.accessibility_context() {
-                WarmupValue::Ready(Some(context)) => Some(context),
-                WarmupValue::Pending | WarmupValue::Ready(None) => None,
-            };
+            let (fallback_reason, warmup_context) = press_time_insert_verdict(
+                &self.config.root_dir,
+                match recording.warmup.accessibility_context() {
+                    WarmupValue::Ready(Some(context)) => Some(context),
+                    WarmupValue::Pending | WarmupValue::Ready(None) => None,
+                },
+            );
             // The press-time read must also positively identify its target
             // (present, with a writable verdict either way) before the
             // fallback dares to arm its edit-learning observation: an
@@ -3395,7 +3410,7 @@ impl App {
             let ax_confirmed = warmup_context
                 .as_ref()
                 .is_some_and(|context| context.writable.is_some());
-            match insert_fallback_reason(warmup_context.as_ref()) {
+            match fallback_reason {
                 Some(reason) => {
                     manual_copy_outcome = Some(reason);
                     self.manual_copy_fallback(&stt.text, &prepared.text, reason, ax_confirmed)?;
@@ -3417,7 +3432,7 @@ impl App {
                             // swaps the text in place about a second later.
                             let app = Arc::clone(self);
                             let repair_text = prepared.text.clone();
-                            let repair_context = warmup_context.clone();
+                            let repair_context = warmup_context;
                             if run_repair
                                 && let Err(error) = std::thread::Builder::new()
                                     .name(String::from("bolo-entity-repair"))
@@ -7205,6 +7220,14 @@ fn create_tray_ui(app: &App) -> Result<TrayUi, AppError> {
     let add_replacement_item =
         MenuItem::with_id("add-replacement-rule", "Replace a Phrase...", true, None);
     let show_onboarding_item = MenuItem::with_id("show-onboarding", "Set Up Bolo...", true, None);
+    // Always listed: the action rechecks trust itself and never resets a
+    // working grant, and the stale-entry case looks granted in Settings.
+    let fix_accessibility_item = MenuItem::with_id(
+        "fix-accessibility",
+        FIX_ACCESSIBILITY_MENU_TITLE,
+        true,
+        None,
+    );
     // The offline model item's label states what clicking will do: a
     // first download, or replacing the model already on disk. The qwen
     // item mirrors it for the multilingual rung's HF snapshot.
@@ -7228,6 +7251,7 @@ fn create_tray_ui(app: &App) -> Result<TrayUi, AppError> {
         &clear_history_item,
         &health_check_item,
         &show_onboarding_item,
+        &fix_accessibility_item,
         &download_offline_model_item,
         &download_qwen_model_item,
     ] {
@@ -7395,6 +7419,7 @@ fn create_tray_ui(app: &App) -> Result<TrayUi, AppError> {
         learned_words_item,
         show_dashboard_item,
         show_onboarding_item,
+        fix_accessibility_item,
         download_offline_model_item,
         download_qwen_model_item,
         quit_item,
@@ -7451,6 +7476,10 @@ fn handle_menu_event(
     }
     if event_id == tray_ui.show_onboarding_item.id().as_ref() {
         app.send_user_event(UserEvent::ShowOnboarding);
+        return;
+    }
+    if event_id == tray_ui.fix_accessibility_item.id().as_ref() {
+        fix_accessibility_from_menu(app);
         return;
     }
     if event_id == tray_ui.update_item.id().as_ref() {
@@ -8582,17 +8611,33 @@ fn bundle_mode() -> bool {
 /// Accessibility fix, matching the text the startup notification and the
 /// paste path already surface. In bundle mode the instruction names Bolo
 /// itself; from source it names the exact interpreter to trust.
-fn accessibility_fix_detail(bundle: bool, python: &str) -> String {
-    if bundle {
-        String::from(
-            "Open System Settings > Privacy & Security > Accessibility and enable Bolo, \
-             then quit Bolo from its menu bar and open Bolo again.",
-        )
-    } else {
-        format!(
+/// `auto_recover` says the trust watcher is running, so the grant is picked
+/// up live; only when it is not does the text keep the restart step, and
+/// it says why. Bundle mode also names the menu's Fix Accessibility
+/// Permission action for the entry that shows as on but does nothing.
+fn accessibility_fix_detail(bundle: bool, python: &str, auto_recover: bool) -> String {
+    let fix_action = FIX_ACCESSIBILITY_MENU_TITLE.trim_end_matches('.');
+    match (bundle, auto_recover) {
+        (true, true) => format!(
+            "Turn on Bolo in System Settings > Privacy & Security > Accessibility. \
+             Bolo starts pasting by itself. Already on? Choose More > {fix_action} \
+             in the Bolo menu."
+        ),
+        (true, false) => format!(
+            "Turn on Bolo in System Settings > Privacy & Security > Accessibility \
+             (already on? Choose More > {fix_action} in the Bolo menu), then quit \
+             Bolo from its menu bar and open Bolo again. Bolo could not start its \
+             permission check, so it needs the restart to see the change."
+        ),
+        (false, true) => format!(
             "Add this Python interpreter in System Settings > Privacy & Security > \
-             Accessibility, then run ./restart.sh: {python}"
-        )
+             Accessibility. Bolo starts pasting by itself: {python}"
+        ),
+        (false, false) => format!(
+            "Add this Python interpreter in System Settings > Privacy & Security > \
+             Accessibility, then run ./restart.sh (Bolo could not start its \
+             permission check): {python}"
+        ),
     }
 }
 
@@ -9696,10 +9741,6 @@ fn should_exit_for_key_reload(
 /// `missing_key` records the required speech key that was missing when the
 /// window opened (either provider's), so the event loop can restart the
 /// runtime after the window closes with that key saved.
-fn is_bundle_mode() -> bool {
-    bundle_mode()
-}
-
 fn open_onboarding_window(
     app: &App,
     window_slot: &mut Option<AppWindow>,
@@ -9758,16 +9799,25 @@ fn answer_window_request(app: &App, window_slot: &mut Option<AppWindow>, request
         accessibility_trust(&app.config.root_dir, false),
         AccessibilityTrust::Trusted
     );
-    let reply = serde_json::json!({
-        "type": "trust_reply",
-        "trusted": trusted,
-        "restart_needed": is_bundle_mode() && trusted,
-    });
+    let reply = onboarding_trust_reply(trusted);
     if let Err(error) = window.send_line(&reply.to_string()) {
         warn!("window trust reply failed: {error}");
     } else {
         info!("answered onboarding trust request (trusted={trusted})");
     }
+}
+
+/// The onboarding `trust_reply` line. `restart_needed` stays in the
+/// contract but is always false now: a trusted answer comes from a daemon
+/// started after the grant (the trust watch restarts it) or from a fresh
+/// per-call helper, and the paste path uses the same helpers, so the grant
+/// already works without relaunching Bolo.
+fn onboarding_trust_reply(trusted: bool) -> serde_json::Value {
+    serde_json::json!({
+        "type": "trust_reply",
+        "trusted": trusted,
+        "restart_needed": false,
+    })
 }
 
 fn open_status_window(app: &App, window_slot: &mut Option<AppWindow>) {
@@ -14723,8 +14773,15 @@ fn type_text(text: &str) -> Result<(), AppError> {
 fn ensure_insert_trust(root_dir: &Path) -> Result<(), AppError> {
     match accessibility_trust(root_dir, false) {
         AccessibilityTrust::Trusted => {}
+        // The daemon can still hold its pre-grant answer: one fresh check
+        // keeps a just-granted user's dictation out of the popup.
+        AccessibilityTrust::Untrusted if recheck_trust_before_insert(root_dir) => {}
         AccessibilityTrust::Untrusted => {
-            let fix = accessibility_fix_detail(bundle_mode(), &python3_executable_path());
+            let fix = accessibility_fix_detail(
+                bundle_mode(),
+                &python3_executable_path(),
+                trust_watcher_running(),
+            );
             warn!("[accessibility] NOT TRUSTED at paste time. {fix}");
             show_notification("Bolo cannot paste", &fix);
             return Err(AppError::AccessibilityNotGranted);
@@ -14812,16 +14869,29 @@ fn parse_popup_copy_text(line: &str, snapshot: &str) -> Option<String> {
 }
 
 /// Ask macOS whether Bolo's Python helper is trusted for Accessibility events.
+/// Any untrusted reading arms the trust watch, so a grant made later (or a
+/// grant revoked mid-session and given back) is picked up without a quit.
 fn accessibility_trust(root_dir: &Path, prompt: bool) -> AccessibilityTrust {
-    if let Some(reply) = request_accessibility_daemon(&AccessDaemonRequest::TrustCheck { prompt })
+    let trust = if let Some(reply) =
+        request_accessibility_daemon(&AccessDaemonRequest::TrustCheck { prompt })
         && let Some(trusted) = parse_daemon_trust_reply(&reply)
     {
-        return if trusted {
+        if trusted {
             AccessibilityTrust::Trusted
         } else {
             AccessibilityTrust::Untrusted
-        };
+        }
+    } else {
+        spawn_accessibility_trust_check(root_dir, prompt)
+    };
+    if trust == AccessibilityTrust::Untrusted {
+        arm_trust_watch();
     }
+    trust
+}
+
+/// One trust reading from a brand-new `accessibility_trusted.py` process.
+fn spawn_accessibility_trust_check(root_dir: &Path, prompt: bool) -> AccessibilityTrust {
     let script = root_dir.join("accessibility_trusted.py");
     if !script.exists() {
         warn!("[accessibility] helper missing at {}", script.display());
@@ -14864,6 +14934,233 @@ fn parse_accessibility_trust(output: &str) -> AccessibilityTrust {
         "true" => AccessibilityTrust::Trusted,
         "false" => AccessibilityTrust::Untrusted,
         _ => AccessibilityTrust::Unavailable,
+    }
+}
+
+// ==== Accessibility grant recovery ====
+//
+// The daemon keeps the trust answer it had when it started, so a grant made
+// while Bolo runs used to need a quit and reopen. While Bolo is untrusted,
+// a watcher thread asks a brand-new helper process every two seconds; the
+// first trusted reading restarts the daemon and tells the user. A trusted
+// Bolo leaves the watcher parked on a condvar. See accessibility_recovery.rs.
+
+static TRUST_WATCH: TrustWatch = TrustWatch::new();
+static FRESH_TRUST_CHECKS: FreshCheckGate = FreshCheckGate::new();
+static TRUST_WATCHER_RUNNING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the watcher thread started, which is what lets the untrusted
+/// notifications drop the quit-and-reopen advice.
+fn trust_watcher_running() -> bool {
+    TRUST_WATCHER_RUNNING.load(std::sync::atomic::Ordering::Acquire)
+}
+
+fn arm_trust_watch() {
+    if TRUST_WATCH.arm() {
+        info!(
+            "[accessibility] untrusted; checking for the grant every {}s",
+            TRUST_RECHECK_INTERVAL.as_secs()
+        );
+    }
+}
+
+/// Start the watcher thread. It parks until something reads untrusted, so
+/// a trusted session pays nothing for it.
+fn start_trust_watcher(root_dir: &Path) {
+    let root_dir = root_dir.to_path_buf();
+    match std::thread::Builder::new()
+        .name(String::from("bolo-trust-watch"))
+        .spawn(move || run_trust_watcher(&root_dir))
+    {
+        Ok(handle) => {
+            TRUST_WATCHER_RUNNING.store(true, std::sync::atomic::Ordering::Release);
+            drop(handle);
+        }
+        Err(error) => warn!("[accessibility] trust watcher failed to start: {error}"),
+    }
+}
+
+fn run_trust_watcher(root_dir: &Path) {
+    loop {
+        TRUST_WATCH.wait_until_armed();
+        match watch_until_trusted(
+            &TRUST_WATCH,
+            TRUST_RECHECK_INTERVAL,
+            || fresh_accessibility_trust(root_dir),
+            std::thread::sleep,
+        ) {
+            WatchOutcome::Granted => {
+                info!("[accessibility] grant detected by a fresh check");
+                recover_after_trust_grant(root_dir);
+            }
+            WatchOutcome::Disarmed => {}
+            WatchOutcome::CheckUnavailable => {
+                warn!(
+                    "[accessibility] fresh trust check failed; watching stops until the next untrusted reading"
+                );
+            }
+        }
+    }
+}
+
+/// One trust reading from a new helper process, never from the daemon,
+/// which can keep its startup answer. The gate keeps it to one check
+/// process at a time across the watcher and the paste path.
+fn fresh_accessibility_trust(root_dir: &Path) -> AccessibilityTrust {
+    FRESH_TRUST_CHECKS.run(|| spawn_accessibility_trust_check(root_dir, false))
+}
+
+/// Remove the daemon from its slot without holding the slot lock while the
+/// child is killed and reaped.
+fn take_access_daemon() -> Option<AccessDaemon> {
+    access_daemon_cell()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+}
+
+/// Pick up a new grant without quitting Bolo: replace the daemon that still
+/// holds its pre-grant answer with one started now. The new daemon is warmed
+/// on the caller's thread so the paste that follows (including direct
+/// typing, which has no per-call fallback) talks to a trusted daemon; this
+/// runs once per grant, never on a trusted session's paste path. The
+/// notification's osascript runs on its own thread. The hotkey helper is
+/// left alone: it detects the dictation key by polling keyboard state,
+/// which needs no Accessibility.
+fn recover_after_trust_grant(root_dir: &Path) {
+    drop(take_access_daemon());
+    start_accessibility_daemon(root_dir);
+    if access_daemon_is_running() {
+        info!("[accessibility] trust granted; helpers restarted");
+    } else {
+        // Requests use fresh per-call helpers, which see the grant, until
+        // the supervisor brings a daemon back.
+        warn!("[accessibility] trust granted; daemon restart failed, using per-call helpers");
+    }
+    if let Err(error) = std::thread::Builder::new()
+        .name(String::from("bolo-trust-notice"))
+        .spawn(|| show_notification(TRUST_GRANTED_TITLE, TRUST_GRANTED_MESSAGE))
+    {
+        warn!("[accessibility] grant notification thread failed to start: {error}");
+    }
+}
+
+/// Menu label of the Fix Accessibility Permission action (under More...).
+/// The untrusted notification names it, so both read from here.
+const FIX_ACCESSIBILITY_MENU_TITLE: &str = "Fix Accessibility Permission...";
+
+/// The menu's Fix Accessibility Permission action, off the event loop: one
+/// fresh trust reading decides the plan (a trusted Bolo is never reset),
+/// bundle mode resets only Bolo's own record and opens the pane, and a
+/// two-line notification says what to do next. The trust watch is armed so
+/// the re-added grant is picked up without a restart.
+fn fix_accessibility_from_menu(app: &App) {
+    let root_dir = app.config.root_dir.clone();
+    if let Err(error) = std::thread::Builder::new()
+        .name(String::from("bolo-fix-accessibility"))
+        .spawn(move || {
+            let bundle = bundle_mode();
+            let plan = fix_permission_plan(bundle, fresh_accessibility_trust(&root_dir));
+            let outcome = run_fix_permission(plan, run_fix_permission_command);
+            info!(
+                "[accessibility] fix_permission {}",
+                serde_json::json!({
+                    "plan": format!("{plan:?}"),
+                    "reset_ok": outcome.reset,
+                    "opened_ok": outcome.opened,
+                })
+            );
+            if matches!(
+                plan,
+                FixPermissionPlan::ResetAndOpen | FixPermissionPlan::OpenOnly
+            ) {
+                arm_trust_watch();
+            }
+            let (title, message) =
+                fix_permission_notice(outcome, bundle, &python3_executable_path());
+            show_notification(title, &message);
+        })
+    {
+        warn!("[accessibility] fix permission thread failed to start: {error}");
+    }
+}
+
+/// Run one fix-permission command; true on a zero exit. Failures are logged
+/// with the command's stderr so a refused reset is diagnosable.
+fn run_fix_permission_command(program: &str, args: &[&str]) -> bool {
+    match Command::new(program).args(args).output() {
+        Ok(output) if output.status.success() => true,
+        Ok(output) => {
+            warn!(
+                "[accessibility] {program} {} exited with {}: {}",
+                args.join(" "),
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+            false
+        }
+        Err(error) => {
+            warn!("[accessibility] {program} failed to run: {error}");
+            false
+        }
+    }
+}
+
+/// Title of the notification sent when a grant is picked up live.
+const TRUST_GRANTED_TITLE: &str = "Bolo can paste now";
+
+/// Body of the notification sent when a grant is picked up live.
+const TRUST_GRANTED_MESSAGE: &str =
+    "Accessibility is on. Your dictations go straight into the app you are using.";
+
+/// Paste-time second opinion: while Bolo waits for a grant, one fresh check
+/// before giving up on the insert. True when the grant is there; the
+/// dictation can then be inserted. Free (a mutex read) while not waiting.
+fn recheck_trust_before_insert(root_dir: &Path) -> bool {
+    match recheck_with(&TRUST_WATCH, || fresh_accessibility_trust(root_dir)) {
+        RecheckOutcome::NotWatching | RecheckOutcome::StillUntrusted => false,
+        RecheckOutcome::Granted { run_recovery } => {
+            info!("[accessibility] grant detected at paste time");
+            if run_recovery {
+                recover_after_trust_grant(root_dir);
+            }
+            true
+        }
+    }
+}
+
+/// The press-time paste-target verdict plus the context the rest of the
+/// insert path may use. While Bolo waits for an Accessibility grant, a
+/// non-writable verdict is what an untrusted helper reads for every target,
+/// so one fresh trust check runs before the popup wins. When it finds the
+/// grant, the press-time reading is discarded and the insert goes ahead.
+fn press_time_insert_verdict(
+    root_dir: &Path,
+    context: Option<AccessibilityContext>,
+) -> (Option<&'static str>, Option<AccessibilityContext>) {
+    let press_reason = insert_fallback_reason(context.as_ref());
+    let reason =
+        fallback_reason_after_trust_recheck(press_reason, || recheck_trust_before_insert(root_dir));
+    if press_reason.is_some() && reason.is_none() {
+        info!("[insert] press-time context was read before the grant; inserting");
+        return (None, None);
+    }
+    (reason, context)
+}
+
+/// The manual-copy verdict after the paste-time trust recheck. A
+/// `not_writable` reading taken while Bolo was untrusted says nothing about
+/// the target, because an untrusted helper cannot read any focused element.
+/// When the recheck finds the grant, that verdict is dropped and the insert
+/// goes ahead. `recheck` only runs when the press-time verdict would divert.
+fn fallback_reason_after_trust_recheck(
+    reason: Option<&'static str>,
+    recheck: impl FnOnce() -> bool,
+) -> Option<&'static str> {
+    match reason {
+        Some(reason) if !recheck() => Some(reason),
+        Some(_) | None => None,
     }
 }
 
@@ -15274,7 +15571,7 @@ mod tests {
         dashboard_cleanup_mode, dashboard_payload, dashboard_provider_label,
         derive_word_correction, downsample_wav_16k_mono, edit_distance,
         edit_learning_context_diverged, empty_retry_engages, empty_transcript_error,
-        enforce_learned_vocabulary_cap, final_refine_choice,
+        enforce_learned_vocabulary_cap, fallback_reason_after_trust_recheck, final_refine_choice,
         final_streaming_result_is_ready_elapsed, finalize_accessibility_context,
         format_transcript_style, handle_dashboard_action, handle_launch_request_for_state,
         handshake_with_deadline, insert_fallback_reason, is_blocklisted_correction,
@@ -15282,15 +15579,16 @@ mod tests {
         load_cleanup_prompt_file, load_learned_vocabulary, load_usage_counters_at,
         load_vocabulary_usage, load_vocabulary_with_learned, mark_stream_died_mid_session,
         microphone_labels, non_empty_transcript, normalize_microphone_value,
-        offline_preview_enabled, onboarding_status_at, override_or_builtin_prompt_from,
-        parse_accessibility_trust, parse_command, parse_daemon_context_reply,
-        parse_daemon_paste_reply, parse_daemon_select_reply, parse_daemon_trust_reply,
-        parse_daemon_type_reply, parse_insert_method, parse_latest_release, parse_popup_copy_text,
-        parse_release_version, parse_replacements_json, parse_stt_fallbacks, parse_u64_env_value,
-        parse_update_outcome, paste_intact_in_context, preview_text_is_new,
-        preview_trailing_window, preview_trailing_window_samples, prompts_window_payload_at,
-        read_vocabulary_file, read_vocabulary_usage_file, record_learned_correction,
-        reload_is_busy, remove_bolo_env_value_at, remove_fillers, request_accessibility_daemon,
+        offline_preview_enabled, onboarding_status_at, onboarding_trust_reply,
+        override_or_builtin_prompt_from, parse_accessibility_trust, parse_command,
+        parse_daemon_context_reply, parse_daemon_paste_reply, parse_daemon_select_reply,
+        parse_daemon_trust_reply, parse_daemon_type_reply, parse_insert_method,
+        parse_latest_release, parse_popup_copy_text, parse_release_version,
+        parse_replacements_json, parse_stt_fallbacks, parse_u64_env_value, parse_update_outcome,
+        paste_intact_in_context, preview_text_is_new, preview_trailing_window,
+        preview_trailing_window_samples, prompts_window_payload_at, read_vocabulary_file,
+        read_vocabulary_usage_file, record_learned_correction, reload_is_busy,
+        remove_bolo_env_value_at, remove_fillers, request_accessibility_daemon,
         resolve_microphone_selection, retry_failed_primary, sanitize_transcript_history,
         save_usage_counters_at, set_streaming_connection, set_streaming_error,
         should_exit_for_key_reload, speech_stats, stable_streaming_best_is_ready_elapsed,
@@ -15563,19 +15861,73 @@ mod tests {
     }
 
     #[test]
-    fn accessibility_fix_names_the_interpreter_and_restart_from_source() {
-        let detail = accessibility_fix_detail(false, "/Users/demo/.bolo/venv/bin/python3");
-        assert!(detail.contains("System Settings > Privacy & Security > Accessibility"));
-        assert!(detail.contains("/Users/demo/.bolo/venv/bin/python3"));
-        assert!(detail.contains("./restart.sh"));
+    fn accessibility_fix_names_the_interpreter_from_source() {
+        let python = "/Users/demo/.bolo/venv/bin/python3";
+        let live = accessibility_fix_detail(false, python, true);
+        assert!(live.contains("System Settings > Privacy & Security > Accessibility"));
+        assert!(live.contains(python));
+        assert!(live.contains("starts pasting by itself"));
+        assert!(!live.contains("restart.sh"));
+        // Without the trust watcher a restart is the only way to pick the
+        // grant up, and the text says why.
+        let restart = accessibility_fix_detail(false, python, false);
+        assert!(restart.contains(python));
+        assert!(restart.contains("./restart.sh"));
+        assert!(restart.contains("could not start its permission check"));
     }
 
     #[test]
     fn accessibility_fix_in_bundle_mode_names_bolo_not_the_interpreter() {
-        let detail = accessibility_fix_detail(true, "/Users/demo/.bolo/venv/bin/python3");
-        assert!(detail.contains("enable Bolo"));
-        assert!(!detail.contains("python3"));
-        assert!(!detail.contains("restart.sh"));
+        let python = "/Users/demo/.bolo/venv/bin/python3";
+        let live = accessibility_fix_detail(true, python, true);
+        assert!(live.contains("Turn on Bolo"));
+        assert!(live.contains("starts pasting by itself"));
+        assert!(!live.contains("python3"));
+        assert!(!live.contains("restart.sh"));
+        assert!(!live.contains("quit"), "the grant is picked up live");
+        // The stale entry from an older build looks on in Settings, so the
+        // text points at the menu action that clears it.
+        assert!(live.contains("More > Fix Accessibility Permission in the Bolo menu"));
+        let restart = accessibility_fix_detail(true, python, false);
+        assert!(restart.contains("quit Bolo"));
+        assert!(restart.contains("could not start its permission check"));
+        assert!(!restart.contains("python3"));
+    }
+
+    #[test]
+    fn onboarding_trust_reply_never_asks_for_a_restart() {
+        for trusted in [true, false] {
+            let reply = onboarding_trust_reply(trusted);
+            assert_eq!(reply["type"], "trust_reply");
+            assert_eq!(reply["trusted"], trusted);
+            assert_eq!(reply["restart_needed"], false);
+        }
+    }
+
+    #[test]
+    fn press_time_fallback_is_rechecked_only_when_it_would_divert() {
+        // No diversion: the recheck never runs, so a normal paste pays no
+        // extra latency.
+        let mut rechecks = 0;
+        assert_eq!(
+            fallback_reason_after_trust_recheck(None, || {
+                rechecks += 1;
+                true
+            }),
+            None
+        );
+        assert_eq!(rechecks, 0);
+        // Still untrusted: the popup keeps the transcript.
+        assert_eq!(
+            fallback_reason_after_trust_recheck(Some("not_writable"), || false),
+            Some("not_writable")
+        );
+        // The grant arrived: the untrusted reading is dropped and the
+        // dictation is inserted instead of going to the popup.
+        assert_eq!(
+            fallback_reason_after_trust_recheck(Some("not_writable"), || true),
+            None
+        );
     }
 
     #[test]
