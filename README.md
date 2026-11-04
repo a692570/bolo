@@ -167,6 +167,14 @@ export BOLO_AUDIO_CONDITIONING="off"
 
 Conditioning is on by default. It keeps the same number of samples and alignment as the raw stream; if the processing engine fails to initialize, Bolo logs it and records without conditioning.
 
+To lower music and video while you hold the dictation key, set:
+
+```bash
+export BOLO_QUIET_AUDIO="on"
+```
+
+This is off by default. While a recording runs, the system output volume drops to 30% of its level and comes back when capture stops. Bolo leaves output alone when it is muted or already at 10% or lower, and it skips the restore if you change the volume or mute during the dictation, so your own adjustment stands. The volume change runs on a background thread through `osascript` and adds no wait to the press or paste path; the `[quiet_audio]` lines in `/tmp/bolo.log` show each duck and restore.
+
 Bolo can also transcribe offline through a local whisper.cpp model. The tier trails the whole cloud ladder (`BOLO_LOCAL_STT=auto`, the default): it runs only when streaming and the batch retry both fail or return no words. A streaming session that dies mid-dictation routes release straight to the offline tier: the WebSocket's death is itself the failure signal, so no refine call or batch attempt runs, and the overlay shows a "Recovered offline" note while the local ladder works. To skip cloud entirely and dictate offline, set:
 
 ```bash

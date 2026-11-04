@@ -4,6 +4,7 @@ mod audio_conditioning;
 mod entity_repair;
 mod local_whisper;
 mod parakeet_sidecar;
+mod quiet_audio;
 mod qwen_sidecar;
 mod recording_fsm;
 mod resample;
@@ -578,6 +579,11 @@ struct ActiveRecording {
     /// cannot serve. The handle is inert; the worker ends on its own
     /// when release drops the hub and the sink channel closes.
     offline_preview: Option<OfflinePreview>,
+    /// Lowers other audio for the life of the recording when
+    /// `BOLO_QUIET_AUDIO` is on. Dropping it queues the restore, so a
+    /// recording that ends on any path (release, too-short tap, error,
+    /// watchdog) puts the volume back.
+    quiet_audio: Option<quiet_audio::QuietAudioGuard>,
 }
 
 impl ActiveRecording {
@@ -1921,6 +1927,7 @@ fn main() -> Result<(), AppError> {
     }
     start_accessibility_daemon(&app.config.root_dir);
     check_accessibility_at_startup(&app.config.root_dir);
+    quiet_audio::start(load_bool_env("BOLO_QUIET_AUDIO", false));
     spawn_release_check(Arc::clone(&app));
     let daemon_root_dir = app.config.root_dir.clone();
     match std::thread::Builder::new()
@@ -2268,6 +2275,7 @@ fn run_lock_watch(path: PathBuf) {
                 "Bolo",
                 "Another Bolo instance took over; this copy is shutting down.",
             );
+            quiet_audio::restore_before_exit();
             std::process::exit(1);
         }
         let need_retake = match LockMeta::read(&path) {
@@ -2708,6 +2716,7 @@ fn run_app_event_loop(app: Arc<App>) -> Result<(), AppError> {
                     drop(prompts_window.take());
                     drop(dashboard_window.take());
                     info!("dashboard requested restart; exiting for the supervisor");
+                    quiet_audio::restore_before_exit();
                     std::process::exit(UPDATE_RESTART_EXIT_CODE);
                 } else {
                     let reply = serde_json::json!({
@@ -2820,6 +2829,7 @@ fn run_app_event_loop(app: Arc<App>) -> Result<(), AppError> {
                     drop(status_window.take());
                     drop(learning_window.take());
                     drop(dashboard_window.take());
+                    quiet_audio::restore_before_exit();
                     std::process::exit(UPDATE_RESTART_EXIT_CODE);
                 }
             }
@@ -2980,6 +2990,9 @@ impl App {
         recording.warmup = self.start_dictation_warmup();
         recording.streaming = streaming;
         recording.offline_preview = offline_preview;
+        // Capture is already running; the duck itself happens on the
+        // quiet-audio worker, so the press path only pays a channel send.
+        recording.quiet_audio = quiet_audio::QuietAudioGuard::engage();
         {
             let mut state = self.lock_state()?;
             state.active = Some(recording);
@@ -3077,6 +3090,9 @@ impl App {
         // hub sender is dropped, so leaving this Arc alive burns the
         // upload's whole wait budget on every dictation.
         recording.hub = None;
+        // Capture has stopped, so other audio can come back now; the
+        // restore runs on the quiet-audio worker and nothing here waits.
+        recording.quiet_audio = None;
         info!(
             "[pipeline] trailing_capture {}",
             serde_json::json!({
@@ -6653,6 +6669,7 @@ fn start_recording(
         warmup: DictationWarmup::default(),
         streaming: None,
         offline_preview: None,
+        quiet_audio: None,
     })
 }
 
@@ -7383,6 +7400,7 @@ fn handle_menu_event(
 ) {
     let event_id = event.id().as_ref();
     if event_id == tray_ui.quit_item.id().as_ref() {
+        quiet_audio::restore_before_exit();
         *control_flow = ControlFlow::Exit;
         return;
     }
@@ -7759,6 +7777,7 @@ fn check_for_updates_from_menu(app: &Arc<App>) {
                 info!("Bolo update installed, restarting runtime");
                 show_notification("Bolo Updated", "Restarting Bolo now.");
                 std::thread::sleep(Duration::from_millis(300));
+                quiet_audio::restore_before_exit();
                 std::process::exit(UPDATE_RESTART_EXIT_CODE);
             }
             Ok(UpdateOutcome::Current) => {
