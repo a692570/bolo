@@ -23,6 +23,13 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from AppKit import NSStringPboardType
+from Quartz import (
+    CGEventGetFlags,
+    CGEventGetIntegerValueField,
+    CGEventKeyboardGetUnicodeString,
+    kCGEventFlagMaskShift,
+    kCGKeyboardEventKeycode,
+)
 
 import insert_text
 from insert_text import (
@@ -314,3 +321,140 @@ def test_pasteboard_matches_state_flips_false_once_a_newer_paste_writes(monkeypa
     insert_text.start_paste("second")
     assert fake.current_text() == "second"
     assert insert_text.pasteboard_matches_state(first) is False
+
+
+# ---------------------------------------------------------------------------
+# Direct typing. The segment split is pure; the event tests build real
+# Quartz keyboard events and read them back without posting any, so no
+# keystroke reaches whatever app is focused and no AX permission is needed.
+
+GRINNING = "\U0001F600"
+# Device-independent modifier bits (Shift, Control, Option, Command, ...).
+MODIFIER_FLAGS_MASK = 0x00FF0000
+
+
+def test_typing_segments_keep_short_text_in_one_event():
+    assert insert_text.typing_segments("hello world") == ["hello world"]
+    assert insert_text.typing_segments("") == []
+
+
+def test_typing_segments_split_long_text_at_the_unit_limit():
+    segments = insert_text.typing_segments("a" * 45)
+    assert segments == ["a" * 20, "a" * 20, "a" * 5]
+
+
+def test_typing_segments_never_split_a_surrogate_pair():
+    # 19 units plus a 2-unit emoji would be 21: the emoji moves to the next
+    # event whole instead of leaving half a surrogate pair behind.
+    segments = insert_text.typing_segments("x" * 19 + GRINNING + "y")
+    assert segments == ["x" * 19, GRINNING + "y"]
+    for segment in segments:
+        # A lone surrogate would raise here.
+        segment.encode("utf-16-le", errors="strict")
+        assert insert_text.utf16_units(segment) <= insert_text.TYPE_CHUNK_UNITS
+
+
+def test_typing_segments_count_utf16_units_not_code_points():
+    # Ten emoji are 10 code points but 20 UTF-16 units: exactly one event.
+    assert insert_text.typing_segments(GRINNING * 10) == [GRINNING * 10]
+    assert insert_text.typing_segments(GRINNING * 11) == [GRINNING * 10, GRINNING]
+
+
+def test_typing_segments_turn_every_line_break_into_a_newline_segment():
+    newline = insert_text.NEWLINE
+    assert insert_text.typing_segments("one\r\ntwo\rthree\nfour\n\nfive") == [
+        "one",
+        newline,
+        "two",
+        newline,
+        "three",
+        newline,
+        "four",
+        newline,
+        newline,
+        "five",
+    ]
+
+
+def test_typing_segments_rejoin_to_the_normalized_text():
+    text = (
+        "Ünïcödé " * 7
+        + GRINNING * 3
+        + "\r\n"
+        + "नमस्ते " * 6
+        + "\U0001F469‍\U0001F4BB"
+    )
+    segments = insert_text.typing_segments(text)
+    assert "".join(segments) == text.replace("\r\n", "\n")
+    assert all(
+        insert_text.utf16_units(segment) <= insert_text.TYPE_CHUNK_UNITS
+        for segment in segments
+    )
+
+
+def test_utf16_units_counts_non_bmp_characters_as_two():
+    assert insert_text.utf16_units("abc") == 3
+    assert insert_text.utf16_units(GRINNING) == 2
+    assert insert_text.utf16_units("é") == 1
+
+
+def test_build_typing_events_carry_each_segment_intact():
+    segments = insert_text.typing_segments("héllo " + GRINNING + "\nworld")
+    pairs = insert_text.build_typing_events(segments)
+    assert pairs is not None
+    assert len(pairs) == len(segments) == 3
+    for segment, (down, up) in zip(segments, pairs):
+        if segment == insert_text.NEWLINE:
+            for event in (down, up):
+                assert (
+                    CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode)
+                    == insert_text.RETURN_KEYCODE
+                )
+                assert CGEventGetFlags(event) & kCGEventFlagMaskShift
+            continue
+        units = insert_text.utf16_units(segment)
+        for event in (down, up):
+            assert CGEventKeyboardGetUnicodeString(event, units, None, None) == (
+                units,
+                segment,
+            )
+            # No modifier leaks in from keys still held at release time.
+            assert CGEventGetFlags(event) & MODIFIER_FLAGS_MASK == 0
+
+
+def _record_posts(monkeypatch):
+    posted = []
+    monkeypatch.setattr(
+        insert_text, "CGEventPost", lambda _tap, event: posted.append(event)
+    )
+    monkeypatch.setattr(insert_text, "TYPE_EVENT_DELAY", 0)
+    return posted
+
+
+def test_type_text_posts_one_down_up_pair_per_segment(monkeypatch):
+    posted = _record_posts(monkeypatch)
+    # Segments: 20 a's, 5 a's, newline, "b".
+    assert insert_text.type_text("a" * 25 + "\nb") is True
+    assert len(posted) == 2 * 4
+
+
+def test_type_text_types_nothing_when_any_event_fails_to_build(monkeypatch):
+    posted = _record_posts(monkeypatch)
+    real_event = insert_text._unicode_key_event
+    monkeypatch.setattr(
+        insert_text,
+        "_unicode_key_event",
+        lambda segment, key_down: None
+        if segment.startswith("b")
+        else real_event(segment, key_down),
+    )
+    # The first segment builds; the second fails. Nothing may be posted, or
+    # the target would hold the first 20 characters with no way to tell.
+    assert insert_text.type_text("a" * 20 + "b" * 5) is False
+    assert posted == []
+
+
+def test_type_text_of_empty_text_is_a_successful_no_op(monkeypatch):
+    posted = _record_posts(monkeypatch)
+    assert insert_text.type_text("") is True
+    assert posted == []

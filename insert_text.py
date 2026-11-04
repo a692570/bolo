@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Paste text while preserving the full macOS pasteboard payload."""
+"""Paste text while preserving the full macOS pasteboard payload.
+
+Also holds the direct-typing insert (``type_text``): synthetic Unicode
+keystrokes for targets that ignore Cmd+V, driven by the accessibility daemon.
+"""
 
 import ctypes
 import ctypes.util
@@ -13,9 +17,12 @@ from objc import ObjCPointerWarning
 from AppKit import NSPasteboard, NSPasteboardItem, NSStringPboardType
 from Quartz import (
     CGEventCreateKeyboardEvent,
+    CGEventKeyboardGetUnicodeString,
+    CGEventKeyboardSetUnicodeString,
     CGEventPost,
     CGEventSetFlags,
     kCGEventFlagMaskCommand,
+    kCGEventFlagMaskShift,
     kCGHIDEventTap,
 )
 
@@ -285,6 +292,124 @@ def perform_paste(text: str) -> int:
         return 2
     finalize_paste(state)
     return 0
+
+
+# CGEventKeyboardSetUnicodeString stores longer strings, but receiving apps
+# read at most 20 UTF-16 units from one keyboard event, so longer runs are
+# split across events.
+TYPE_CHUNK_UNITS = 20
+# Pause after each typed event pair: back-to-back posts can outrun targets
+# that drain their key queue slowly (remote desktop clients, Electron apps).
+TYPE_EVENT_DELAY = 0.004
+# Carrier keycode for Unicode-string events. Apps that honor the attached
+# string ignore it; there is no keycode that is neutral everywhere.
+UNICODE_EVENT_KEYCODE = 0
+RETURN_KEYCODE = 36
+NEWLINE = "\n"
+
+
+def utf16_units(text: str) -> int:
+    """Length of ``text`` in UTF-16 code units, the unit the CGEvent API
+    counts in. A character outside the BMP (most emoji) is two units."""
+    return len(text.encode("utf-16-le")) // 2
+
+
+def typing_segments(text: str, max_units: int = TYPE_CHUNK_UNITS):
+    """Split ``text`` into the strings one keyboard event each will carry.
+
+    Every line break (CRLF, CR or LF) becomes its own ``NEWLINE`` segment,
+    typed as a Return key; every other segment fits in ``max_units`` UTF-16
+    units. Splits fall on code point boundaries, so a surrogate pair is never
+    cut in half (half a pair would reach the target as an invalid lone
+    surrogate). The segments concatenate back to the newline-normalized text.
+    """
+    normalized = text.replace("\r\n", NEWLINE).replace("\r", NEWLINE)
+    segments = []
+    chunk = []
+    chunk_units = 0
+    for character in normalized:
+        if character == NEWLINE:
+            if chunk:
+                segments.append("".join(chunk))
+                chunk, chunk_units = [], 0
+            segments.append(NEWLINE)
+            continue
+        units = utf16_units(character)
+        if chunk and chunk_units + units > max_units:
+            segments.append("".join(chunk))
+            chunk, chunk_units = [], 0
+        chunk.append(character)
+        chunk_units += units
+    if chunk:
+        segments.append("".join(chunk))
+    return segments
+
+
+def _unicode_key_event(segment: str, key_down: bool):
+    """One keyboard event carrying ``segment``, or None when Quartz refused
+    it or the string did not read back intact."""
+    event = CGEventCreateKeyboardEvent(None, UNICODE_EVENT_KEYCODE, key_down)
+    if event is None:
+        return None
+    # Clear the modifiers: a key still physically held (the dictation key
+    # itself, a Command a user is resting on) must not turn text into
+    # shortcuts.
+    CGEventSetFlags(event, 0)
+    units = utf16_units(segment)
+    CGEventKeyboardSetUnicodeString(event, units, segment)
+    read_back = CGEventKeyboardGetUnicodeString(event, units, None, None)
+    if tuple(read_back) != (units, segment):
+        return None
+    return event
+
+
+def _return_key_event(key_down: bool):
+    """Shift+Return: a line break in chat apps (Slack, Teams, browser chat
+    boxes) where a bare Return would send the message mid-dictation, and a
+    plain newline in editors."""
+    event = CGEventCreateKeyboardEvent(None, RETURN_KEYCODE, key_down)
+    if event is None:
+        return None
+    CGEventSetFlags(event, kCGEventFlagMaskShift)
+    return event
+
+
+def build_typing_events(segments):
+    """Build every (key down, key up) pair before any is posted.
+
+    Returns None if any event fails to build or verify, so a failure lands
+    before the first keystroke and never leaves half the text typed.
+    """
+    pairs = []
+    for segment in segments:
+        if segment == NEWLINE:
+            down, up = _return_key_event(True), _return_key_event(False)
+        else:
+            down = _unicode_key_event(segment, True)
+            up = _unicode_key_event(segment, False)
+        if down is None or up is None:
+            return None
+        pairs.append((down, up))
+    return pairs
+
+
+def type_text(text: str) -> bool:
+    """Type ``text`` into the focused app as synthetic keystrokes.
+
+    The insert for targets that ignore Cmd+V (remote desktops, VMs, some
+    terminals); the clipboard is never touched. Returns False, with nothing
+    typed, when the events could not be built.
+    """
+    if not text:
+        return True
+    pairs = build_typing_events(typing_segments(text))
+    if pairs is None:
+        return False
+    for down, up in pairs:
+        CGEventPost(kCGHIDEventTap, down)
+        CGEventPost(kCGHIDEventTap, up)
+        time.sleep(TYPE_EVENT_DELAY)
+    return True
 
 
 def main():
