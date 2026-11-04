@@ -51,7 +51,8 @@ use tray_icon::menu::{
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
 use accessibility_recovery::{
-    FreshCheckGate, RecheckOutcome, TRUST_RECHECK_INTERVAL, TrustWatch, WatchOutcome, recheck_with,
+    FixPermissionPlan, FreshCheckGate, RecheckOutcome, TRUST_RECHECK_INTERVAL, TrustWatch,
+    WatchOutcome, fix_permission_notice, fix_permission_plan, recheck_with, run_fix_permission,
     watch_until_trusted,
 };
 use audio_conditioning::AudioConditioner;
@@ -1817,6 +1818,7 @@ struct TrayUi {
     learned_words_item: MenuItem,
     show_dashboard_item: MenuItem,
     show_onboarding_item: MenuItem,
+    fix_accessibility_item: MenuItem,
     download_offline_model_item: MenuItem,
     download_qwen_model_item: MenuItem,
     quit_item: MenuItem,
@@ -7218,6 +7220,14 @@ fn create_tray_ui(app: &App) -> Result<TrayUi, AppError> {
     let add_replacement_item =
         MenuItem::with_id("add-replacement-rule", "Replace a Phrase...", true, None);
     let show_onboarding_item = MenuItem::with_id("show-onboarding", "Set Up Bolo...", true, None);
+    // Always listed: the action rechecks trust itself and never resets a
+    // working grant, and the stale-entry case looks granted in Settings.
+    let fix_accessibility_item = MenuItem::with_id(
+        "fix-accessibility",
+        FIX_ACCESSIBILITY_MENU_TITLE,
+        true,
+        None,
+    );
     // The offline model item's label states what clicking will do: a
     // first download, or replacing the model already on disk. The qwen
     // item mirrors it for the multilingual rung's HF snapshot.
@@ -7241,6 +7251,7 @@ fn create_tray_ui(app: &App) -> Result<TrayUi, AppError> {
         &clear_history_item,
         &health_check_item,
         &show_onboarding_item,
+        &fix_accessibility_item,
         &download_offline_model_item,
         &download_qwen_model_item,
     ] {
@@ -7408,6 +7419,7 @@ fn create_tray_ui(app: &App) -> Result<TrayUi, AppError> {
         learned_words_item,
         show_dashboard_item,
         show_onboarding_item,
+        fix_accessibility_item,
         download_offline_model_item,
         download_qwen_model_item,
         quit_item,
@@ -7464,6 +7476,10 @@ fn handle_menu_event(
     }
     if event_id == tray_ui.show_onboarding_item.id().as_ref() {
         app.send_user_event(UserEvent::ShowOnboarding);
+        return;
+    }
+    if event_id == tray_ui.fix_accessibility_item.id().as_ref() {
+        fix_accessibility_from_menu(app);
         return;
     }
     if event_id == tray_ui.update_item.id().as_ref() {
@@ -8597,17 +8613,21 @@ fn bundle_mode() -> bool {
 /// itself; from source it names the exact interpreter to trust.
 /// `auto_recover` says the trust watcher is running, so the grant is picked
 /// up live; only when it is not does the text keep the restart step, and
-/// it says why.
+/// it says why. Bundle mode also names the menu's Fix Accessibility
+/// Permission action for the entry that shows as on but does nothing.
 fn accessibility_fix_detail(bundle: bool, python: &str, auto_recover: bool) -> String {
+    let fix_action = FIX_ACCESSIBILITY_MENU_TITLE.trim_end_matches('.');
     match (bundle, auto_recover) {
-        (true, true) => String::from(
+        (true, true) => format!(
             "Turn on Bolo in System Settings > Privacy & Security > Accessibility. \
-             Bolo starts pasting by itself.",
+             Bolo starts pasting by itself. Already on? Choose More > {fix_action} \
+             in the Bolo menu."
         ),
-        (true, false) => String::from(
-            "Turn on Bolo in System Settings > Privacy & Security > Accessibility, \
-             then quit Bolo from its menu bar and open Bolo again. Bolo could not \
-             start its permission check, so it needs the restart to see the change.",
+        (true, false) => format!(
+            "Turn on Bolo in System Settings > Privacy & Security > Accessibility \
+             (already on? Choose More > {fix_action} in the Bolo menu), then quit \
+             Bolo from its menu bar and open Bolo again. Bolo could not start its \
+             permission check, so it needs the restart to see the change."
         ),
         (false, true) => format!(
             "Add this Python interpreter in System Settings > Privacy & Security > \
@@ -15026,6 +15046,67 @@ fn recover_after_trust_grant(root_dir: &Path) {
     }
 }
 
+/// Menu label of the Fix Accessibility Permission action (under More...).
+/// The untrusted notification names it, so both read from here.
+const FIX_ACCESSIBILITY_MENU_TITLE: &str = "Fix Accessibility Permission...";
+
+/// The menu's Fix Accessibility Permission action, off the event loop: one
+/// fresh trust reading decides the plan (a trusted Bolo is never reset),
+/// bundle mode resets only Bolo's own record and opens the pane, and a
+/// two-line notification says what to do next. The trust watch is armed so
+/// the re-added grant is picked up without a restart.
+fn fix_accessibility_from_menu(app: &App) {
+    let root_dir = app.config.root_dir.clone();
+    if let Err(error) = std::thread::Builder::new()
+        .name(String::from("bolo-fix-accessibility"))
+        .spawn(move || {
+            let bundle = bundle_mode();
+            let plan = fix_permission_plan(bundle, fresh_accessibility_trust(&root_dir));
+            let outcome = run_fix_permission(plan, run_fix_permission_command);
+            info!(
+                "[accessibility] fix_permission {}",
+                serde_json::json!({
+                    "plan": format!("{plan:?}"),
+                    "reset_ok": outcome.reset,
+                    "opened_ok": outcome.opened,
+                })
+            );
+            if matches!(
+                plan,
+                FixPermissionPlan::ResetAndOpen | FixPermissionPlan::OpenOnly
+            ) {
+                arm_trust_watch();
+            }
+            let (title, message) =
+                fix_permission_notice(outcome, bundle, &python3_executable_path());
+            show_notification(title, &message);
+        })
+    {
+        warn!("[accessibility] fix permission thread failed to start: {error}");
+    }
+}
+
+/// Run one fix-permission command; true on a zero exit. Failures are logged
+/// with the command's stderr so a refused reset is diagnosable.
+fn run_fix_permission_command(program: &str, args: &[&str]) -> bool {
+    match Command::new(program).args(args).output() {
+        Ok(output) if output.status.success() => true,
+        Ok(output) => {
+            warn!(
+                "[accessibility] {program} {} exited with {}: {}",
+                args.join(" "),
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+            false
+        }
+        Err(error) => {
+            warn!("[accessibility] {program} failed to run: {error}");
+            false
+        }
+    }
+}
+
 /// Title of the notification sent when a grant is picked up live.
 const TRUST_GRANTED_TITLE: &str = "Bolo can paste now";
 
@@ -15804,6 +15885,9 @@ mod tests {
         assert!(!live.contains("python3"));
         assert!(!live.contains("restart.sh"));
         assert!(!live.contains("quit"), "the grant is picked up live");
+        // The stale entry from an older build looks on in Settings, so the
+        // text points at the menu action that clears it.
+        assert!(live.contains("More > Fix Accessibility Permission in the Bolo menu"));
         let restart = accessibility_fix_detail(true, python, false);
         assert!(restart.contains("quit Bolo"));
         assert!(restart.contains("could not start its permission check"));
