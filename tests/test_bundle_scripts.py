@@ -515,6 +515,9 @@ def test_launcher_corrupted_bundle_fails_at_runtime(tmp_path):
     staged_helper.parent.mkdir(parents=True, exist_ok=True)
     subprocess.run(["cp", str(HELPER), str(staged_helper)], check=True)
     staged_helper.chmod(0o755)
+    # A ready venv so the run gets past the helper venv step and reaches
+    # the signature check itself.
+    _stage_fake_venv(tmp_path)
     stub_dir = tmp_path / "stubbin"
     stub_dir.mkdir()
     # A codesign stub that always fails: the helper must treat the
@@ -522,6 +525,13 @@ def test_launcher_corrupted_bundle_fails_at_runtime(tmp_path):
     stub = stub_dir / "codesign"
     stub.write_text("#!/bin/bash\nexit 1\n")
     stub.chmod(0o755)
+    # Record the notification instead of showing one on the test machine.
+    notified = tmp_path / "osascript-args"
+    osascript_stub = stub_dir / "osascript"
+    osascript_stub.write_text(
+        "#!/bin/bash\nprintf '%s\\n' \"$@\" >> \"{0}\"\n".format(notified)
+    )
+    osascript_stub.chmod(0o755)
     env = dict(os.environ)
     env.update(
         {
@@ -539,6 +549,21 @@ def test_launcher_corrupted_bundle_fails_at_runtime(tmp_path):
         timeout=60,
     )
     assert strict.returncode == 1
+    # The failure names the cause and the fix: files changed after
+    # install (bundled Python cache writes are the common case), reinstall
+    # from the DMG, and the same build keeps the existing permissions.
+    log = (tmp_path / "runtime" / "bolo.log").read_text()
+    assert "code signature does not verify" in log
+    assert "changed after install" in log
+    assert "bundled Python" in log
+    assert "Reinstall Bolo from its DMG" in log
+    assert "same build keeps your existing permissions" in log
+    assert "damaged or incomplete" not in log
+    notice = notified.read_text()
+    assert "Bolo was modified after install" in notice
+    assert "Reinstall Bolo from its DMG" in notice
+    assert "keeps your permissions" in notice
+    notified.unlink()
     # A passing stub lets the helper continue (it will then fail later
     # on the missing runtime binary, but never on the signature check).
     ok_stub = stub_dir / "codesign"

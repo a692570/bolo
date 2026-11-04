@@ -167,13 +167,16 @@ export BOLO_PYTHON="$VENV_DIR/bin/python3"
 # cache, not per-launch state.) The bundle is never re-signed here:
 # modifying a signed bundle breaks its seal, and for a real Developer ID
 # release the trust chain must survive from build to launch. If the
-# signature no longer verifies, the copy is damaged or tampered with, so
-# stop and tell the user to reinstall instead of silently patching it.
+# signature no longer verifies, files inside the app changed after install,
+# so stop and tell the user to reinstall instead of silently patching it.
+# The usual cause is a tool running the bundled Python, which writes
+# __pycache__ files into the sealed app. Reinstalling the same build gives
+# back the same code signature, so macOS keeps its permission grants.
 # Shallow verify is a few milliseconds; --deep on a ~150MB bundle would
 # add seconds to every launch.
 if ! codesign --verify "$APP_DIR" >/dev/null 2>&1; then
-    echo "[bolo] ERROR: Bolo's code signature does not verify; this copy is damaged or incomplete. Reinstall Bolo from the latest DMG." >> "$LOG" 2>/dev/null || true
-    osascript -e 'display notification "This copy of Bolo is damaged or incomplete. Reinstall it from the latest Bolo DMG." with title "Bolo"' >/dev/null 2>&1 || true
+    echo "[bolo] ERROR: Bolo's code signature does not verify: files inside Bolo.app changed after install, for example a tool ran Bolo's bundled Python and it wrote cache files into the app. Reinstall Bolo from its DMG. Reinstalling the same build keeps your existing permissions." >> "$LOG" 2>/dev/null || true
+    osascript -e 'display notification "Files inside Bolo.app changed after install, for example cache files from running its bundled Python. Reinstall Bolo from its DMG; the same build keeps your permissions." with title "Bolo was modified after install"' >/dev/null 2>&1 || true
     exit 1
 fi
 
