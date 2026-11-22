@@ -389,7 +389,11 @@ def main():
         "selected_text": "" if (element is None or secure) else selected_text(element),
         # Paste-target verdict for the insert decision; absent field on a
         # stale helper means "unknown" and the runtime keeps pasting.
-        "writable": element is not None and is_writable_element(element),
+        # None (JSON null) when no element could be read, e.g. an Electron
+        # app whose accessibility tree is still being built: that is
+        # "unknown", and the runtime keeps pasting. Only a real element
+        # that fails the check reports False and diverts to the popup.
+        "writable": None if element is None else is_writable_element(element),
         # Owner of the focused element (None when nothing is focused or a
         # stale helper predates the field); probes use it to recognize the
         # manual-copy popup's text view without reading field content.

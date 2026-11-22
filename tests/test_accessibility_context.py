@@ -256,3 +256,16 @@ def test_ordinary_field_reports_writable_true(monkeypatch, capsys, refusal_log):
     output = json.loads(capsys.readouterr().out)
     assert output["writable"] is True
     assert refusal_log == []
+
+
+def test_unreadable_focus_reports_writable_unknown_not_false(
+    monkeypatch, capsys, refusal_log
+):
+    # Electron apps return no focused element until their accessibility tree
+    # is built. That is "unknown" (null), which keeps the runtime pasting,
+    # not a confirmed non-writable target that diverts to the copy popup.
+    run_context_main(monkeypatch, None, app=("OpenChamber", "dev.openchamber.desktop"))
+    output = json.loads(capsys.readouterr().out)
+    assert output["writable"] is None
+    assert output["focused_pid"] is None
+    assert refusal_log == []
