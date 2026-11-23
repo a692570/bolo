@@ -443,6 +443,21 @@ def test_build_dmg_release_preflight_fails_fast():
     assert "--release needs BOLO_CODESIGN_IDENTITY" in run.stderr
 
 
+def test_build_dmg_ships_hash_based_pycache_before_signing():
+    # Regression (2026-11-21): the first import of the bundled Python
+    # rewrote stale .pyc files inside the sealed app and the signature
+    # broke ("this copy of Bolo is damaged"). The build must keep source
+    # mtimes and precompile both arch trees with unchecked-hash caches
+    # before the codesign phase.
+    text = BUILD_DMG.read_text()
+    assert 'cp -Rp "$PYBUILD/aarch64/python"' in text
+    assert 'cp -Rp "$PYBUILD/x86_64/python"' in text
+    assert "--invalidation-mode unchecked-hash" in text
+    assert text.index("--invalidation-mode unchecked-hash") < text.index(
+        "Phase 6: codesign"
+    )
+
+
 def test_build_dmg_release_mode_signs_with_identity_and_notarizes():
     text = BUILD_DMG.read_text()
     # Release signing: nested Mach-O files first (bottom-up, detected by

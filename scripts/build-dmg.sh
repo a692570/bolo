@@ -379,8 +379,19 @@ cp "$ROOT/Third-Party Notices.txt" "$APP/Contents/Resources/Third-Party Notices.
 chmod +x "$APP/Contents/Resources/ensure-python-env.sh"
 
 mkdir -p "$APP/Contents/Resources/python" "$APP/Contents/Resources/wheels"
-cp -R "$PYBUILD/aarch64/python" "$APP/Contents/Resources/python/aarch64"
-cp -R "$PYBUILD/x86_64/python" "$APP/Contents/Resources/python/x86_64"
+cp -Rp "$PYBUILD/aarch64/python" "$APP/Contents/Resources/python/aarch64"
+cp -Rp "$PYBUILD/x86_64/python" "$APP/Contents/Resources/python/x86_64"
+# Python rewrites a .pyc whose recorded source mtime no longer matches, and
+# the x86_64 tree has no .pyc at all. Either way the first import inside the
+# installed app would write into the sealed bundle and break its code
+# signature ("this copy of Bolo is damaged"). Ship hash-based caches that are
+# never revalidated against the source mtime. 3.12 bytecode is architecture
+# independent, so the arm64 interpreter compiles both trees.
+for arch in aarch64 x86_64; do
+    "$BUNDLED_PY" -m compileall -q -f --invalidation-mode unchecked-hash \
+        "$APP/Contents/Resources/python/$arch/lib/python3.12" >/dev/null \
+        || fail "could not precompile the $arch python runtime"
+done
 cp "$WHEELS"/*.whl "$APP/Contents/Resources/wheels/"
 cp "$ICON_DIR/Bolo.icns" "$APP/Contents/Resources/Bolo.icns"
 
