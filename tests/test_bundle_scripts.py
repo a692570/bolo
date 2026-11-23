@@ -458,6 +458,19 @@ def test_build_dmg_ships_hash_based_pycache_before_signing():
     )
 
 
+def test_build_dmg_preview_signs_with_a_stable_local_identity_when_present():
+    # Regression (2026-11-23): ad-hoc signatures are the build's own cdhash,
+    # so every update dropped the Accessibility grant. A preview build signs
+    # with the local "Bolo Local Signing" identity when it exists and falls
+    # back to ad-hoc (with a log line saying what that costs) when it does not.
+    text = BUILD_DMG.read_text()
+    assert "Bolo Local Signing" in text
+    assert "BOLO_PREVIEW_IDENTITY" in text
+    assert 'codesign --force --deep --sign "$PREVIEW_SIGN_HASH" "$APP"' in text
+    assert 'codesign --force --deep --sign - "$APP"' in text  # ad-hoc fallback
+    assert "drop its permission grants" in text
+
+
 def test_build_dmg_release_mode_signs_with_identity_and_notarizes():
     text = BUILD_DMG.read_text()
     # Release signing: nested Mach-O files first (bottom-up, detected by

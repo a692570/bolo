@@ -9,7 +9,7 @@
 #   3. pyobjc wheels (resolved from helper-requirements.txt, cached)
 #   4. app icon (scripts/make_icon.py under a build-time venv)
 #   5. Bolo.app staging (launcher, binary, helpers, runtimes, wheels, plist)
-#   6. codesign: ad-hoc by default (preview); --release requires a real
+#   6. codesign: a local identity or ad-hoc by default (preview); --release requires a real
 #      Developer ID identity and the notary profile up front
 #   6.5 Finder presentation: background image + programmatic .DS_Store
 #       (scripts/make-dmg-layout.py with the pinned ds_store/mac_alias
@@ -89,7 +89,23 @@ if [ "$RELEASE" = 1 ]; then
         || fail "notarytool profile '$NOTARY_PROFILE' is not usable (store it with: xcrun notarytool store-credentials)"
     log "release preflight passed: Developer ID identity + notary profile present"
 else
-    log "preview mode: the bundle will be ad-hoc signed, never notarized"
+    # A preview build signed with a stable local identity keeps one code
+    # requirement ("com.a692570.bolo" plus that certificate) across rebuilds,
+    # so macOS keeps the Accessibility and Microphone grants. An ad-hoc
+    # signature is the build's own cdhash, which changes every build and
+    # drops those grants on every update. BOLO_PREVIEW_IDENTITY overrides the
+    # certificate name; the default is the "Bolo Local Signing" certificate
+    # in the login keychain (see docs/RELEASING.md for how to create it).
+    PREVIEW_SIGN_NAME="${BOLO_PREVIEW_IDENTITY:-Bolo Local Signing}"
+    PREVIEW_SIGN_HASH="$(security find-identity -p codesigning 2>/dev/null \
+        | awk -v name="\"$PREVIEW_SIGN_NAME\"" 'index($0, name) {print $2; exit}')"
+    if [ -n "$PREVIEW_SIGN_HASH" ]; then
+        PREVIEW_SIGN_LABEL="locally signed ($PREVIEW_SIGN_NAME)"
+        log "preview mode: the bundle will be signed with the local identity '$PREVIEW_SIGN_NAME', never notarized"
+    else
+        PREVIEW_SIGN_LABEL="ad-hoc signed"
+        log "preview mode: no '$PREVIEW_SIGN_NAME' identity found; the bundle will be ad-hoc signed and macOS will drop its permission grants on every update"
+    fi
 fi
 
 mkdir -p "$BUILD" "$DIST" "$DOWNLOADS" "$WHEELS" "$ICON_DIR" "$PYBUILD"
@@ -465,8 +481,13 @@ if [ "$RELEASE" = 1 ]; then
     codesign --verify --strict "$APP" >/dev/null \
         || fail "signed bundle fails verification"
 else
-    log "ad-hoc code signing the bundle (preview build, never notarized)"
-    codesign --force --deep --sign - "$APP" || fail "ad-hoc codesign failed"
+    if [ -n "$PREVIEW_SIGN_HASH" ]; then
+        log "code signing the bundle as '$PREVIEW_SIGN_NAME' (preview build, never notarized)"
+        codesign --force --deep --sign "$PREVIEW_SIGN_HASH" "$APP" || fail "local-identity codesign failed"
+    else
+        log "ad-hoc code signing the bundle (preview build, never notarized)"
+        codesign --force --deep --sign - "$APP" || fail "ad-hoc codesign failed"
+    fi
 fi
 
 # --- Phase 6.5: Finder presentation (background + icon layout) --------------------------
@@ -663,11 +684,11 @@ if [ "$RELEASE" = 1 ]; then
         || fail "Gatekeeper assessment rejected the DMG"
     log "notarized and stapled: $DMG"
 else
-    log "preview build: ad-hoc signed, NOT notarized; label it as a preview"
+    log "preview build: $PREVIEW_SIGN_LABEL, NOT notarized; label it as a preview"
 fi
 
 if [ "$RELEASE" = 1 ]; then
     log "done: $DMG (${SIZE_MB}MB, universal $MOUNTED_ARCHS, Developer ID signed + notarized)"
 else
-    log "done: $DMG (${SIZE_MB}MB, universal $MOUNTED_ARCHS, ad-hoc preview, not notarized)"
+    log "done: $DMG (${SIZE_MB}MB, universal $MOUNTED_ARCHS, ${PREVIEW_SIGN_LABEL} preview, not notarized)"
 fi
