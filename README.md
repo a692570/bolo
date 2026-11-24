@@ -37,7 +37,7 @@ Two macOS caveats, both consequences of shipping without a paid Developer ID:
 scripts/build-dmg.sh
 ```
 
-The script builds the universal Rust binary (bootstrapping a private rustup toolchain inside `build/` when the system rust cannot cross-compile for x86_64), downloads the pinned python-build-standalone runtimes, resolves the pyobjc wheels, renders the app icon, stages `Bolo.app`, ad-hoc signs it, packs `dist/Bolo-<version>.dmg`, and verifies the mounted result. Artifacts are cached in `build/` and the DMG lands in `dist/`; both are gitignored.
+The script builds the universal Rust binary (bootstrapping a private rustup toolchain inside `build/` when the system rust cannot cross-compile for x86_64), downloads the pinned python-build-standalone runtimes, resolves the pyobjc wheels, renders the app icon, stages `Bolo.app`, signs it (with the local `Bolo Local Signing` certificate when it exists, ad-hoc otherwise), packs `dist/Bolo-<version>.dmg`, and verifies the mounted result. Artifacts are cached in `build/` and the DMG lands in `dist/`; both are gitignored.
 
 > **AI agent prompt:** Copy and paste this into Claude Code, ChatGPT, Cursor, or any coding agent:
 >

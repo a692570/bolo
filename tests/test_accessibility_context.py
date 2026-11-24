@@ -269,3 +269,26 @@ def test_unreadable_focus_reports_writable_unknown_not_false(
     assert output["writable"] is None
     assert output["focused_pid"] is None
     assert refusal_log == []
+
+
+def test_daemon_reports_writable_unknown_when_no_element_is_readable(monkeypatch):
+    # Regression (2026-11-22): the persistent daemon answered writable=False
+    # when OpenChamber's app-level focused element returned no value, so every
+    # dictation there diverted to the copy popup instead of pasting. No
+    # element is "unknown" (null); only a real non-editable element is False.
+    import accessibility_daemon
+
+    monkeypatch.setattr(
+        accessibility_context, "frontmost_app",
+        lambda: ("OpenChamber", "dev.openchamber.desktop"),
+    )
+    monkeypatch.setattr(accessibility_context, "focused_element", lambda: None)
+    reply = accessibility_daemon.handle_read_context({})
+    assert reply["writable"] is None
+    assert reply["focused_pid"] is None
+    assert reply["before_cursor"] == "" and reply["selected_text"] == ""
+
+    element = use_fake_element(monkeypatch, {"AXRole": "AXButton"})
+    stub_value_writes(monkeypatch, False)
+    monkeypatch.setattr(accessibility_context, "focused_element", lambda: element)
+    assert accessibility_daemon.handle_read_context({})["writable"] is False

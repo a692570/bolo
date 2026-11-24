@@ -24,9 +24,10 @@ exactly one response line per request:
 * ``{"type":"read_context"}`` -> ``{"type":"context","app":...,
   "bundle_id":...,"before_cursor":...,"selected_text":...,"writable":
   <bool>,"focused_pid":<int|null>}``, or ``{"type":"context","app":null}``
-  when the read failed outright. ``writable`` is False when nothing
-  editable was focused; the runtime treats an absent ``writable`` (older
-  daemon) as "unknown" and keeps pasting. ``focused_pid`` names the
+  when the read failed outright. ``writable`` is False when a focused
+  element is not an editable target and null when no element could be read;
+  the runtime treats null or an absent ``writable`` (older daemon) as
+  "unknown" and keeps pasting. ``focused_pid`` names the
   process owning the focused element (used by the manual-copy fallback's
   edit-learning probe to recognize its popup) and is absent on older
   daemons.
@@ -235,11 +236,16 @@ def handle_read_context(_request):
             "selected_text": ""
             if element is None or secure
             else accessibility_context.selected_text(element),
-            # Paste-target verdict: False (including no focused element and
-            # password fields) routes the insert to the manual-copy popup.
-            # Secured elements never have their value read on any path.
-            "writable": element is not None
-            and accessibility_context.is_writable_element(element),
+            # Paste-target verdict: False (a real element that is not an
+            # editable target, including password fields) routes the insert
+            # to the manual-copy popup. None (JSON null) means no element
+            # could be read, e.g. an Electron app such as OpenChamber whose
+            # accessibility tree is not built yet: that is "unknown" and the
+            # runtime keeps pasting. Secured elements never have their value
+            # read on any path.
+            "writable": None
+            if element is None
+            else accessibility_context.is_writable_element(element),
             # Owner of the focused element; the fallback edit-learning probe
             # pins the manual-copy popup's process through it.
             "focused_pid": accessibility_context.focused_element_pid(element),
